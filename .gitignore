@@ -1,0 +1,32 @@
+# Rust
+target/
+Cargo.lock
+node_modules/
+package.json
+package-lock.json
+
+# WASM
+*.wasm
+pkg/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Coverage
+coverage/
+lcov.info
+
+# Fuzz artifacts
+artifacts/
+corpus/

@@ -1,0 +1,28 @@
+[package]
+name = "drift-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+drift-core = { path = "../drift-core", default-features = false }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "WebSocket", "BroadcastChannel", "Window", "Navigator",
+    "Storage", "Crypto", "SubtleCrypto",
+    "StorageManager", "FileSystemDirectoryHandle",
+    "FileSystemFileHandle", "FileSystemWritableFileStream",
+    "FileSystemGetFileOptions", "FileSystemGetDirectoryOptions",
+    "FileSystemCreateWritableOptions", "FileSystemRemoveOptions",
+    "Blob", "File", "WritableStream"
+] }
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen-futures = "0.4"
+async-trait = "0.1"

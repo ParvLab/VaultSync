@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/drift-core",
+    "crates/drift-wasm",
+    "crates/drift-coordinator-postgres",
+    "crates/drift-coordinator-redis",
+    "crates/drift-coordinator-sqlite",
+    "crates/drift-coordinator-memory",
+    "crates/drift-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Drift Contributors"]

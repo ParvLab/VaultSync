@@ -1,0 +1,12 @@
+[package]
+name = "drift-fuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+drift-core = { path = "../drift-core" }
+libfuzzer-sys = "0.4"
+
+[profile.release]
+debug = 1
