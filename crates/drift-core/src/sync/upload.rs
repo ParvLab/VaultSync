@@ -16,15 +16,39 @@ pub struct UploadQueue {
     oplog: Arc<OpLog>,
     coordinator: Arc<dyn Coordinator>,
     config: UploadConfig,
+    retry_engine: std::sync::Mutex<crate::sync::retry::RetryEngine>,
 }
 
 impl UploadQueue {
-    pub fn new(oplog: Arc<OpLog>, coordinator: Arc<dyn Coordinator>, config: UploadConfig) -> Self {
-        Self { oplog, coordinator, config }
+    pub fn new(
+        oplog: Arc<OpLog>,
+        coordinator: Arc<dyn Coordinator>,
+        config: UploadConfig,
+        retry_config: crate::sync::retry::RetryConfig,
+    ) -> Self {
+        Self {
+            oplog,
+            coordinator,
+            config,
+            retry_engine: std::sync::Mutex::new(crate::sync::retry::RetryEngine::new(retry_config)),
+        }
     }
 
     pub async fn process_batch(&self) -> Result<usize, DriftError> {
-        let entries = self.oplog.read_pending(self.config.batch_size).await?;
+        let raw_entries = self.oplog.read_pending(self.config.batch_size).await?;
+        if raw_entries.is_empty() {
+            return Ok(0);
+        }
+
+        // Filter out entries that cannot be retried yet based on the retry engine
+        let entries: Vec<_> = {
+            let engine = self.retry_engine.lock().unwrap();
+            raw_entries
+                .into_iter()
+                .filter(|e| engine.can_retry(&e.id))
+                .collect()
+        };
+
         if entries.is_empty() {
             return Ok(0);
         }
@@ -45,10 +69,47 @@ impl UploadQueue {
                 for (entry, seq) in entries.iter().zip(sequences.iter()) {
                     self.oplog.mark_synced(&entry.id, *seq).await?;
                 }
+                {
+                    let mut engine = self.retry_engine.lock().unwrap();
+                    for entry in &entries {
+                        engine.record_success(&entry.id);
+                    }
+                }
                 Ok(entries.len())
             }
-            Err(CoordinatorError::NotAvailable) => Ok(0),
-            Err(e) => Err(DriftError::Coordinator(format!("upload failed: {e:?}"))),
+            Err(CoordinatorError::NotAvailable) => {
+                let failed_ids: Vec<String> = {
+                    let mut engine = self.retry_engine.lock().unwrap();
+                    let mut exhausted = Vec::new();
+                    for entry in &entries {
+                        if engine.record_failure(&entry.id).is_none() {
+                            exhausted.push(entry.id.clone());
+                        }
+                    }
+                    exhausted
+                };
+                for id in failed_ids {
+                    self.oplog.mark_failed(&id, "Coordinator not available: retry limit reached").await?;
+                }
+                Ok(0)
+            }
+            Err(e) => {
+                let err_msg = format!("upload failed: {e:?}");
+                let failed_ids: Vec<String> = {
+                    let mut engine = self.retry_engine.lock().unwrap();
+                    let mut exhausted = Vec::new();
+                    for entry in &entries {
+                        if engine.record_failure(&entry.id).is_none() {
+                            exhausted.push(entry.id.clone());
+                        }
+                    }
+                    exhausted
+                };
+                for id in failed_ids {
+                    self.oplog.mark_failed(&id, &err_msg).await?;
+                }
+                Err(DriftError::Coordinator(err_msg))
+            }
         }
     }
 

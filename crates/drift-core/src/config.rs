@@ -12,6 +12,7 @@ pub struct DriftConfig {
     pub upload: UploadConfig,
     pub download: DownloadConfig,
     pub retry: RetryConfig,
+    pub sync_interval: std::time::Duration,
 }
 
 impl Default for DriftConfig {
@@ -24,6 +25,7 @@ impl Default for DriftConfig {
             upload: UploadConfig::default(),
             download: DownloadConfig::default(),
             retry: RetryConfig::default(),
+            sync_interval: std::time::Duration::from_secs(5),
         }
     }
 }

@@ -25,17 +25,23 @@ impl Default for RetryConfig {
 pub struct RetryEngine {
     config: RetryConfig,
     attempts: HashMap<String, u32>,
+    next_retry: HashMap<String, std::time::Instant>,
 }
 
 impl RetryEngine {
     pub fn new(config: RetryConfig) -> Self {
-        Self { config, attempts: HashMap::new() }
+        Self {
+            config,
+            attempts: HashMap::new(),
+            next_retry: HashMap::new(),
+        }
     }
 
     pub fn record_failure(&mut self, id: &str) -> Option<Duration> {
         let attempts = self.attempts.entry(id.to_string()).or_insert(0);
         *attempts += 1;
         if *attempts >= self.config.max_attempts {
+            self.next_retry.remove(id);
             return None;
         }
         let delay = self.config.initial_delay.as_secs_f64()
@@ -46,14 +52,27 @@ impl RetryEngine {
             let jitter = rand::random::<f64>() * 0.5 + 0.75;
             delay = Duration::from_secs_f64(delay.as_secs_f64() * jitter);
         }
+        self.next_retry.insert(id.to_string(), std::time::Instant::now() + delay);
         Some(delay)
     }
 
     pub fn record_success(&mut self, id: &str) {
         self.attempts.remove(id);
+        self.next_retry.remove(id);
     }
 
     pub fn is_exhausted(&self, id: &str) -> bool {
         self.attempts.get(id).copied().unwrap_or(0) >= self.config.max_attempts
+    }
+
+    pub fn can_retry(&self, id: &str) -> bool {
+        if self.is_exhausted(id) {
+            return false;
+        }
+        if let Some(&time) = self.next_retry.get(id) {
+            std::time::Instant::now() >= time
+        } else {
+            true
+        }
     }
 }

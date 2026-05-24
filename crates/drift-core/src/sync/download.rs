@@ -16,6 +16,7 @@ impl Default for DownloadConfig {
 
 pub struct DownloadQueue {
     coordinator: Arc<dyn Coordinator>,
+    storage: Arc<dyn crate::storage::traits::Storage>,
     namespace: String,
     last_sequence: std::sync::atomic::AtomicU64,
     config: DownloadConfig,
@@ -26,6 +27,7 @@ pub struct DownloadQueue {
 impl DownloadQueue {
     pub fn new(
         coordinator: Arc<dyn Coordinator>,
+        storage: Arc<dyn crate::storage::traits::Storage>,
         namespace: &str,
         last_sequence: u64,
         config: DownloadConfig,
@@ -34,6 +36,7 @@ impl DownloadQueue {
     ) -> Self {
         Self {
             coordinator,
+            storage,
             namespace: namespace.to_string(),
             last_sequence: std::sync::atomic::AtomicU64::new(last_sequence),
             config,
@@ -50,13 +53,12 @@ impl DownloadQueue {
                 let namespace_pk = self.decryptor.keyring().active_key().public_key;
 
                 for m in &mutations {
-                    // Decrypt yrs_update bytes from coordinator mutation
                     let decrypted_bytes = self.decryptor.decrypt(&m.encrypted_blob, &namespace_pk)?;
 
                     let entry = OplogEntry {
                         id: m.id.clone(),
                         namespace: m.namespace.clone(),
-                        replica_id: "".to_string(), // Coordinator doesn't expose sender replica ID in PendingMutation
+                        replica_id: "".to_string(),
                         mutation_type: MutationType::CrdtUpdate,
                         doc_id: m.doc_id.clone(),
                         record_id: m.record_id.clone(),
@@ -69,12 +71,30 @@ impl DownloadQueue {
                         created_at: m.timestamp,
                     };
 
-                    // Apply to storage and fire subscriptions
                     self.reconciler.apply_remote_update(&entry).await?;
                 }
 
                 if let Some(last) = mutations.last() {
-                    self.last_sequence.store(last.sequence, std::sync::atomic::Ordering::SeqCst);
+                    let new_seq = last.sequence;
+                    self.last_sequence.store(new_seq, std::sync::atomic::Ordering::SeqCst);
+
+                    let mut state = match self.storage.read_sync_state(&self.namespace).await? {
+                        Some(s) => s,
+                        None => crate::sync::state::SyncState {
+                            namespace: self.namespace.clone(),
+                            replica_id: "".to_string(),
+                            last_synced_sequence: new_seq,
+                            connection_status: crate::sync::state::ConnectionStatus::Connected,
+                            leader_status: Some(true),
+                            last_connected_at: None,
+                            last_sync_at: None,
+                            schema_version: 0,
+                        }
+                    };
+                    state.last_synced_sequence = new_seq;
+                    state.last_sync_at = Some(std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64);
+                    self.storage.write_sync_state(&state).await?;
                 }
                 Ok(count)
             }

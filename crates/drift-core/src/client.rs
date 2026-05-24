@@ -40,6 +40,7 @@ pub struct DriftClient {
     download_queue: Arc<DownloadQueue>,
     _reconciler: Arc<Reconciler>,
     _telemetry: Arc<DriftTelemetry>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl DriftClient {
@@ -76,16 +77,23 @@ impl DriftClient {
 
         let oplog = Arc::new(OpLog::new(storage.clone(), &config.namespace));
 
+        let last_sequence = match storage.read_sync_state(&config.namespace).await? {
+            Some(state) => state.last_synced_sequence,
+            None => 0,
+        };
+
         let upload_queue = Arc::new(UploadQueue::new(
             oplog.clone(),
             coordinator.clone(),
             config.upload.clone(),
+            config.retry.clone(),
         ));
 
         let download_queue = Arc::new(DownloadQueue::new(
             coordinator.clone(),
+            storage.clone(),
             &config.namespace,
-            0,
+            last_sequence,
             config.download.clone(),
             reconciler.clone(),
             decryptor.clone(),
@@ -93,6 +101,8 @@ impl DriftClient {
 
         let schema = Arc::new(std::sync::Mutex::new(SchemaRegistry::new()));
         let _telemetry = Arc::new(DriftTelemetry::new());
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
         let client = Self {
             config,
@@ -104,11 +114,31 @@ impl DriftClient {
             _oplog: oplog,
             schema,
             subscriptions,
-            upload_queue,
-            download_queue,
+            upload_queue: upload_queue.clone(),
+            download_queue: download_queue.clone(),
             _reconciler: reconciler,
             _telemetry,
+            shutdown_tx,
         };
+
+        let upload_queue_clone = upload_queue.clone();
+        let download_queue_clone = download_queue.clone();
+        let sync_interval = client.config.sync_interval;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + sync_interval, sync_interval);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let _ = upload_queue_clone.process_batch().await;
+                        let _ = download_queue_clone.process_batch().await;
+                    }
+                    _ = shutdown_rx.changed() => {
+                        break;
+                    }
+                }
+            }
+        });
 
         client.initialize().await?;
         Ok(client)
@@ -127,6 +157,7 @@ impl DriftClient {
 
     pub async fn shutdown(&self) -> Result<(), DriftError> {
         tracing::info!("Drift client shutting down");
+        let _ = self.shutdown_tx.send(true);
         Ok(())
     }
 
@@ -291,17 +322,21 @@ impl DriftClient {
     }
 
     pub async fn sync_status(&self) -> Result<SyncState, DriftError> {
-        let last_seq = self.download_queue.last_sequence();
-        Ok(SyncState {
-            namespace: self.config.namespace.clone(),
-            replica_id: self.config.replica_id.clone(),
-            last_synced_sequence: last_seq,
-            connection_status: crate::sync::state::ConnectionStatus::Connected,
-            leader_status: Some(true),
-            last_connected_at: None,
-            last_sync_at: None,
-            schema_version: 0,
-        })
+        if let Some(state) = self.storage.read_sync_state(&self.config.namespace).await? {
+            Ok(state)
+        } else {
+            let last_seq = self.download_queue.last_sequence();
+            Ok(SyncState {
+                namespace: self.config.namespace.clone(),
+                replica_id: self.config.replica_id.clone(),
+                last_synced_sequence: last_seq,
+                connection_status: crate::sync::state::ConnectionStatus::Connected,
+                leader_status: Some(true),
+                last_connected_at: None,
+                last_sync_at: None,
+                schema_version: 0,
+            })
+        }
     }
 
     pub async fn pending_uploads(&self) -> Result<usize, DriftError> {
@@ -320,7 +355,26 @@ impl DriftClient {
         self.schema.lock().unwrap().define(doc_id, schema)
     }
 
-    pub async fn apply_migration(&self, _migration: MigrationDefinition) -> Result<(), DriftError> {
+    pub async fn apply_migration(&self, migration: MigrationDefinition) -> Result<(), DriftError> {
+        if !migration.verify_checksum() {
+            return Err(DriftError::Schema("Migration checksum verification failed".into()));
+        }
+        let applied = self.storage.read_migrations().await?;
+        if applied.iter().any(|m| m.version == migration.version) {
+            tracing::info!(version = %migration.version, "Migration already applied, skipping");
+            return Ok(());
+        }
+        
+        migration.apply()?;
+
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let record = crate::storage::traits::MigrationRecord {
+            version: migration.version.clone(),
+            applied_at: epoch,
+            checksum: migration.checksum.clone(),
+        };
+        self.storage.write_migration(&record).await?;
         Ok(())
     }
 }
