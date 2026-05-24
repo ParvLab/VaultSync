@@ -259,6 +259,36 @@ impl Storage for OpfsStorage {
         Ok(())
     }
 
+    async fn write_document_and_oplog(&self, doc_id: &str, record_id: &str, bytes: &[u8], entry: &OplogEntry) -> Result<(), DriftError> {
+        let (root, mut index) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.root_handle(), inner.index.clone())
+        };
+        Self::write_doc_file(&root, doc_id, record_id, bytes).await?;
+        index.doc_listing.entry(doc_id.to_string()).or_default().push(record_id.to_string());
+        index.oplog.push(entry.clone());
+        Self::flush_index(&root, &index).await?;
+        let mut inner = self.inner.lock().unwrap();
+        inner.index = index;
+        Ok(())
+    }
+
+    async fn delete_document_and_oplog(&self, doc_id: &str, record_id: &str, entry: &OplogEntry) -> Result<(), DriftError> {
+        let (root, mut index) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.root_handle(), inner.index.clone())
+        };
+        Self::delete_doc_file(&root, doc_id, record_id).await?;
+        if let Some(listing) = index.doc_listing.get_mut(doc_id) {
+            listing.retain(|r| r != record_id);
+        }
+        index.oplog.push(entry.clone());
+        Self::flush_index(&root, &index).await?;
+        let mut inner = self.inner.lock().unwrap();
+        inner.index = index;
+        Ok(())
+    }
+
     async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, DriftError> {
         let (root, record_ids) = {
             let inner = self.inner.lock().unwrap();

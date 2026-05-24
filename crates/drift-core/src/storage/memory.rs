@@ -48,6 +48,22 @@ impl Storage for InMemoryStorage {
         Ok(())
     }
 
+    async fn write_document_and_oplog(&self, doc_id: &str, record_id: &str, bytes: &[u8], entry: &OplogEntry) -> Result<(), DriftError> {
+        let mut docs = self.documents.write().map_err(|e| DriftError::Storage(e.to_string()))?;
+        let mut oplog = self.oplog.write().map_err(|e| DriftError::Storage(e.to_string()))?;
+        docs.insert((doc_id.to_string(), record_id.to_string()), bytes.to_vec());
+        oplog.push(entry.clone());
+        Ok(())
+    }
+
+    async fn delete_document_and_oplog(&self, doc_id: &str, record_id: &str, entry: &OplogEntry) -> Result<(), DriftError> {
+        let mut docs = self.documents.write().map_err(|e| DriftError::Storage(e.to_string()))?;
+        let mut oplog = self.oplog.write().map_err(|e| DriftError::Storage(e.to_string()))?;
+        docs.remove(&(doc_id.to_string(), record_id.to_string()));
+        oplog.push(entry.clone());
+        Ok(())
+    }
+
     async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, DriftError> {
         let docs = self.documents.read().map_err(|e| DriftError::Storage(e.to_string()))?;
         let mut results = Vec::new();

@@ -33,6 +33,8 @@ impl UploadQueue {
             id: e.id.clone(),
             namespace: e.namespace.clone(),
             replica_id: e.replica_id.clone(),
+            doc_id: e.doc_id.clone(),
+            record_id: e.record_id.clone(),
             encrypted_blob: e.encrypted_blob.clone().unwrap_or_default(),
             timestamp: e.timestamp,
             schema_version: 0,

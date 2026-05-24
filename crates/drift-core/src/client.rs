@@ -32,18 +32,33 @@ pub struct DriftClient {
     coordinator: Arc<dyn Coordinator>,
     keyring: Arc<KeyRing>,
     encryptor: Arc<E2eeEncryptor>,
-    decryptor: Arc<E2eeDecryptor>,
-    oplog: Arc<OpLog>,
+    _decryptor: Arc<E2eeDecryptor>,
+    _oplog: Arc<OpLog>,
     schema: Arc<std::sync::Mutex<SchemaRegistry>>,
     subscriptions: Arc<std::sync::Mutex<SubscriptionEngine>>,
     upload_queue: Arc<UploadQueue>,
     download_queue: Arc<DownloadQueue>,
-    reconciler: Arc<Reconciler>,
+    _reconciler: Arc<Reconciler>,
     _telemetry: Arc<DriftTelemetry>,
 }
 
 impl DriftClient {
     pub async fn new(config: DriftConfig) -> Result<Self, DriftError> {
+        let coordinator = Arc::new(InMemoryCoordinator::new());
+        let keyring = Arc::new(KeyRing::generate());
+        Self::new_with_keyring(config, coordinator, keyring).await
+    }
+
+    pub async fn new_with_coordinator(config: DriftConfig, coordinator: Arc<dyn Coordinator>) -> Result<Self, DriftError> {
+        let keyring = Arc::new(KeyRing::generate());
+        Self::new_with_keyring(config, coordinator, keyring).await
+    }
+
+    pub async fn new_with_keyring(
+        config: DriftConfig,
+        coordinator: Arc<dyn Coordinator>,
+        keyring: Arc<KeyRing>,
+    ) -> Result<Self, DriftError> {
         let storage: Arc<dyn Storage> = match &config.storage {
             #[cfg(feature = "storage-sqlite")]
             StorageConfig::Sqlite { path } => Arc::new(SQLiteStorage::new(path)?),
@@ -53,11 +68,8 @@ impl DriftClient {
             StorageConfig::Wasm => return Err(DriftError::Config("WASM storage not available in native build".into())),
         };
 
-        let coordinator: Arc<dyn Coordinator> = Arc::new(InMemoryCoordinator::new());
-
-        let keyring = Arc::new(KeyRing::generate());
-        let encryptor = Arc::new(E2eeEncryptor::new(KeyRing::generate()));
-        let decryptor = Arc::new(E2eeDecryptor::new(KeyRing::generate()));
+        let encryptor = Arc::new(E2eeEncryptor::new(keyring.clone()));
+        let decryptor = Arc::new(E2eeDecryptor::new(keyring.clone()));
 
         let subscriptions = Arc::new(std::sync::Mutex::new(SubscriptionEngine::new()));
         let reconciler = Arc::new(Reconciler::new(storage.clone(), subscriptions.clone()));
@@ -75,6 +87,8 @@ impl DriftClient {
             &config.namespace,
             0,
             config.download.clone(),
+            reconciler.clone(),
+            decryptor.clone(),
         ));
 
         let schema = Arc::new(std::sync::Mutex::new(SchemaRegistry::new()));
@@ -86,13 +100,13 @@ impl DriftClient {
             coordinator,
             keyring,
             encryptor,
-            decryptor,
-            oplog,
+            _decryptor: decryptor,
+            _oplog: oplog,
             schema,
             subscriptions,
             upload_queue,
             download_queue,
-            reconciler,
+            _reconciler: reconciler,
             _telemetry,
         };
 
@@ -118,13 +132,13 @@ impl DriftClient {
 
     pub async fn insert(&self, doc_id: &str, record_id: &str, fields: HashMap<String, CrdtValue>) -> Result<(), DriftError> {
         let mut doc = CRDTDocument::new(doc_id, record_id, 0);
-        let mut update_bytes = Vec::new();
         for (field, value) in &fields {
-            let update = doc.set_field(field, value.clone());
-            update_bytes = update;
+            doc.set_field(field, value.clone());
         }
-        let snapshot = doc.to_snapshot();
-        self.storage.insert_document(doc_id, record_id, &snapshot).await?;
+        let update_bytes = doc.to_snapshot();
+        let snapshot = update_bytes.clone();
+
+        let encrypted_blob = self.encryptor.encrypt(&update_bytes, &self.keyring.active_key().public_key)?;
 
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -136,14 +150,20 @@ impl DriftClient {
             doc_id: doc_id.to_string(),
             record_id: record_id.to_string(),
             yrs_update: update_bytes,
-            encrypted_blob: None,
+            encrypted_blob: Some(encrypted_blob),
             timestamp: epoch,
             sequence: None,
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: epoch,
         };
-        self.oplog.append(entry).await?;
+        
+        self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await?;
+
+        // Fire reactive subscriptions locally
+        let state = doc.to_map();
+        self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
+
         Ok(())
     }
 
@@ -153,13 +173,13 @@ impl DriftClient {
             Some(bytes) => CRDTDocument::from_snapshot(&bytes)?,
             None => CRDTDocument::new(doc_id, record_id, 0),
         };
-        let mut update_bytes = Vec::new();
         for (field, value) in &fields {
-            let update = doc.set_field(field, value.clone());
-            update_bytes = update;
+            doc.set_field(field, value.clone());
         }
-        let snapshot = doc.to_snapshot();
-        self.storage.insert_document(doc_id, record_id, &snapshot).await?;
+        let update_bytes = doc.to_snapshot();
+        let snapshot = update_bytes.clone();
+
+        let encrypted_blob = self.encryptor.encrypt(&update_bytes, &self.keyring.active_key().public_key)?;
 
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -171,14 +191,20 @@ impl DriftClient {
             doc_id: doc_id.to_string(),
             record_id: record_id.to_string(),
             yrs_update: update_bytes,
-            encrypted_blob: None,
+            encrypted_blob: Some(encrypted_blob),
             timestamp: epoch,
             sequence: None,
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: epoch,
         };
-        self.oplog.append(entry).await?;
+
+        self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await?;
+
+        // Fire reactive subscriptions locally
+        let state = doc.to_map();
+        self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
+
         Ok(())
     }
 
@@ -186,8 +212,11 @@ impl DriftClient {
         let existing = self.storage.get_document(doc_id, record_id).await?;
         if let Some(bytes) = existing {
             let mut doc = CRDTDocument::from_snapshot(&bytes)?;
-            let update_bytes = doc.delete_field("doc_id");
-            self.storage.delete_document(doc_id, record_id).await?;
+            doc.set_field("_deleted", CrdtValue::Boolean(true));
+            let update_bytes = doc.to_snapshot();
+            let snapshot = update_bytes.clone();
+
+            let encrypted_blob = self.encryptor.encrypt(&update_bytes, &self.keyring.active_key().public_key)?;
 
             let epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -199,14 +228,19 @@ impl DriftClient {
                 doc_id: doc_id.to_string(),
                 record_id: record_id.to_string(),
                 yrs_update: update_bytes,
-                encrypted_blob: None,
+                encrypted_blob: Some(encrypted_blob),
                 timestamp: epoch,
                 sequence: None,
                 sync_status: SyncStatus::Pending,
                 synced_at: None,
                 created_at: epoch,
             };
-            self.oplog.append(entry).await?;
+
+            self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await?;
+
+            // Fire reactive subscriptions locally
+            let state = doc.to_map();
+            self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
         }
         Ok(())
     }
@@ -215,7 +249,12 @@ impl DriftClient {
         match self.storage.get_document(doc_id, record_id).await? {
             Some(bytes) => {
                 let doc = CRDTDocument::from_snapshot(&bytes)?;
-                Ok(Some(doc.to_map()))
+                let map = doc.to_map();
+                if let Some(CrdtValue::Boolean(true)) = map.get("_deleted") {
+                    Ok(None)
+                } else {
+                    Ok(Some(map))
+                }
             }
             None => Ok(None),
         }
@@ -227,6 +266,9 @@ impl DriftClient {
         for (_rid, bytes) in docs {
             let doc = CRDTDocument::from_snapshot(&bytes)?;
             let map = doc.to_map();
+            if let Some(CrdtValue::Boolean(true)) = map.get("_deleted") {
+                continue;
+            }
             if filter.as_ref().map_or(true, |f| f.matches(&map)) {
                 results.push(map);
             }
@@ -243,14 +285,17 @@ impl DriftClient {
     }
 
     pub async fn force_sync(&self) -> Result<usize, DriftError> {
-        self.upload_queue.process_batch().await
+        let uploaded = self.upload_queue.process_batch().await?;
+        let downloaded = self.download_queue.process_batch().await?;
+        Ok(uploaded + downloaded)
     }
 
     pub async fn sync_status(&self) -> Result<SyncState, DriftError> {
+        let last_seq = self.download_queue.last_sequence();
         Ok(SyncState {
             namespace: self.config.namespace.clone(),
             replica_id: self.config.replica_id.clone(),
-            last_synced_sequence: 0,
+            last_synced_sequence: last_seq,
             connection_status: crate::sync::state::ConnectionStatus::Connected,
             leader_status: Some(true),
             last_connected_at: None,

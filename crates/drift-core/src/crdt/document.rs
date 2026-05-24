@@ -1,7 +1,6 @@
 use std::collections::HashMap;
-use yrs::{Doc, Map, MapRef, Out, ReadTxn, Transact, Update, WriteTxn};
+use yrs::{Doc, Map, MapRef, Out, ReadTxn, Transact, Update, WriteTxn, Array, GetString};
 use yrs::updates::decoder::Decode;
-use yrs::updates::encoder::Encode;
 use yrs::any::Any;
 use crate::crdt::types::CrdtValue;
 use crate::error::DriftError;
@@ -21,6 +20,7 @@ impl CRDTDocument {
         let root = txn.get_or_insert_map("root");
         root.insert(&mut txn, "doc_id", doc_id);
         root.insert(&mut txn, "record_id", record_id);
+        root.insert(&mut txn, "schema_version", schema_version as f64);
         drop(txn);
         Self {
             doc_id: doc_id.to_string(),
@@ -47,12 +47,18 @@ impl CRDTDocument {
         let record_id = root.get(&txn, "record_id")
             .and_then(|v| extract_string(&v))
             .unwrap_or_default();
+        let schema_version = root.get(&txn, "schema_version")
+            .and_then(|v| match v {
+                Out::Any(Any::Number(n)) => Some(n as u64),
+                _ => None,
+            })
+            .unwrap_or(0);
         drop(txn);
 
         Ok(Self {
             doc_id,
             record_id,
-            schema_version: 0,
+            schema_version,
             inner: doc,
             root,
         })
@@ -60,10 +66,7 @@ impl CRDTDocument {
 
     pub fn to_snapshot(&self) -> Vec<u8> {
         let txn = self.inner.transact();
-        let sv = txn.state_vector();
-        let ds = yrs::DeleteSet::default();
-        let snapshot = yrs::Snapshot::new(sv, ds);
-        snapshot.encode_v1()
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
     }
 
     pub fn apply_update(&mut self, update: &[u8]) -> Result<(), DriftError> {
@@ -132,8 +135,14 @@ fn extract_string(out: &Out) -> Option<String> {
 fn out_to_crdt_value(out: &Out, txn: &yrs::Transaction) -> CrdtValue {
     match out {
         Out::Any(any) => any_to_crdt_value(any),
-        Out::YText(_) => CrdtValue::Null,
-        Out::YArray(_) => CrdtValue::Null,
+        Out::YText(text) => CrdtValue::String(text.get_string(txn)),
+        Out::YArray(arr) => {
+            let mut items = Vec::new();
+            for item in arr.iter(txn) {
+                items.push(out_to_crdt_value(&item, txn));
+            }
+            CrdtValue::Array(items)
+        }
         Out::YMap(map) => {
             let mut fields = HashMap::new();
             for (k, v) in map.iter(txn) {

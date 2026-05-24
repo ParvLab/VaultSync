@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -93,11 +94,11 @@ impl KeyRing {
 }
 
 pub struct E2eeEncryptor {
-    keyring: KeyRing,
+    keyring: Arc<KeyRing>,
 }
 
 impl E2eeEncryptor {
-    pub fn new(keyring: KeyRing) -> Self {
+    pub fn new(keyring: Arc<KeyRing>) -> Self {
         Self { keyring }
     }
 
@@ -111,11 +112,11 @@ impl E2eeEncryptor {
 }
 
 pub struct E2eeDecryptor {
-    keyring: KeyRing,
+    keyring: Arc<KeyRing>,
 }
 
 impl E2eeDecryptor {
-    pub fn new(keyring: KeyRing) -> Self {
+    pub fn new(keyring: Arc<KeyRing>) -> Self {
         Self { keyring }
     }
 

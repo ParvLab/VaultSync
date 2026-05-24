@@ -52,6 +52,15 @@ impl Storage for EncryptedStorage {
         self.inner.delete_document(doc_id, record_id).await
     }
 
+    async fn write_document_and_oplog(&self, doc_id: &str, record_id: &str, bytes: &[u8], entry: &OplogEntry) -> Result<(), DriftError> {
+        let encrypted = self.encrypt(bytes)?;
+        self.inner.write_document_and_oplog(doc_id, record_id, &encrypted, entry).await
+    }
+
+    async fn delete_document_and_oplog(&self, doc_id: &str, record_id: &str, entry: &OplogEntry) -> Result<(), DriftError> {
+        self.inner.delete_document_and_oplog(doc_id, record_id, entry).await
+    }
+
     async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, DriftError> {
         let docs = self.inner.list_documents(doc_id).await?;
         docs.into_iter().map(|(rid, data)| {

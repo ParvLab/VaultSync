@@ -76,8 +76,8 @@ mod tests {
         let alice_pk = kr_alice.active_key().public_key;
         let bob_pk = kr_bob.active_key().public_key;
 
-        let encryptor = E2eeEncryptor::new(kr_alice);
-        let decryptor = E2eeDecryptor::new(kr_bob);
+        let encryptor = E2eeEncryptor::new(std::sync::Arc::new(kr_alice));
+        let decryptor = E2eeDecryptor::new(std::sync::Arc::new(kr_bob));
 
         let msg = b"mutual encrypted message";
         let ciphertext = encryptor.encrypt(msg, &bob_pk).unwrap();

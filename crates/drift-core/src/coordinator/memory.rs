@@ -34,6 +34,8 @@ impl Coordinator for InMemoryCoordinator {
                 id: m.id,
                 namespace: namespace.to_string(),
                 sequence: seq,
+                doc_id: m.doc_id,
+                record_id: m.record_id,
                 encrypted_blob: m.encrypted_blob,
                 timestamp: m.timestamp,
             });

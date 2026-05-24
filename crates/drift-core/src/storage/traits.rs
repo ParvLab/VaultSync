@@ -39,6 +39,9 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn delete_document(&self, doc_id: &str, record_id: &str) -> Result<(), DriftError>;
     async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, DriftError>;
 
+    async fn write_document_and_oplog(&self, doc_id: &str, record_id: &str, bytes: &[u8], entry: &OplogEntry) -> Result<(), DriftError>;
+    async fn delete_document_and_oplog(&self, doc_id: &str, record_id: &str, entry: &OplogEntry) -> Result<(), DriftError>;
+
     async fn append_oplog(&self, entry: &OplogEntry) -> Result<(), DriftError>;
     async fn read_pending_oplog(&self, namespace: &str, limit: usize) -> Result<Vec<OplogEntry>, DriftError>;
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), DriftError>;

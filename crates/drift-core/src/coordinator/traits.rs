@@ -9,6 +9,8 @@ pub struct EncryptedMutation {
     pub id: String,
     pub namespace: String,
     pub replica_id: String,
+    pub doc_id: String,
+    pub record_id: String,
     pub encrypted_blob: Vec<u8>,
     pub timestamp: u64,
     pub schema_version: u64,
@@ -19,6 +21,8 @@ pub struct PendingMutation {
     pub id: String,
     pub namespace: String,
     pub sequence: SequenceId,
+    pub doc_id: String,
+    pub record_id: String,
     pub encrypted_blob: Vec<u8>,
     pub timestamp: u64,
 }
