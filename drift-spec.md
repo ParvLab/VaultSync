@@ -31,6 +31,7 @@
 24. [Integrations (Optional Plugins)](#24-integrations-optional-plugins)
 25. [Development Roadmap](#25-development-roadmap)
 26. [Real-World Use Cases](#26-real-world-use-cases)
+27. [Multi-Namespace & Multi-Tenant Architecture](#27-multi-namespace--multi-tenant-architecture)
 
 ---
 
@@ -614,6 +615,180 @@ Compaction cycle:
 
 New replicas bootstrap from the latest Yrs document snapshot + mutations after the snapshot — not from full oplog replay.
 
+### 8.4 IndexedDB Backend Schema
+
+IndexedDB is the browser fallback storage backend when OPFS is unavailable (older browsers, specific privacy modes). Unlike OPFS which uses a single SQLite file, IndexedDB uses a key-value object store model.
+
+#### Object Stores
+
+```
+drift_documents
+  keyPath: ["doc_id", "record_id"]
+  indexes:
+    - name: "by_doc_id",    keyPath: "doc_id"
+    - name: "by_updated_at", keyPath: "updated_at"
+
+drift_oplog
+  keyPath: "id"
+  indexes:
+    - name: "by_namespace_status", keyPath: ["namespace", "sync_status"]
+    - name: "by_namespace_seq",    keyPath: ["namespace", "sequence"]
+    - name: "by_doc_record",       keyPath: ["doc_id", "record_id"]
+
+drift_sync_state
+  keyPath: "namespace"
+
+drift_schema_meta
+  keyPath: "doc_id"
+
+drift_migrations
+  keyPath: "version"
+
+drift_keys
+  keyPath: ["namespace", "version"]
+
+drift_replica_meta
+  keyPath: "id"
+```
+
+#### Transaction Strategy
+
+IndexedDB transactions are scoped and short-lived by browser design. Drift uses the following rules:
+
+1. **CRDT write + oplog append** — one `readwrite` transaction on `["drift_documents", "drift_oplog"]`. Both stores are opened in the same transaction to maintain atomicity (equivalent to SQLite's `BEGIN ... COMMIT`).
+2. **Reads** — use `readonly` transactions; open the minimum required stores.
+3. **Sync state update** — separate `readwrite` transaction on `["drift_sync_state"]` after upload/download completes.
+
+#### Version Migration
+
+IndexedDB uses integer database version numbers. Every schema change increments the version, and `onupgradeneeded` applies changes:
+
+```typescript
+const DB_VERSION = 1;
+
+function onupgradeneeded(event: IDBVersionChangeEvent) {
+  const db = (event.target as IDBOpenDBRequest).result;
+  const oldVersion = event.oldVersion;
+
+  if (oldVersion < 1) {
+    // Initial schema
+    const docs = db.createObjectStore("drift_documents", { keyPath: ["doc_id", "record_id"] });
+    docs.createIndex("by_doc_id", "doc_id");
+    docs.createIndex("by_updated_at", "updated_at");
+
+    const oplog = db.createObjectStore("drift_oplog", { keyPath: "id" });
+    oplog.createIndex("by_namespace_status", ["namespace", "sync_status"]);
+    oplog.createIndex("by_namespace_seq", ["namespace", "sequence"]);
+    oplog.createIndex("by_doc_record", ["doc_id", "record_id"]);
+
+    db.createObjectStore("drift_sync_state", { keyPath: "namespace" });
+    db.createObjectStore("drift_schema_meta", { keyPath: "doc_id" });
+    db.createObjectStore("drift_migrations", { keyPath: "version" });
+    db.createObjectStore("drift_keys", { keyPath: ["namespace", "version"] });
+    db.createObjectStore("drift_replica_meta", { keyPath: "id" });
+  }
+
+  // Future versions add migrations here:
+  // if (oldVersion < 2) { /* add new object store or index */ }
+}
+```
+
+Drift schema migrations (user-defined field additions) do **not** increment the IndexedDB version. They are recorded in the `drift_migrations` object store, exactly as in the SQLite backend. IndexedDB version upgrades are reserved for internal Drift storage schema changes only.
+
+#### Performance Notes
+
+| Operation | OPFS (SQLite) | IndexedDB |
+|---|---|---|
+| Single record read | 0.5–2 ms | 2–10 ms |
+| Single record write | 1–5 ms | 5–20 ms |
+| Batch read (100 records) | 1–5 ms | 10–50 ms |
+| Oplog append | 1–5 ms | 5–20 ms |
+
+IndexedDB is slower due to browser IPC overhead per transaction. Use OPFS (SQLite via WASM) when available for production performance.
+
+### 8.5 Tombstone GC Safety with Offline Replicas
+
+CRDT tombstone garbage collection (GC) has a well-known safety hazard that must be explicitly managed.
+
+#### The Problem
+
+OR-Set and Array CRDTs use tombstones to mark deletions. When Replica A deletes an element, it writes a tombstone. When Replica B, which added the element, receives the tombstone, the CRDT merges: element is deleted.
+
+If the tombstone is garbage-collected (removed to save space) before Replica C (offline since before the delete) reconnects:
+
+```
+Replica A:  OR-Set = { "tag:urgent" }
+Replica B:  OR-Set = { "tag:urgent" }
+
+Replica A deletes "tag:urgent" → tombstone written
+Both replicas GC the tombstone after 30 days
+
+Replica C (offline for 35 days) reconnects:
+  Replica C's state: { "tag:urgent" } — element still present, no tombstone
+  CRDT merge: no tombstone to apply → element RESURRECTED ❌
+```
+
+This is not a bug in the CRDT algorithm — it is a known, expected behavior. The safety requirement is:
+
+> **The tombstone retention period must be strictly greater than the maximum expected offline duration of any replica in the namespace.**
+
+#### Drift's GC Safety Rules
+
+1. **Default tombstone retention: 90 days.** Any replica offline longer than 90 days is considered stale and must perform a full re-bootstrap (receive a fresh coordinator snapshot) rather than incremental merge.
+
+2. **Configurable per namespace:**
+
+```typescript
+const drift = new Drift({
+  namespace: "workspace:core",
+  crdt: {
+    tombstoneRetentionDays: 180,  // override default 90 days
+    maxOfflineDays: 180           // must match tombstone retention
+  }
+})
+```
+
+3. **Coordinator-enforced cutoff:** The coordinator tracks each replica's `last_heartbeat`. If a replica has been offline for longer than `maxOfflineDays`, the coordinator rejects its reconnection with `ReplicaTooStaleError`. The replica must re-bootstrap from snapshot.
+
+```
+Replica reconnects after 100 days (default maxOfflineDays = 90)
+         │
+         ▼
+Coordinator: replica.last_heartbeat > maxOfflineDays?
+         │
+         YES
+         ▼
+Coordinator returns: { error: "REPLICA_TOO_STALE", bootstrapFrom: latestSnapshotSequence }
+         │
+         ▼
+Replica discards local CRDT state
+         │
+         ▼
+Replica bootstraps from latest coordinator snapshot (Section 17.3)
+         │
+         ▼
+All local pending mutations are re-uploaded
+```
+
+4. **GC never runs on unsynced tombstones:** A tombstone is only eligible for GC if:
+   - The operation that created it has `sync_status = synced`
+   - The tombstone is older than `tombstoneRetentionDays`
+   - The coordinator confirms the tombstone has been distributed to all currently-active replicas
+
+5. **User-facing warning:** When a replica reconnects after a long offline period approaching `maxOfflineDays`, Drift emits a warning via the observability system:
+
+```json
+{
+  "level": "warn",
+  "message": "Replica approaching stale threshold",
+  "fields": {
+    "offline_days": 85,
+    "max_offline_days": 90,
+    "action": "sync_immediately_to_avoid_bootstrap"
+  }
+}
+```
+
 ---
 
 ## 9. Operation Log (Oplog)
@@ -704,6 +879,71 @@ CREATE INDEX idx_oplog_record      ON drift_oplog(doc_id, record_id);
 | `previous_payload` field for undo | Not stored (CRDT document snapshot handles undo) | Yrs documents can be rolled back by reloading a prior snapshot |
 | Separate conflict_info column | Not needed | CRDTs have no conflicts to record |
 | `pending_sync → synced → failed → conflict` statuses | `pending → synced → failed` | CRDTs never enter a "conflict" state |
+
+### 9.5 Batch Operation Encoding
+
+`db.batch([...])` allows multiple CRDT mutations to be submitted as a single logical unit. Understanding how batches are stored is important for sync correctness.
+
+#### Encoding: One `CRDT_BATCH` Oplog Entry
+
+A batch is stored as a **single oplog entry** with `mutation_type = CRDT_BATCH`. The `yrs_update` field contains a concatenation of all individual Yrs binary diffs, prefixed with a 4-byte count and per-diff length framing:
+
+```
+CRDT_BATCH binary layout (yrs_update field):
+┌──────────────┬──────────────────────────────────────────────────────────┐
+│ count: u32   │ N × (doc_id_len: u16, doc_id: bytes, record_id_len: u16, │
+│ (4 bytes)    │       record_id: bytes, update_len: u32, yrs_update: bytes)│
+└──────────────┴──────────────────────────────────────────────────────────┘
+```
+
+The `encrypted_blob` field contains a single AEAD ciphertext over the entire batch payload — one encrypt call, not N.
+
+#### Atomicity
+
+A batch is **committed atomically**:
+
+```rust
+// All mutations in one storage transaction — all succeed or all roll back
+txn.begin();
+  for op in batch_ops {
+    let yrs_update = apply_crdt_mutation(op)?;
+    collect_batch_yrs_updates(&mut batch, yrs_update);
+  }
+  let encrypted = encrypt(batch_payload, namespace_key);
+  oplog.insert(OplogEntry {
+    mutation_type: CrdtBatch,
+    yrs_update: batch_payload,
+    encrypted_blob: encrypted,
+    ..
+  });
+txn.commit();
+```
+
+If any mutation in the batch fails (e.g., schema validation error), the entire transaction rolls back. No partial batch is written to storage.
+
+#### Ordering Within a Batch
+
+Mutations within a batch are applied in the order they appear in the batch array. On the receiving replica, the batch is unpacked and each Yrs update is merged in order:
+
+```
+db.batch([
+  db.todos.update("todo:1", { priority: 5 }),   // applied first
+  db.todos.update("todo:2", { completed: true }) // applied second
+])
+```
+
+The ordering is deterministic and preserved through the coordinator (sequence assignment covers the batch as a unit, not individual operations within it).
+
+#### Coordinator Behavior on Batch
+
+The coordinator treats a `CRDT_BATCH` as an atomic unit:
+- Either the entire batch is accepted and assigned one sequence number, or it is rejected entirely.
+- There is no partial acceptance of individual operations within a batch.
+- If the coordinator rejects a batch (schema version mismatch, auth failure), the entire batch enters `failed` state and the retry engine reschedules the whole batch.
+
+#### Subscription Behavior
+
+A batch fires **one subscription callback per affected document** after the entire batch commits — not one callback per mutation within the batch. If the batch touches 3 different documents, 3 subscription callbacks fire (one per document), each receiving the full post-batch state of that document.
 
 ---
 
@@ -817,6 +1057,75 @@ CREATE TABLE drift_migrations (
 
 If a migration checksum does not match, Drift **refuses to apply the migration and logs the discrepancy to the observability system**. The operator must resolve the tampered migration before sync continues.
 
+### 10.5 Schema Version Negotiation Between Replicas
+
+When replicas with different schema versions interact, Drift must handle the version gap gracefully without data loss.
+
+#### Backward Compatibility Rules
+
+Drift schema changes follow additive-only constraints:
+- **Adding a field** is always backward compatible. A v2 replica sends mutations with the new field; a v1 replica applies them and simply ignores fields it doesn't know about (CRDT documents are open maps — unknown fields are stored without breaking anything).
+- **Removing a field** requires a migration that marks the field as deprecated. A v2 replica that drops a field still accepts incoming v1 mutations that set that field; it just doesn't surface it in queries.
+- **Changing a CRDT type** (e.g., from `lww` to `counter`) is **not** backward compatible and requires a new field name. This is enforced by the schema validator on migration apply.
+
+#### Version Negotiation Flow
+
+```
+Replica B (schema v2) receives mutation from Replica A (schema v1)
+         │
+         ▼
+Replica B's schema engine checks:
+  mutation.schema_version (1) vs local_schema_version (2)
+         │
+         ▼
+If mutation.schema_version < local:
+  → Check if mutation targets fields that exist in v1 schema
+  → If yes: apply normally (additive fields in v2 are simply absent in mutation)
+  → If no: reject with SchemaMismatch error, log to observability
+         │
+         ▼
+If mutation.schema_version > local (Replica B is behind):
+  → Apply the mutation (newer replicas only add fields)
+  → Emit warning: "Received mutation from newer schema version; upgrade recommended"
+  → Schedule schema pull from coordinator
+```
+
+#### Coordinator Enforcement
+
+The coordinator checks schema version on `push()`:
+
+| Replica Version | Coordinator Version | Result |
+|---|---|---|
+| Equal | Equal | ✅ Accept |
+| Replica < Coordinator (minor gap, ≤ 2 versions) | Coordinator newer | ✅ Accept with warning |
+| Replica < Coordinator (major gap, > 2 versions) | Coordinator much newer | ❌ Reject — `SCHEMA_TOO_OLD` |
+| Replica > Coordinator | Replica is ahead | ✅ Accept (coordinator will be upgraded) |
+
+On `SCHEMA_TOO_OLD`, the coordinator returns:
+
+```json
+{
+  "error": "SCHEMA_TOO_OLD",
+  "replica_version": 1,
+  "coordinator_version": 5,
+  "migration_instructions": [
+    { "from": 1, "to": 2, "description": "Add priority field" },
+    { "from": 2, "to": 3, "description": "Add tags OR-Set" }
+  ]
+}
+```
+
+The client surfaces this as a `SchemaMigrationRequired` error. The application must run pending migrations before sync resumes.
+
+#### Local Schema Validation on Write
+
+Before writing a mutation locally, the schema engine validates:
+1. All required fields are present (fields without defaults)
+2. Field values match declared types (string → string, number → number)
+3. CRDT type is respected (cannot decrement a field declared as `counter` via LWW set)
+
+Schema validation errors are surfaced immediately as synchronous errors on `db.todos.insert(...)` — they never enter the oplog.
+
 ---
 
 ## 11. End-to-End Encryption
@@ -921,6 +1230,211 @@ Keys can be rotated without data loss:
 ### Replay Attack Prevention
 
 Each mutation includes a unique ID (`mut_abc123`). The coordinator deduplicates by mutation ID. Replayed mutations are silently dropped — idempotent by design.
+
+### 11.1 Key Distribution Protocol
+
+This section specifies how replicas discover each other's public keys and how new devices obtain keys for historical data.
+
+#### The Coordinator as a Key Registry
+
+The coordinator's `drift_coordinator_replicas` table is the authoritative key registry for a namespace. Every replica's public key is stored there on registration. The `Coordinator` trait is extended with a key-fetch method:
+
+```rust
+#[async_trait]
+pub trait Coordinator: Send + Sync + Debug {
+    // ... existing methods ...
+
+    /// Fetch public keys for all active replicas in the namespace.
+    /// Used by a replica before encrypting a mutation for broadcast.
+    async fn get_peer_keys(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ReplicaPublicKey>, CoordinatorError>;
+
+    /// Fetch the public key for a specific replica.
+    async fn get_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+    ) -> Result<Option<ReplicaPublicKey>, CoordinatorError>;
+}
+
+pub struct ReplicaPublicKey {
+    pub replica_id: String,
+    pub public_key:  Vec<u8>,    // X25519 public key bytes
+    pub key_version: u32,        // increments on rotation
+    pub signed_at:   u64,        // Unix ms — when this key was registered
+}
+```
+
+#### Key Caching on the Client
+
+Replicas cache peer public keys locally in `drift_keys` (type: `peer_pk`). The cache is refreshed:
+1. On startup: fetch all current peer keys for the namespace
+2. On `ReplicaKeyChanged` coordinator event (see Key Rotation Notification below)
+3. On cache miss: if a mutation arrives from a replica whose key is not in cache, fetch immediately from coordinator
+
+```typescript
+// Cache miss flow
+coordinator.subscribe("key:changed", async (event) => {
+  const key = await coordinator.get_replica_key(namespace, event.replica_id);
+  keyCache.set(event.replica_id, key);
+});
+```
+
+#### Encryption Fan-Out
+
+When a replica uploads a mutation, it does **not** encrypt once per recipient. Instead:
+
+1. The mutation's `yrs_update` is encrypted with the **namespace shared key** — a symmetric key that all authorized replicas in the namespace share.
+2. The namespace key itself is stored locally (device-encrypted) and is never sent to the coordinator.
+3. When a new replica joins the namespace, it receives the namespace key via a secure out-of-band channel (see New Device Onboarding below).
+
+> **Design note:** This symmetric-key model is simpler and more efficient than per-recipient X25519 DH for namespaces with many replicas. The original spec section described per-replica asymmetric encryption, which is corrected here to the symmetric namespace key model.
+
+#### New Device Onboarding (Key Bootstrap)
+
+A new device joining an existing namespace cannot decrypt historical mutations without the namespace symmetric key. The onboarding flow:
+
+```
+New Device generates X25519 keypair (device_sk, device_pk)
+         │
+         ▼
+New Device authenticates to coordinator with JWT
+         │
+         ▼
+New Device sends onboarding request to an existing trusted replica:
+  { namespace, device_pk, auth_token }
+         │
+         ▼
+Trusted Replica verifies auth_token
+         │
+         ▼
+Trusted Replica encrypts namespace_sk with device_pk:
+  wrapped_key = X25519_encrypt(namespace_sk, device_pk, replica_sk)
+         │
+         ▼
+Trusted Replica sends wrapped_key to New Device
+         │
+         ▼
+New Device decrypts: namespace_sk = X25519_decrypt(wrapped_key, device_sk, replica_pk)
+         │
+         ▼
+New Device stores namespace_sk encrypted with device local key
+         │
+         ▼
+New Device can now decrypt all historical and future mutations
+```
+
+If no trusted replica is online at onboarding time, the coordinator holds the wrapped key for async delivery (coordinator holds it encrypted with the coordinator's own key, not plaintext). The new device receives it on next trusted-replica connection.
+
+#### Key Validation — TOFU Policy
+
+Drift uses **Trust-On-First-Use (TOFU)** for public keys:
+
+- The first time a replica sees another replica's public key, it is accepted and cached.
+- Subsequent interactions validate that the public key has not changed (key pinning after first contact).
+- If a key changes unexpectedly (not via the signed key rotation flow), the replica logs a `KEY_CHANGED_UNEXPECTEDLY` warning and pauses sync for operator review.
+
+For high-security namespaces (healthcare, finance), operators can configure `keyValidation: "strict"` which requires manual operator approval for any new replica key before sync proceeds.
+
+```typescript
+const drift = new Drift({
+  namespace: "healthcare:patient-records",
+  e2ee: {
+    keyValidation: "strict",  // default: "tofu"
+    onNewKeyDetected: async (replicaId, newKey) => {
+      await notifySecurityTeam(replicaId, newKey);
+      return "reject"; // "accept" | "reject"
+    }
+  }
+})
+```
+
+#### Key Rotation Notification
+
+When a replica rotates its key:
+
+```
+1. Replica generates new keypair (device_pk_new, device_sk_new)
+2. Replica re-wraps namespace_sk with new device key
+3. Replica uploads to coordinator:
+   {
+     replica_id,
+     old_key_version: 1,
+     new_key_version: 2,
+     new_public_key:  device_pk_new,
+     signature: sign(old_device_sk, concat(replica_id, new_public_key, new_key_version))
+   }
+4. Coordinator verifies signature with stored old public key
+5. Coordinator updates drift_coordinator_replicas.public_key and key_version
+6. Coordinator broadcasts { event: "key:changed", replica_id, new_key_version } to all connected replicas
+7. All replicas update their key cache
+```
+
+Mutations in-flight at rotation time are unaffected — they were encrypted with the namespace symmetric key, not per-device keys.
+
+---
+
+### 11.2 Local At-Rest Encryption
+
+The `drift_oplog.yrs_update` column stores plaintext CRDT diffs locally for fast merge. This section specifies how to configure optional local encryption at rest.
+
+#### Default Behavior (No At-Rest Encryption)
+
+By default, the local database is not encrypted. Protection comes from:
+- OS-level sandboxing (OPFS in browser is origin-private)
+- Process isolation on native (SQLite file owned by app user)
+- Full-device encryption (FDE) from the OS (FileVault, BitLocker, Android/iOS FDE)
+
+For most applications, OS-level sandboxing + FDE is sufficient.
+
+#### Opt-In At-Rest Encryption
+
+For applications with higher local security requirements (shared devices, kiosks, healthcare), Drift supports optional at-rest encryption:
+
+```typescript
+const drift = new Drift({
+  storage: "sqlite",
+  namespace: "healthcare:records",
+  storageEncryption: {
+    enabled: true,
+    mode: "sqlcipher",     // "sqlcipher" | "app-level"
+    keyDerivation: "os-keychain"  // "os-keychain" | "passphrase" | "hardware-key"
+  }
+})
+```
+
+#### Mode 1: SQLCipher (Full Database Encryption)
+
+Encrypts the entire SQLite database file using SQLCipher (AES-256 CBC, PBKDF2 key derivation):
+
+- **Key source (os-keychain):** Drift generates a 256-bit random key and stores it in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). The SQLite file is unreadable without the OS keychain entry.
+- **Key source (passphrase):** User-supplied passphrase → PBKDF2 (100,000 iterations, SHA-256) → 256-bit key. Prompted on app start.
+- **Performance:** ~5–10% overhead on read/write operations (AES hardware acceleration on modern CPUs).
+
+#### Mode 2: App-Level (Field-Level Encryption)
+
+Encrypts individual CRDT fields before writing to storage. Only `yrs_update`, `encrypted_blob`, and `key_blob` columns are encrypted. Schema metadata and oplog status remain readable (for query performance).
+
+#### Key Loss Policy
+
+| Scenario | Result | Recovery |
+|---|---|---|
+| OS keychain key deleted | Database inaccessible | Must re-bootstrap from coordinator snapshot |
+| Passphrase forgotten | Database inaccessible | Must re-bootstrap from coordinator snapshot |
+| Device stolen (FDE enabled) | Data safe (FDE protects) | No action needed |
+| Device stolen (no FDE, no at-rest) | Data exposed if offline | Enable at-rest encryption for sensitive namespaces |
+
+**Key loss is intentional by design** — there is no "forgot my encryption key" recovery path. The coordinator holds encrypted blobs; a new device can re-bootstrap from coordinator snapshot without needing the lost local key. Applications must communicate this trade-off to users.
+
+#### Browser (OPFS) At-Rest Encryption
+
+In browser environments, the OPFS directory is already sandboxed to the application origin. At-rest encryption adds:
+
+- **WebCrypto `subtle.generateKey()`** generates an AES-GCM key stored in the browser's `IndexedDB` (the `drift_keys` system store, not application data).
+- The IndexedDB storage of the key is protected by the browser's same-origin policy.
+- This provides defense-in-depth against browser extension attacks that bypass origin isolation.
 
 ---
 
@@ -1166,6 +1680,220 @@ failed        ← upload failed; in retry queue
 ### Why "conflict" State Is Removed
 
 In the old spec, operations could enter a `conflict` state. In CRDT-native Drift, **mutations never conflict**. Every Yrs update can be applied to any document state and produces a deterministic result. The `conflict` status is eliminated.
+
+### 13.1 WebSocket Wire Protocol
+
+This section defines the exact message format over the WebSocket transport between Drift replicas and the coordinator server.
+
+#### Connection URL
+
+```
+wss://<coordinator-host>/drift/v1/sync
+```
+
+All messages are sent as binary WebSocket frames (not text). The frame format is:
+
+```
+┌──────────────┬──────────────┬──────────────────────────────────────┐
+│ type: u8     │ length: u32  │ payload: JSON bytes (length bytes)    │
+│ (1 byte)     │ (4 bytes)    │                                       │
+└──────────────┴──────────────┴──────────────────────────────────────┘
+Total header: 5 bytes. Payload: length bytes.
+```
+
+#### Message Type Enum
+
+| Value | Name | Direction | Description |
+|---|---|---|---|
+| `0x01` | `AUTH` | Client → Server | Authenticate replica with JWT |
+| `0x02` | `AUTH_ACK` | Server → Client | Authentication result |
+| `0x03` | `REGISTER` | Client → Server | Register replica in namespace |
+| `0x04` | `REGISTER_ACK` | Server → Client | Registration result + bootstrap info |
+| `0x05` | `PUSH` | Client → Server | Upload batch of encrypted mutations |
+| `0x06` | `PUSH_ACK` | Server → Client | Sequence numbers assigned |
+| `0x07` | `PULL` | Client → Server | Request mutations after a sequence |
+| `0x08` | `PULL_RESPONSE` | Server → Client | Batch of mutations |
+| `0x09` | `SUBSCRIBE` | Client → Server | Subscribe to real-time mutations |
+| `0x0A` | `MUTATION_PUSH` | Server → Client | Real-time mutation delivery |
+| `0x0B` | `HEARTBEAT` | Client → Server | Keep-alive ping |
+| `0x0C` | `HEARTBEAT_ACK` | Server → Client | Keep-alive pong |
+| `0x0D` | `KEY_FETCH` | Client → Server | Fetch peer public keys |
+| `0x0E` | `KEY_RESPONSE` | Server → Client | Peer public keys |
+| `0x0F` | `ERROR` | Server → Client | Error response to any client message |
+| `0x10` | `SCHEMA_SYNC` | Client → Server | Report current schema version |
+| `0x11` | `SCHEMA_MIGRATION` | Server → Client | Migration instructions from coordinator |
+| `0x12` | `KEY_CHANGED` | Server → Client | Broadcast: a replica rotated its key |
+
+#### Message Payloads (JSON)
+
+**`AUTH` (0x01)**
+```json
+{
+  "token": "<JWT>",
+  "protocol_version": 1,
+  "replica_id": "replica-abc123",
+  "namespace": "workspace:core"
+}
+```
+
+**`AUTH_ACK` (0x02)**
+```json
+{
+  "status": "ok",           // "ok" | "error"
+  "error": null,            // or "INVALID_TOKEN" | "NAMESPACE_NOT_FOUND" | etc.
+  "session_id": "sess-xyz"
+}
+```
+
+**`REGISTER` (0x03)**
+```json
+{
+  "replica_id":     "replica-abc123",
+  "namespace":      "workspace:core",
+  "public_key":     "<base64 X25519 public key>",
+  "schema_version": 3,
+  "last_sequence":  42
+}
+```
+
+**`REGISTER_ACK` (0x04)**
+```json
+{
+  "status":              "ok",
+  "coordinator_sequence": 150,
+  "snapshot_available":  true,
+  "snapshot_sequence":   100,
+  "snapshot_url":        "https://coordinator/snapshots/snap-xyz",
+  "error":               null
+}
+```
+
+**`PUSH` (0x05)**
+```json
+{
+  "request_id": "req-001",
+  "mutations": [
+    {
+      "id":             "mut-abc123",
+      "encrypted_blob": "<base64 AEAD ciphertext>",
+      "timestamp":      1740000000000,
+      "schema_version": 3,
+      "mutation_type":  "CRDT_UPDATE"
+    }
+  ]
+}
+```
+
+**`PUSH_ACK` (0x06)**
+```json
+{
+  "request_id": "req-001",
+  "sequences":  [43, 44, 45],
+  "error":      null
+}
+```
+
+**`PULL` (0x07)**
+```json
+{
+  "request_id":   "req-002",
+  "namespace":    "workspace:core",
+  "after":        42,
+  "limit":        100
+}
+```
+
+**`PULL_RESPONSE` (0x08)**
+```json
+{
+  "request_id": "req-002",
+  "mutations": [
+    {
+      "id":             "mut-remote-001",
+      "replica_id":     "replica-xyz",
+      "sequence":       43,
+      "encrypted_blob": "<base64>",
+      "timestamp":      1740000001000
+    }
+  ],
+  "has_more": false
+}
+```
+
+**`MUTATION_PUSH` (0x0A)** — real-time push from coordinator
+```json
+{
+  "id":             "mut-remote-002",
+  "replica_id":     "replica-xyz",
+  "sequence":       44,
+  "encrypted_blob": "<base64>",
+  "timestamp":      1740000002000
+}
+```
+
+**`ERROR` (0x0F)**
+```json
+{
+  "request_id":  "req-001",
+  "code":        "SCHEMA_TOO_OLD",
+  "message":     "Replica schema v1 is too old; coordinator at v5",
+  "retryable":   false,
+  "data": {
+    "replica_version":      1,
+    "coordinator_version":  5
+  }
+}
+```
+
+#### Authentication Handshake Sequence
+
+```
+Client                          Coordinator Server
+  │                                     │
+  │──── WebSocket upgrade (WSS) ────────►│
+  │                                     │
+  │──── AUTH (type=0x01) ───────────────►│  JWT + namespace + replica_id
+  │                                     │
+  │◄─── AUTH_ACK (type=0x02) ───────────│  status=ok | error
+  │                                     │
+  │  (if AUTH_ACK status=error: server closes connection with code 4001)
+  │                                     │
+  │──── REGISTER (type=0x03) ───────────►│  public_key + schema_version + last_sequence
+  │                                     │
+  │◄─── REGISTER_ACK (type=0x04) ───────│  coordinator_sequence + snapshot info
+  │                                     │
+  │──── SUBSCRIBE (type=0x09) ──────────►│  start real-time mutation stream
+  │                                     │
+  │  (connection now active, real-time sync running)
+  │                                     │
+  │──── PUSH (type=0x05) ───────────────►│  upload pending mutations
+  │◄─── PUSH_ACK (type=0x06) ───────────│  sequence numbers assigned
+  │                                     │
+  │◄─── MUTATION_PUSH (type=0x0A) ──────│  mutations from other replicas
+  │                                     │
+  │──── HEARTBEAT (type=0x0B) ──────────►│  every 30 seconds
+  │◄─── HEARTBEAT_ACK (type=0x0C) ──────│
+```
+
+#### Version Negotiation
+
+The `AUTH` message includes `protocol_version: 1`. The server responds with:
+- `AUTH_ACK { status: "ok" }` if it supports that version
+- `AUTH_ACK { status: "error", error: "PROTOCOL_VERSION_UNSUPPORTED", supported: [1, 2] }` if not
+
+Clients should attempt the highest version they support. If rejected, retry with a lower version from the server's `supported` list.
+
+#### Connection Loss and Recovery
+
+If the WebSocket connection drops mid-stream:
+1. Client detects close event (or heartbeat timeout — 3 missed heartbeats = dead)
+2. Client marks connection as `disconnected`, pauses upload queue
+3. Client starts reconnect loop (exponential backoff: 1s → 2s → 4s → ... → 30s)
+4. On reconnect: full `AUTH` + `REGISTER` handshake with `last_sequence` from `drift_sync_state`
+5. Coordinator replays all mutations after `last_sequence` via `PULL_RESPONSE`
+6. If `PUSH` was in-flight when disconnect happened: client re-sends on reconnect (idempotent by `mutation_id`)
+
+Partially sent `PUSH` frames (TCP half-open): the 5-byte frame header includes the `length` field. If the connection closes before `length` bytes are received, the server discards the partial frame and the client re-sends the full message on reconnect.
 
 ---
 
@@ -1590,6 +2318,431 @@ Replica marks sync_status = "connected"
          ▼
 Normal real-time sync begins
 ```
+
+### 17.1 Coordinator Server — Deployable Binary
+
+The `Coordinator` trait defines what a coordinator backend does (push, pull, subscribe, register, heartbeat). This section defines the **coordinator server** — the deployable process that exposes those capabilities over WebSocket (Protocol §13.1) to Drift replicas.
+
+#### Architecture
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                  drift-coordinator-server                   │
+│                                                             │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │           Axum HTTP/WebSocket Server               │    │
+│  │   POST /drift/v1/snapshot  (snapshot upload)       │    │
+│  │   GET  /drift/v1/snapshot/:id (snapshot download)  │    │
+│  │   WS   /drift/v1/sync  (main sync WebSocket)       │    │
+│  │   GET  /health                                     │    │
+│  │   GET  /metrics  (Prometheus)                      │    │
+│  └────────────────────┬───────────────────────────────┘    │
+│                        │                                    │
+│  ┌─────────────────────▼──────────────────────────────┐    │
+│  │           Connection Manager                       │    │
+│  │   - Track connected replicas per namespace         │    │
+│  │   - Session state (replica_id, namespace, seq)     │    │
+│  │   - Fan-out: send MUTATION_PUSH to all connections │    │
+│  └─────────────────────┬──────────────────────────────┘    │
+│                         │                                   │
+│  ┌──────────────────────▼─────────────────────────────┐    │
+│  │           Coordinator Backend (trait impl)          │    │
+│  │   PostgresCoordinator | RedisCoordinator | etc.     │    │
+│  └─────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────────────────┘
+```
+
+#### Running the Coordinator Server
+
+```bash
+# Docker — PostgreSQL backend
+docker run -p 8080:8080 \
+  -e DRIFT_DB_URL=postgres://user:pass@db:5432/drift \
+  -e DRIFT_AUTH_JWKS_URL=https://your-auth.example.com/.well-known/jwks.json \
+  driftsync/coordinator:latest
+
+# Binary
+drift-server \
+  --backend postgres \
+  --db-url postgres://user:pass@localhost/drift \
+  --port 8080 \
+  --auth-jwks-url https://your-auth.example.com/.well-known/jwks.json
+```
+
+#### Configuration
+
+```toml
+# drift-coordinator.toml
+
+[server]
+host = "0.0.0.0"
+port = 8080
+tls  = true
+tls_cert = "/etc/drift/cert.pem"
+tls_key  = "/etc/drift/key.pem"
+
+[backend]
+type = "postgres"   # "postgres" | "redis" | "sqlite"
+url  = "postgres://user:pass@localhost/drift"
+
+[auth]
+jwks_url  = "https://your-auth.example.com/.well-known/jwks.json"
+audience  = "drift-sync"
+algorithm = "RS256"
+
+[limits]
+max_connections_per_namespace = 10000
+max_mutation_size_bytes       = 1048576   # 1MB
+max_batch_size                = 1000
+heartbeat_timeout_seconds     = 90
+
+[compaction]
+snapshot_interval_mutations   = 10000
+mutation_retention_days       = 90       # matches tombstone GC threshold (§8.5)
+```
+
+#### Session Lifecycle
+
+```
+WebSocket connected
+  → Auth (JWT validated)
+  → Register (replica saved/updated in DB)
+  → Subscribe (added to namespace fan-out group)
+  → Real-time loop:
+      Receive PUSH → store → assign sequence → PUSH_ACK + fan-out to others
+      Receive PULL → query DB → PULL_RESPONSE
+      Receive HEARTBEAT → update last_heartbeat → HEARTBEAT_ACK
+  → WebSocket closed → removed from fan-out group
+```
+
+### 17.2 Partial Sync
+
+Partial sync allows a replica to synchronize only a subset of records from a namespace rather than all records. This is essential for multi-tenant apps (sync only records belonging to this user) and large datasets.
+
+#### Subset Declaration
+
+A replica declares its sync subset at initialization:
+
+```typescript
+const drift = new Drift({
+  namespace: "workspace:core",
+  sync: {
+    partial: {
+      todos: { where: { assignee: userId } },  // only my todos
+      projects: true,                           // all projects
+      settings: { where: { scope: "global" } }
+    }
+  }
+})
+```
+
+The subset is declared as a per-table filter predicate over **unencrypted, indexed fields** only (see E2EE Constraint below).
+
+#### How Partial Sync Works
+
+```
+Replica registers with coordinator:
+  { ..., partial_sync: { "todos": { assignee: "user-123" }, "projects": {} } }
+         │
+         ▼
+Coordinator stores partial_sync filter in drift_coordinator_replicas.sync_filter
+         │
+         ▼
+When a mutation arrives from another replica:
+  coordinator checks: does this mutation's (doc_id, record_id) match the filter?
+         │
+  ├─ YES: include in MUTATION_PUSH to this replica
+  └─ NO:  skip (do not push)
+         │
+         ▼
+On PULL request: coordinator filters response by sync_filter
+```
+
+#### Enforcement Location
+
+Partial sync is **enforced by the coordinator**, not the client. The client declares the filter; the coordinator applies it before delivery. This ensures:
+1. Replicas only receive mutations they declared interest in (bandwidth efficiency)
+2. A replica cannot "declare away" records it should sync (filter is advisory, not a security boundary — see Authorization §23.1 for security)
+
+#### E2EE Constraint
+
+The coordinator cannot inspect encrypted field values. Partial sync filters can only operate on **routing metadata** that is stored unencrypted by the coordinator:
+
+```
+Available for partial sync filtering:
+  ✅ doc_id        (table name)
+  ✅ record_id     (record identifier, if structured: "user-123:todo-456")
+  ✅ replica_id    (which device produced the mutation)
+  ✅ timestamp     (when it was produced)
+
+NOT available for partial sync filtering (E2EE):
+  ❌ field values  (encrypted, coordinator cannot read)
+  ❌ CRDT type     (encrypted, coordinator cannot read)
+```
+
+**Best practice:** Embed filter dimensions into the `record_id`:
+
+```typescript
+// Instead of: { id: "todo-456", assignee: "user-123" }
+// Use structured record IDs:
+db.todos.insert({ id: `user-${userId}:todo-${todoId}`, text: "..." })
+// Partial sync filter: { where: { record_id: { startsWith: `user-${userId}:` } } }
+```
+
+#### When Records Enter or Exit the Subset
+
+If a record moves out of a replica's partial sync set (e.g., a todo is re-assigned to another user):
+
+```
+Todo "user-123:todo-456" updated: assignee → "user-999"
+         │
+         ▼
+Record ID changes to "user-999:todo-456" (new coordinator routing)
+         │
+         ▼
+User 123's replica: no longer receives updates for this record
+         │
+         ▼
+User 123's replica: CRDT document "user-123:todo-456" becomes stale
+         │
+         ▼
+Coordinator sends "RECORD_EVICTED" notification:
+  { doc_id: "todos", old_record_id: "user-123:todo-456" }
+         │
+         ▼
+Replica soft-deletes the local CRDT document
+```
+
+### 17.3 Snapshot Bootstrap Protocol
+
+This section details how coordinator-side snapshots are created, stored, and used to onboard new replicas without replaying the full mutation history.
+
+#### Who Creates Snapshots
+
+Snapshots are created by the **coordinator server**, not by individual replicas. This ensures all replicas in a namespace see a consistent snapshot point.
+
+```
+Coordinator server background job (runs every snapshot_interval_mutations):
+  1. Lock namespace (pause PUSH processing for < 100ms)
+  2. Fetch all coordinator mutations from last_snapshot_sequence to latest
+  3. Compute the union Yrs state: apply all mutations in sequence order
+     (coordinator cannot decrypt — stores the opaque encrypted diffs; snapshot is
+      the encrypted diff history, not a plaintext Yrs document)
+  4. Compress: zstd compress the encrypted mutation batch
+  5. Store in drift_coordinator_snapshots:
+     { namespace, sequence: current_max, snapshot_bytes: compressed, created_at }
+  6. Record snapshot_sequence as new baseline
+  7. Unlock namespace
+```
+
+> **Important:** The coordinator snapshot is **not** a decrypted Yrs document state. It is a compressed batch of encrypted mutations from the last snapshot to the current point. This preserves E2EE — the coordinator never decrypts.
+
+#### Snapshot Format
+
+```
+snapshot_bytes layout (after zstd decompression):
+┌─────────────────────────────────────────────────────────┐
+│ header: { version: u8, namespace: str, sequence: u64,   │
+│           mutation_count: u32, created_at: u64 }         │
+├─────────────────────────────────────────────────────────┤
+│ mutations: [ { id, replica_id, encrypted_blob, ts }, … ] │
+│ (ordered by sequence, from last_snapshot_sequence to    │
+│  snapshot_sequence inclusive)                            │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### New Replica Bootstrap Flow
+
+```
+New replica sends REGISTER with last_sequence = 0
+         │
+         ▼
+Coordinator: snapshot_available = true?
+         │
+    ┌────┴────────────────────────────────────────────────┐
+    │ YES                                                  │ NO
+    ▼                                                      ▼
+REGISTER_ACK with snapshot_url              REGISTER_ACK with snapshot_available=false
+         │                                                 │
+         ▼                                                 ▼
+Replica downloads snapshot               Replica sends PULL(after=0, limit=1000)
+         │                               and pages through full history
+         ▼
+Replica decompresses snapshot
+         │
+         ▼
+Replica decrypts each mutation with namespace_sk
+         │
+         ▼
+Replica applies each mutation to local Yrs documents in sequence order
+         │
+         ▼
+Replica sends PULL(after=snapshot_sequence) for mutations since snapshot
+         │
+         ▼
+Normal sync begins from snapshot_sequence
+```
+
+#### Snapshot Integrity
+
+The new replica validates snapshot integrity by:
+1. Verifying each mutation's `replica_id` is registered in the coordinator (via KEY_FETCH)
+2. Verifying the mutation sequence numbers are contiguous and match the snapshot header
+3. Any gap in sequence numbers is reported as `SNAPSHOT_INTEGRITY_ERROR` and the replica falls back to full history replay
+
+#### Snapshot Frequency
+
+| Dataset Size | Recommended Interval |
+|---|---|
+| < 10K mutations | Every 10K mutations (or monthly) |
+| 10K–100K mutations | Every 10K mutations |
+| > 100K mutations | Every 10K mutations, older snapshots pruned after 2× tombstone retention |
+
+### 17.4 Coordinator Fan-Out Mechanism
+
+When a mutation is stored by the coordinator, it must be delivered in real-time to all other connected replicas in the same namespace. This section specifies how each coordinator backend handles fan-out.
+
+#### Fan-Out Pattern
+
+```
+Replica A uploads mutation → Coordinator stores (sequence=44)
+         │
+         ▼
+Coordinator broadcasts MUTATION_PUSH to:
+  Replica B (connected via WebSocket session)
+  Replica C (connected via WebSocket session)
+  (not back to Replica A — filtered by replica_id)
+```
+
+#### Per-Backend Fan-Out
+
+| Backend | Fan-Out Mechanism | Real-Time Latency |
+|---|---|---|
+| **PostgreSQL** | `LISTEN/NOTIFY` channel per namespace. Server process listens; when `pg_notify('namespace:workspace:core', seq)` fires, server pushes to connected WebSocket sessions. | 5–50 ms |
+| **Redis** | `PUBLISH` to channel `drift:{namespace}`. Server subscribes via `SUBSCRIBE drift:*`; delivers to matching WebSocket sessions. | 1–10 ms |
+| **SQLite** | Polling loop: server polls `SELECT ... WHERE sequence > last_known` every 250ms. Suitable only for dev/single-instance. | 250ms (polling interval) |
+| **Cloudflare Durable Objects** | DO single-writer model: all WebSocket connections to the DO get push via DO's built-in WebSocket hibernation API. | 10–50 ms |
+| **Supabase** | Supabase Realtime channel subscribed to `drift_coordinator_mutations` insert events. | 10–100 ms |
+
+#### Connection Manager (Server-Side State)
+
+The coordinator server maintains an in-memory connection map per namespace:
+
+```rust
+// Server-side, per process
+struct ConnectionManager {
+    // namespace → set of (replica_id, tx: mpsc::Sender<WsMessage>)
+    sessions: DashMap<String, Vec<ReplicaSession>>,
+}
+
+impl ConnectionManager {
+    pub async fn fan_out(&self, namespace: &str, mutation: PendingMutation, from_replica: &str) {
+        if let Some(sessions) = self.sessions.get(namespace) {
+            for session in sessions.iter() {
+                if session.replica_id != from_replica {  // don't echo back
+                    let _ = session.tx.send(WsMessage::MutationPush(mutation.clone())).await;
+                }
+            }
+        }
+    }
+}
+```
+
+For multi-instance coordinator deployments (HA), the in-memory fan-out is replaced with the backend pub/sub mechanism — Postgres LISTEN/NOTIFY or Redis PUBLISH ensures mutations are fanned out across all server instances.
+
+### 17.5 Coordinator High Availability
+
+For production deployments requiring uptime guarantees, the coordinator can run in high-availability configuration.
+
+#### Architecture: Active-Passive with Postgres
+
+The simplest HA model uses Postgres replication (primary + replica) and multiple coordinator server instances:
+
+```
+┌──────────────────┐    ┌──────────────────┐
+│  Coordinator     │    │  Coordinator     │
+│  Server A        │    │  Server B        │
+│  (primary)       │    │  (standby)       │
+└────────┬─────────┘    └────────┬─────────┘
+         │                       │
+         └───────────┬───────────┘
+                     │ (load balanced via HAProxy / AWS ALB)
+                     ▼
+         ┌─────────────────────┐
+         │  Postgres Primary   │◄──── Postgres Replica (read replica)
+         └─────────────────────┘
+```
+
+Both coordinator server instances connect to the same Postgres primary. Fan-out uses `LISTEN/NOTIFY` which is shared across all connections to the same Postgres instance.
+
+#### Sequence Number Safety on Failover
+
+Sequence numbers are assigned by Postgres `BIGSERIAL` (atomic, durable). Even if Coordinator Server A crashes after assigning sequence=44 but before sending `PUSH_ACK`:
+- The sequence is committed in Postgres
+- The client re-sends the mutation on reconnect (idempotent by `mutation_id`)
+- Coordinator deduplicates by `mutation_id` (UNIQUE constraint) — returns existing sequence=44
+
+Sequence numbers are never reused or rolled back. Gaps in sequence numbers (from rejected mutations) are normal and clients handle them gracefully.
+
+#### Client Failover
+
+Drift clients are configured with multiple coordinator endpoints:
+
+```typescript
+const drift = new Drift({
+  coordinator: new PostgresCoordinator({
+    endpoints: [
+      "wss://coordinator-a.example.com/drift/v1/sync",
+      "wss://coordinator-b.example.com/drift/v1/sync"
+    ],
+    strategy: "round-robin"  // "round-robin" | "failover"
+  })
+})
+```
+
+On connection failure, the client rotates to the next endpoint automatically. The new connection's `REGISTER` message includes `last_sequence`, so the coordinator catches the client up from where it left off.
+
+### 17.6 Coordinator-Side Compaction
+
+As months of mutations accumulate, the coordinator's `drift_coordinator_mutations` table grows unboundedly. Compaction prunes old entries while maintaining correctness.
+
+#### Safety Rule: Minimum Sequence Fence
+
+The coordinator tracks the **minimum acknowledged sequence** across all registered replicas:
+
+```sql
+SELECT MIN(last_sequence) as min_seq
+FROM drift_coordinator_replicas
+WHERE namespace = 'workspace:core'
+  AND last_heartbeat > NOW() - INTERVAL '90 days';  -- only active replicas
+```
+
+Mutations with `sequence < min_seq` are safe to delete — every active replica has already received and applied them.
+
+#### Compaction Process
+
+```
+Background job runs daily (or triggered by mutation count threshold):
+  1. Compute min_seq = MIN(last_sequence) across active replicas
+  2. Snapshot: create a compressed snapshot of mutations [last_snapshot_seq, min_seq]
+  3. Store snapshot in drift_coordinator_snapshots
+  4. Delete from drift_coordinator_mutations WHERE sequence < min_seq
+  5. Update compaction watermark
+```
+
+#### New Replica After Compaction
+
+If a new replica joins and requests `PULL(after=0)`, but the coordinator has compacted mutations before sequence 5000:
+- Coordinator returns `PULL_RESPONSE` starting from the oldest available sequence
+- `REGISTER_ACK` includes `compaction_floor: 5000` — sequences below this are unavailable
+- Client bootstraps from the latest snapshot (§17.3) which covers the compacted range
+
+#### Stale Replica Detection
+
+If a replica's `last_sequence` is below the `compaction_floor` when it reconnects (offline longer than retention period):
+1. Coordinator returns `REPLICA_TOO_STALE` error
+2. Client performs full bootstrap from latest snapshot
+3. All local pending mutations (with sequences < compaction_floor) are re-uploaded with new IDs
 
 ---
 
@@ -2232,9 +3385,67 @@ Every incoming mutation is validated by the coordinator:
 
 Mutations failing validation are rejected with a specific error code. The client logs the rejection and surfaces it as a sync error.
 
-### Replay Attack Prevention
-
 Each mutation includes a client-generated unique ID (`mut_abc123`). The coordinator deduplicates by mutation ID. A replayed mutation is silently dropped — idempotent by design. The E2EE layer also prevents meaningful replay since the coordinator cannot produce new valid ciphertexts without the private key.
+
+### 23.1 Authorization Plugin Interface
+
+By default, any replica with a valid JWT for a namespace can push and pull any mutation in that namespace. For finer-grained control, the coordinator supports an authorization plugin interface.
+
+#### The Authz Interface
+
+When a replica pushes a mutation or attempts a pull, the coordinator calls the configured authorization plugin:
+
+```rust
+#[async_trait]
+pub trait AuthorizationPlugin: Send + Sync {
+    /// Authorize a mutation push.
+    async fn authorize_push(
+        &self,
+        replica_id: &str,
+        namespace: &str,
+        mutation_metadata: &MutationMetadata,
+    ) -> Result<AuthzDecision, AuthzError>;
+
+    /// Authorize a pull request.
+    async fn authorize_pull(
+        &self,
+        replica_id: &str,
+        namespace: &str,
+    ) -> Result<AuthzDecision, AuthzError>;
+}
+
+pub enum AuthzDecision {
+    Allow,
+    Deny(String), // Reason for denial
+}
+
+pub struct MutationMetadata {
+    pub doc_id: String,       // e.g., "todos"
+    pub record_id: String,    // e.g., "user-123:todo-456"
+    pub mutation_type: String,// "CRDT_UPDATE", "CRDT_INSERT", "CRDT_DELETE"
+}
+```
+
+#### The E2EE Constraint
+
+**CRITICAL:** Because Drift uses End-to-End Encryption, the coordinator cannot read the contents of the mutation. The `yrs_update` and the affected field names/values are inside the `encrypted_blob`.
+
+Therefore, **authorization can only be performed on routing metadata**. You cannot write an authorization rule like:
+❌ *"Deny if `priority > 5`"*
+❌ *"Deny if updating the `role` field"*
+
+You can only write rules like:
+✅ *"Deny if replica does not own the namespace"*
+✅ *"Deny if `doc_id` is 'system_settings'"*
+✅ *"Deny if `record_id` does not start with `user-${replica_id}:`"*
+
+If field-level authorization is required, those fields must be extracted from the CRDT document and placed in the routing metadata (like `record_id`) before encryption.
+
+#### Coordinator Enforcement
+
+1. **On Push Deny:** The mutation is rejected. The coordinator returns `{"error": "FORBIDDEN", "reason": "<reason>"}` in the `PUSH_ACK`. The client marks the mutation as `failed` (permanent failure, no retry).
+2. **On Pull Deny:** The `PULL` request is rejected with `FORBIDDEN`.
+3. **Redaction:** Because mutations are E2EE encrypted blobs, the coordinator cannot "redact" specific fields from a mutation before sending it to a reader. It must allow or deny the entire blob.
 
 ---
 
@@ -2443,6 +3654,67 @@ Two developers on the same office Wi-Fi:
   → When one developer leaves the office, P2P disconnects
   → Coordinator takes over transparently
 ```
+
+---
+
+## 27. Multi-Namespace & Multi-Tenant Architecture
+
+Drift isolates data by `namespace`. The spec generally describes one replica syncing one namespace. This section defines how applications handle multiple namespaces concurrently.
+
+### Client-Side: Multiple Namespaces per Device
+
+A user may belong to multiple workspaces or projects, each mapped to a distinct Drift namespace (e.g., `workspace:design` and `workspace:engineering`).
+
+#### Storage Isolation
+
+All namespaces on a device share the same underlying local storage (e.g., one SQLite file or OPFS directory) to minimize overhead. Data is isolated via the `namespace` column in the `drift_oplog`, `drift_sync_state`, and `drift_documents` tables.
+
+#### Client Instantiation
+
+The application creates one `Drift` instance per namespace:
+
+```typescript
+const designSync = new Drift({ namespace: "workspace:design", storage: "sqlite" })
+const engSync = new Drift({ namespace: "workspace:engineering", storage: "sqlite" })
+```
+
+#### Connection Multiplexing
+
+To avoid opening N WebSocket connections for N namespaces, Drift multiplexes namespaces over a single physical WebSocket connection to the coordinator:
+
+1. The underlying transport maintains one WSS connection per coordinator host.
+2. The `AUTH` message authenticates the connection.
+3. The client sends multiple `REGISTER` messages over the single connection, one per namespace.
+4. All `PUSH`, `PULL`, and `MUTATION_PUSH` frames include the `namespace` field to route data appropriately.
+
+#### Leader Election Sharing
+
+In a multi-tab environment, the leader election lock is acquired **per storage backend**, not per namespace. If Tab A wins the lock for the SQLite file, it becomes the leader for *all* namespaces stored in that file.
+
+### Server-Side: Headless Replicas
+
+A backend service (e.g., a Node.js worker) may need to act as a replica for thousands of user namespaces simultaneously to bridge Drift data to a legacy system or perform AI processing.
+
+#### The "Super-Replica" Pattern
+
+A backend service initializes Drift with a super-token and dynamically registers namespaces:
+
+```typescript
+const serverDrift = new DriftServer({
+  storage: "postgres", // Server uses Postgres for its local replica storage
+  coordinator: "wss://coordinator.internal"
+})
+
+// Dynamically attach to namespaces as users log in or events occur
+await serverDrift.attachNamespace("user:123", serverKeypair)
+await serverDrift.attachNamespace("user:456", serverKeypair)
+```
+
+#### Server Performance Considerations
+
+- **Oplog batching:** The server-side storage implementation batches CRDT writes across namespaces to maximize throughput.
+- **Memory limits:** Yrs documents (the CRDT cache) are kept in memory only for actively syncing namespaces. Inactive namespaces are evicted from memory and reloaded from storage when a new mutation arrives.
+- **Key management:** The server maintains its own `server_sk` and registers its `server_pk` in every namespace it joins. When a user creates a namespace, they must encrypt the namespace symmetric key for the server's public key to allow the server to decrypt mutations.
 
 ---
 
