@@ -68,7 +68,15 @@ impl DriftClient {
             StorageConfig::InMemory => Arc::new(InMemoryStorage::new()),
             StorageConfig::Wasm => return Err(DriftError::Config("WASM storage not available in native build".into())),
         };
+        Self::new_with_storage(config, coordinator, keyring, storage).await
+    }
 
+    pub async fn new_with_storage(
+        config: DriftConfig,
+        coordinator: Arc<dyn Coordinator>,
+        keyring: Arc<KeyRing>,
+        storage: Arc<dyn Storage>,
+    ) -> Result<Self, DriftError> {
         let encryptor = Arc::new(E2eeEncryptor::new(keyring.clone()));
         let decryptor = Arc::new(E2eeDecryptor::new(keyring.clone()));
 

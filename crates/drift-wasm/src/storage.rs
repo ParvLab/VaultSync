@@ -446,3 +446,163 @@ impl Storage for OpfsStorage {
         Ok(())
     }
 }
+
+use crate::indexeddb::IndexedDbStorage;
+
+#[derive(Debug)]
+pub enum BrowserStorage {
+    Opfs(OpfsStorage),
+    Idb(IndexedDbStorage),
+}
+
+impl BrowserStorage {
+    pub async fn new(db_name: &str) -> Result<Self, DriftError> {
+        match OpfsStorage::new().await {
+            Ok(opfs) => {
+                tracing::info!("Using OPFS storage backend");
+                Ok(Self::Opfs(opfs))
+            }
+            Err(e) => {
+                tracing::warn!("OPFS storage not available, falling back to IndexedDB: {:?}", e);
+                let idb = IndexedDbStorage::new(db_name).await?;
+                Ok(Self::Idb(idb))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Storage for BrowserStorage {
+    async fn insert_document(&self, doc_id: &str, record_id: &str, bytes: &[u8]) -> Result<(), DriftError> {
+        match self {
+            Self::Opfs(s) => s.insert_document(doc_id, record_id, bytes).await,
+            Self::Idb(s) => s.insert_document(doc_id, record_id, bytes).await,
+        }
+    }
+
+    async fn get_document(&self, doc_id: &str, record_id: &str) -> Result<Option<Vec<u8>>, DriftError> {
+        match self {
+            Self::Opfs(s) => s.get_document(doc_id, record_id).await,
+            Self::Idb(s) => s.get_document(doc_id, record_id).await,
+        }
+    }
+
+    async fn delete_document(&self, doc_id: &str, record_id: &str) -> Result<(), DriftError> {
+        match self {
+            Self::Opfs(s) => s.delete_document(doc_id, record_id).await,
+            Self::Idb(s) => s.delete_document(doc_id, record_id).await,
+        }
+    }
+
+    async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, DriftError> {
+        match self {
+            Self::Opfs(s) => s.list_documents(doc_id).await,
+            Self::Idb(s) => s.list_documents(doc_id).await,
+        }
+    }
+
+    async fn write_document_and_oplog(&self, doc_id: &str, record_id: &str, bytes: &[u8], entry: &OplogEntry) -> Result<(), DriftError> {
+        match self {
+            Self::Opfs(s) => s.write_document_and_oplog(doc_id, record_id, bytes, entry).await,
+            Self::Idb(s) => s.write_document_and_oplog(doc_id, record_id, bytes, entry).await,
+        }
+    }
+
+    async fn delete_document_and_oplog(&self, doc_id: &str, record_id: &str, entry: &OplogEntry) -> Result<(), DriftError> {
+        match self {
+            Self::Opfs(s) => s.delete_document_and_oplog(doc_id, record_id, entry).await,
+            Self::Idb(s) => s.delete_document_and_oplog(doc_id, record_id, entry).await,
+        }
+    }
+
+    async fn append_oplog(&self, entry: &OplogEntry) -> Result<(), DriftError> {
+        match self {
+            Self::Opfs(s) => s.append_oplog(entry).await,
+            Self::Idb(s) => s.append_oplog(entry).await,
+        }
+    }
+
+    async fn read_pending_oplog(&self, namespace: &str, limit: usize) -> Result<Vec<OplogEntry>, DriftError> {
+        match self {
+            Self::Opfs(s) => s.read_pending_oplog(namespace, limit).await,
+            Self::Idb(s) => s.read_pending_oplog(namespace, limit).await,
+        }
+    }
+
+    async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), DriftError> {
+        match self {
+            Self::Opfs(s) => s.mark_synced(id, sequence).await,
+            Self::Idb(s) => s.mark_synced(id, sequence).await,
+        }
+    }
+
+    async fn mark_failed(&self, id: &str, error: &str) -> Result<(), DriftError> {
+        match self {
+            Self::Opfs(s) => s.mark_failed(id, error).await,
+            Self::Idb(s) => s.mark_failed(id, error).await,
+        }
+    }
+
+    async fn read_oplog_after_sequence(&self, namespace: &str, seq: u64) -> Result<Vec<OplogEntry>, DriftError> {
+        match self {
+            Self::Opfs(s) => s.read_oplog_after_sequence(namespace, seq).await,
+            Self::Idb(s) => s.read_oplog_after_sequence(namespace, seq).await,
+        }
+    }
+
+    async fn read_sync_state(&self, namespace: &str) -> Result<Option<SyncState>, DriftError> {
+        match self {
+            Self::Opfs(s) => s.read_sync_state(namespace).await,
+            Self::Idb(s) => s.read_sync_state(namespace).await,
+        }
+    }
+
+    async fn write_sync_state(&self, state: &SyncState) -> Result<(), DriftError> {
+        match self {
+            Self::Opfs(s) => s.write_sync_state(state).await,
+            Self::Idb(s) => s.write_sync_state(state).await,
+        }
+    }
+
+    async fn read_schema(&self, doc_id: &str) -> Result<Option<SchemaMeta>, DriftError> {
+        match self {
+            Self::Opfs(s) => s.read_schema(doc_id).await,
+            Self::Idb(s) => s.read_schema(doc_id).await,
+        }
+    }
+
+    async fn write_schema(&self, meta: &SchemaMeta) -> Result<(), DriftError> {
+        match self {
+            Self::Opfs(s) => s.write_schema(meta).await,
+            Self::Idb(s) => s.write_schema(meta).await,
+        }
+    }
+
+    async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, DriftError> {
+        match self {
+            Self::Opfs(s) => s.read_migrations().await,
+            Self::Idb(s) => s.read_migrations().await,
+        }
+    }
+
+    async fn write_migration(&self, record: &MigrationRecord) -> Result<(), DriftError> {
+        match self {
+            Self::Opfs(s) => s.write_migration(record).await,
+            Self::Idb(s) => s.write_migration(record).await,
+        }
+    }
+
+    async fn read_keys(&self, namespace: &str) -> Result<Vec<KeyRecord>, DriftError> {
+        match self {
+            Self::Opfs(s) => s.read_keys(namespace).await,
+            Self::Idb(s) => s.read_keys(namespace).await,
+        }
+    }
+
+    async fn write_key(&self, key: &KeyRecord) -> Result<(), DriftError> {
+        match self {
+            Self::Opfs(s) => s.write_key(key).await,
+            Self::Idb(s) => s.write_key(key).await,
+        }
+    }
+}

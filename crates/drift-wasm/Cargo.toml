@@ -5,10 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-drift-core = { path = "../drift-core", default-features = false }
+drift-core = { path = "../drift-core", default-features = false, features = ["async-runtime"] }
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = [
     "WebSocket", "BroadcastChannel", "Window", "Navigator",
@@ -17,7 +17,11 @@ web-sys = { version = "0.3", features = [
     "FileSystemFileHandle", "FileSystemWritableFileStream",
     "FileSystemGetFileOptions", "FileSystemGetDirectoryOptions",
     "FileSystemCreateWritableOptions", "FileSystemRemoveOptions",
-    "Blob", "File", "WritableStream"
+    "Blob", "File", "WritableStream",
+    "IdbDatabase", "IdbTransaction", "IdbObjectStore",
+    "IdbFactory", "IdbRequest", "IdbOpenDbRequest",
+    "IdbTransactionMode", "IdbVersionChangeEvent",
+    "Event", "EventTarget", "BinaryType", "MessageEvent"
 ] }
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
@@ -26,3 +30,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasm-bindgen-futures = "0.4"
 async-trait = "0.1"
+tracing = "0.1"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+

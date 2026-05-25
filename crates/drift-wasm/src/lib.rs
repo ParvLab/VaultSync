@@ -7,6 +7,7 @@ pub fn init() {
 
 pub mod client;
 pub mod storage;
+pub mod indexeddb;
 pub mod ipc;
 pub mod e2ee;
 pub mod transport;

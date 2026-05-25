@@ -14,9 +14,6 @@ storage-sqlite = ["dep:rusqlite"]
 # CRDT
 yrs = "0.19"
 
-# Async
-tokio = { version = "1", features = ["full"], optional = true }
-
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -46,6 +43,12 @@ uuid = { version = "1", features = ["v4", "js"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 futures = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["full"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", features = ["sync", "macros", "rt", "time"], optional = true }
 
 [dev-dependencies]
 proptest = "1"
