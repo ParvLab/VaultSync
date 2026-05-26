@@ -9,6 +9,7 @@ members = [
     "crates/drift-coordinator-memory",
     "crates/drift-coordinator-cloudflare",
     "crates/drift-cli",
+    "crates/drift-fuzz",
 ]
 
 [workspace.package]

@@ -44,6 +44,7 @@ pub struct DriftClient {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub metrics: Arc<crate::telemetry::metrics::DriftMetrics>,
     pub debug_api: Arc<crate::telemetry::debug::DebugApi>,
+    pub leader_election: Arc<crate::ipc::leader_election::LeaderElection>,
 }
 
 impl DriftClient {
@@ -126,6 +127,8 @@ impl DriftClient {
             tracing::error!(error = %e, "Crash recovery failed during startup");
         }
 
+        let leader_election = Arc::new(crate::ipc::leader_election::LeaderElection::new(&config.namespace, &config.storage));
+
         let client = Self {
             config,
             storage,
@@ -143,9 +146,9 @@ impl DriftClient {
             shutdown_tx,
             metrics,
             debug_api,
+            leader_election: leader_election.clone(),
         };
 
-        let leader_election = Arc::new(crate::ipc::leader_election::LeaderElection::new(&client.config.namespace, &client.config.storage));
         let leader_election_clone = leader_election.clone();
         let upload_queue_clone = upload_queue.clone();
         let download_queue_clone = download_queue.clone();
@@ -394,7 +397,9 @@ impl DriftClient {
     }
 
     pub async fn sync_status(&self) -> Result<SyncState, DriftError> {
-        if let Some(state) = self.storage.read_sync_state(&self.config.namespace).await? {
+        let is_leader = self.leader_election.is_leader();
+        if let Some(mut state) = self.storage.read_sync_state(&self.config.namespace).await? {
+            state.leader_status = Some(is_leader);
             Ok(state)
         } else {
             let last_seq = self.download_queue.last_sequence();
@@ -403,7 +408,7 @@ impl DriftClient {
                 replica_id: self.config.replica_id.clone(),
                 last_synced_sequence: last_seq,
                 connection_status: crate::sync::state::ConnectionStatus::Connected,
-                leader_status: Some(true),
+                leader_status: Some(is_leader),
                 last_connected_at: None,
                 last_sync_at: None,
                 schema_version: 0,
@@ -484,7 +489,10 @@ impl DriftClient {
             return Ok(());
         }
         
-        migration.apply()?;
+        if let Err(e) = migration.apply() {
+            let _ = migration.rollback();
+            return Err(e);
+        }
 
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();

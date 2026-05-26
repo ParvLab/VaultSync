@@ -3,3 +3,6 @@ pub mod traits;
 pub mod sqlite;
 pub mod memory;
 pub mod encryption_shim;
+
+#[cfg(test)]
+pub mod tests;

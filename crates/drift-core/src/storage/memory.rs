@@ -91,10 +91,13 @@ impl Storage for InMemoryStorage {
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), DriftError> {
         let mut oplog = self.oplog.write().map_err(|e| DriftError::Storage(e.to_string()))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         for entry in oplog.iter_mut() {
             if entry.id == id {
                 entry.sync_status = crate::oplog::entry::SyncStatus::Synced;
                 entry.sequence = Some(sequence);
+                entry.synced_at = Some(now);
             }
         }
         Ok(())

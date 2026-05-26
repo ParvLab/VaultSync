@@ -57,3 +57,7 @@ tokio = { version = "1", features = ["sync", "macros", "rt", "time"], optional =
 proptest = "1"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "crdt_bench"
+harness = false

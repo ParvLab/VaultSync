@@ -1,7 +1,7 @@
 use serde::{Serialize, Deserialize};
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncState {
     pub namespace: String,
     pub replica_id: String,
@@ -13,7 +13,7 @@ pub struct SyncState {
     pub schema_version: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectionStatus {
     Connected,
     Disconnected,
