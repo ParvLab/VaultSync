@@ -58,4 +58,9 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
 
     async fn read_keys(&self, namespace: &str) -> Result<Vec<KeyRecord>, DriftError>;
     async fn write_key(&self, key: &KeyRecord) -> Result<(), DriftError>;
+
+    async fn reset_stale_pending(&self, namespace: &str, older_than_ms: u64) -> Result<usize, DriftError>;
+    async fn delete_synced_oplog_older_than(&self, namespace: &str, older_than_secs: u64) -> Result<usize, DriftError>;
+    async fn list_tombstoned_documents(&self, namespace: &str, older_than_secs: u64) -> Result<Vec<(String, String)>, DriftError>;
+    async fn update_oplog_encrypted_blob(&self, id: &str, new_blob: &[u8]) -> Result<(), DriftError>;
 }

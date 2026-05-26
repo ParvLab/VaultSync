@@ -15,6 +15,10 @@ pub struct NamespaceKeypair {
 }
 
 pub struct KeyRing {
+    inner: std::sync::RwLock<KeyRingInner>,
+}
+
+struct KeyRingInner {
     keys: Vec<NamespaceKeypair>,
     active_version: u64,
 }
@@ -23,41 +27,50 @@ impl KeyRing {
     pub fn generate() -> Self {
         let keypair = generate_keypair(1);
         Self {
-            keys: vec![keypair],
-            active_version: 1,
+            inner: std::sync::RwLock::new(KeyRingInner {
+                keys: vec![keypair],
+                active_version: 1,
+            }),
         }
     }
 
     pub fn from_key(key: NamespaceKeypair) -> Self {
         let version = key.version;
         Self {
-            keys: vec![key],
-            active_version: version,
+            inner: std::sync::RwLock::new(KeyRingInner {
+                keys: vec![key],
+                active_version: version,
+            }),
         }
     }
 
-    pub fn add_key(&mut self, key: NamespaceKeypair) {
-        if key.version > self.active_version {
-            self.active_version = key.version;
+    pub fn add_key(&self, key: NamespaceKeypair) {
+        let mut inner = self.inner.write().unwrap();
+        if key.version > inner.active_version {
+            inner.active_version = key.version;
         }
-        self.keys.push(key);
+        inner.keys.push(key);
     }
 
-    pub fn active_key(&self) -> &NamespaceKeypair {
-        self.keys.iter()
-            .find(|k| k.version == self.active_version)
+    pub fn active_key(&self) -> NamespaceKeypair {
+        let inner = self.inner.read().unwrap();
+        inner.keys.iter()
+            .find(|k| k.version == inner.active_version)
+            .cloned()
             .expect("active key always present")
     }
 
-    pub fn key_by_version(&self, version: u64) -> Option<&NamespaceKeypair> {
-        self.keys.iter().find(|k| k.version == version)
+    pub fn key_by_version(&self, version: u64) -> Option<NamespaceKeypair> {
+        let inner = self.inner.read().unwrap();
+        inner.keys.iter().find(|k| k.version == version).cloned()
     }
 
-    pub fn rotate(&mut self) -> NamespaceKeypair {
-        let new_version = self.active_version + 1;
+    pub fn rotate(&self) -> NamespaceKeypair {
+        let mut inner = self.inner.write().unwrap();
+        let new_version = inner.active_version + 1;
         let keypair = generate_keypair(new_version);
-        self.active_version = new_version;
-        self.keys.push(keypair.clone());
+        inner.active_version = new_version;
+        inner.keys.push(keypair.clone());
         keypair
     }
 
@@ -98,7 +111,8 @@ impl KeyRing {
     }
 
     pub fn active_version(&self) -> u64 {
-        self.active_version
+        let inner = self.inner.read().unwrap();
+        inner.active_version
     }
 
     pub fn derive_namespace_key(&self, namespace: &str) -> [u8; 32] {

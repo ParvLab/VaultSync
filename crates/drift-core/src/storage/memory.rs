@@ -158,4 +158,62 @@ impl Storage for InMemoryStorage {
         self.keys.write().map_err(|e| DriftError::Storage(e.to_string()))?.push(key.clone());
         Ok(())
     }
+
+    async fn reset_stale_pending(&self, namespace: &str, older_than_ms: u64) -> Result<usize, DriftError> {
+        let mut oplog = self.oplog.write().map_err(|e| DriftError::Storage(e.to_string()))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let threshold = now.saturating_sub(older_than_ms);
+        let mut count = 0;
+        for entry in oplog.iter_mut() {
+            if entry.namespace == namespace && !matches!(entry.sync_status, crate::oplog::entry::SyncStatus::Synced) && entry.created_at < threshold {
+                entry.sync_status = crate::oplog::entry::SyncStatus::Pending;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn delete_synced_oplog_older_than(&self, namespace: &str, older_than_secs: u64) -> Result<usize, DriftError> {
+        let mut oplog = self.oplog.write().map_err(|e| DriftError::Storage(e.to_string()))?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let threshold = now_secs.saturating_sub(older_than_secs);
+        let initial_len = oplog.len();
+        oplog.retain(|entry| {
+            !(entry.namespace == namespace
+                && matches!(entry.sync_status, crate::oplog::entry::SyncStatus::Synced)
+                && entry.synced_at.unwrap_or(0) < threshold)
+        });
+        Ok(initial_len - oplog.len())
+    }
+
+    async fn list_tombstoned_documents(&self, namespace: &str, older_than_secs: u64) -> Result<Vec<(String, String)>, DriftError> {
+        let oplog = self.oplog.read().map_err(|e| DriftError::Storage(e.to_string()))?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let threshold = now_ms.saturating_sub(older_than_secs * 1000);
+        let mut results = std::collections::HashSet::new();
+        for entry in oplog.iter() {
+            if entry.namespace == namespace
+                && matches!(entry.mutation_type, crate::oplog::entry::MutationType::CrdtDelete)
+                && matches!(entry.sync_status, crate::oplog::entry::SyncStatus::Synced)
+                && entry.created_at < threshold
+            {
+                results.insert((entry.doc_id.clone(), entry.record_id.clone()));
+            }
+        }
+        Ok(results.into_iter().collect())
+    }
+
+    async fn update_oplog_encrypted_blob(&self, id: &str, new_blob: &[u8]) -> Result<(), DriftError> {
+        let mut oplog = self.oplog.write().map_err(|e| DriftError::Storage(e.to_string()))?;
+        for entry in oplog.iter_mut() {
+            if entry.id == id {
+                entry.encrypted_blob = Some(new_blob.to_vec());
+                break;
+            }
+        }
+        Ok(())
+    }
 }

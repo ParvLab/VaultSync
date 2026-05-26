@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use aead::KeyInit;
 use crate::config::DriftConfig;
 use crate::error::DriftError;
 use crate::crdt::document::CRDTDocument;
@@ -41,6 +42,8 @@ pub struct DriftClient {
     _reconciler: Arc<Reconciler>,
     _telemetry: Arc<DriftTelemetry>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    pub metrics: Arc<crate::telemetry::metrics::DriftMetrics>,
+    pub debug_api: Arc<crate::telemetry::debug::DebugApi>,
 }
 
 impl DriftClient {
@@ -90,11 +93,15 @@ impl DriftClient {
             None => 0,
         };
 
+        let metrics = Arc::new(crate::telemetry::metrics::DriftMetrics::new());
+        let debug_api = Arc::new(crate::telemetry::debug::DebugApi::new(storage.clone(), metrics.clone()));
+
         let upload_queue = Arc::new(UploadQueue::new(
             oplog.clone(),
             coordinator.clone(),
             config.upload.clone(),
             config.retry.clone(),
+            metrics.clone(),
         ));
 
         let download_queue = Arc::new(DownloadQueue::new(
@@ -105,12 +112,19 @@ impl DriftClient {
             config.download.clone(),
             reconciler.clone(),
             decryptor.clone(),
+            metrics.clone(),
         ));
 
         let schema = Arc::new(std::sync::Mutex::new(SchemaRegistry::new()));
         let _telemetry = Arc::new(DriftTelemetry::new());
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Perform crash recovery on startup before starting the sync loop
+        let crash_recovery = crate::ipc::crash_recovery::CrashRecovery::new(storage.clone(), config.namespace.clone());
+        if let Err(e) = crash_recovery.recover().await {
+            tracing::error!(error = %e, "Crash recovery failed during startup");
+        }
 
         let client = Self {
             config,
@@ -127,21 +141,71 @@ impl DriftClient {
             _reconciler: reconciler,
             _telemetry,
             shutdown_tx,
+            metrics,
+            debug_api,
         };
 
+        let leader_election = Arc::new(crate::ipc::leader_election::LeaderElection::new(&client.config.namespace, &client.config.storage));
+        let leader_election_clone = leader_election.clone();
         let upload_queue_clone = upload_queue.clone();
         let download_queue_clone = download_queue.clone();
         let sync_interval = client.config.sync_interval;
+        let namespace_clone = client.config.namespace.clone();
+        let storage_clone = client.storage.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + sync_interval, sync_interval);
+            let mut is_leader = match leader_election_clone.try_acquire() {
+                Ok(status) => status,
+                Err(e) => {
+                    tracing::error!(error = %e, "Leader election try_acquire failed during startup");
+                    false
+                }
+            };
+
+            if let Ok(Some(mut state)) = storage_clone.read_sync_state(&namespace_clone).await {
+                state.leader_status = Some(is_leader);
+                let _ = storage_clone.write_sync_state(&state).await;
+            }
+
+            let compaction_engine = crate::sync::compaction::CompactionEngine::new(
+                storage_clone.clone(),
+                crate::sync::compaction::CompactionConfig::default(),
+            );
+            let mut sync_cycles = 0;
+
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let _ = upload_queue_clone.process_batch().await;
-                        let _ = download_queue_clone.process_batch().await;
+                        if !is_leader {
+                            is_leader = match leader_election_clone.try_acquire() {
+                                Ok(status) => status,
+                                Err(e) => {
+                                    tracing::error!(error = %e, "Leader election try_acquire failed");
+                                    false
+                                }
+                            };
+                            if let Ok(Some(mut state)) = storage_clone.read_sync_state(&namespace_clone).await {
+                                state.leader_status = Some(is_leader);
+                                let _ = storage_clone.write_sync_state(&state).await;
+                            }
+                        }
+
+                        if is_leader {
+                            let _ = upload_queue_clone.process_batch().await;
+                            let _ = download_queue_clone.process_batch().await;
+
+                            sync_cycles += 1;
+                            if sync_cycles >= 100 {
+                                sync_cycles = 0;
+                                if let Err(e) = compaction_engine.run_compaction(&namespace_clone).await {
+                                    tracing::error!(error = %e, "Compaction failed");
+                                }
+                            }
+                        }
                     }
                     _ = shutdown_rx.changed() => {
+                        leader_election_clone.release();
                         break;
                     }
                 }
@@ -352,6 +416,47 @@ impl DriftClient {
     }
 
     pub async fn rotate_keys(&self) -> Result<(), DriftError> {
+        let old_namespace_key = self.keyring.derive_namespace_key(&self.config.namespace);
+
+        let new_pair = self.keyring.rotate();
+        let new_namespace_key = self.keyring.derive_namespace_key(&self.config.namespace);
+
+        let pending = self.storage.read_pending_oplog(&self.config.namespace, 10000).await?;
+
+        for entry in pending {
+            if let Some(encrypted_blob) = entry.encrypted_blob {
+                let old_cipher = chacha20poly1305::ChaCha20Poly1305::new(
+                    chacha20poly1305::Key::from_slice(&old_namespace_key)
+                );
+                let nonce = chacha20poly1305::Nonce::from_slice(&[0u8; 12]);
+                use aead::Aead;
+                let plaintext = old_cipher.decrypt(nonce, encrypted_blob.as_slice())
+                    .map_err(|e| DriftError::Encryption(format!("failed to decrypt during key rotation: {e}")))?;
+
+                let new_cipher = chacha20poly1305::ChaCha20Poly1305::new(
+                    chacha20poly1305::Key::from_slice(&new_namespace_key)
+                );
+                let new_encrypted_blob = new_cipher.encrypt(nonce, plaintext.as_slice())
+                    .map_err(|e| DriftError::Encryption(format!("failed to re-encrypt during key rotation: {e}")))?;
+
+                self.storage.update_oplog_encrypted_blob(&entry.id, &new_encrypted_blob).await?;
+            }
+        }
+
+        let key_rec = crate::storage::traits::KeyRecord {
+            namespace: self.config.namespace.clone(),
+            key_bytes: new_pair.private_key.to_vec(),
+            version: new_pair.version,
+        };
+        self.storage.write_key(&key_rec).await?;
+
+        self.coordinator.register(&self.config.namespace, ReplicaInfo {
+            replica_id: self.config.replica_id.clone(),
+            namespace: self.config.namespace.clone(),
+            public_key: new_pair.public_key.to_vec(),
+            schema_version: 0,
+        }).await.map_err(|e| DriftError::Coordinator(format!("re-register failed: {e:?}")))?;
+
         Ok(())
     }
 

@@ -473,6 +473,84 @@ impl Storage for SQLiteStorage {
         .await
         .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
     }
+
+    async fn reset_stale_pending(&self, namespace: &str, older_than_ms: u64) -> Result<usize, DriftError> {
+        let namespace = namespace.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let threshold = now.saturating_sub(older_than_ms) as i64;
+            let changes = conn.execute(
+                "UPDATE oplog SET sync_status = 'Pending'
+                 WHERE namespace = ?1 AND sync_status != 'Synced' AND created_at < ?2",
+                params![namespace, threshold],
+            )?;
+            Ok(changes)
+        })
+        .await
+        .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
+    }
+
+    async fn delete_synced_oplog_older_than(&self, namespace: &str, older_than_secs: u64) -> Result<usize, DriftError> {
+        let namespace = namespace.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            let threshold = now_secs.saturating_sub(older_than_secs) as i64;
+            let changes = conn.execute(
+                "DELETE FROM oplog WHERE namespace = ?1 AND sync_status = 'Synced' AND synced_at < ?2",
+                params![namespace, threshold],
+            )?;
+            Ok(changes)
+        })
+        .await
+        .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
+    }
+
+    async fn list_tombstoned_documents(&self, namespace: &str, older_than_secs: u64) -> Result<Vec<(String, String)>, DriftError> {
+        let namespace = namespace.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let threshold = now_ms.saturating_sub(older_than_secs * 1000) as i64;
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT doc_id, record_id FROM oplog
+                 WHERE namespace = ?1 AND mutation_type = 'CrdtDelete' AND sync_status = 'Synced' AND created_at < ?2"
+            )?;
+            let rows = stmt.query_map(params![namespace, threshold], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await
+        .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
+    }
+
+    async fn update_oplog_encrypted_blob(&self, id: &str, new_blob: &[u8]) -> Result<(), DriftError> {
+        let id = id.to_string();
+        let new_blob = new_blob.to_vec();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "UPDATE oplog SET encrypted_blob = ?2 WHERE id = ?1",
+                params![id, new_blob],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
+    }
 }
 
 impl SQLiteStorage {

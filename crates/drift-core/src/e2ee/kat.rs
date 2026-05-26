@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     fn keyring_rotate_changes_key() {
-        let mut kr = KeyRing::generate();
+        let kr = KeyRing::generate();
         let first = kr.active_key().clone();
         kr.rotate();
         let second = kr.active_key();

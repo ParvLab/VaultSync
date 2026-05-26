@@ -119,4 +119,20 @@ impl Storage for EncryptedStorage {
     async fn write_key(&self, key: &KeyRecord) -> Result<(), DriftError> {
         self.inner.write_key(key).await
     }
+
+    async fn reset_stale_pending(&self, namespace: &str, older_than_ms: u64) -> Result<usize, DriftError> {
+        self.inner.reset_stale_pending(namespace, older_than_ms).await
+    }
+
+    async fn delete_synced_oplog_older_than(&self, namespace: &str, older_than_secs: u64) -> Result<usize, DriftError> {
+        self.inner.delete_synced_oplog_older_than(namespace, older_than_secs).await
+    }
+
+    async fn list_tombstoned_documents(&self, namespace: &str, older_than_secs: u64) -> Result<Vec<(String, String)>, DriftError> {
+        self.inner.list_tombstoned_documents(namespace, older_than_secs).await
+    }
+
+    async fn update_oplog_encrypted_blob(&self, id: &str, new_blob: &[u8]) -> Result<(), DriftError> {
+        self.inner.update_oplog_encrypted_blob(id, new_blob).await
+    }
 }

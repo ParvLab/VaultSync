@@ -4,6 +4,7 @@ use crate::coordinator::traits::{Coordinator, CoordinatorError};
 use crate::e2ee::keyring::E2eeDecryptor;
 use crate::oplog::entry::{OplogEntry, MutationType, SyncStatus};
 use crate::sync::reconciler::Reconciler;
+use crate::telemetry::metrics::DriftMetrics;
 
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
@@ -22,6 +23,7 @@ pub struct DownloadQueue {
     config: DownloadConfig,
     reconciler: Arc<Reconciler>,
     decryptor: Arc<E2eeDecryptor>,
+    metrics: Arc<DriftMetrics>,
 }
 
 impl DownloadQueue {
@@ -33,6 +35,7 @@ impl DownloadQueue {
         config: DownloadConfig,
         reconciler: Arc<Reconciler>,
         decryptor: Arc<E2eeDecryptor>,
+        metrics: Arc<DriftMetrics>,
     ) -> Self {
         Self {
             coordinator,
@@ -42,6 +45,7 @@ impl DownloadQueue {
             config,
             reconciler,
             decryptor,
+            metrics,
         }
     }
 
@@ -90,14 +94,28 @@ impl DownloadQueue {
                         }
                     };
                     state.last_synced_sequence = new_seq;
-                    state.last_sync_at = Some(std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                    state.last_sync_at = Some(now_ms);
                     self.storage.write_sync_state(&state).await?;
+
+                    // Record sync lag using last mutation's timestamp
+                    let lag = now_ms.saturating_sub(last.timestamp);
+                    self.metrics.record_sync_lag(lag as f64);
+                }
+                if count > 0 {
+                    self.metrics.record_download(count);
                 }
                 Ok(count)
             }
-            Err(CoordinatorError::NotAvailable) => Ok(0),
-            Err(e) => Err(DriftError::Coordinator(format!("download failed: {e:?}"))),
+            Err(CoordinatorError::NotAvailable) => {
+                self.metrics.record_sync_error();
+                Ok(0)
+            }
+            Err(e) => {
+                self.metrics.record_sync_error();
+                Err(DriftError::Coordinator(format!("download failed: {e:?}")))
+            }
         }
     }
 

@@ -3,6 +3,8 @@ use crate::error::DriftError;
 use crate::oplog::log::OpLog;
 use crate::coordinator::traits::{Coordinator, EncryptedMutation, CoordinatorError};
 
+use crate::telemetry::metrics::DriftMetrics;
+
 #[derive(Debug, Clone)]
 pub struct UploadConfig {
     pub batch_size: usize,
@@ -17,6 +19,7 @@ pub struct UploadQueue {
     coordinator: Arc<dyn Coordinator>,
     config: UploadConfig,
     retry_engine: std::sync::Mutex<crate::sync::retry::RetryEngine>,
+    metrics: Arc<DriftMetrics>,
 }
 
 impl UploadQueue {
@@ -25,12 +28,14 @@ impl UploadQueue {
         coordinator: Arc<dyn Coordinator>,
         config: UploadConfig,
         retry_config: crate::sync::retry::RetryConfig,
+        metrics: Arc<DriftMetrics>,
     ) -> Self {
         Self {
             oplog,
             coordinator,
             config,
             retry_engine: std::sync::Mutex::new(crate::sync::retry::RetryEngine::new(retry_config)),
+            metrics,
         }
     }
 
@@ -75,9 +80,11 @@ impl UploadQueue {
                         engine.record_success(&entry.id);
                     }
                 }
+                self.metrics.record_upload(entries.len());
                 Ok(entries.len())
             }
             Err(CoordinatorError::NotAvailable) => {
+                self.metrics.record_sync_error();
                 let failed_ids: Vec<String> = {
                     let mut engine = self.retry_engine.lock().unwrap();
                     let mut exhausted = Vec::new();
@@ -94,6 +101,7 @@ impl UploadQueue {
                 Ok(0)
             }
             Err(e) => {
+                self.metrics.record_sync_error();
                 let err_msg = format!("upload failed: {e:?}");
                 let failed_ids: Vec<String> = {
                     let mut engine = self.retry_engine.lock().unwrap();

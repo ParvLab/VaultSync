@@ -437,4 +437,20 @@ impl Storage for IndexedDbStorage {
         *self.index.lock().unwrap() = index;
         Ok(())
     }
+
+    async fn reset_stale_pending(&self, _namespace: &str, _older_than_ms: u64) -> Result<usize, DriftError> {
+        Ok(0)
+    }
+
+    async fn delete_synced_oplog_older_than(&self, _namespace: &str, _older_than_secs: u64) -> Result<usize, DriftError> {
+        Ok(0)
+    }
+
+    async fn list_tombstoned_documents(&self, _namespace: &str, _older_than_secs: u64) -> Result<Vec<(String, String)>, DriftError> {
+        Ok(Vec::new())
+    }
+
+    async fn update_oplog_encrypted_blob(&self, _id: &str, _new_blob: &[u8]) -> Result<(), DriftError> {
+        Ok(())
+    }
 }
