@@ -1,0 +1,15 @@
+[package]
+name = "drift-coordinator-cloudflare"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+drift-core = { path = "../drift-core" }
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tracing = "0.1"
+futures = "0.3"
