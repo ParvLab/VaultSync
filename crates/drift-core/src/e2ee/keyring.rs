@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use sha2::{Sha256, Digest};
+use hkdf::Hkdf;
 use crate::error::DriftError;
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,14 @@ impl KeyRing {
         Self {
             keys: vec![keypair],
             active_version: 1,
+        }
+    }
+
+    pub fn from_key(key: NamespaceKeypair) -> Self {
+        let version = key.version;
+        Self {
+            keys: vec![key],
+            active_version: version,
         }
     }
 
@@ -91,6 +100,15 @@ impl KeyRing {
     pub fn active_version(&self) -> u64 {
         self.active_version
     }
+
+    pub fn derive_namespace_key(&self, namespace: &str) -> [u8; 32] {
+        let active = self.active_key();
+        let hk = Hkdf::<Sha256>::new(Some(b"drift-namespace"), &active.private_key);
+        let mut okm = [0u8; 32];
+        hk.expand(namespace.as_bytes(), &mut okm)
+            .expect("32 bytes is a valid length for HKDF output");
+        okm
+    }
 }
 
 pub struct E2eeEncryptor {
@@ -104,6 +122,14 @@ impl E2eeEncryptor {
 
     pub fn encrypt(&self, plaintext: &[u8], recipient_pk: &[u8; 32]) -> Result<Vec<u8>, DriftError> {
         super::encrypt::encrypt(plaintext, &self.keyring.active_key().private_key, recipient_pk)
+    }
+
+    pub fn encrypt_symmetric(&self, plaintext: &[u8], namespace: &str) -> Result<Vec<u8>, DriftError> {
+        let key = self.keyring.derive_namespace_key(namespace);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let nonce = Nonce::from_slice(&[0u8; 12]);
+        cipher.encrypt(nonce, plaintext)
+            .map_err(|e| DriftError::Encryption(format!("symmetric encrypt failed: {e}")))
     }
 
     pub fn keyring(&self) -> &KeyRing {
@@ -122,6 +148,14 @@ impl E2eeDecryptor {
 
     pub fn decrypt(&self, ciphertext: &[u8], sender_pk: &[u8; 32]) -> Result<Vec<u8>, DriftError> {
         super::decrypt::decrypt(ciphertext, &self.keyring.active_key().private_key, sender_pk)
+    }
+
+    pub fn decrypt_symmetric(&self, ciphertext: &[u8], namespace: &str) -> Result<Vec<u8>, DriftError> {
+        let key = self.keyring.derive_namespace_key(namespace);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let nonce = Nonce::from_slice(&[0u8; 12]);
+        cipher.decrypt(nonce, ciphertext)
+            .map_err(|e| DriftError::Encryption(format!("symmetric decrypt failed: {e}")))
     }
 
     pub fn keyring(&self) -> &KeyRing {

@@ -252,3 +252,53 @@ async fn test_retry_backoff_and_failed_status() {
     let pending = client.pending_uploads().await.unwrap();
     assert_eq!(pending, 0);
 }
+
+#[tokio::test]
+async fn test_two_replicas_independent_keyrings_sync() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let alice_db_path = temp_dir.path().join("alice_ind.db").to_string_lossy().to_string();
+    let bob_db_path = temp_dir.path().join("bob_ind.db").to_string_lossy().to_string();
+
+    let coordinator = Arc::new(InMemoryCoordinator::new());
+    
+    // Generate Alice's keyring
+    let kr_alice = drift_core::e2ee::keyring::KeyRing::generate();
+    let alice_key = kr_alice.active_key().clone();
+
+    // Bob initializes a keyring with the same active keypair
+    let kr_bob = drift_core::e2ee::keyring::KeyRing::from_key(alice_key);
+
+    let mut config_alice = DriftConfig::default();
+    config_alice.namespace = "ind-sync-ns".to_string();
+    config_alice.replica_id = "replica-alice".to_string();
+    config_alice.storage = StorageConfig::Sqlite { path: alice_db_path };
+    config_alice.sync_interval = std::time::Duration::from_secs(3600);
+    let client_alice = DriftClient::new_with_keyring(config_alice, coordinator.clone(), Arc::new(kr_alice))
+        .await
+        .unwrap();
+
+    let mut config_bob = DriftConfig::default();
+    config_bob.namespace = "ind-sync-ns".to_string();
+    config_bob.replica_id = "replica-bob".to_string();
+    config_bob.storage = StorageConfig::Sqlite { path: bob_db_path };
+    config_bob.sync_interval = std::time::Duration::from_secs(3600);
+    let client_bob = DriftClient::new_with_keyring(config_bob, coordinator.clone(), Arc::new(kr_bob))
+        .await
+        .unwrap();
+
+    // Alice inserts a document
+    let mut fields = HashMap::new();
+    fields.insert("value".to_string(), CrdtValue::String("independent keys work".to_string()));
+    client_alice.insert("doc-4", "record-4", fields).await.unwrap();
+
+    // Alice forces sync (uploads)
+    client_alice.force_sync().await.unwrap();
+
+    // Bob forces sync (downloads)
+    client_bob.force_sync().await.unwrap();
+
+    // Verify Bob successfully decrypted and read the document
+    let bob_doc = client_bob.get("doc-4", "record-4").await.unwrap().unwrap();
+    assert_eq!(bob_doc.get("value").unwrap(), &CrdtValue::String("independent keys work".to_string()));
+}
+

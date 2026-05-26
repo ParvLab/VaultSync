@@ -50,10 +50,8 @@ impl DownloadQueue {
         match self.coordinator.pull(&self.namespace, after, self.config.batch_size).await {
             Ok(mutations) => {
                 let count = mutations.len();
-                let namespace_pk = self.decryptor.keyring().active_key().public_key;
-
                 for m in &mutations {
-                    let decrypted_bytes = self.decryptor.decrypt(&m.encrypted_blob, &namespace_pk)?;
+                    let decrypted_bytes = self.decryptor.decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
                     let entry = OplogEntry {
                         id: m.id.clone(),

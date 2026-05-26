@@ -177,7 +177,7 @@ impl DriftClient {
         let update_bytes = doc.to_snapshot();
         let snapshot = update_bytes.clone();
 
-        let encrypted_blob = self.encryptor.encrypt(&update_bytes, &self.keyring.active_key().public_key)?;
+        let encrypted_blob = self.encryptor.encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -218,7 +218,7 @@ impl DriftClient {
         let update_bytes = doc.to_snapshot();
         let snapshot = update_bytes.clone();
 
-        let encrypted_blob = self.encryptor.encrypt(&update_bytes, &self.keyring.active_key().public_key)?;
+        let encrypted_blob = self.encryptor.encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -255,7 +255,7 @@ impl DriftClient {
             let update_bytes = doc.to_snapshot();
             let snapshot = update_bytes.clone();
 
-            let encrypted_blob = self.encryptor.encrypt(&update_bytes, &self.keyring.active_key().public_key)?;
+            let encrypted_blob = self.encryptor.encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
             let epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -368,7 +368,13 @@ impl DriftClient {
             return Err(DriftError::Schema("Migration checksum verification failed".into()));
         }
         let applied = self.storage.read_migrations().await?;
-        if applied.iter().any(|m| m.version == migration.version) {
+        if let Some(existing) = applied.iter().find(|m| m.version == migration.version) {
+            if existing.checksum != migration.checksum {
+                return Err(DriftError::Schema(format!(
+                    "Migration checksum mismatch for version {}: expected {}, found {}",
+                    migration.version, existing.checksum, migration.checksum
+                )));
+            }
             tracing::info!(version = %migration.version, "Migration already applied, skipping");
             return Ok(());
         }

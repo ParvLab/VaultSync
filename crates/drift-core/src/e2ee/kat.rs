@@ -85,4 +85,24 @@ mod tests {
 
         assert_eq!(&plaintext, msg);
     }
+
+    #[test]
+    fn e2ee_symmetric_roundtrip() {
+        use crate::e2ee::keyring::{E2eeEncryptor, E2eeDecryptor};
+
+        let kr_alice = KeyRing::generate();
+        let alice_key = kr_alice.active_key().clone();
+        let kr_bob = KeyRing::from_key(alice_key);
+
+        let encryptor = E2eeEncryptor::new(std::sync::Arc::new(kr_alice));
+        let decryptor = E2eeDecryptor::new(std::sync::Arc::new(kr_bob));
+
+        let msg = b"symmetric encrypted message";
+        let namespace = "test-namespace";
+        
+        let ciphertext = encryptor.encrypt_symmetric(msg, namespace).unwrap();
+        let plaintext = decryptor.decrypt_symmetric(&ciphertext, namespace).unwrap();
+
+        assert_eq!(&plaintext, msg);
+    }
 }
