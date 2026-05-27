@@ -1,6 +1,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use wasm_bindgen_test::*;
+use wasm_bindgen::prelude::*;
 use drift_wasm::client::WasmDriftClient;
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -64,3 +65,105 @@ async fn test_wasm_drift_client_insert_get_update_delete() {
         .await
         .expect("Failed to shutdown client");
 }
+
+#[wasm_bindgen_test]
+async fn test_find_returns_all_records() {
+    let client = WasmDriftClient::new("test_ns_find", "replica_find")
+        .await
+        .expect("Failed to create WasmDriftClient");
+
+    let doc_id = "doc_find";
+    
+    client.insert(doc_id, "rec_1", r#"{"val": 1}"#).await.unwrap();
+    client.insert(doc_id, "rec_2", r#"{"val": 2}"#).await.unwrap();
+    client.insert(doc_id, "rec_3", r#"{"val": 3}"#).await.unwrap();
+
+    let results = client.find(doc_id).await.expect("Failed to find records");
+    assert_eq!(results.length(), 3);
+    
+    let mut found_vals = Vec::new();
+    for i in 0..3 {
+        let js_val = results.get(i);
+        let val_str = js_val.as_string().expect("Expected string in find array");
+        let parsed: serde_json::Value = serde_json::from_str(&val_str).unwrap();
+        let rec_id = parsed["record_id"].as_str().unwrap().to_string();
+        let val = parsed["val"].as_f64().unwrap() as i32;
+        found_vals.push((rec_id, val));
+    }
+    
+    found_vals.sort();
+    assert_eq!(found_vals[0], ("rec_1".to_string(), 1));
+    assert_eq!(found_vals[1], ("rec_2".to_string(), 2));
+    assert_eq!(found_vals[2], ("rec_3".to_string(), 3));
+
+    client.shutdown().await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_subscribe_fires_on_insert() {
+    use wasm_bindgen::JsCast;
+    use std::sync::{Arc, Mutex};
+
+    let client = WasmDriftClient::new("test_ns_sub", "replica_sub")
+        .await
+        .expect("Failed to create WasmDriftClient");
+
+    let doc_id = "doc_sub";
+    let fired_data = Arc::new(Mutex::new(None));
+    let fired_data_clone = fired_data.clone();
+
+    let closure = wasm_bindgen::prelude::Closure::wrap(Box::new(move |record_id: JsValue, json: JsValue| {
+        let rec_str = record_id.as_string().unwrap();
+        let json_str = json.as_string().unwrap();
+        let mut lock = fired_data_clone.lock().unwrap();
+        *lock = Some((rec_str, json_str));
+    }) as Box<dyn FnMut(JsValue, JsValue)>);
+
+    let js_func = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
+
+    let mut handle = client.subscribe(doc_id, js_func);
+
+    client.insert(doc_id, "rec_sub_1", r#"{"hello": "world"}"#).await.unwrap();
+
+    let result = fired_data.lock().unwrap().take();
+    assert!(result.is_some(), "Expected subscription callback to fire");
+    
+    let (rec_id, json_str) = result.unwrap();
+    assert_eq!(rec_id, "rec_sub_1");
+    let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(parsed["hello"], "world");
+
+    handle.cancel(&client).unwrap();
+
+    client.insert(doc_id, "rec_sub_2", r#"{"hello": "again"}"#).await.unwrap();
+
+    let result_after = fired_data.lock().unwrap().take();
+    assert!(result_after.is_none(), "Expected no callback after cancellation");
+
+    drop(closure);
+    client.shutdown().await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn test_sync_status_returns_state() {
+    let client = WasmDriftClient::new("test_ns_sync", "replica_sync")
+        .await
+        .expect("Failed to create WasmDriftClient");
+
+    let status_val = client.sync_status().await.expect("Failed to get sync status");
+    assert!(!status_val.is_null());
+    
+    let status_str = status_val.as_string().expect("Expected string return value");
+    let parsed: serde_json::Value = serde_json::from_str(&status_str).unwrap();
+    
+    assert_eq!(parsed["namespace"], "test_ns_sync");
+    assert_eq!(parsed["replica_id"], "replica_sync");
+    let conn_status = parsed["connection_status"].as_str().expect("Expected connection_status string");
+    assert!(
+        conn_status == "Connected" || conn_status == "Disconnected" || conn_status == "Syncing",
+        "Invalid connection status: {}", conn_status
+    );
+
+    client.shutdown().await.unwrap();
+}
+

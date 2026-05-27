@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use sha2::{Sha256, Digest};
@@ -139,7 +138,7 @@ impl E2eeEncryptor {
     }
 
     pub fn encrypt_symmetric(&self, plaintext: &[u8], namespace: &str) -> Result<Vec<u8>, DriftError> {
-        let start = std::time::Instant::now();
+        let start = crate::time_utils::PlatformInstant::now();
         let active_version = self.keyring.active_version();
         let span = tracing::info_span!("e2ee.encrypt", namespace = namespace, key_version = active_version);
         let _enter = span.enter();
@@ -181,7 +180,7 @@ impl E2eeDecryptor {
     }
 
     pub fn decrypt_symmetric(&self, ciphertext: &[u8], namespace: &str) -> Result<Vec<u8>, DriftError> {
-        let start = std::time::Instant::now();
+        let start = crate::time_utils::PlatformInstant::now();
         let active_version = self.keyring.active_version();
         let span = tracing::info_span!("e2ee.decrypt", namespace = namespace, key_version = active_version);
         let _enter = span.enter();
@@ -240,8 +239,5 @@ fn derive_encryption_key(device_key: &[u8]) -> [u8; 32] {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    crate::time_utils::system_time_now_secs()
 }

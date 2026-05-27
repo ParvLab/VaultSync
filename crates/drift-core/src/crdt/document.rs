@@ -70,7 +70,7 @@ impl CRDTDocument {
     }
 
     pub fn apply_update(&mut self, update: &[u8]) -> Result<(), DriftError> {
-        let start = std::time::Instant::now();
+        let start = crate::time_utils::PlatformInstant::now();
         let span = tracing::info_span!("crdt.merge", doc_id = self.doc_id.as_str());
         let _enter = span.enter();
 

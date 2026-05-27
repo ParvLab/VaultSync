@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::collections::VecDeque;
-use serde_json::{json, Value};
+use serde_json::Value;
+#[cfg(feature = "telemetry")]
+use serde_json::json;
 
 #[derive(Clone, Default)]
 pub struct SpanBuffer {

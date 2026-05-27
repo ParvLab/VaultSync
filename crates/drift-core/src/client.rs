@@ -40,6 +40,9 @@ pub struct DriftClient {
     download_queue: Arc<DownloadQueue>,
     _reconciler: Arc<Reconciler>,
     _telemetry: Arc<DriftTelemetry>,
+    #[cfg(target_arch = "wasm32")]
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(not(target_arch = "wasm32"))]
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub metrics: Arc<crate::telemetry::metrics::DriftMetrics>,
     pub debug_api: Arc<crate::telemetry::debug::DebugApi>,
@@ -148,6 +151,10 @@ impl DriftClient {
         let schema = Arc::new(std::sync::Mutex::new(SchemaRegistry::new()));
         let _telemetry = Arc::new(DriftTelemetry::new());
 
+        #[cfg(target_arch = "wasm32")]
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(not(target_arch = "wasm32"))]
+        #[allow(unused_mut)]
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Perform crash recovery on startup before starting the sync loop
@@ -172,6 +179,9 @@ impl DriftClient {
             download_queue: download_queue.clone(),
             _reconciler: reconciler,
             _telemetry,
+            #[cfg(target_arch = "wasm32")]
+            shutdown_flag: shutdown_flag.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
             shutdown_tx,
             metrics,
             debug_api,
@@ -185,8 +195,7 @@ impl DriftClient {
         let namespace_clone = client.config.namespace.clone();
         let storage_clone = client.storage.clone();
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + sync_interval, sync_interval);
+        crate::time_utils::spawn(async move {
             let mut is_leader = match leader_election_clone.try_acquire() {
                 Ok(status) => status,
                 Err(e) => {
@@ -206,44 +215,85 @@ impl DriftClient {
             );
             let mut sync_cycles = 0;
 
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if !is_leader {
-                            is_leader = match leader_election_clone.try_acquire() {
-                                Ok(status) => status,
-                                Err(e) => {
-                                    tracing::error!(error = %e, "Leader election try_acquire failed");
-                                    false
-                                }
-                            };
-                            if let Ok(Some(mut state)) = storage_clone.read_sync_state(&namespace_clone).await {
-                                state.leader_status = Some(is_leader);
-                                let _ = storage_clone.write_sync_state(&state).await;
-                            }
-                        }
-
-                        if is_leader {
-                            let _ = upload_queue_clone.process_batch().await;
-                            let _ = download_queue_clone.process_batch().await;
-
-                            sync_cycles += 1;
-                            if sync_cycles % 100 == 0 {
-                                if let Err(e) = compaction_engine.run_compaction(&namespace_clone).await {
-                                    tracing::error!(error = %e, "Compaction failed");
-                                }
-                            }
-                            if sync_cycles >= 1000 {
-                                sync_cycles = 0;
-                                if let Err(e) = compaction_engine.run_snapshot_compaction(&namespace_clone).await {
-                                    tracing::error!(error = %e, "Snapshot compaction failed");
-                                }
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.changed() => {
+            #[cfg(target_arch = "wasm32")]
+            {
+                loop {
+                    if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
                         leader_election_clone.release();
                         break;
+                    }
+
+                    if !is_leader {
+                        is_leader = match leader_election_clone.try_acquire() {
+                            Ok(status) => status,
+                            Err(_) => false,
+                        };
+                        if let Ok(Some(mut state)) = storage_clone.read_sync_state(&namespace_clone).await {
+                            state.leader_status = Some(is_leader);
+                            let _ = storage_clone.write_sync_state(&state).await;
+                        }
+                    }
+
+                    if is_leader {
+                        let _ = upload_queue_clone.process_batch().await;
+                        let _ = download_queue_clone.process_batch().await;
+
+                        sync_cycles += 1;
+                        if sync_cycles % 100 == 0 {
+                            let _ = compaction_engine.run_compaction(&namespace_clone).await;
+                        }
+                        if sync_cycles >= 1000 {
+                            sync_cycles = 0;
+                            let _ = compaction_engine.run_snapshot_compaction(&namespace_clone).await;
+                        }
+                    }
+
+                    crate::time_utils::sleep(sync_interval).await;
+                }
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + sync_interval, sync_interval);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            if !is_leader {
+                                is_leader = match leader_election_clone.try_acquire() {
+                                    Ok(status) => status,
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "Leader election try_acquire failed");
+                                        false
+                                    }
+                                };
+                                if let Ok(Some(mut state)) = storage_clone.read_sync_state(&namespace_clone).await {
+                                    state.leader_status = Some(is_leader);
+                                    let _ = storage_clone.write_sync_state(&state).await;
+                                }
+                            }
+
+                            if is_leader {
+                                let _ = upload_queue_clone.process_batch().await;
+                                let _ = download_queue_clone.process_batch().await;
+
+                                sync_cycles += 1;
+                                if sync_cycles % 100 == 0 {
+                                    if let Err(e) = compaction_engine.run_compaction(&namespace_clone).await {
+                                        tracing::error!(error = %e, "Compaction failed");
+                                    }
+                                }
+                                if sync_cycles >= 1000 {
+                                    sync_cycles = 0;
+                                    if let Err(e) = compaction_engine.run_snapshot_compaction(&namespace_clone).await {
+                                        tracing::error!(error = %e, "Snapshot compaction failed");
+                                    }
+                                }
+                            }
+                        }
+                        _ = shutdown_rx.changed() => {
+                            leader_election_clone.release();
+                            break;
+                        }
                     }
                 }
             }
@@ -283,6 +333,9 @@ impl DriftClient {
 
     pub async fn shutdown(&self) -> Result<(), DriftError> {
         tracing::info!("Drift client shutting down");
+        #[cfg(target_arch = "wasm32")]
+        self.shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = self.shutdown_tx.send(true);
         Ok(())
     }
@@ -302,8 +355,7 @@ impl DriftClient {
 
         let encrypted_blob = self.encryptor.encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let epoch = crate::time_utils::system_time_now_ms();
         let entry = OplogEntry {
             id: uuid::Uuid::new_v4().to_string(),
             replica_id: self.config.replica_id.clone(),
@@ -368,8 +420,7 @@ impl DriftClient {
 
         let encrypted_blob = self.encryptor.encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let epoch = crate::time_utils::system_time_now_ms();
         let entry = OplogEntry {
             id: uuid::Uuid::new_v4().to_string(),
             replica_id: self.config.replica_id.clone(),
@@ -430,8 +481,7 @@ impl DriftClient {
 
             let encrypted_blob = self.encryptor.encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-            let epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let epoch = crate::time_utils::system_time_now_ms();
             let entry = OplogEntry {
                 id: uuid::Uuid::new_v4().to_string(),
                 replica_id: self.config.replica_id.clone(),
@@ -611,8 +661,7 @@ impl DriftClient {
             return Err(e);
         }
 
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let epoch = crate::time_utils::system_time_now_secs();
         let record = crate::storage::traits::MigrationRecord {
             version: migration.version.clone(),
             applied_at: epoch,

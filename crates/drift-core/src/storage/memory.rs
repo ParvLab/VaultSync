@@ -91,8 +91,7 @@ impl Storage for InMemoryStorage {
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), DriftError> {
         let mut oplog = self.oplog.write().map_err(|e| DriftError::Storage(e.to_string()))?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = crate::time_utils::system_time_now_secs();
         for entry in oplog.iter_mut() {
             if entry.id == id {
                 entry.sync_status = crate::oplog::entry::SyncStatus::Synced;
@@ -164,8 +163,7 @@ impl Storage for InMemoryStorage {
 
     async fn reset_stale_pending(&self, namespace: &str, older_than_ms: u64) -> Result<usize, DriftError> {
         let mut oplog = self.oplog.write().map_err(|e| DriftError::Storage(e.to_string()))?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now = crate::time_utils::system_time_now_ms();
         let threshold = now.saturating_sub(older_than_ms);
         let mut count = 0;
         for entry in oplog.iter_mut() {
@@ -179,8 +177,7 @@ impl Storage for InMemoryStorage {
 
     async fn delete_synced_oplog_older_than(&self, namespace: &str, older_than_secs: u64) -> Result<usize, DriftError> {
         let mut oplog = self.oplog.write().map_err(|e| DriftError::Storage(e.to_string()))?;
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now_secs = crate::time_utils::system_time_now_secs();
         let threshold = now_secs.saturating_sub(older_than_secs);
         let initial_len = oplog.len();
         oplog.retain(|entry| {
@@ -193,8 +190,7 @@ impl Storage for InMemoryStorage {
 
     async fn list_tombstoned_documents(&self, namespace: &str, older_than_secs: u64) -> Result<Vec<(String, String)>, DriftError> {
         let oplog = self.oplog.read().map_err(|e| DriftError::Storage(e.to_string()))?;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now_ms = crate::time_utils::system_time_now_ms();
         let threshold = now_ms.saturating_sub(older_than_secs * 1000);
         let mut results = std::collections::HashSet::new();
         for entry in oplog.iter() {

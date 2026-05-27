@@ -25,7 +25,7 @@ impl Default for RetryConfig {
 pub struct RetryEngine {
     config: RetryConfig,
     attempts: HashMap<String, u32>,
-    next_retry: HashMap<String, std::time::Instant>,
+    next_retry: HashMap<String, crate::time_utils::PlatformInstant>,
 }
 
 impl RetryEngine {
@@ -52,7 +52,7 @@ impl RetryEngine {
             let jitter = rand::random::<f64>() * 0.5 + 0.75;
             delay = Duration::from_secs_f64(delay.as_secs_f64() * jitter);
         }
-        self.next_retry.insert(id.to_string(), std::time::Instant::now() + delay);
+        self.next_retry.insert(id.to_string(), crate::time_utils::PlatformInstant::now() + delay);
         Some(delay)
     }
 
@@ -70,7 +70,7 @@ impl RetryEngine {
             return false;
         }
         if let Some(&time) = self.next_retry.get(id) {
-            std::time::Instant::now() >= time
+            crate::time_utils::PlatformInstant::now() >= time
         } else {
             true
         }

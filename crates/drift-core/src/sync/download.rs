@@ -100,8 +100,7 @@ impl DownloadQueue {
                         }
                     };
                     state.last_synced_sequence = new_seq;
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                    let now_ms = crate::time_utils::system_time_now_ms();
                     state.last_sync_at = Some(now_ms);
                     self.storage.write_sync_state(&state).await?;
 

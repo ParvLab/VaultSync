@@ -72,7 +72,7 @@ impl Coordinator for InMemoryCoordinator {
         let ops = self.ops.clone();
         let namespace_str = namespace.to_string();
         
-        tokio::spawn(async move {
+        crate::time_utils::spawn(async move {
             let mut last_sent = from_sequence;
             
             // 1. Collect all existing mutations from the in-memory store while holding the lock

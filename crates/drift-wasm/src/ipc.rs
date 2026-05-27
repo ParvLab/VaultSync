@@ -43,4 +43,18 @@ impl WasmIPC {
         *lock = String::new(); // Clear after reading
         val
     }
+
+    pub fn on_message(&self, callback: js_sys::Function) {
+        let last_received_clone = self.last_received.clone();
+        let closure = Closure::wrap(Box::new(move |e: MessageEvent| {
+            let data = e.data();
+            if let Some(msg_str) = data.as_string() {
+                let mut lock = last_received_clone.lock().unwrap();
+                *lock = msg_str;
+            }
+            let _ = callback.call1(&JsValue::NULL, &data);
+        }) as Box<dyn FnMut(MessageEvent)>);
+        self.channel.set_onmessage(Some(closure.as_ref().unchecked_ref()));
+        closure.forget();
+    }
 }

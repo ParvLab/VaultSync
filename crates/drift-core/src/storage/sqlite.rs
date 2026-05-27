@@ -479,8 +479,7 @@ impl Storage for SQLiteStorage {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let now = crate::time_utils::system_time_now_ms();
             let threshold = now.saturating_sub(older_than_ms) as i64;
             let changes = conn.execute(
                 "UPDATE oplog SET sync_status = 'Pending'
@@ -498,8 +497,7 @@ impl Storage for SQLiteStorage {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            let now_secs = crate::time_utils::system_time_now_secs();
             let threshold = now_secs.saturating_sub(older_than_secs) as i64;
             let changes = conn.execute(
                 "DELETE FROM oplog WHERE namespace = ?1 AND sync_status = 'Synced' AND synced_at < ?2",
@@ -516,8 +514,7 @@ impl Storage for SQLiteStorage {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let now_ms = crate::time_utils::system_time_now_ms();
             let threshold = now_ms.saturating_sub(older_than_secs * 1000) as i64;
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT doc_id, record_id FROM oplog

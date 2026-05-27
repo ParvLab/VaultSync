@@ -15,7 +15,9 @@ type LockHandle = std::fs::File;
 type LockHandle = ();
 
 pub struct LeaderElection {
+    #[allow(dead_code)]
     namespace: String,
+    #[allow(dead_code)]
     unique_key: String,
     is_leader: Arc<AtomicBool>,
     lock_handle: std::sync::Mutex<Option<LockHandle>>,
@@ -123,7 +125,7 @@ impl LeaderElection {
             }
             #[cfg(not(any(windows, unix)))]
             {
-                drop(handle);
+                let _ = handle;
             }
         }
         self.is_leader.store(false, Ordering::SeqCst);

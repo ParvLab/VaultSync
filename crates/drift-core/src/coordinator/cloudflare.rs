@@ -69,7 +69,7 @@ impl Coordinator for CloudflareCoordinator {
         let config = self.config.clone();
         let ns = namespace.to_string();
         
-        tokio::spawn(async move {
+        crate::time_utils::spawn(async move {
             let mut last_seq = from_sequence;
             loop {
                 let url = format!(

@@ -8,6 +8,7 @@ pub mod sync;
 pub mod coordinator;
 pub mod ipc;
 pub mod telemetry;
+pub mod time_utils;
 
 #[cfg(feature = "async-runtime")]
 mod client;
