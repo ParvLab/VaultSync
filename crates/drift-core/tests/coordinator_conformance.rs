@@ -2,7 +2,7 @@ use std::sync::Arc;
 use drift_core::coordinator::traits::{Coordinator, EncryptedMutation, ReplicaInfo};
 use drift_core::coordinator::memory::InMemoryCoordinator;
 use drift_coordinator_sqlite::coordinator::SQLiteCoordinator;
-use drift_coordinator_cloudflare::coordinator::{CloudflareCoordinator, CloudflareConfig};
+use drift_coordinator_http::coordinator::{HttpCoordinator, HttpCoordinatorConfig};
 use drift_coordinator_redis::coordinator::RedisCoordinator;
 use std::sync::Mutex;
 use std::collections::HashMap;
@@ -426,11 +426,11 @@ async fn test_sqlite_coordinator_conformance() {
 }
 
 #[tokio::test]
-async fn test_cloudflare_coordinator_conformance() {
-    let (server_url, _handle) = drift_coordinator_cloudflare::test_utils::run_mock_server().await;
-    let coord = Arc::new(CloudflareCoordinator::new(CloudflareConfig {
-        worker_url: server_url,
-        api_token: None,
+async fn test_http_coordinator_conformance() {
+    let (server_url, _handle) = drift_coordinator_http::test_utils::run_mock_server().await;
+    let coord = Arc::new(HttpCoordinator::new(HttpCoordinatorConfig {
+        url: server_url,
+        auth_token: None,
     }));
     run_coordinator_conformance_suite(coord).await;
 }

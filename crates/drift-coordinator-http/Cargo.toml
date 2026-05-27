@@ -1,12 +1,12 @@
 [package]
-name = "drift-coordinator-cloudflare"
+name = "drift-coordinator-http"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 drift-core = { path = "../drift-core" }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

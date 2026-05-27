@@ -58,7 +58,7 @@ impl DriftClient {
 
     /// Selects coordinator from `config.coordinator_endpoint` URL scheme:
     ///   "memory://"     → InMemoryCoordinator
-    ///   "http(s)://"    → CloudflareCoordinator (speaks REST to any conforming HTTP endpoint)
+    ///   "http(s)://"    → HttpCoordinator (speaks REST to any conforming HTTP endpoint)
     ///   <anything else> → InMemoryCoordinator (safe fallback)
     pub async fn connect(config: DriftConfig) -> Result<Self, DriftError> {
         let coordinator: Arc<dyn Coordinator> =
@@ -68,10 +68,10 @@ impl DriftClient {
                    || config.coordinator_endpoint.starts_with("https://") {
                 #[cfg(feature = "coordinator-http")]
                 {
-                    Arc::new(crate::coordinator::cloudflare::CloudflareCoordinator::new(
-                        crate::coordinator::cloudflare::CloudflareConfig {
-                            worker_url: config.coordinator_endpoint.clone(),
-                            api_token: None,
+                    Arc::new(crate::coordinator::http::HttpCoordinator::new(
+                        crate::coordinator::http::HttpCoordinatorConfig {
+                            url: config.coordinator_endpoint.clone(),
+                            auth_token: config.auth_token.clone(),
                         }
                     ))
                 }

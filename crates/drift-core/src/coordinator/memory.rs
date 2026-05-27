@@ -108,7 +108,11 @@ impl Coordinator for InMemoryCoordinator {
 
     async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
         let mut reps = self.replicas.write().map_err(|_| CoordinatorError::NotAvailable)?;
-        reps.insert((namespace.to_string(), info.replica_id.clone()), info);
+        reps.insert((namespace.to_string(), info.replica_id.clone()), info.clone());
+        
+        let mut versions = self.schema_versions.write().map_err(|_| CoordinatorError::NotAvailable)?;
+        let current = versions.entry(namespace.to_string()).or_insert(0);
+        *current = (*current).max(info.schema_version);
         Ok(())
     }
 

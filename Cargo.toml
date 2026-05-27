@@ -7,7 +7,8 @@ members = [
     "crates/drift-coordinator-redis",
     "crates/drift-coordinator-sqlite",
     "crates/drift-coordinator-memory",
-    "crates/drift-coordinator-cloudflare",
+    "crates/drift-coordinator-http",
+    "crates/drift-coordinator-server",
     "crates/drift-cli",
     "crates/drift-fuzz",
 ]

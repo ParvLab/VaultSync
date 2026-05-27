@@ -4,4 +4,4 @@ pub mod memory;
 #[cfg(feature = "async-runtime")]
 pub mod mock;
 #[cfg(feature = "coordinator-http")]
-pub mod cloudflare;
+pub mod http;
