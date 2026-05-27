@@ -216,6 +216,23 @@ impl DriftClient {
         });
 
         client.initialize().await?;
+
+        #[cfg(feature = "telemetry")]
+        if let Some(port) = client.config.debug_port {
+            let rx = client.shutdown_tx.subscribe();
+            client.debug_api.start(
+                port,
+                client.config.namespace.clone(),
+                client.config.replica_id.clone(),
+                client.keyring.clone(),
+                client.coordinator.clone(),
+                client.leader_election.clone(),
+                client.upload_queue.clone(),
+                client.download_queue.clone(),
+                rx,
+            );
+        }
+
         Ok(client)
     }
 
@@ -237,6 +254,11 @@ impl DriftClient {
     }
 
     pub async fn insert(&self, doc_id: &str, record_id: &str, fields: HashMap<String, CrdtValue>) -> Result<(), DriftError> {
+        let span = tracing::info_span!("drift.write", doc_id = doc_id, record_id = record_id, namespace = self.config.namespace.as_str());
+        let _enter = span.enter();
+
+        self.metrics.record_mutation_attempt(&self.config.namespace, "attempt");
+
         let mut doc = CRDTDocument::new(doc_id, record_id, 0);
         for (field, value) in &fields {
             doc.set_field(field, value.clone());
@@ -264,16 +286,41 @@ impl DriftClient {
             created_at: epoch,
         };
         
-        self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await?;
+        let append_span = tracing::info_span!("oplog.append", entry_id = entry.id.as_str(), namespace = self.config.namespace.as_str());
+        let append_guard = append_span.enter();
+        let res = self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await;
+        drop(append_guard);
 
-        // Fire reactive subscriptions locally
-        let state = doc.to_map();
-        self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
+        match res {
+            Ok(_) => {
+                self.metrics.record_mutation_attempt(&self.config.namespace, "success");
+                let pending = self.pending_uploads().await.unwrap_or(0);
+                self.metrics.set_mutations_pending(&self.config.namespace, pending as i64);
+                if let Ok(entries) = self.storage.read_pending_oplog(&self.config.namespace, 10000).await {
+                    self.metrics.set_oplog_size(&self.config.namespace, entries.len() as i64);
+                }
+                
+                // Fire reactive subscriptions locally
+                let state = doc.to_map();
+                let sub_span = tracing::info_span!("subscription.fire", doc_id = doc_id);
+                let _sub_guard = sub_span.enter();
+                self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
 
-        Ok(())
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.record_mutation_failed(&self.config.namespace, "storage_error");
+                Err(e)
+            }
+        }
     }
 
     pub async fn update(&self, doc_id: &str, record_id: &str, fields: HashMap<String, CrdtValue>) -> Result<(), DriftError> {
+        let span = tracing::info_span!("drift.write", doc_id = doc_id, record_id = record_id, namespace = self.config.namespace.as_str());
+        let _enter = span.enter();
+
+        self.metrics.record_mutation_attempt(&self.config.namespace, "attempt");
+
         let existing = self.storage.get_document(doc_id, record_id).await?;
         let mut doc = match existing {
             Some(bytes) => CRDTDocument::from_snapshot(&bytes)?,
@@ -305,16 +352,41 @@ impl DriftClient {
             created_at: epoch,
         };
 
-        self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await?;
+        let append_span = tracing::info_span!("oplog.append", entry_id = entry.id.as_str(), namespace = self.config.namespace.as_str());
+        let append_guard = append_span.enter();
+        let res = self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await;
+        drop(append_guard);
 
-        // Fire reactive subscriptions locally
-        let state = doc.to_map();
-        self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
+        match res {
+            Ok(_) => {
+                self.metrics.record_mutation_attempt(&self.config.namespace, "success");
+                let pending = self.pending_uploads().await.unwrap_or(0);
+                self.metrics.set_mutations_pending(&self.config.namespace, pending as i64);
+                if let Ok(entries) = self.storage.read_pending_oplog(&self.config.namespace, 10000).await {
+                    self.metrics.set_oplog_size(&self.config.namespace, entries.len() as i64);
+                }
 
-        Ok(())
+                // Fire reactive subscriptions locally
+                let state = doc.to_map();
+                let sub_span = tracing::info_span!("subscription.fire", doc_id = doc_id);
+                let _sub_guard = sub_span.enter();
+                self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
+
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.record_mutation_failed(&self.config.namespace, "storage_error");
+                Err(e)
+            }
+        }
     }
 
     pub async fn delete(&self, doc_id: &str, record_id: &str) -> Result<(), DriftError> {
+        let span = tracing::info_span!("drift.write", doc_id = doc_id, record_id = record_id, namespace = self.config.namespace.as_str());
+        let _enter = span.enter();
+
+        self.metrics.record_mutation_attempt(&self.config.namespace, "attempt");
+
         let existing = self.storage.get_document(doc_id, record_id).await?;
         if let Some(bytes) = existing {
             let mut doc = CRDTDocument::from_snapshot(&bytes)?;
@@ -342,11 +414,31 @@ impl DriftClient {
                 created_at: epoch,
             };
 
-            self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await?;
+            let append_span = tracing::info_span!("oplog.append", entry_id = entry.id.as_str(), namespace = self.config.namespace.as_str());
+            let append_guard = append_span.enter();
+            let res = self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await;
+            drop(append_guard);
 
-            // Fire reactive subscriptions locally
-            let state = doc.to_map();
-            self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
+            match res {
+                Ok(_) => {
+                    self.metrics.record_mutation_attempt(&self.config.namespace, "success");
+                    let pending = self.pending_uploads().await.unwrap_or(0);
+                    self.metrics.set_mutations_pending(&self.config.namespace, pending as i64);
+                    if let Ok(entries) = self.storage.read_pending_oplog(&self.config.namespace, 10000).await {
+                        self.metrics.set_oplog_size(&self.config.namespace, entries.len() as i64);
+                    }
+
+                    // Fire reactive subscriptions locally
+                    let state = doc.to_map();
+                    let sub_span = tracing::info_span!("subscription.fire", doc_id = doc_id);
+                    let _sub_guard = sub_span.enter();
+                    self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
+                }
+                Err(e) => {
+                    self.metrics.record_mutation_failed(&self.config.namespace, "storage_error");
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }

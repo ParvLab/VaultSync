@@ -52,4 +52,7 @@ pub trait Coordinator: Send + Sync + std::fmt::Debug {
     async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError>;
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError>;
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError>;
+    async fn list_replicas(&self, _namespace: &str) -> Result<Vec<ReplicaInfo>, CoordinatorError> {
+        Ok(vec![])
+    }
 }

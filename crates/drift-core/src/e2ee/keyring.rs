@@ -139,11 +139,22 @@ impl E2eeEncryptor {
     }
 
     pub fn encrypt_symmetric(&self, plaintext: &[u8], namespace: &str) -> Result<Vec<u8>, DriftError> {
+        let start = std::time::Instant::now();
+        let active_version = self.keyring.active_version();
+        let span = tracing::info_span!("e2ee.encrypt", namespace = namespace, key_version = active_version);
+        let _enter = span.enter();
+
         let key = self.keyring.derive_namespace_key(namespace);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let nonce = Nonce::from_slice(&[0u8; 12]);
-        cipher.encrypt(nonce, plaintext)
-            .map_err(|e| DriftError::Encryption(format!("symmetric encrypt failed: {e}")))
+        let res = cipher.encrypt(nonce, plaintext)
+            .map_err(|e| DriftError::Encryption(format!("symmetric encrypt failed: {e}")));
+
+        if res.is_ok() {
+            let duration_us = start.elapsed().as_micros() as f64;
+            crate::telemetry::metrics::get_metrics().record_encryption_time("encrypt", duration_us);
+        }
+        res
     }
 
     pub fn keyring(&self) -> &KeyRing {
@@ -165,11 +176,22 @@ impl E2eeDecryptor {
     }
 
     pub fn decrypt_symmetric(&self, ciphertext: &[u8], namespace: &str) -> Result<Vec<u8>, DriftError> {
+        let start = std::time::Instant::now();
+        let active_version = self.keyring.active_version();
+        let span = tracing::info_span!("e2ee.decrypt", namespace = namespace, key_version = active_version);
+        let _enter = span.enter();
+
         let key = self.keyring.derive_namespace_key(namespace);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let nonce = Nonce::from_slice(&[0u8; 12]);
-        cipher.decrypt(nonce, ciphertext)
-            .map_err(|e| DriftError::Encryption(format!("symmetric decrypt failed: {e}")))
+        let res = cipher.decrypt(nonce, ciphertext)
+            .map_err(|e| DriftError::Encryption(format!("symmetric decrypt failed: {e}")));
+
+        if res.is_ok() {
+            let duration_us = start.elapsed().as_micros() as f64;
+            crate::telemetry::metrics::get_metrics().record_encryption_time("decrypt", duration_us);
+        }
+        res
     }
 
     pub fn keyring(&self) -> &KeyRing {

@@ -70,10 +70,18 @@ impl CRDTDocument {
     }
 
     pub fn apply_update(&mut self, update: &[u8]) -> Result<(), DriftError> {
+        let start = std::time::Instant::now();
+        let span = tracing::info_span!("crdt.merge", doc_id = self.doc_id.as_str());
+        let _enter = span.enter();
+
         let decoded = Update::decode_v1(update)
             .map_err(|e| DriftError::Crdt(format!("failed to decode update: {e}")))?;
         let mut txn = self.inner.transact_mut();
         txn.apply_update(decoded);
+        drop(txn);
+
+        let duration_us = start.elapsed().as_micros() as f64;
+        crate::telemetry::metrics::get_metrics().record_crdt_merge_time(&self.doc_id, duration_us);
         Ok(())
     }
 

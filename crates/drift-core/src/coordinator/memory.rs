@@ -11,6 +11,7 @@ pub struct InMemoryCoordinator {
     next_seq: std::sync::atomic::AtomicU64,
     ops: Arc<RwLock<BTreeMap<(String, u64), PendingMutation>>>,
     schema_versions: Arc<RwLock<std::collections::HashMap<String, u64>>>,
+    replicas: Arc<RwLock<std::collections::HashMap<(String, String), ReplicaInfo>>>,
 }
 
 impl InMemoryCoordinator {
@@ -19,6 +20,7 @@ impl InMemoryCoordinator {
             next_seq: std::sync::atomic::AtomicU64::new(1),
             ops: Arc::new(RwLock::new(BTreeMap::new())),
             schema_versions: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            replicas: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -61,9 +63,21 @@ impl Coordinator for InMemoryCoordinator {
         Ok(Box::new(InMemorySubscription { rx: Some(rx) }))
     }
 
-    async fn register(&self, _namespace: &str, _info: ReplicaInfo) -> Result<(), CoordinatorError> { Ok(()) }
+    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+        let mut reps = self.replicas.write().map_err(|_| CoordinatorError::NotAvailable)?;
+        reps.insert((namespace.to_string(), info.replica_id.clone()), info);
+        Ok(())
+    }
 
     async fn heartbeat(&self, _namespace: &str, _replica_id: &str) -> Result<(), CoordinatorError> { Ok(()) }
+
+    async fn list_replicas(&self, namespace: &str) -> Result<Vec<ReplicaInfo>, CoordinatorError> {
+        let reps = self.replicas.read().map_err(|_| CoordinatorError::NotAvailable)?;
+        Ok(reps.iter()
+            .filter(|((ns, _), _)| ns == namespace)
+            .map(|(_, v)| v.clone())
+            .collect())
+    }
 
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError> {
         Ok(self.schema_versions.read().map_err(|_| CoordinatorError::NotAvailable)?

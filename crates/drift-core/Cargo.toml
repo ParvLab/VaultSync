@@ -7,7 +7,15 @@ license.workspace = true
 [features]
 default = ["async-runtime", "telemetry", "storage-sqlite"]
 async-runtime = ["dep:tokio"]
-telemetry = ["dep:tracing-subscriber", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+telemetry = [
+    "dep:tracing-subscriber",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:axum",
+    "dep:prometheus"
+]
 storage-sqlite = ["dep:rusqlite"]
 
 [dependencies]
@@ -35,8 +43,11 @@ rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optional = true }
 opentelemetry = { version = "0.22", optional = true }
-opentelemetry_sdk = { version = "0.22", optional = true }
-opentelemetry-otlp = { version = "0.15", optional = true }
+opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.15", features = ["grpc-tonic"], optional = true }
+tracing-opentelemetry = { version = "0.23", optional = true }
+axum = { version = "0.6", optional = true }
+prometheus = { version = "0.13", features = ["process"], optional = true }
 
 # Utilities
 thiserror = "1"

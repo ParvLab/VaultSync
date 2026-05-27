@@ -51,8 +51,12 @@ impl DownloadQueue {
 
     pub async fn process_batch(&self) -> Result<usize, DriftError> {
         let after = self.last_sequence.load(std::sync::atomic::Ordering::SeqCst);
+        let span = tracing::info_span!("transport.receive", batch_size = self.config.batch_size, namespace = self.namespace.as_str());
+        let _enter = span.enter();
+
         match self.coordinator.pull(&self.namespace, after, self.config.batch_size).await {
             Ok(mutations) => {
+                self.metrics.set_connection_status(&self.namespace, true);
                 let count = mutations.len();
                 for m in &mutations {
                     let decrypted_bytes = self.decryptor.decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
@@ -73,6 +77,8 @@ impl DownloadQueue {
                         created_at: m.timestamp,
                     };
 
+                    let merge_remote_span = tracing::info_span!("crdt.merge_remote", sequence = m.sequence);
+                    let _merge_guard = merge_remote_span.enter();
                     self.reconciler.apply_remote_update(&entry).await?;
                 }
 
@@ -102,6 +108,7 @@ impl DownloadQueue {
                     // Record sync lag using last mutation's timestamp
                     let lag = now_ms.saturating_sub(last.timestamp);
                     self.metrics.record_sync_lag(lag as f64);
+                    self.metrics.record_download_lag(&self.namespace, lag as f64);
                 }
                 if count > 0 {
                     self.metrics.record_download(count);
@@ -109,10 +116,12 @@ impl DownloadQueue {
                 Ok(count)
             }
             Err(CoordinatorError::NotAvailable) => {
+                self.metrics.set_connection_status(&self.namespace, false);
                 self.metrics.record_sync_error();
                 Ok(0)
             }
             Err(e) => {
+                self.metrics.set_connection_status(&self.namespace, false);
                 self.metrics.record_sync_error();
                 Err(DriftError::Coordinator(format!("download failed: {e:?}")))
             }

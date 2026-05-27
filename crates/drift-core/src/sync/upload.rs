@@ -69,8 +69,12 @@ impl UploadQueue {
             schema_version: 0,
         }).collect();
 
+        let span = tracing::info_span!("transport.send", batch_size = mutations.len(), namespace = self.oplog.namespace());
+        let _enter = span.enter();
+
         match self.coordinator.push(&self.oplog.namespace(), mutations).await {
             Ok(sequences) => {
+                self.metrics.set_connection_status(&self.oplog.namespace(), true);
                 for (entry, seq) in entries.iter().zip(sequences.iter()) {
                     self.oplog.mark_synced(&entry.id, *seq).await?;
                 }
@@ -84,6 +88,7 @@ impl UploadQueue {
                 Ok(entries.len())
             }
             Err(CoordinatorError::NotAvailable) => {
+                self.metrics.set_connection_status(&self.oplog.namespace(), false);
                 self.metrics.record_sync_error();
                 let failed_ids: Vec<String> = {
                     let mut engine = self.retry_engine.lock().unwrap();
@@ -101,6 +106,7 @@ impl UploadQueue {
                 Ok(0)
             }
             Err(e) => {
+                self.metrics.set_connection_status(&self.oplog.namespace(), false);
                 self.metrics.record_sync_error();
                 let err_msg = format!("upload failed: {e:?}");
                 let failed_ids: Vec<String> = {

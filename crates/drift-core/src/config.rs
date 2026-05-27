@@ -13,6 +13,7 @@ pub struct DriftConfig {
     pub download: DownloadConfig,
     pub retry: RetryConfig,
     pub sync_interval: std::time::Duration,
+    pub debug_port: Option<u16>,
 }
 
 impl Default for DriftConfig {
@@ -26,6 +27,7 @@ impl Default for DriftConfig {
             download: DownloadConfig::default(),
             retry: RetryConfig::default(),
             sync_interval: std::time::Duration::from_secs(5),
+            debug_port: None,
         }
     }
 }
