@@ -1,24 +1,328 @@
 use async_trait::async_trait;
 use drift_core::coordinator::traits::*;
+use futures::Stream;
 
-#[derive(Debug)]
-pub struct RedisCoordinator;
+#[derive(Debug, Clone)]
+pub struct RedisCoordinator {
+    conn: redis::aio::MultiplexedConnection,
+}
 
 impl RedisCoordinator {
-    pub async fn new(url: &str) -> Self {
+    pub async fn new(url: &str) -> Result<Self, CoordinatorError> {
         tracing::info!("Connecting to Redis: {}", url);
-        Self
+        let client = redis::Client::open(url)
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        let conn = client.get_multiplexed_tokio_connection().await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        Ok(Self { conn })
     }
+}
+
+fn stream_id_to_seq(id: &str) -> SequenceId {
+    let (ms, seq) = id.split_once('-').unwrap_or((id, "0"));
+    let ms: u64 = ms.parse().unwrap_or(0);
+    let seq: u64 = seq.parse().unwrap_or(0);
+    ms * 1_000_000 + seq
+}
+
+fn seq_to_stream_id(seq: SequenceId) -> String {
+    let ms = seq / 1_000_000;
+    let s = seq % 1_000_000;
+    format!("{}-{}", ms, s)
+}
+
+fn parse_stream_entry(entry_val: &redis::Value, namespace: &str) -> Option<PendingMutation> {
+    let bulk = match entry_val {
+        redis::Value::Bulk(b) if b.len() == 2 => b,
+        _ => return None,
+    };
+    
+    let id_str = match &bulk[0] {
+        redis::Value::Data(d) => std::str::from_utf8(d).ok()?,
+        _ => return None,
+    };
+    let sequence = stream_id_to_seq(id_str);
+    
+    let fields = match &bulk[1] {
+        redis::Value::Bulk(f) => f,
+        _ => return None,
+    };
+    
+    let mut id = None;
+    let mut doc_id = None;
+    let mut record_id = None;
+    let mut encrypted_blob = None;
+    let mut timestamp = None;
+    
+    for chunk in fields.chunks_exact(2) {
+        let key = match &chunk[0] {
+            redis::Value::Data(d) => std::str::from_utf8(d).ok()?,
+            _ => continue,
+        };
+        match key {
+            "id" => {
+                if let redis::Value::Data(d) = &chunk[1] {
+                    id = Some(std::str::from_utf8(d).ok()?.to_string());
+                }
+            }
+            "doc_id" => {
+                if let redis::Value::Data(d) = &chunk[1] {
+                    doc_id = Some(std::str::from_utf8(d).ok()?.to_string());
+                }
+            }
+            "record_id" => {
+                if let redis::Value::Data(d) = &chunk[1] {
+                    record_id = Some(std::str::from_utf8(d).ok()?.to_string());
+                }
+            }
+            "blob" => {
+                if let redis::Value::Data(d) = &chunk[1] {
+                    encrypted_blob = Some(d.clone());
+                }
+            }
+            "ts" => {
+                if let redis::Value::Data(d) = &chunk[1] {
+                    let ts_str = std::str::from_utf8(d).ok()?;
+                    timestamp = Some(ts_str.parse::<u64>().ok()?);
+                } else if let redis::Value::Int(i) = &chunk[1] {
+                    timestamp = Some(*i as u64);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    Some(PendingMutation {
+        id: id?,
+        namespace: namespace.to_string(),
+        sequence,
+        doc_id: doc_id?,
+        record_id: record_id?,
+        encrypted_blob: encrypted_blob?,
+        timestamp: timestamp.unwrap_or(0),
+    })
 }
 
 #[async_trait]
 impl Coordinator for RedisCoordinator {
-    async fn push(&self, _namespace: &str, _mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> { Ok(vec![]) }
-    async fn pull(&self, _namespace: &str, _after: SequenceId, _limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> { Ok(vec![]) }
-    async fn register(&self, _namespace: &str, _info: ReplicaInfo) -> Result<(), CoordinatorError> { Ok(()) }
-    async fn heartbeat(&self, _namespace: &str, _replica_id: &str) -> Result<(), CoordinatorError> { Ok(()) }
-    async fn subscribe(&self, _namespace: &str, _from_sequence: SequenceId) -> Result<Box<dyn futures::Stream<Item = PendingMutation> + Send>, CoordinatorError> {
-        Ok(Box::new(futures::stream::empty()))
+    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let stream_key = format!("drift:{}:mutations", namespace);
+        let mut seqs = Vec::with_capacity(mutations.len());
+
+        for mutation in mutations {
+            let res: String = redis::cmd("XADD")
+                .arg(&stream_key)
+                .arg("*")
+                .arg("id").arg(&mutation.id)
+                .arg("replica_id").arg(&mutation.replica_id)
+                .arg("doc_id").arg(&mutation.doc_id)
+                .arg("record_id").arg(&mutation.record_id)
+                .arg("blob").arg(&mutation.encrypted_blob)
+                .arg("ts").arg(mutation.timestamp.to_string())
+                .arg("schema_version").arg(mutation.schema_version.to_string())
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+            seqs.push(stream_id_to_seq(&res));
+        }
+        Ok(seqs)
     }
-    async fn schema_version(&self, _namespace: &str) -> Result<u64, CoordinatorError> { Ok(0) }
+
+    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let stream_key = format!("drift:{}:mutations", namespace);
+        let start_id = seq_to_stream_id(after.saturating_add(1));
+        
+        let res: redis::Value = redis::cmd("XRANGE")
+            .arg(&stream_key)
+            .arg(&start_id)
+            .arg("+")
+            .arg("COUNT").arg(limit)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+        let mut mutations = Vec::new();
+        if let redis::Value::Bulk(entries) = res {
+            for entry in entries {
+                if let Some(m) = parse_stream_entry(&entry, namespace) {
+                    mutations.push(m);
+                }
+            }
+        }
+        
+        Ok(mutations)
+    }
+
+    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let replicas_key = format!("drift:{}:replicas", namespace);
+        let schema_key = format!("drift:{}:schema_version", namespace);
+        
+        let info_str = serde_json::to_string(&info)
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+        redis::cmd("HSET")
+            .arg(&replicas_key)
+            .arg(&info.replica_id)
+            .arg(&info_str)
+            .query_async::<_, ()>(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+        let current_version: Option<String> = redis::cmd("GET")
+            .arg(&schema_key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+        let current_v = match current_version {
+            Some(s) => s.parse::<u64>().unwrap_or(0),
+            None => 0,
+        };
+        
+        if info.schema_version > current_v {
+            redis::cmd("SET")
+                .arg(&schema_key)
+                .arg(info.schema_version.to_string())
+                .query_async::<_, ()>(&mut conn)
+                .await
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        }
+        
+        Ok(())
+    }
+
+    async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let heartbeats_key = format!("drift:{}:replicas:heartbeats", namespace);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+            
+        redis::cmd("HSET")
+            .arg(&heartbeats_key)
+            .arg(replica_id)
+            .arg(now.to_string())
+            .query_async::<_, ()>(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+        Ok(())
+    }
+
+    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+        let (tx_mpsc, rx_mpsc) = tokio::sync::mpsc::channel(1024);
+        let mut conn = self.conn.clone();
+        let stream_key = format!("drift:{}:mutations", namespace);
+        let namespace = namespace.to_string();
+        
+        tokio::spawn(async move {
+            let mut last_id_str = if from_sequence == 0 {
+                "0-0".to_string()
+            } else {
+                seq_to_stream_id(from_sequence)
+            };
+            
+            loop {
+                let res: redis::Value = match redis::cmd("XREAD")
+                    .arg("BLOCK").arg(500)
+                    .arg("COUNT").arg(100)
+                    .arg("STREAMS").arg(&stream_key).arg(&last_id_str)
+                    .query_async(&mut conn)
+                    .await
+                {
+                    Ok(val) => val,
+                    Err(e) => {
+                        tracing::error!("Redis XREAD error: {}; retrying in 1s...", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                
+                let mut entries = Vec::new();
+                if let redis::Value::Bulk(streams) = res {
+                    for stream in streams {
+                        if let redis::Value::Bulk(si) = stream {
+                            if si.len() == 2 {
+                                if let redis::Value::Bulk(e) = &si[1] {
+                                    entries.extend(e.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                for entry in entries {
+                    let entry_id = match &entry {
+                        redis::Value::Bulk(b) if b.len() == 2 => match &b[0] {
+                            redis::Value::Data(d) => std::str::from_utf8(d).ok().map(|s| s.to_string()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    
+                    if let Some(id_str) = entry_id {
+                        if let Some(m) = parse_stream_entry(&entry, &namespace) {
+                            last_id_str = id_str;
+                            if tx_mpsc.send(m).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        
+        Ok(Box::new(RedisSubscription { rx: rx_mpsc }))
+    }
+
+    async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let schema_key = format!("drift:{}:schema_version", namespace);
+        
+        let res: Option<String> = redis::cmd("GET")
+            .arg(&schema_key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+        match res {
+            Some(s) => Ok(s.parse::<u64>().unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    async fn list_replicas(&self, namespace: &str) -> Result<Vec<ReplicaInfo>, CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let replicas_key = format!("drift:{}:replicas", namespace);
+        
+        let res: Vec<String> = redis::cmd("HVALS")
+            .arg(&replicas_key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+        let mut replicas = Vec::new();
+        for s in res {
+            if let Ok(info) = serde_json::from_str(&s) {
+                replicas.push(info);
+            }
+        }
+        Ok(replicas)
+    }
+}
+
+struct RedisSubscription {
+    rx: tokio::sync::mpsc::Receiver<PendingMutation>,
+}
+
+impl Stream for RedisSubscription {
+    type Item = PendingMutation;
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
 }

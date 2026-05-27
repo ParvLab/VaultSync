@@ -53,6 +53,36 @@ impl DriftClient {
         Self::new_with_keyring(config, coordinator, keyring).await
     }
 
+    /// Selects coordinator from `config.coordinator_endpoint` URL scheme:
+    ///   "memory://"     → InMemoryCoordinator
+    ///   "http(s)://"    → CloudflareCoordinator (speaks REST to any conforming HTTP endpoint)
+    ///   <anything else> → InMemoryCoordinator (safe fallback)
+    pub async fn connect(config: DriftConfig) -> Result<Self, DriftError> {
+        let coordinator: Arc<dyn Coordinator> =
+            if config.coordinator_endpoint.starts_with("memory://") {
+                Arc::new(InMemoryCoordinator::new())
+            } else if config.coordinator_endpoint.starts_with("http://")
+                   || config.coordinator_endpoint.starts_with("https://") {
+                #[cfg(feature = "coordinator-http")]
+                {
+                    Arc::new(crate::coordinator::cloudflare::CloudflareCoordinator::new(
+                        crate::coordinator::cloudflare::CloudflareConfig {
+                            worker_url: config.coordinator_endpoint.clone(),
+                            api_token: None,
+                        }
+                    ))
+                }
+                #[cfg(not(feature = "coordinator-http"))]
+                {
+                    return Err(DriftError::Config("HTTP coordinator feature 'coordinator-http' is not enabled".into()));
+                }
+            } else {
+                Arc::new(InMemoryCoordinator::new())
+            };
+        let keyring = Arc::new(KeyRing::generate());
+        Self::new_with_keyring(config, coordinator, keyring).await
+    }
+
     pub async fn new_with_coordinator(config: DriftConfig, coordinator: Arc<dyn Coordinator>) -> Result<Self, DriftError> {
         let keyring = Arc::new(KeyRing::generate());
         Self::new_with_keyring(config, coordinator, keyring).await

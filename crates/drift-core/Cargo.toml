@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["async-runtime", "telemetry", "storage-sqlite"]
+default = ["async-runtime", "telemetry", "storage-sqlite", "coordinator-http"]
 async-runtime = ["dep:tokio"]
 telemetry = [
     "dep:tracing-subscriber",
@@ -17,8 +17,10 @@ telemetry = [
     "dep:prometheus"
 ]
 storage-sqlite = ["dep:rusqlite"]
+coordinator-http = ["dep:reqwest"]
 
 [dependencies]
+reqwest = { version = "0.12", features = ["json"], optional = true }
 # CRDT
 yrs = "0.19"
 
@@ -68,6 +70,9 @@ tokio = { version = "1", features = ["sync", "macros", "rt", "time"], optional =
 proptest = "1"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+drift-coordinator-sqlite = { path = "../drift-coordinator-sqlite" }
+drift-coordinator-cloudflare = { path = "../drift-coordinator-cloudflare" }
+drift-coordinator-redis = { path = "../drift-coordinator-redis" }
 
 [[bench]]
 name = "crdt_bench"

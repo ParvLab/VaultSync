@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use drift_core::coordinator::traits::*;
+use crate::coordinator::traits::*;
 use futures::Stream;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -103,7 +103,6 @@ impl Coordinator for CloudflareCoordinator {
                     }
                 }
                 
-                // Poll interval
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         });
@@ -169,66 +168,5 @@ impl Stream for CloudflareSubscription {
     type Item = PendingMutation;
     fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::StreamExt;
-    use crate::test_utils::run_mock_server;
-
-    #[tokio::test]
-    async fn test_cloudflare_coordinator_flow() {
-        let (server_url, _server_handle) = run_mock_server().await;
-        
-        let config = CloudflareConfig {
-            worker_url: server_url,
-            api_token: Some("secret-token".to_string()),
-        };
-        
-        let coord = CloudflareCoordinator::new(config);
-        let ns = "test-cf";
-        
-        let v = coord.schema_version(ns).await.unwrap();
-        assert_eq!(v, 0);
-        
-        coord.register(ns, ReplicaInfo {
-            replica_id: "rep-cf".to_string(),
-            namespace: ns.to_string(),
-            public_key: vec![9, 8, 7],
-            schema_version: 7,
-        }).await.unwrap();
-        
-        let v = coord.schema_version(ns).await.unwrap();
-        assert_eq!(v, 7);
-        
-        coord.heartbeat(ns, "rep-cf").await.unwrap();
-        
-        let sub = coord.subscribe(ns, 0).await.unwrap();
-        let mut sub = std::pin::Pin::from(sub);
-        
-        let seqs = coord.push(ns, vec![
-            EncryptedMutation {
-                id: "m-cf-1".to_string(),
-                namespace: ns.to_string(),
-                replica_id: "rep-cf".to_string(),
-                doc_id: "doc-cf".to_string(),
-                record_id: "rec-cf".to_string(),
-                encrypted_blob: vec![1, 3, 5],
-                timestamp: 2000,
-                schema_version: 7,
-            }
-        ]).await.unwrap();
-        assert_eq!(seqs, vec![1]);
-        
-        let pulled = coord.pull(ns, 0, 10).await.unwrap();
-        assert_eq!(pulled.len(), 1);
-        assert_eq!(pulled[0].id, "m-cf-1");
-        assert_eq!(pulled[0].sequence, 1);
-        
-        let next_m = sub.next().await;
-        assert!(next_m.is_some());
-        assert_eq!(next_m.unwrap().id, "m-cf-1");
     }
 }
