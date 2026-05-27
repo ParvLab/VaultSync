@@ -465,6 +465,18 @@ impl Storage for OpfsStorage {
         // Actually, we can just stub it since key rotation is a desktop client priority.
         Ok(())
     }
+
+    async fn list_active_documents(&self, _namespace: &str) -> Result<Vec<(String, String)>, DriftError> {
+        Ok(Vec::new())
+    }
+
+    async fn read_synced_oplog_for_document(&self, _namespace: &str, _doc_id: &str, _record_id: &str) -> Result<Vec<OplogEntry>, DriftError> {
+        Ok(Vec::new())
+    }
+
+    async fn delete_synced_oplog_before_timestamp(&self, _namespace: &str, _doc_id: &str, _record_id: &str, _timestamp: u64) -> Result<usize, DriftError> {
+        Ok(0)
+    }
 }
 
 use crate::indexeddb::IndexedDbStorage;
@@ -651,6 +663,27 @@ impl Storage for BrowserStorage {
         match self {
             Self::Opfs(s) => s.update_oplog_encrypted_blob(id, new_blob).await,
             Self::Idb(s) => s.update_oplog_encrypted_blob(id, new_blob).await,
+        }
+    }
+
+    async fn list_active_documents(&self, namespace: &str) -> Result<Vec<(String, String)>, DriftError> {
+        match self {
+            Self::Opfs(s) => s.list_active_documents(namespace).await,
+            Self::Idb(s) => s.list_active_documents(namespace).await,
+        }
+    }
+
+    async fn read_synced_oplog_for_document(&self, namespace: &str, doc_id: &str, record_id: &str) -> Result<Vec<OplogEntry>, DriftError> {
+        match self {
+            Self::Opfs(s) => s.read_synced_oplog_for_document(namespace, doc_id, record_id).await,
+            Self::Idb(s) => s.read_synced_oplog_for_document(namespace, doc_id, record_id).await,
+        }
+    }
+
+    async fn delete_synced_oplog_before_timestamp(&self, namespace: &str, doc_id: &str, record_id: &str, timestamp: u64) -> Result<usize, DriftError> {
+        match self {
+            Self::Opfs(s) => s.delete_synced_oplog_before_timestamp(namespace, doc_id, record_id, timestamp).await,
+            Self::Idb(s) => s.delete_synced_oplog_before_timestamp(namespace, doc_id, record_id, timestamp).await,
         }
     }
 }

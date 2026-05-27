@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
+use tokio::sync::broadcast;
 use super::traits::*;
 
 #[derive(Debug)]
@@ -12,15 +13,18 @@ pub struct InMemoryCoordinator {
     ops: Arc<RwLock<BTreeMap<(String, u64), PendingMutation>>>,
     schema_versions: Arc<RwLock<std::collections::HashMap<String, u64>>>,
     replicas: Arc<RwLock<std::collections::HashMap<(String, String), ReplicaInfo>>>,
+    tx: broadcast::Sender<PendingMutation>,
 }
 
 impl InMemoryCoordinator {
     pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(4096);
         Self {
             next_seq: std::sync::atomic::AtomicU64::new(1),
             ops: Arc::new(RwLock::new(BTreeMap::new())),
             schema_versions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             replicas: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            tx,
         }
     }
 }
@@ -29,10 +33,11 @@ impl InMemoryCoordinator {
 impl Coordinator for InMemoryCoordinator {
     async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
         let mut seqs = Vec::new();
+        let mut to_broadcast = Vec::new();
         let mut ops = self.ops.write().map_err(|_| CoordinatorError::NotAvailable)?;
         for m in mutations {
             let seq = self.next_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            ops.insert((namespace.to_string(), seq), PendingMutation {
+            let pm = PendingMutation {
                 id: m.id,
                 namespace: namespace.to_string(),
                 sequence: seq,
@@ -40,9 +45,17 @@ impl Coordinator for InMemoryCoordinator {
                 record_id: m.record_id,
                 encrypted_blob: m.encrypted_blob,
                 timestamp: m.timestamp,
-            });
+            };
+            ops.insert((namespace.to_string(), seq), pm.clone());
             seqs.push(seq);
+            to_broadcast.push(pm);
         }
+        drop(ops);
+
+        for pm in to_broadcast {
+            let _ = self.tx.send(pm);
+        }
+
         Ok(seqs)
     }
 
@@ -52,15 +65,45 @@ impl Coordinator for InMemoryCoordinator {
         Ok(range.take(_limit).map(|(_, v)| v.clone()).collect())
     }
 
-    async fn subscribe(&self, _namespace: &str, _from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let ops = self.ops.read().map_err(|_| CoordinatorError::NotAvailable)?;
-        let range = ops.range((_namespace.to_string(), _from_sequence + 1)..);
-        for (_, v) in range.take(100) {
-            let _ = tx.send(v.clone());
-        }
-        drop(ops);
-        Ok(Box::new(InMemorySubscription { rx: Some(rx) }))
+    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+        let (tx_mpsc, rx_mpsc) = tokio::sync::mpsc::channel(4096);
+        let mut rx_broadcast = self.tx.subscribe();
+        
+        let ops = self.ops.clone();
+        let namespace_str = namespace.to_string();
+        
+        tokio::spawn(async move {
+            let mut last_sent = from_sequence;
+            
+            // 1. Collect all existing mutations from the in-memory store while holding the lock
+            let mut existing = Vec::new();
+            if let Ok(ops_guard) = ops.read() {
+                let range = ops_guard.range((namespace_str.clone(), from_sequence + 1)..);
+                for ((_, _), v) in range {
+                    existing.push(v.clone());
+                }
+            } // lock is released here
+            
+            // Send existing mutations
+            for v in existing {
+                last_sent = last_sent.max(v.sequence);
+                if tx_mpsc.send(v).await.is_err() {
+                    return;
+                }
+            }
+            
+            // 2. Stream new mutations from the broadcast channel
+            while let Ok(m) = rx_broadcast.recv().await {
+                if m.namespace == namespace_str && m.sequence > last_sent {
+                    last_sent = m.sequence;
+                    if tx_mpsc.send(m).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        
+        Ok(Box::new(InMemorySubscription { rx: Some(rx_mpsc) }))
     }
 
     async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
@@ -86,7 +129,7 @@ impl Coordinator for InMemoryCoordinator {
 }
 
 struct InMemorySubscription {
-    rx: Option<tokio::sync::mpsc::UnboundedReceiver<PendingMutation>>,
+    rx: Option<tokio::sync::mpsc::Receiver<PendingMutation>>,
 }
 
 impl Stream for InMemorySubscription {

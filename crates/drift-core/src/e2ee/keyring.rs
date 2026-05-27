@@ -146,15 +146,20 @@ impl E2eeEncryptor {
 
         let key = self.keyring.derive_namespace_key(namespace);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-        let nonce = Nonce::from_slice(&[0u8; 12]);
-        let res = cipher.encrypt(nonce, plaintext)
-            .map_err(|e| DriftError::Encryption(format!("symmetric encrypt failed: {e}")));
+        
+        let mut nonce_bytes = [0u8; 12];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        
+        let mut ciphertext = cipher.encrypt(nonce, plaintext)
+            .map_err(|e| DriftError::Encryption(format!("symmetric encrypt failed: {e}")))?;
 
-        if res.is_ok() {
-            let duration_us = start.elapsed().as_micros() as f64;
-            crate::telemetry::metrics::get_metrics().record_encryption_time("encrypt", duration_us);
-        }
-        res
+        let mut result = nonce_bytes.to_vec();
+        result.append(&mut ciphertext);
+
+        let duration_us = start.elapsed().as_micros() as f64;
+        crate::telemetry::metrics::get_metrics().record_encryption_time("encrypt", duration_us);
+        Ok(result)
     }
 
     pub fn keyring(&self) -> &KeyRing {
@@ -181,10 +186,16 @@ impl E2eeDecryptor {
         let span = tracing::info_span!("e2ee.decrypt", namespace = namespace, key_version = active_version);
         let _enter = span.enter();
 
+        if ciphertext.len() < 12 {
+            return Err(DriftError::Encryption("invalid ciphertext length (missing nonce)".into()));
+        }
+        let nonce_bytes = &ciphertext[..12];
+        let actual_ciphertext = &ciphertext[12..];
+
         let key = self.keyring.derive_namespace_key(namespace);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-        let nonce = Nonce::from_slice(&[0u8; 12]);
-        let res = cipher.decrypt(nonce, ciphertext)
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let res = cipher.decrypt(nonce, actual_ciphertext)
             .map_err(|e| DriftError::Encryption(format!("symmetric decrypt failed: {e}")));
 
         if res.is_ok() {

@@ -219,4 +219,36 @@ impl Storage for InMemoryStorage {
         }
         Ok(())
     }
+
+    async fn list_active_documents(&self, namespace: &str) -> Result<Vec<(String, String)>, DriftError> {
+        let oplog = self.oplog.read().map_err(|e| DriftError::Storage(e.to_string()))?;
+        let mut results = std::collections::HashSet::new();
+        for entry in oplog.iter() {
+            if entry.namespace == namespace {
+                results.insert((entry.doc_id.clone(), entry.record_id.clone()));
+            }
+        }
+        Ok(results.into_iter().collect())
+    }
+
+    async fn read_synced_oplog_for_document(&self, namespace: &str, doc_id: &str, record_id: &str) -> Result<Vec<OplogEntry>, DriftError> {
+        let oplog = self.oplog.read().map_err(|e| DriftError::Storage(e.to_string()))?;
+        Ok(oplog.iter()
+            .filter(|e| e.namespace == namespace && e.doc_id == doc_id && e.record_id == record_id && matches!(e.sync_status, crate::oplog::entry::SyncStatus::Synced))
+            .cloned()
+            .collect())
+    }
+
+    async fn delete_synced_oplog_before_timestamp(&self, namespace: &str, doc_id: &str, record_id: &str, timestamp: u64) -> Result<usize, DriftError> {
+        let mut oplog = self.oplog.write().map_err(|e| DriftError::Storage(e.to_string()))?;
+        let initial_len = oplog.len();
+        oplog.retain(|entry| {
+            !(entry.namespace == namespace
+                && entry.doc_id == doc_id
+                && entry.record_id == record_id
+                && matches!(entry.sync_status, crate::oplog::entry::SyncStatus::Synced)
+                && entry.created_at < timestamp)
+        });
+        Ok(initial_len - oplog.len())
+    }
 }

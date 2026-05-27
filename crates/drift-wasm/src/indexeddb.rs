@@ -453,4 +453,16 @@ impl Storage for IndexedDbStorage {
     async fn update_oplog_encrypted_blob(&self, _id: &str, _new_blob: &[u8]) -> Result<(), DriftError> {
         Ok(())
     }
+
+    async fn list_active_documents(&self, _namespace: &str) -> Result<Vec<(String, String)>, DriftError> {
+        Ok(Vec::new())
+    }
+
+    async fn read_synced_oplog_for_document(&self, _namespace: &str, _doc_id: &str, _record_id: &str) -> Result<Vec<OplogEntry>, DriftError> {
+        Ok(Vec::new())
+    }
+
+    async fn delete_synced_oplog_before_timestamp(&self, _namespace: &str, _doc_id: &str, _record_id: &str, _timestamp: u64) -> Result<usize, DriftError> {
+        Ok(0)
+    }
 }

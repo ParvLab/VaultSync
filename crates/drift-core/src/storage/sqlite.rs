@@ -551,6 +551,66 @@ impl Storage for SQLiteStorage {
         .await
         .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
     }
+
+    async fn list_active_documents(&self, namespace: &str) -> Result<Vec<(String, String)>, DriftError> {
+        let namespace = namespace.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT doc_id, record_id FROM oplog WHERE namespace = ?1"
+            )?;
+            let rows = stmt.query_map(params![namespace], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await
+        .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
+    }
+
+    async fn read_synced_oplog_for_document(&self, namespace: &str, doc_id: &str, record_id: &str) -> Result<Vec<OplogEntry>, DriftError> {
+        let namespace = namespace.to_string();
+        let doc_id = doc_id.to_string();
+        let record_id = record_id.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, namespace, replica_id, mutation_type, doc_id, record_id, yrs_update, encrypted_blob, timestamp, sequence, sync_status, synced_at, created_at
+                 FROM oplog WHERE namespace = ?1 AND doc_id = ?2 AND record_id = ?3 AND sync_status = 'Synced' ORDER BY sequence ASC"
+            )?;
+            let rows = stmt.query_map(params![namespace, doc_id, record_id], Self::map_oplog_entry)?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await
+        .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
+    }
+
+    async fn delete_synced_oplog_before_timestamp(&self, namespace: &str, doc_id: &str, record_id: &str, timestamp: u64) -> Result<usize, DriftError> {
+        let namespace = namespace.to_string();
+        let doc_id = doc_id.to_string();
+        let record_id = record_id.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let changes = conn.execute(
+                "DELETE FROM oplog WHERE namespace = ?1 AND doc_id = ?2 AND record_id = ?3 AND sync_status = 'Synced' AND created_at < ?4",
+                params![namespace, doc_id, record_id, timestamp as i64],
+            )?;
+            Ok(changes)
+        })
+        .await
+        .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
+    }
 }
 
 impl SQLiteStorage {

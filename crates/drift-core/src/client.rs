@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use aead::KeyInit;
 use crate::config::DriftConfig;
 use crate::error::DriftError;
 use crate::crdt::document::CRDTDocument;
@@ -199,10 +198,15 @@ impl DriftClient {
                             let _ = download_queue_clone.process_batch().await;
 
                             sync_cycles += 1;
-                            if sync_cycles >= 100 {
-                                sync_cycles = 0;
+                            if sync_cycles % 100 == 0 {
                                 if let Err(e) = compaction_engine.run_compaction(&namespace_clone).await {
                                     tracing::error!(error = %e, "Compaction failed");
+                                }
+                            }
+                            if sync_cycles >= 1000 {
+                                sync_cycles = 0;
+                                if let Err(e) = compaction_engine.run_snapshot_compaction(&namespace_clone).await {
+                                    tracing::error!(error = %e, "Snapshot compaction failed");
                                 }
                             }
                         }
@@ -513,29 +517,20 @@ impl DriftClient {
     }
 
     pub async fn rotate_keys(&self) -> Result<(), DriftError> {
-        let old_namespace_key = self.keyring.derive_namespace_key(&self.config.namespace);
+        let old_active_key = self.keyring.active_key();
 
         let new_pair = self.keyring.rotate();
-        let new_namespace_key = self.keyring.derive_namespace_key(&self.config.namespace);
+
+        let old_keyring = Arc::new(KeyRing::from_key(old_active_key));
+        let old_decryptor = E2eeDecryptor::new(old_keyring);
+        let new_encryptor = self.encryptor.clone();
 
         let pending = self.storage.read_pending_oplog(&self.config.namespace, 10000).await?;
 
         for entry in pending {
             if let Some(encrypted_blob) = entry.encrypted_blob {
-                let old_cipher = chacha20poly1305::ChaCha20Poly1305::new(
-                    chacha20poly1305::Key::from_slice(&old_namespace_key)
-                );
-                let nonce = chacha20poly1305::Nonce::from_slice(&[0u8; 12]);
-                use aead::Aead;
-                let plaintext = old_cipher.decrypt(nonce, encrypted_blob.as_slice())
-                    .map_err(|e| DriftError::Encryption(format!("failed to decrypt during key rotation: {e}")))?;
-
-                let new_cipher = chacha20poly1305::ChaCha20Poly1305::new(
-                    chacha20poly1305::Key::from_slice(&new_namespace_key)
-                );
-                let new_encrypted_blob = new_cipher.encrypt(nonce, plaintext.as_slice())
-                    .map_err(|e| DriftError::Encryption(format!("failed to re-encrypt during key rotation: {e}")))?;
-
+                let plaintext = old_decryptor.decrypt_symmetric(&encrypted_blob, &self.config.namespace)?;
+                let new_encrypted_blob = new_encryptor.encrypt_symmetric(&plaintext, &self.config.namespace)?;
                 self.storage.update_oplog_encrypted_blob(&entry.id, &new_encrypted_blob).await?;
             }
         }

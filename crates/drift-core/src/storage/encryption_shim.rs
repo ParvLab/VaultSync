@@ -135,4 +135,16 @@ impl Storage for EncryptedStorage {
     async fn update_oplog_encrypted_blob(&self, id: &str, new_blob: &[u8]) -> Result<(), DriftError> {
         self.inner.update_oplog_encrypted_blob(id, new_blob).await
     }
+
+    async fn list_active_documents(&self, namespace: &str) -> Result<Vec<(String, String)>, DriftError> {
+        self.inner.list_active_documents(namespace).await
+    }
+
+    async fn read_synced_oplog_for_document(&self, namespace: &str, doc_id: &str, record_id: &str) -> Result<Vec<OplogEntry>, DriftError> {
+        self.inner.read_synced_oplog_for_document(namespace, doc_id, record_id).await
+    }
+
+    async fn delete_synced_oplog_before_timestamp(&self, namespace: &str, doc_id: &str, record_id: &str, timestamp: u64) -> Result<usize, DriftError> {
+        self.inner.delete_synced_oplog_before_timestamp(namespace, doc_id, record_id, timestamp).await
+    }
 }
