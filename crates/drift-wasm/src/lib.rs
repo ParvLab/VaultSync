@@ -11,3 +11,4 @@ pub mod indexeddb;
 pub mod ipc;
 pub mod e2ee;
 pub mod transport;
+pub mod ws_coordinator;

@@ -39,6 +39,38 @@ impl WasmDriftClient {
         Ok(Self { client })
     }
 
+    pub async fn new_with_coordinator(
+        namespace: &str,
+        replica_id: &str,
+        coordinator_url: &str,
+        auth_token: Option<String>,
+    ) -> Result<WasmDriftClient, JsValue> {
+        let mut config = DriftConfig::default();
+        config.namespace = namespace.to_string();
+        config.replica_id = replica_id.to_string();
+        
+        let db_name = format!("{}_db", namespace);
+        let storage = Arc::new(BrowserStorage::new(&db_name).await
+            .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?);
+
+        let coordinator = Arc::new(crate::ws_coordinator::WasmWsCoordinator::new(
+            coordinator_url,
+            auth_token,
+        ));
+        let keyring = Arc::new(KeyRing::generate());
+
+        let client = DriftClient::new_with_storage(
+            config,
+            coordinator,
+            keyring,
+            storage,
+        )
+        .await
+        .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?;
+
+        Ok(Self { client })
+    }
+
     pub async fn insert(&self, doc_id: &str, record_id: &str, json: &str) -> Result<(), JsValue> {
         let fields = json_to_fields(json)?;
         self.client.insert(doc_id, record_id, fields).await

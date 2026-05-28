@@ -1,4 +1,5 @@
 pub mod traits;
+pub mod ws_proto;
 #[cfg(feature = "async-runtime")]
 pub mod memory;
 #[cfg(feature = "async-runtime")]

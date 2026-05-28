@@ -10,7 +10,7 @@ drift-coordinator-sqlite = { path = "../drift-coordinator-sqlite" }
 drift-coordinator-redis = { path = "../drift-coordinator-redis" }
 drift-coordinator-memory = { path = "../drift-coordinator-memory" }
 
-axum = { version = "0.6", features = ["headers"] }
+axum = { version = "0.6", features = ["headers", "ws"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

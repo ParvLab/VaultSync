@@ -1688,7 +1688,7 @@ This section defines the exact message format over the WebSocket transport betwe
 #### Connection URL
 
 ```
-wss://<coordinator-host>/drift/v1/sync
+wss://<coordinator-host>/namespace/:namespace/ws
 ```
 
 All messages are sent as binary WebSocket frames (not text). The frame format is:
@@ -1729,7 +1729,7 @@ Total header: 5 bytes. Payload: length bytes.
 **`AUTH` (0x01)**
 ```json
 {
-  "token": "<JWT>",
+  "token": "<JWT or Bearer Token>",
   "protocol_version": 1,
   "replica_id": "replica-abc123",
   "namespace": "workspace:core"
