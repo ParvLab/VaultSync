@@ -315,6 +315,24 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                             }
                         }
                     }
+                    MSG_SCHEMA_SYNC => {
+                        if let Ok(sync) = serde_json::from_slice::<SchemaSyncPayload>(payload) {
+                            let current_v = state.coordinator.schema_version(&ns).await.unwrap_or(0);
+                            let status = if sync.version == current_v {
+                                "ok".to_string()
+                            } else {
+                                "mismatch".to_string()
+                            };
+                            let resp = SchemaMigrationPayload {
+                                status,
+                                current_version: current_v,
+                                error: None,
+                            };
+                            if let Ok(frame) = encode_frame(MSG_SCHEMA_MIGRATION, &resp) {
+                                let _ = tx.send(Message::Binary(frame)).await;
+                            }
+                        }
+                    }
                     MSG_SUBSCRIBE => {
                         if let Ok(sub) = serde_json::from_slice::<SubscribePayload>(payload) {
                             if let Some(cancel) = active_sub_tx.take() {

@@ -47,6 +47,7 @@ pub struct DriftClient {
     pub metrics: Arc<crate::telemetry::metrics::DriftMetrics>,
     pub debug_api: Arc<crate::telemetry::debug::DebugApi>,
     pub leader_election: Arc<crate::ipc::leader_election::LeaderElection>,
+    pub schema_version: u64,
 }
 
 impl DriftClient {
@@ -113,6 +114,21 @@ impl DriftClient {
         keyring: Arc<KeyRing>,
         storage: Arc<dyn Storage>,
     ) -> Result<Self, DriftError> {
+        Self::new_with_storage_and_migrations(config, coordinator, keyring, storage, crate::schema::migration::get_global_migrations()).await
+    }
+
+    pub async fn new_with_storage_and_migrations(
+        config: DriftConfig,
+        coordinator: Arc<dyn Coordinator>,
+        keyring: Arc<KeyRing>,
+        storage: Arc<dyn Storage>,
+        migrations: Vec<Arc<crate::schema::migration::MigrationDefinition>>,
+    ) -> Result<Self, DriftError> {
+        let runner = crate::schema::migration::MigrationRunner::new(storage.clone(), migrations);
+        runner.validate_applied().await?;
+        runner.run_pending().await?;
+        let schema_version = runner.current_version().await;
+
         let encryptor = Arc::new(E2eeEncryptor::new(keyring.clone()));
         let decryptor = Arc::new(E2eeDecryptor::new(keyring.clone()));
 
@@ -186,6 +202,7 @@ impl DriftClient {
             metrics,
             debug_api,
             leader_election: leader_election.clone(),
+            schema_version,
         };
 
         let leader_election_clone = leader_election.clone();
@@ -326,7 +343,7 @@ impl DriftClient {
             replica_id: self.config.replica_id.clone(),
             namespace: self.config.namespace.clone(),
             public_key: self.keyring.active_key().public_key.to_vec(),
-            schema_version: 0,
+            schema_version: self.schema_version,
         }).await.map_err(|e| DriftError::Coordinator(format!("register failed: {e:?}")))?;
         Ok(())
     }

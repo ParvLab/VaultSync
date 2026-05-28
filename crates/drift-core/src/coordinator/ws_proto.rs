@@ -15,6 +15,8 @@ pub const MSG_MUTATION_PUSH: u8  = 0x0A;
 pub const MSG_HEARTBEAT: u8      = 0x0B;
 pub const MSG_HEARTBEAT_ACK: u8  = 0x0C;
 pub const MSG_ERROR: u8          = 0x0F;
+pub const MSG_SCHEMA_SYNC: u8       = 0x10;
+pub const MSG_SCHEMA_MIGRATION: u8  = 0x11;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthPayload {
@@ -134,4 +136,17 @@ pub fn decode_frame(data: &[u8]) -> Result<(u8, &[u8]), String> {
     }
     
     Ok((msg_type, &data[5..5 + length]))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaSyncPayload {
+    pub namespace: String,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaMigrationPayload {
+    pub status: String, // "ok" | "mismatch"
+    pub current_version: u64,
+    pub error: Option<String>,
 }

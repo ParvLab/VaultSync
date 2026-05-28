@@ -28,6 +28,7 @@ pub struct HttpCoordinator {
     config: HttpCoordinatorConfig,
     #[cfg(not(target_arch = "wasm32"))]
     ws_client: Arc<tokio::sync::Mutex<Option<WsClientHandle>>>,
+    schema_version: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl HttpCoordinator {
@@ -37,6 +38,7 @@ impl HttpCoordinator {
             config,
             #[cfg(not(target_arch = "wasm32"))]
             ws_client: Arc::new(tokio::sync::Mutex::new(None)),
+            schema_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -88,11 +90,12 @@ impl HttpCoordinator {
         }
 
         // 2. REGISTER handshake
+        let current_version = self.schema_version.load(std::sync::atomic::Ordering::Relaxed);
         let reg = RegisterPayload {
             replica_id: auth.replica_id.clone(),
             namespace: namespace.to_string(),
             public_key: vec![],
-            schema_version: 0,
+            schema_version: current_version,
             last_sequence: after,
         };
 
@@ -115,6 +118,39 @@ impl HttpCoordinator {
 
         if msg_type != MSG_REGISTER_ACK {
             return Err(CoordinatorError::Internal(format!("Expected MSG_REGISTER_ACK, got {:02X}", msg_type)));
+        }
+
+        // 2.5. SCHEMA_SYNC handshake
+        let sync = SchemaSyncPayload {
+            namespace: namespace.to_string(),
+            version: current_version,
+        };
+        let sync_frame = encode_frame(MSG_SCHEMA_SYNC, &sync)
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        ws_sink.send(Message::Binary(sync_frame)).await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        let resp = ws_stream.next().await
+            .ok_or_else(|| CoordinatorError::Internal("Connection closed during SCHEMA_SYNC".to_string()))?
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        let bin = match resp {
+            Message::Binary(b) => b,
+            _ => return Err(CoordinatorError::Internal("Expected binary frame during SCHEMA_SYNC".to_string())),
+        };
+
+        let (msg_type, payload) = decode_frame(&bin)
+            .map_err(|e| CoordinatorError::Internal(e))?;
+
+        if msg_type != MSG_SCHEMA_MIGRATION {
+            return Err(CoordinatorError::Internal(format!("Expected MSG_SCHEMA_MIGRATION, got {:02X}", msg_type)));
+        }
+
+        let migration_payload: SchemaMigrationPayload = serde_json::from_slice(payload)
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        if migration_payload.status == "mismatch" {
+            return Err(CoordinatorError::SchemaMismatch);
         }
 
         // 3. SUBSCRIBE handshake
@@ -413,6 +449,7 @@ impl Coordinator for HttpCoordinator {
     }
 
     async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+        self.schema_version.store(info.schema_version, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle_opt = self.ws_client.lock().await.clone();

@@ -11,6 +11,7 @@ members = [
     "crates/drift-coordinator-server",
     "crates/drift-cli",
     "crates/drift-fuzz",
+    "crates/drift-napi",
 ]
 
 [workspace.package]

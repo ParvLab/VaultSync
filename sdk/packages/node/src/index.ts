@@ -1,0 +1,124 @@
+import { createRequire } from 'module';
+import * as path from 'path';
+import * as fs from 'fs';
+import { fileURLToPath } from 'url';
+import type { DriftConfig, RecordFields, SyncStatus, SubscriptionCallback, UnsubscribeFn } from './types.js';
+
+export * from './types.js';
+
+const nodeRequire = createRequire(import.meta.url);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Paths to scan for the native addon
+const paths = [
+  path.join(__dirname, '../drift_napi.node'),
+  path.join(__dirname, '../../../../target/release/drift_napi.node'),
+  path.join(__dirname, '../../../../target/release/drift_napi.dll'),
+  path.join(__dirname, '../../../../target/release/libdrift_napi.so'),
+  path.join(__dirname, '../../../../target/release/libdrift_napi.dylib'),
+  path.join(__dirname, '../../../../target/debug/drift_napi.node'),
+  path.join(__dirname, '../../../../target/debug/drift_napi.dll'),
+  path.join(__dirname, '../../../../target/debug/libdrift_napi.so'),
+  path.join(__dirname, '../../../../target/debug/libdrift_napi.dylib'),
+];
+
+let nativeModule: any = null;
+for (const p of paths) {
+  if (fs.existsSync(p)) {
+    let targetPath = p;
+    // Node requires the extension to be '.node' to load via dlopen.
+    if (!p.endsWith('.node')) {
+      const dir = path.dirname(p);
+      const ext = path.extname(p);
+      const base = path.basename(p, ext);
+      const dest = path.join(dir, `${base}.node`);
+      if (!fs.existsSync(dest) || fs.statSync(p).mtimeMs > fs.statSync(dest).mtimeMs) {
+        try {
+          fs.copyFileSync(p, dest);
+        } catch (e) {
+          // If we fail to copy (e.g. read-only filesystem), continue
+        }
+      }
+      targetPath = dest;
+    }
+    try {
+      nativeModule = nodeRequire(targetPath);
+      break;
+    } catch (e) {
+      // Continue searching
+    }
+  }
+}
+
+if (!nativeModule) {
+  throw new Error("Could not find or load drift-napi native addon");
+}
+
+export class DriftClient {
+  private inner: any;
+
+  private constructor(inner: any) {
+    this.inner = inner;
+  }
+
+  static async create(config: DriftConfig): Promise<DriftClient> {
+    const inner = await nativeModule.createClient(
+      config.namespace,
+      config.replicaId,
+      config.storagePath || null,
+      config.coordinatorUrl || null,
+      config.authToken || null
+    );
+    return new DriftClient(inner);
+  }
+
+  async insert(docId: string, recordId: string, fields: RecordFields): Promise<void> {
+    await this.inner.insert(docId, recordId, JSON.stringify(fields));
+  }
+
+  async update(docId: string, recordId: string, fields: RecordFields): Promise<void> {
+    await this.inner.update(docId, recordId, JSON.stringify(fields));
+  }
+
+  async delete(docId: string, recordId: string): Promise<void> {
+    await this.inner.delete(docId, recordId);
+  }
+
+  async get(docId: string, recordId: string): Promise<RecordFields | null> {
+    const jsonStr = await this.inner.get(docId, recordId);
+    if (!jsonStr) return null;
+    return JSON.parse(jsonStr);
+  }
+
+  async find(docId: string): Promise<RecordFields[]> {
+    const arr = await this.inner.find(docId);
+    const result: RecordFields[] = [];
+    for (let i = 0; i < arr.length; i++) {
+      result.push(JSON.parse(arr[i]));
+    }
+    return result;
+  }
+
+  async syncStatus(): Promise<SyncStatus> {
+    const statusStr = await this.inner.syncStatus();
+    return JSON.parse(statusStr);
+  }
+
+  subscribe(docId: string, callback: SubscriptionCallback): UnsubscribeFn {
+    const wasmCallback = (err: any, recordId: string, jsonStr: string) => {
+      if (err) {
+        console.error("Subscription error:", err);
+        return;
+      }
+      callback(recordId, JSON.parse(jsonStr));
+    };
+    const subId = this.inner.subscribe(docId, wasmCallback);
+    return () => {
+      this.inner.unsubscribe(subId);
+    };
+  }
+
+  async shutdown(): Promise<void> {
+    await this.inner.shutdown();
+  }
+}

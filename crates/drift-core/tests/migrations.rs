@@ -155,3 +155,32 @@ async fn test_concurrent_migration() {
     // Callback should only run once
     assert_eq!(run_count.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn test_migration_auto_execution() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("mig_auto.db").to_string_lossy().to_string();
+
+    let run_count = Arc::new(AtomicU32::new(0));
+    let run_count_clone = run_count.clone();
+
+    // Define local migrations
+    let migration = MigrationDefinition::new("v9.9.9", Box::new(move || {
+        run_count_clone.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }));
+    let migrations = vec![Arc::new(migration)];
+
+    let mut config = DriftConfig::default();
+    config.storage = StorageConfig::Sqlite { path: db_path.clone() };
+    
+    let storage = Arc::new(drift_core::storage::sqlite::SQLiteStorage::new(&db_path).unwrap());
+    let coordinator = Arc::new(drift_core::coordinator::memory::InMemoryCoordinator::new());
+    let keyring = Arc::new(drift_core::e2ee::keyring::KeyRing::generate());
+    
+    let client = DriftClient::new_with_storage_and_migrations(config, coordinator, keyring, storage, migrations).await.unwrap();
+
+    // Verify it ran automatically
+    assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    assert_eq!(client.schema_version, 9);
+}
