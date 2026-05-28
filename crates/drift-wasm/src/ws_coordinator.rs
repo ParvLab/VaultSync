@@ -21,6 +21,7 @@ struct WasmWsCoordinatorInner {
     ws: Mutex<Option<WebSocket>>,
     pending_requests: Mutex<HashMap<String, oneshot::Sender<Vec<u8>>>>,
     subscribers: Mutex<Vec<mpsc::Sender<PendingMutation>>>,
+    peer_coord: Mutex<Option<drift_transport_webrtc::PeerCoordinator>>,
 }
 
 impl std::fmt::Debug for WasmWsCoordinatorInner {
@@ -33,6 +34,10 @@ impl std::fmt::Debug for WasmWsCoordinatorInner {
 
 impl WasmWsCoordinator {
     pub fn new(url: &str, auth_token: Option<String>) -> Self {
+        let ice_servers = vec!["stun:stun.l.google.com:19302".to_string()];
+        let peer_coord = drift_transport_webrtc::PeerCoordinator::new(
+            drift_transport_webrtc::WebRtcConfig { ice_servers }
+        );
         Self {
             inner: Arc::new(WasmWsCoordinatorInner {
                 url: url.to_string(),
@@ -40,6 +45,7 @@ impl WasmWsCoordinator {
                 ws: Mutex::new(None),
                 pending_requests: Mutex::new(HashMap::new()),
                 subscribers: Mutex::new(Vec::new()),
+                peer_coord: Mutex::new(Some(peer_coord)),
             }),
         }
     }
@@ -177,6 +183,16 @@ impl WasmWsCoordinator {
                                 sub.try_send(mutat.clone()).is_ok()
                             });
                         }
+                    } else if msg_type == MSG_P2P_SIGNAL_ACK {
+                        if let Ok(ack) = serde_json::from_slice::<P2PSignalAckPayload>(payload) {
+                            if let Some(ref peer_coord) = *inner_clone.peer_coord.lock().unwrap() {
+                                let _ = peer_coord.handle_signaling_message(
+                                    &ack.sender_replica_id,
+                                    &ack.signal_type,
+                                    &ack.data
+                                ).await;
+                            }
+                        }
                     } else {
                         if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(payload) {
                             if let Some(req_id) = json_val.get("request_id").and_then(|v| v.as_str()) {
@@ -207,6 +223,61 @@ impl WasmWsCoordinator {
                 }
             }
         });
+
+        // 5. Initialize WebRTC peer coordinator signaling and registration
+        if let Some(ref peer_coord) = *self.inner.peer_coord.lock().unwrap() {
+            let ws_sender = ws.clone();
+            let peer_coord_clone = peer_coord.clone();
+            let ns_str = namespace.to_string();
+            let my_replica_id = auth.replica_id.clone();
+            
+            // Set signaling handler
+            wasm_bindgen_futures::spawn_local(async move {
+                peer_coord_clone.set_signal_handler(move |target_id, signal_type, data| {
+                    let ws_send = ws_sender.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let sig = P2PSignalPayload {
+                            target_replica_id: target_id,
+                            signal_type,
+                            data,
+                        };
+                        if let Ok(frame) = encode_frame(MSG_P2P_SIGNAL, &sig) {
+                            let _ = ws_send.send_with_u8_array(&frame);
+                        }
+                    });
+                }).await;
+            });
+
+            // Register with PeerCoordinator
+            let info = ReplicaInfo {
+                replica_id: auth.replica_id.clone(),
+                namespace: namespace.to_string(),
+                public_key: vec![],
+                schema_version: 0,
+            };
+            
+            let peer_coord_clone = peer_coord.clone();
+            let ns_str_clone = ns_str.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = peer_coord_clone.register(&ns_str_clone, info).await;
+            });
+
+            // Spawn discovery loop
+            let peer_coord_clone = peer_coord.clone();
+            let http_url = self.inner.url.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                loop {
+                    drift_core::time_utils::sleep(std::time::Duration::from_secs(30)).await;
+                    if let Ok(active_replicas) = fetch_replicas(&http_url, &ns_str).await {
+                        for peer in active_replicas {
+                            if peer.replica_id > my_replica_id {
+                                let _ = peer_coord_clone.initiate_connection(&peer.replica_id).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         *self.inner.ws.lock().unwrap() = Some(ws);
         Ok(())
@@ -350,4 +421,35 @@ impl Coordinator for WasmWsCoordinator {
     async fn schema_version(&self, _namespace: &str) -> Result<u64, CoordinatorError> {
         Ok(0)
     }
+}
+
+async fn fetch_replicas(url: &str, namespace: &str) -> Result<Vec<ReplicaInfo>, String> {
+    use wasm_bindgen_futures::JsFuture;
+    let window = web_sys::window().ok_or("No window object found".to_string())?;
+    let req_url = format!("{}/namespace/{}/replicas", url.trim_end_matches('/'), namespace);
+    
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("GET");
+    
+    let request = web_sys::Request::new_with_str_and_init(&req_url, &opts)
+        .map_err(|e| format!("Failed to create request: {:?}", e))?;
+        
+    let resp_value = JsFuture::from(window.fetch_with_request(&request)).await
+        .map_err(|e| format!("Fetch failed: {:?}", e))?;
+        
+    let resp = resp_value.dyn_into::<web_sys::Response>()
+        .map_err(|_| "Failed to cast to Response".to_string())?;
+        
+    if !resp.ok() {
+        return Err(format!("HTTP error: {}", resp.status()));
+    }
+    
+    let text_value = JsFuture::from(resp.text().map_err(|e| format!("{:?}", e))?).await
+        .map_err(|e| format!("Failed to read text: {:?}", e))?;
+        
+    let text_str: String = text_value.as_string().unwrap_or_default();
+    let replicas: Vec<ReplicaInfo> = serde_json::from_str(&text_str)
+        .map_err(|e| format!("Failed to parse JSON: {:?}", e))?;
+        
+    Ok(replicas)
 }

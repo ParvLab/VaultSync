@@ -110,6 +110,22 @@ pub async fn register_replica(
     Ok(StatusCode::OK)
 }
 
+pub async fn list_replicas(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(ns): Path<String>,
+) -> Result<Json<Vec<ReplicaInfo>>, StatusCode> {
+    authorize_namespace(&state, &headers, &ns).await?;
+
+    let replicas = state.coordinator.list_replicas(&ns).await
+        .map_err(|e| {
+            tracing::error!("Failed to list replicas: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(replicas))
+}
+
 #[derive(serde::Deserialize)]
 pub struct HeartbeatQuery {
     pub replica_id: String,

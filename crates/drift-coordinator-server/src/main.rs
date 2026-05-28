@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         coordinator,
         token_store,
         config: config.clone(),
+        sessions: Default::default(),
     };
 
     // Build the Axum router

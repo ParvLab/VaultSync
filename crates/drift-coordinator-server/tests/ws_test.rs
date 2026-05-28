@@ -38,6 +38,7 @@ async fn spawn_test_server(auth_token: Option<String>, admin_token: Option<Strin
         coordinator,
         token_store,
         config,
+        sessions: Default::default(),
     };
 
     let app = build_router(state);

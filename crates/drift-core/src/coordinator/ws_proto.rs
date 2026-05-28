@@ -17,6 +17,8 @@ pub const MSG_HEARTBEAT_ACK: u8  = 0x0C;
 pub const MSG_ERROR: u8          = 0x0F;
 pub const MSG_SCHEMA_SYNC: u8       = 0x10;
 pub const MSG_SCHEMA_MIGRATION: u8  = 0x11;
+pub const MSG_P2P_SIGNAL: u8        = 0x13;
+pub const MSG_P2P_SIGNAL_ACK: u8    = 0x14;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthPayload {
@@ -149,4 +151,18 @@ pub struct SchemaMigrationPayload {
     pub status: String, // "ok" | "mismatch"
     pub current_version: u64,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2PSignalPayload {
+    pub target_replica_id: String,
+    pub signal_type: String, // "offer" | "answer" | "candidate"
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2PSignalAckPayload {
+    pub sender_replica_id: String,
+    pub signal_type: String, // "offer" | "answer" | "candidate"
+    pub data: String,
 }

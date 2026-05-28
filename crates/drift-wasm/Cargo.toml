@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 drift-core = { path = "../drift-core", default-features = false, features = ["async-runtime"] }
+drift-transport-webrtc = { path = "../drift-transport-webrtc" }
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = [
     "WebSocket", "BroadcastChannel", "Window", "Navigator",
@@ -21,7 +22,8 @@ web-sys = { version = "0.3", features = [
     "IdbDatabase", "IdbTransaction", "IdbObjectStore",
     "IdbFactory", "IdbRequest", "IdbOpenDbRequest",
     "IdbTransactionMode", "IdbVersionChangeEvent",
-    "Event", "EventTarget", "BinaryType", "MessageEvent"
+    "Event", "EventTarget", "BinaryType", "MessageEvent",
+    "Request", "RequestInit", "Response"
 ] }
 js-sys = "0.3"
 console_error_panic_hook = "0.1"

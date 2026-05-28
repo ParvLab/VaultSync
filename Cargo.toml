@@ -12,6 +12,7 @@ members = [
     "crates/drift-cli",
     "crates/drift-fuzz",
     "crates/drift-napi",
+    "crates/drift-transport-webrtc",
 ]
 
 [workspace.package]

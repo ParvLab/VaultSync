@@ -252,6 +252,36 @@ impl Coordinator for SQLiteCoordinator {
             }
         }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
     }
+
+    async fn list_replicas(&self, namespace: &str) -> Result<Vec<ReplicaInfo>, CoordinatorError> {
+        let conn = self.conn.clone();
+        let namespace_str = namespace.to_string();
+        
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            let mut stmt = conn_guard.prepare(
+                "SELECT replica_id, namespace, public_key, schema_version
+                 FROM replicas
+                 WHERE namespace = ?1"
+            ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+            let rows = stmt.query_map(params![namespace_str], |row| {
+                let schema_version: i64 = row.get(3)?;
+                Ok(ReplicaInfo {
+                    replica_id: row.get(0)?,
+                    namespace: row.get(1)?,
+                    public_key: row.get(2)?,
+                    schema_version: schema_version as u64,
+                })
+            }).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+            let mut replicas = Vec::new();
+            for r in rows {
+                replicas.push(r.map_err(|e| CoordinatorError::Internal(e.to_string()))?);
+            }
+            Ok(replicas)
+        }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
+    }
 }
 
 struct SqliteSubscription {

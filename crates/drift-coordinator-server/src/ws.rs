@@ -224,6 +224,10 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         return;
     }
 
+    // Register session
+    let replica_id = reg_payload.replica_id.clone();
+    state.sessions.sessions.write().await.insert((ns.clone(), replica_id.clone()), tx.clone());
+
     // Keep track of active subscription cancellation token
     let mut active_sub_tx: Option<tokio::sync::oneshot::Sender<()>> = None;
 
@@ -392,6 +396,23 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                             }
                         }
                     }
+                    MSG_P2P_SIGNAL => {
+                        if let Ok(sig) = serde_json::from_slice::<P2PSignalPayload>(payload) {
+                            let sessions_guard = state.sessions.sessions.read().await;
+                            if let Some(target_tx) = sessions_guard.get(&(ns.clone(), sig.target_replica_id.clone())) {
+                                let ack = P2PSignalAckPayload {
+                                    sender_replica_id: replica_id.clone(),
+                                    signal_type: sig.signal_type,
+                                    data: sig.data,
+                                };
+                                if let Ok(ack_frame) = encode_frame(MSG_P2P_SIGNAL_ACK, &ack) {
+                                    let _ = target_tx.send(Message::Binary(ack_frame)).await;
+                                }
+                            } else {
+                                warn!("WebRTC signaling target replica not found: {}", sig.target_replica_id);
+                            }
+                        }
+                    }
                     _ => {
                         warn!("Received unexpected message type over WS: 0x{:02X}", msg_type);
                     }
@@ -411,5 +432,6 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
     if let Some(cancel) = active_sub_tx.take() {
         let _ = cancel.send(());
     }
+    state.sessions.sessions.write().await.remove(&(ns.clone(), replica_id.clone()));
     writer_task.abort();
 }
