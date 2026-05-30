@@ -26,6 +26,17 @@ pub fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE TABLE IF NOT EXISTS schema_versions (
             namespace TEXT PRIMARY KEY,
             version INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS snapshots (
+            namespace TEXT NOT NULL,
+            doc_id TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            bytes BLOB NOT NULL,
+            checksum INTEGER NOT NULL,
+            PRIMARY KEY (namespace, doc_id, record_id)
         );"
     )?;
     Ok(())

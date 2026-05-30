@@ -282,6 +282,133 @@ impl Coordinator for SQLiteCoordinator {
             Ok(replicas)
         }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
     }
+
+    async fn get_snapshot(&self, namespace: &str, doc_id: &str, record_id: &str)
+        -> Result<Option<drift_core::crdt::snapshot::Snapshot>, CoordinatorError> {
+        let conn = self.conn.clone();
+        let ns = namespace.to_string();
+        let doc = doc_id.to_string();
+        let rec = record_id.to_string();
+        
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            let mut stmt = conn_guard.prepare(
+                "SELECT bytes FROM snapshots WHERE namespace = ?1 AND doc_id = ?2 AND record_id = ?3"
+            ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+            let mut rows = stmt.query(params![ns, doc, rec]).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            if let Some(row) = rows.next().map_err(|e| CoordinatorError::Internal(e.to_string()))? {
+                let bytes: Vec<u8> = row.get(0).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                let snap = drift_core::crdt::snapshot::Snapshot::decode(&bytes)
+                    .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                Ok(Some(snap))
+            } else {
+                Ok(None)
+            }
+        }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
+    }
+
+    async fn store_snapshot(&self, namespace: &str, snapshot: &drift_core::crdt::snapshot::Snapshot)
+        -> Result<(), CoordinatorError> {
+        let conn = self.conn.clone();
+        let ns = namespace.to_string();
+        let doc = snapshot.doc_id.clone();
+        let rec = snapshot.record_id.clone();
+        let seq = snapshot.sequence;
+        let created_at = snapshot.created_at;
+        let checksum = snapshot.checksum;
+        let bytes = snapshot.encode().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            conn_guard.execute(
+                "INSERT OR REPLACE INTO snapshots (namespace, doc_id, record_id, sequence, created_at, bytes, checksum)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![ns, doc, rec, seq as i64, created_at as i64, bytes, checksum as i64]
+            ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            Ok(())
+        }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
+    }
+
+    async fn compact_oplog(&self, namespace: &str) -> Result<drift_core::sync::compaction::CompactionStats, CoordinatorError> {
+        let conn = self.conn.clone();
+        let ns = namespace.to_string();
+        
+        tokio::task::spawn_blocking(move || {
+            let mut conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            let tx = conn_guard.transaction().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+            // 1. Get all snapshots for the namespace
+            let mut snaps = Vec::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT doc_id, record_id, sequence FROM snapshots WHERE namespace = ?1"
+                ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                
+                let rows = stmt.query_map(params![ns], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+                }).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                
+                for r in rows {
+                    snaps.push(r.map_err(|e| CoordinatorError::Internal(e.to_string()))?);
+                }
+            }
+            
+            let mut oplog_removed = 0;
+            let mut snapshots_collapsed = 0;
+            
+            // 2. Delete mutations with sequence <= snap.sequence
+            {
+                let mut del_stmt = tx.prepare(
+                    "DELETE FROM mutations 
+                     WHERE namespace = ?1 AND doc_id = ?2 AND record_id = ?3 AND sequence <= ?4"
+                ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                
+                for (doc_id, record_id, sequence) in snaps {
+                    let deleted = del_stmt.execute(params![ns, doc_id, record_id, sequence])
+                        .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                    if deleted > 0 {
+                        oplog_removed += deleted;
+                        snapshots_collapsed += 1;
+                    }
+                }
+            }
+            
+            tx.commit().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+            Ok(drift_core::sync::compaction::CompactionStats {
+                oplog_removed,
+                docs_removed: 0,
+                snapshots_collapsed,
+            })
+        }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
+    }
+
+    async fn list_snapshots(&self, namespace: &str)
+        -> Result<Vec<drift_core::crdt::snapshot::Snapshot>, CoordinatorError> {
+        let conn = self.conn.clone();
+        let ns = namespace.to_string();
+        
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            let mut stmt = conn_guard.prepare(
+                "SELECT bytes FROM snapshots WHERE namespace = ?1"
+            ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+            let rows = stmt.query_map(params![ns], |row| {
+                let bytes: Vec<u8> = row.get(0)?;
+                let snap = drift_core::crdt::snapshot::Snapshot::decode(&bytes)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                Ok(snap)
+            }).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+            let mut snaps = Vec::new();
+            for r in rows {
+                snaps.push(r.map_err(|e| CoordinatorError::Internal(e.to_string()))?);
+            }
+            Ok(snaps)
+        }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
+    }
 }
 
 struct SqliteSubscription {
@@ -357,5 +484,69 @@ mod tests {
         let next_m = next_m.unwrap();
         assert_eq!(next_m.id, "m-1");
         assert_eq!(next_m.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_coordinator_snapshots() {
+        let coord = SQLiteCoordinator::new(":memory:");
+        let ns = "test-namespace";
+        
+        let doc = drift_core::crdt::document::CRDTDocument::new("doc-1", "rec-1", 1);
+        let snap = drift_core::crdt::snapshot::Snapshot::from_document(&doc, 42);
+        
+        // Initially get should be None
+        let retrieved = coord.get_snapshot(ns, "doc-1", "rec-1").await.unwrap();
+        assert!(retrieved.is_none());
+        
+        // Store
+        coord.store_snapshot(ns, &snap).await.unwrap();
+        
+        // Get
+        let retrieved = coord.get_snapshot(ns, "doc-1", "rec-1").await.unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.doc_id, "doc-1");
+        assert_eq!(retrieved.record_id, "rec-1");
+        assert_eq!(retrieved.sequence, 42);
+        assert_eq!(retrieved.checksum, snap.checksum);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_coordinator_compaction() {
+        let coord = SQLiteCoordinator::new(":memory:");
+        let ns = "test-namespace";
+        
+        // Push a mutation
+        let mutations = vec![
+            EncryptedMutation {
+                id: "m-1".to_string(),
+                namespace: ns.to_string(),
+                replica_id: "replica-1".to_string(),
+                doc_id: "doc-1".to_string(),
+                record_id: "rec-1".to_string(),
+                encrypted_blob: vec![4, 5, 6],
+                timestamp: 1000,
+                schema_version: 1,
+            }
+        ];
+        coord.push(ns, mutations).await.unwrap(); // sequence 1
+        
+        // At this point pull should return the mutation
+        let pulled = coord.pull(ns, 0, 10).await.unwrap();
+        assert_eq!(pulled.len(), 1);
+        
+        // Store snapshot at sequence 1
+        let doc = drift_core::crdt::document::CRDTDocument::new("doc-1", "rec-1", 1);
+        let snap = drift_core::crdt::snapshot::Snapshot::from_document(&doc, 1);
+        coord.store_snapshot(ns, &snap).await.unwrap();
+        
+        // Run compaction
+        let stats = coord.compact_oplog(ns).await.unwrap();
+        assert_eq!(stats.oplog_removed, 1);
+        assert_eq!(stats.snapshots_collapsed, 1);
+        
+        // Mutation should now be deleted from coordinator mutations table
+        let pulled = coord.pull(ns, 0, 10).await.unwrap();
+        assert_eq!(pulled.len(), 0);
     }
 }

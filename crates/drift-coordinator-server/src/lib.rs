@@ -18,6 +18,8 @@ pub fn build_router(state: AppState) -> axum::Router {
         .route("/namespace/:ns/events", axum::routing::get(routes::events_stream))
         .route("/namespace/:ns/ws", axum::routing::get(ws::ws_handler))
         .route("/admin/namespace/:ns", axum::routing::post(routes::admin_register_namespace))
+        .route("/admin/namespace/:ns/compact", axum::routing::post(routes::admin_compact))
+        .route("/admin/namespace/:ns/snapshot/:doc_id/:record_id", axum::routing::get(routes::admin_get_snapshot))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }

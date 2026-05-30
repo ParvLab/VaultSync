@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::sse::{Event, Sse},
+    response::{sse::{Event, Sse}, IntoResponse},
     Json,
 };
 use drift_core::coordinator::traits::{EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId};
@@ -238,6 +238,60 @@ pub async fn admin_register_namespace(
         namespace: ns,
         token,
     }))
+}
+
+pub async fn admin_compact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(ns): Path<String>,
+) -> Result<Json<drift_core::sync::compaction::CompactionStats>, StatusCode> {
+    // Verify admin token
+    let admin_token = state.config.admin_token.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let auth_header = headers.get(axum::http::header::AUTHORIZATION)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let auth_str = auth_header.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    
+    if auth_str != format!("Bearer {}", admin_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let stats = state.coordinator.compact_oplog(&ns).await
+        .map_err(|e| {
+            tracing::error!("Failed to compact oplog: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(stats))
+}
+
+pub async fn admin_get_snapshot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((ns, doc_id, record_id)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, StatusCode> {
+    // Verify admin token
+    let admin_token = state.config.admin_token.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let auth_header = headers.get(axum::http::header::AUTHORIZATION)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let auth_str = auth_header.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    
+    if auth_str != format!("Bearer {}", admin_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let snapshot = state.coordinator.get_snapshot(&ns, &doc_id, &record_id).await
+        .map_err(|e| {
+            tracing::error!("Failed to get snapshot: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let bytes = snapshot.encode().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/octet-stream"));
+
+    Ok((headers, bytes))
 }
 
 // ----------------------------------------------------

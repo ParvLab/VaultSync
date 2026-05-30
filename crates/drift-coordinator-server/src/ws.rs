@@ -211,17 +211,45 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         error: None,
     };
 
+    let mut available_snapshots = Vec::new();
+
     if let Err(e) = reg_result {
         error!("Failed to register replica: {:?}", e);
         reg_ack.status = "error".to_string();
         reg_ack.error = Some(format!("{:?}", e));
-    } else if let Ok(seq) = state.coordinator.schema_version(&ns).await {
-        reg_ack.coordinator_sequence = seq;
+    } else {
+        if let Ok(seq) = state.coordinator.schema_version(&ns).await {
+            reg_ack.coordinator_sequence = seq;
+        }
+        if let Ok(snaps) = state.coordinator.list_snapshots(&ns).await {
+            available_snapshots = snaps.into_iter()
+                .filter(|s| s.sequence > reg_payload.last_sequence)
+                .collect::<Vec<_>>();
+            if !available_snapshots.is_empty() {
+                reg_ack.snapshot_available = true;
+                reg_ack.snapshot_sequence = available_snapshots.iter().map(|s| s.sequence).max().unwrap_or(0);
+            }
+        }
     }
 
     let ack_frame = encode_frame(MSG_REGISTER_ACK, &reg_ack).expect("Failed to encode MSG_REGISTER_ACK");
     if tx.send(Message::Binary(ack_frame)).await.is_err() {
         return;
+    }
+
+    for snap in available_snapshots {
+        let snap_payload = SnapshotPayload {
+            doc_id: snap.doc_id,
+            record_id: snap.record_id,
+            sequence: snap.sequence,
+            bytes: snap.bytes,
+            checksum: snap.checksum,
+        };
+        if let Ok(snap_frame) = encode_frame(MSG_SNAPSHOT, &snap_payload) {
+            if tx.send(Message::Binary(snap_frame)).await.is_err() {
+                return;
+            }
+        }
     }
 
     // Register session
@@ -394,6 +422,11 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                             if let Ok(frame) = encode_frame(MSG_HEARTBEAT_ACK, &ack) {
                                 let _ = tx.send(Message::Binary(frame)).await;
                             }
+                        }
+                    }
+                    MSG_SNAPSHOT => {
+                        if let Ok(snap) = serde_json::from_slice::<drift_core::crdt::snapshot::Snapshot>(payload) {
+                            let _ = state.coordinator.store_snapshot(&ns, &snap).await;
                         }
                     }
                     MSG_P2P_SIGNAL => {

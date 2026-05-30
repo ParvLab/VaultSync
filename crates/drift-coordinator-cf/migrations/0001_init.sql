@@ -1,12 +1,12 @@
 CREATE TABLE IF NOT EXISTS mutations (
-  id TEXT PRIMARY KEY,
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT UNIQUE NOT NULL,
   namespace TEXT NOT NULL,
   replica_id TEXT NOT NULL,
   doc_id TEXT NOT NULL,
   record_id TEXT NOT NULL,
   encrypted_blob BLOB NOT NULL,
-  timestamp INTEGER NOT NULL,
-  sequence INTEGER PRIMARY KEY AUTOINCREMENT
+  timestamp INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS replicas (
@@ -20,4 +20,15 @@ CREATE TABLE IF NOT EXISTS replicas (
 CREATE TABLE IF NOT EXISTS schema_versions (
   namespace TEXT PRIMARY KEY,
   version INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+  namespace TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  bytes BLOB NOT NULL,
+  checksum INTEGER NOT NULL,
+  PRIMARY KEY (namespace, doc_id, record_id)
 );

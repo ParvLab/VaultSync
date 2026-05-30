@@ -55,4 +55,19 @@ pub trait Coordinator: Send + Sync + std::fmt::Debug {
     async fn list_replicas(&self, _namespace: &str) -> Result<Vec<ReplicaInfo>, CoordinatorError> {
         Ok(vec![])
     }
+    async fn get_snapshot(&self, _namespace: &str, _doc_id: &str, _record_id: &str)
+        -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+        Ok(None)
+    }
+    async fn store_snapshot(&self, _namespace: &str, _snapshot: &crate::crdt::snapshot::Snapshot)
+        -> Result<(), CoordinatorError> {
+        Ok(())
+    }
+    async fn compact_oplog(&self, _namespace: &str) -> Result<crate::sync::compaction::CompactionStats, CoordinatorError> {
+        Ok(crate::sync::compaction::CompactionStats::default())
+    }
+    async fn list_snapshots(&self, _namespace: &str)
+        -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+        Ok(vec![])
+    }
 }

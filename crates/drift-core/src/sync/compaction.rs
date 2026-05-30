@@ -19,7 +19,7 @@ impl Default for CompactionConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CompactionStats {
     pub oplog_removed: usize,
     pub docs_removed: usize,
@@ -37,7 +37,7 @@ impl CompactionEngine {
     }
 
     pub async fn run_compaction(&self, namespace: &str) -> Result<CompactionStats, DriftError> {
-        let oplog_removed = self.storage.delete_synced_oplog_older_than(namespace, self.config.max_synced_age_secs).await?;
+        let age_oplog_removed = self.storage.delete_synced_oplog_older_than(namespace, self.config.max_synced_age_secs).await?;
 
         let candidates = self.storage.list_tombstoned_documents(namespace, self.config.tombstone_grace_secs).await?;
         let mut docs_removed = 0;
@@ -52,10 +52,12 @@ impl CompactionEngine {
             }
         }
 
+        let snapshot_stats = self.run_snapshot_compaction(namespace).await?;
+
         Ok(CompactionStats {
-            oplog_removed,
+            oplog_removed: age_oplog_removed + snapshot_stats.oplog_removed,
             docs_removed,
-            snapshots_collapsed: 0,
+            snapshots_collapsed: snapshot_stats.snapshots_collapsed,
         })
     }
 

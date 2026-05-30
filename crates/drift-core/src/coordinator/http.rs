@@ -20,6 +20,8 @@ pub struct HttpCoordinatorConfig {
 struct WsClientHandle {
     tx: tokio::sync::mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
     pending_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
+    /// Snapshots received during the REGISTER handshake, keyed by (doc_id, record_id)
+    received_snapshots: Arc<tokio::sync::Mutex<Vec<crate::crdt::snapshot::Snapshot>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,11 +115,53 @@ impl HttpCoordinator {
             _ => return Err(CoordinatorError::Internal("Expected binary frame during REGISTER".to_string())),
         };
 
-        let (msg_type, _) = decode_frame(&bin)
+        let (msg_type, _payload) = decode_frame(&bin)
             .map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type != MSG_REGISTER_ACK {
             return Err(CoordinatorError::Internal(format!("Expected MSG_REGISTER_ACK, got {:02X}", msg_type)));
+        }
+
+        // 2.5 Drain any MSG_SNAPSHOT frames the server pushes immediately after REGISTER_ACK.
+        // The server sends N snapshot frames (one per document behind), then waits for the
+        // client to send SCHEMA_SYNC.  We collect them here so callers can apply them.
+        let mut bootstrap_snapshots: Vec<crate::crdt::snapshot::Snapshot> = Vec::new();
+        loop {
+            // Peek the next frame with a short timeout; if nothing arrives quickly
+            // the server has finished sending snapshots.
+            let next = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                ws_stream.next(),
+            ).await;
+            match next {
+                Ok(Some(Ok(Message::Binary(peeked)))) => {
+                    if let Ok((peeked_type, peeked_payload)) = decode_frame(&peeked) {
+                        if peeked_type == MSG_SNAPSHOT {
+                            if let Ok(snap_payload) = serde_json::from_slice::<SnapshotPayload>(peeked_payload) {
+                                let snap = crate::crdt::snapshot::Snapshot {
+                                    doc_id: snap_payload.doc_id,
+                                    record_id: snap_payload.record_id,
+                                    schema_version: 0,
+                                    sequence: snap_payload.sequence,
+                                    created_at: 0,
+                                    bytes: snap_payload.bytes,
+                                    checksum: snap_payload.checksum,
+                                };
+                                if snap.verify_checksum() {
+                                    bootstrap_snapshots.push(snap);
+                                }
+                            }
+                            continue; // read more snapshot frames
+                        }
+                        // Non-snapshot frame — put it back... we can't unread, so just warn and drop.
+                        // In practice this should not happen because the server only sends snapshots
+                        // between REGISTER_ACK and waiting for SCHEMA_SYNC.
+                        warn!("Unexpected frame type 0x{:02X} while draining post-REGISTER snapshots — ignoring", peeked_type);
+                    }
+                    break;
+                }
+                _ => break, // timeout or close — done draining
+            }
         }
 
         // 2.5. SCHEMA_SYNC handshake
@@ -200,12 +244,17 @@ impl HttpCoordinator {
 
         // Reader task
         let ws_client_to_clear = self.ws_client.clone();
+        // Build the shared snapshot cache from bootstrapped snapshots before locking ws_client
+        let received_snapshots_arc = Arc::new(tokio::sync::Mutex::new(bootstrap_snapshots));
         let mut client_lock = self.ws_client.lock().await;
         *client_lock = Some(WsClientHandle {
             tx: write_tx,
             pending_requests: pending_requests_clone,
+            received_snapshots: received_snapshots_arc.clone(),
         });
+        drop(client_lock);
 
+        let _namespace_str = namespace.to_string();
         crate::time_utils::spawn(async move {
             while let Some(msg_res) = ws_stream.next().await {
                 let msg = match msg_res {
@@ -219,6 +268,33 @@ impl HttpCoordinator {
                             if let Ok(mutat) = serde_json::from_slice::<PendingMutation>(payload) {
                                 if mut_tx.send(mutat).await.is_err() {
                                     break;
+                                }
+                            }
+                        } else if msg_type == MSG_SNAPSHOT {
+                            // Server occasionally pushes a fresh snapshot (e.g. after compaction).
+                            // Store it in the cache; the sync engine will apply it via get_snapshot.
+                            if let Ok(snap_payload) = serde_json::from_slice::<SnapshotPayload>(payload) {
+                                if snap_payload.checksum != 0 {
+                                    let snap = crate::crdt::snapshot::Snapshot {
+                                        doc_id: snap_payload.doc_id,
+                                        record_id: snap_payload.record_id,
+                                        schema_version: 0,
+                                        sequence: snap_payload.sequence,
+                                        created_at: 0,
+                                        bytes: snap_payload.bytes,
+                                        checksum: snap_payload.checksum,
+                                    };
+                                    if snap.verify_checksum() {
+                                        let mut snaps = received_snapshots_arc.lock().await;
+                                        // Update or insert keyed by (doc_id, record_id)
+                                        if let Some(existing) = snaps.iter_mut().find(|s| s.doc_id == snap.doc_id && s.record_id == snap.record_id) {
+                                            if snap.sequence > existing.sequence {
+                                                *existing = snap;
+                                            }
+                                        } else {
+                                            snaps.push(snap);
+                                        }
+                                    }
                                 }
                             }
                         } else {
@@ -532,6 +608,57 @@ impl Coordinator for HttpCoordinator {
         let version = resp.json::<u64>().await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(version)
+    }
+
+    async fn store_snapshot(&self, _namespace: &str, snapshot: &crate::crdt::snapshot::Snapshot) -> Result<(), CoordinatorError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let handle_opt = self.ws_client.lock().await.clone();
+            if let Some(handle) = handle_opt {
+                let frame = encode_frame(MSG_SNAPSHOT, snapshot)
+                    .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_snapshot(
+        &self,
+        _namespace: &str,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let handle_opt = self.ws_client.lock().await.clone();
+            if let Some(handle) = handle_opt {
+                let snaps = handle.received_snapshots.lock().await;
+                let found = snaps
+                    .iter()
+                    .find(|s| s.doc_id == doc_id && s.record_id == record_id)
+                    .cloned();
+                return Ok(found);
+            }
+        }
+        Ok(None)
+    }
+
+    async fn list_snapshots(
+        &self,
+        _namespace: &str,
+    ) -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let handle_opt = self.ws_client.lock().await.clone();
+            if let Some(handle) = handle_opt {
+                let snaps = handle.received_snapshots.lock().await;
+                return Ok(snaps.clone());
+            }
+        }
+        Ok(vec![])
     }
 }
 
