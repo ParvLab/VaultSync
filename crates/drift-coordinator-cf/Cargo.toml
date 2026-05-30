@@ -1,0 +1,18 @@
+[package]
+name = "drift-coordinator-cf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+worker = { version = "0.8.3", features = ["d1"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+drift-core = { path = "../drift-core", default-features = false }
+wasm-bindgen = "0.2"
+uuid = { version = "1", features = ["v4", "wasm-bindgen"] }
+async-trait = "0.1"
+futures = "0.3"

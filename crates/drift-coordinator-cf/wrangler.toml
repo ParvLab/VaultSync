@@ -1,0 +1,20 @@
+name = "drift-coordinator-cf"
+main = "build/worker/shim.mjs"
+compatibility_date = "2023-10-30"
+
+[build]
+command = "cd crates/drift-coordinator-cf && worker-build --no-opt"
+
+
+[[d1_databases]]
+binding = "DB"
+database_name = "drift-d1"
+database_id = "drift-d1-local"
+
+[[durable_objects.bindings]]
+name = "NAMESPACE_DO"
+class_name = "NamespaceDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["NamespaceDurableObject"]
