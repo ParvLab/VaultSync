@@ -7,6 +7,8 @@ struct WebSocketAttachment {
     replica_id: String,
     namespace: String,
     authenticated: bool,
+    #[serde(default)]
+    namespaces: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -27,13 +29,14 @@ struct D1SchemaVersionRow {
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
-    // Standard middleware/routing to extract namespace from /namespace/:ns/...
     let url = req.url()?;
     let path = url.path();
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     
     let ns = if segments.len() >= 2 && segments[0] == "namespace" {
         segments[1]
+    } else if segments.len() == 1 && segments[0] == "ws" {
+        "__mux__"
     } else {
         "default"
     };
@@ -61,6 +64,15 @@ impl DurableObject for NamespaceDurableObject {
         let path = url.path();
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         
+        if segments.len() == 1 && segments[0] == "ws" {
+            let pairs = WebSocketPair::new()?;
+            let client = pairs.client;
+            let server = pairs.server;
+
+            self.state.accept_web_socket(&server);
+            return Response::from_websocket(client);
+        }
+
         if segments.len() < 3 {
             return Response::error("Not Found", 404);
         }
@@ -194,8 +206,6 @@ impl DurableObject for NamespaceDurableObject {
                 Response::from_json(&version.to_string())
             }
             "snapshot" => {
-                // GET /namespace/:ns/snapshot/:doc_id/:record_id
-                // Returns the latest snapshot bytes for a document
                 if req.method() != Method::Get {
                     return Response::error("Method Not Allowed", 405);
                 }
@@ -225,8 +235,6 @@ impl DurableObject for NamespaceDurableObject {
                 }
             }
             "compact" => {
-                // POST /namespace/:ns/compact
-                // Deletes mutations that have been superseded by a snapshot
                 if req.method() != Method::Post {
                     return Response::error("Method Not Allowed", 405);
                 }
@@ -258,8 +266,6 @@ impl DurableObject for NamespaceDurableObject {
                         snap.sequence.into(),
                     ])?.run().await?;
 
-                    // worker 0.8.3 D1Result does not expose rows_affected; count each
-                    // snapshot entry as 1 compaction unit for operational tracking.
                     oplog_removed += 1;
                     snapshots_collapsed += 1;
                 }
@@ -277,7 +283,6 @@ impl DurableObject for NamespaceDurableObject {
                 })
             }
             "replicas" => {
-                // GET /namespace/:ns/replicas
                 #[derive(Deserialize)]
                 struct D1ReplicaRow {
                     replica_id: String,
@@ -334,10 +339,13 @@ impl DurableObject for NamespaceDurableObject {
                     Err(_) => return Ok(()),
                 };
                 
+                let mut namespaces = HashMap::new();
+                namespaces.insert(auth_payload.namespace.clone(), auth_payload.replica_id.clone());
                 let attachment = WebSocketAttachment {
                     replica_id: auth_payload.replica_id.clone(),
                     namespace: auth_payload.namespace.clone(),
                     authenticated: true,
+                    namespaces,
                 };
                 ws.serialize_attachment(&attachment)?;
 
@@ -351,6 +359,117 @@ impl DurableObject for NamespaceDurableObject {
                     &ack
                 ).map_err(|e| worker::Error::from(e.to_string()))?;
                 ws.send_with_bytes(&ack_frame)?;
+            }
+            drift_core::coordinator::ws_proto::MSG_NAMESPACE_ADD => {
+                let add_payload: drift_core::coordinator::ws_proto::NamespaceAddPayload = match serde_json::from_slice(payload) {
+                    Ok(p) => p,
+                    Err(_) => return Ok(()),
+                };
+
+                let mut attachment = match ws.deserialize_attachment::<WebSocketAttachment>()? {
+                    Some(a) => a,
+                    None => WebSocketAttachment {
+                        replica_id: add_payload.replica_id.clone(),
+                        namespace: add_payload.namespace.clone(),
+                        authenticated: true,
+                        namespaces: HashMap::new(),
+                    },
+                };
+                attachment.namespaces.insert(add_payload.namespace.clone(), add_payload.replica_id.clone());
+                ws.serialize_attachment(&attachment)?;
+
+                let stmt = db.prepare(
+                    "INSERT OR REPLACE INTO replicas (replica_id, namespace, public_key, schema_version, last_seen)
+                     VALUES (?1, ?2, ?3, ?4, ?5)"
+                );
+                let pub_key_js = js_sys::Uint8Array::from(add_payload.public_key.as_slice());
+                let now = Date::now().as_millis() as i64;
+                stmt.bind(&[
+                    add_payload.replica_id.clone().into(),
+                    add_payload.namespace.clone().into(),
+                    pub_key_js.into(),
+                    (add_payload.schema_version as i64).into(),
+                    now.into(),
+                ])?.run().await?;
+
+                let schema_stmt = db.prepare(
+                    "INSERT INTO schema_versions (namespace, version)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(namespace) DO UPDATE SET version = MAX(version, excluded.version)"
+                );
+                schema_stmt.bind(&[add_payload.namespace.clone().into(), (add_payload.schema_version as i64).into()])?.run().await?;
+
+                let mut ack = drift_core::coordinator::ws_proto::NamespaceAckPayload {
+                    namespace: add_payload.namespace.clone(),
+                    status: "ok".to_string(),
+                    coordinator_sequence: 0,
+                    snapshot_available: false,
+                    snapshot_sequence: 0,
+                    error: None,
+                };
+                if let Ok(Some(row)) = db.prepare("SELECT version FROM schema_versions WHERE namespace = ?1")
+                    .bind(&[add_payload.namespace.clone().into()])?.first::<D1SchemaVersionRow>(None).await
+                {
+                    ack.coordinator_sequence = row.version as u64;
+                }
+
+                let mut available_snapshots = Vec::new();
+                let snap_stmt = db.prepare("SELECT bytes FROM snapshots WHERE namespace = ?1");
+                
+                #[derive(Deserialize)]
+                struct D1SnapshotRow {
+                    bytes: Vec<u8>,
+                }
+                
+                if let Ok(rows) = snap_stmt.bind(&[add_payload.namespace.clone().into()])?.all().await {
+                    if let Ok(row_results) = rows.results::<D1SnapshotRow>() {
+                        for row in row_results {
+                            if let Ok(snap) = drift_core::crdt::snapshot::Snapshot::decode(&row.bytes) {
+                                if snap.sequence > add_payload.last_sequence {
+                                    available_snapshots.push(snap);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if !available_snapshots.is_empty() {
+                    ack.snapshot_available = true;
+                    ack.snapshot_sequence = available_snapshots.iter().map(|s| s.sequence).max().unwrap_or(0);
+                }
+
+                let ack_frame = drift_core::coordinator::ws_proto::encode_frame(
+                    drift_core::coordinator::ws_proto::MSG_NAMESPACE_ACK,
+                    &ack
+                ).map_err(|e| worker::Error::from(e.to_string()))?;
+                ws.send_with_bytes(&ack_frame)?;
+
+                for snap in available_snapshots {
+                    let snap_payload = drift_core::coordinator::ws_proto::SnapshotPayload {
+                        doc_id: snap.doc_id,
+                        record_id: snap.record_id,
+                        sequence: snap.sequence,
+                        bytes: snap.bytes,
+                        checksum: snap.checksum,
+                        namespace: add_payload.namespace.clone(),
+                    };
+                    if let Ok(snap_frame) = drift_core::coordinator::ws_proto::encode_frame(
+                        drift_core::coordinator::ws_proto::MSG_SNAPSHOT,
+                        &snap_payload
+                    ) {
+                        let _ = ws.send_with_bytes(&snap_frame);
+                    }
+                }
+            }
+            drift_core::coordinator::ws_proto::MSG_NAMESPACE_DROP => {
+                let drop_payload: drift_core::coordinator::ws_proto::NamespaceDropPayload = match serde_json::from_slice(payload) {
+                    Ok(p) => p,
+                    Err(_) => return Ok(()),
+                };
+                if let Some(mut attachment) = ws.deserialize_attachment::<WebSocketAttachment>()? {
+                    attachment.namespaces.remove(&drop_payload.namespace);
+                    ws.serialize_attachment(&attachment)?;
+                }
             }
             drift_core::coordinator::ws_proto::MSG_REGISTER => {
                 let attachment: WebSocketAttachment = match ws.deserialize_attachment::<WebSocketAttachment>()? {
@@ -435,6 +554,7 @@ impl DurableObject for NamespaceDurableObject {
                         sequence: snap.sequence,
                         bytes: snap.bytes,
                         checksum: snap.checksum,
+                        namespace: attachment.namespace.clone(),
                     };
                     if let Ok(snap_frame) = drift_core::coordinator::ws_proto::encode_frame(
                         drift_core::coordinator::ws_proto::MSG_SNAPSHOT,
@@ -454,6 +574,11 @@ impl DurableObject for NamespaceDurableObject {
                     Err(_) => return Ok(()),
                 };
 
+                let ns = match push.mutations.first() {
+                    Some(m) => m.namespace.clone(),
+                    None => attachment.namespace.clone(),
+                };
+
                 let mut sequences = Vec::new();
                 let mut pending_to_broadcast = Vec::new();
 
@@ -462,7 +587,7 @@ impl DurableObject for NamespaceDurableObject {
                     let blob_js = js_sys::Uint8Array::from(m.encrypted_blob.as_slice());
                     stmt.bind(&[
                         m.id.clone().into(),
-                        attachment.namespace.clone().into(),
+                        ns.clone().into(),
                         m.replica_id.clone().into(),
                         m.doc_id.clone().into(),
                         m.record_id.clone().into(),
@@ -478,7 +603,7 @@ impl DurableObject for NamespaceDurableObject {
 
                     pending_to_broadcast.push(drift_core::coordinator::traits::PendingMutation {
                         id: m.id,
-                        namespace: attachment.namespace.clone(),
+                        namespace: ns.clone(),
                         sequence: seq,
                         doc_id: m.doc_id,
                         record_id: m.record_id,
@@ -502,7 +627,7 @@ impl DurableObject for NamespaceDurableObject {
                 for socket in all_ws {
                     if socket != ws {
                         if let Ok(Some(sock_attachment)) = socket.deserialize_attachment::<WebSocketAttachment>() {
-                            if sock_attachment.authenticated && sock_attachment.namespace == attachment.namespace {
+                            if sock_attachment.authenticated && (sock_attachment.namespace == ns || sock_attachment.namespaces.contains_key(&ns)) {
                                 for pm in &pending_to_broadcast {
                                     if let Ok(frame) = drift_core::coordinator::ws_proto::encode_frame(
                                         drift_core::coordinator::ws_proto::MSG_MUTATION_PUSH,
@@ -526,6 +651,8 @@ impl DurableObject for NamespaceDurableObject {
                     Err(_) => return Ok(()),
                 };
 
+                let ns = if !pull.namespace.is_empty() { pull.namespace.clone() } else { attachment.namespace.clone() };
+
                 let stmt = db.prepare(
                     "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence
                      FROM mutations
@@ -534,7 +661,7 @@ impl DurableObject for NamespaceDurableObject {
                      LIMIT ?3"
                 );
                 let rows: Vec<D1MutationRow> = stmt.bind(&[
-                    attachment.namespace.clone().into(),
+                    ns.into(),
                     (pull.after as i64).into(),
                     (pull.limit as i64).into()
                 ])?.all().await?.results()?;
@@ -572,6 +699,8 @@ impl DurableObject for NamespaceDurableObject {
                     Err(_) => return Ok(()),
                 };
 
+                let ns = if !sub.namespace.is_empty() { sub.namespace.clone() } else { attachment.namespace.clone() };
+
                 let stmt = db.prepare(
                     "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence
                      FROM mutations
@@ -579,7 +708,7 @@ impl DurableObject for NamespaceDurableObject {
                      ORDER BY sequence ASC"
                 );
                 let rows: Vec<D1MutationRow> = stmt.bind(&[
-                    attachment.namespace.clone().into(),
+                    ns.into(),
                     (sub.after as i64).into()
                 ])?.all().await?.results()?;
 
@@ -612,8 +741,18 @@ impl DurableObject for NamespaceDurableObject {
                 };
 
                 let now = Date::now().as_millis() as i64;
-                let stmt = db.prepare("UPDATE replicas SET last_seen = ?1 WHERE namespace = ?2 AND replica_id = ?3");
-                stmt.bind(&[now.into(), attachment.namespace.clone().into(), hb.replica_id.into()])?.run().await?;
+                
+                if !hb.namespace.is_empty() {
+                    let stmt = db.prepare("UPDATE replicas SET last_seen = ?1 WHERE namespace = ?2 AND replica_id = ?3");
+                    stmt.bind(&[now.into(), hb.namespace.clone().into(), hb.replica_id.into()])?.run().await?;
+                } else {
+                    let mut namespaces_to_hb = vec![attachment.namespace.clone()];
+                    namespaces_to_hb.extend(attachment.namespaces.keys().cloned());
+                    for ns in namespaces_to_hb {
+                        let stmt = db.prepare("UPDATE replicas SET last_seen = ?1 WHERE namespace = ?2 AND replica_id = ?3");
+                        stmt.bind(&[now.into(), ns.into(), hb.replica_id.clone().into()])?.run().await?;
+                    }
+                }
 
                 let ack = drift_core::coordinator::ws_proto::HeartbeatAckPayload {};
                 let ack_frame = drift_core::coordinator::ws_proto::encode_frame(
@@ -627,23 +766,38 @@ impl DurableObject for NamespaceDurableObject {
                     Some(a) if a.authenticated => a,
                     _ => return Ok(()),
                 };
-                if let Ok(snap) = serde_json::from_slice::<drift_core::crdt::snapshot::Snapshot>(payload) {
-                    let snap_bytes = snap.encode().map_err(|e| worker::Error::from(e.to_string()))?;
-                    let stmt = db.prepare(
-                        "INSERT OR REPLACE INTO snapshots (namespace, doc_id, record_id, sequence, created_at, bytes, checksum)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-                    );
-                    let snap_bytes_js = js_sys::Uint8Array::from(snap_bytes.as_slice());
-                    stmt.bind(&[
-                        attachment.namespace.clone().into(),
-                        snap.doc_id.into(),
-                        snap.record_id.into(),
-                        (snap.sequence as i64).into(),
-                        (snap.created_at as i64).into(),
-                        snap_bytes_js.into(),
-                        (snap.checksum as i64).into(),
-                    ])?.run().await?;
-                }
+                
+                let (ns, snap) = if let Ok(snap_payload) = serde_json::from_slice::<drift_core::coordinator::ws_proto::SnapshotPayload>(payload) {
+                    (snap_payload.namespace.clone(), drift_core::crdt::snapshot::Snapshot {
+                        doc_id: snap_payload.doc_id,
+                        record_id: snap_payload.record_id,
+                        schema_version: 0,
+                        sequence: snap_payload.sequence,
+                        created_at: 0,
+                        bytes: snap_payload.bytes,
+                        checksum: snap_payload.checksum,
+                    })
+                } else if let Ok(snap) = serde_json::from_slice::<drift_core::crdt::snapshot::Snapshot>(payload) {
+                    (attachment.namespace.clone(), snap)
+                } else {
+                    return Ok(());
+                };
+
+                let snap_bytes = snap.encode().map_err(|e| worker::Error::from(e.to_string()))?;
+                let stmt = db.prepare(
+                    "INSERT OR REPLACE INTO snapshots (namespace, doc_id, record_id, sequence, created_at, bytes, checksum)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                );
+                let snap_bytes_js = js_sys::Uint8Array::from(snap_bytes.as_slice());
+                stmt.bind(&[
+                    ns.into(),
+                    snap.doc_id.into(),
+                    snap.record_id.into(),
+                    (snap.sequence as i64).into(),
+                    (snap.created_at as i64).into(),
+                    snap_bytes_js.into(),
+                    (snap.checksum as i64).into(),
+                ])?.run().await?;
             }
             drift_core::coordinator::ws_proto::MSG_P2P_SIGNAL => {
                 let attachment: WebSocketAttachment = match ws.deserialize_attachment::<WebSocketAttachment>()? {
@@ -659,8 +813,8 @@ impl DurableObject for NamespaceDurableObject {
                 for socket in all_ws {
                     if let Ok(Some(sock_attachment)) = socket.deserialize_attachment::<WebSocketAttachment>() {
                         if sock_attachment.authenticated 
-                           && sock_attachment.namespace == attachment.namespace
-                           && sock_attachment.replica_id == sig.target_replica_id 
+                           && (sock_attachment.namespace == attachment.namespace || sock_attachment.namespaces.keys().any(|k| attachment.namespaces.contains_key(k)))
+                           && (sock_attachment.replica_id == sig.target_replica_id || sock_attachment.namespaces.values().any(|v| v == &sig.target_replica_id))
                         {
                             let ack = drift_core::coordinator::ws_proto::P2PSignalAckPayload {
                                 sender_replica_id: attachment.replica_id.clone(),

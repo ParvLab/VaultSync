@@ -244,6 +244,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
             sequence: snap.sequence,
             bytes: snap.bytes,
             checksum: snap.checksum,
+            namespace: ns.clone(),
         };
         if let Ok(snap_frame) = encode_frame(MSG_SNAPSHOT, &snap_payload) {
             if tx.send(Message::Binary(snap_frame)).await.is_err() {
@@ -359,6 +360,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                                 status,
                                 current_version: current_v,
                                 error: None,
+                                namespace: ns.clone(),
                             };
                             if let Ok(frame) = encode_frame(MSG_SCHEMA_MIGRATION, &resp) {
                                 let _ = tx.send(Message::Binary(frame)).await;

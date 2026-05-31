@@ -231,6 +231,7 @@ impl HttpCoordinator {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 let hb = HeartbeatPayload {
                     replica_id: replica_id_hb.clone(),
+                    namespace: "".to_string(),
                 };
                 if let Ok(frame) = encode_frame(MSG_HEARTBEAT, &hb) {
                     if write_tx_heartbeat.send(Message::Binary(frame)).await.is_err() {
@@ -566,6 +567,7 @@ impl Coordinator for HttpCoordinator {
             if let Some(handle) = handle_opt {
                 let hb = HeartbeatPayload {
                     replica_id: replica_id.to_string(),
+                    namespace: namespace.to_string(),
                 };
                 if let Ok(frame) = encode_frame(MSG_HEARTBEAT, &hb) {
                     if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {

@@ -6,6 +6,8 @@ pub mod schema;
 pub mod subscription;
 pub mod sync;
 pub mod coordinator;
+#[cfg(feature = "coordinator-http")]
+pub mod drift_server;
 pub mod ipc;
 pub mod telemetry;
 pub mod time_utils;

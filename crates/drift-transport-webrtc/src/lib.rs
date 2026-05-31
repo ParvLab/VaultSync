@@ -3,6 +3,9 @@ use drift_core::coordinator::traits::*;
 use futures::Stream;
 
 #[cfg(target_arch = "wasm32")]
+use futures::Future;
+
+#[cfg(target_arch = "wasm32")]
 use std::sync::Arc;
 
 #[cfg(target_arch = "wasm32")]

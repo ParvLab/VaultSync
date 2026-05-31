@@ -20,6 +20,9 @@ pub const MSG_SCHEMA_MIGRATION: u8  = 0x11;
 pub const MSG_SNAPSHOT: u8          = 0x12;
 pub const MSG_P2P_SIGNAL: u8        = 0x13;
 pub const MSG_P2P_SIGNAL_ACK: u8    = 0x14;
+pub const MSG_NAMESPACE_ADD: u8     = 0x22;
+pub const MSG_NAMESPACE_ACK: u8     = 0x23;
+pub const MSG_NAMESPACE_DROP: u8    = 0x24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthPayload {
@@ -93,6 +96,33 @@ pub struct SubscribePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatPayload {
     pub replica_id: String,
+    #[serde(default)]
+    pub namespace: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamespaceAddPayload {
+    pub namespace: String,
+    pub replica_id: String,
+    pub public_key: Vec<u8>,
+    pub schema_version: u64,
+    pub last_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamespaceAckPayload {
+    pub namespace: String,
+    pub status: String, // "ok" | "error"
+    pub coordinator_sequence: u64,
+    pub snapshot_available: bool,
+    pub snapshot_sequence: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamespaceDropPayload {
+    pub namespace: String,
+    pub replica_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +182,8 @@ pub struct SchemaMigrationPayload {
     pub status: String, // "ok" | "mismatch"
     pub current_version: u64,
     pub error: Option<String>,
+    #[serde(default)]
+    pub namespace: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,4 +207,6 @@ pub struct SnapshotPayload {
     pub sequence: u64,
     pub bytes: Vec<u8>,
     pub checksum: u32,
+    #[serde(default)]
+    pub namespace: String,
 }

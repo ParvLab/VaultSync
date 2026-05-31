@@ -140,11 +140,13 @@ impl HttpCoordinator {
         // Heartbeat task
         let write_tx_heartbeat = write_tx.clone();
         let replica_id_hb = auth.replica_id.clone();
+        let namespace_hb = namespace.to_string();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 let hb = HeartbeatPayload {
                     replica_id: replica_id_hb.clone(),
+                    namespace: namespace_hb.clone(),
                 };
                 if let Ok(frame) = encode_frame(MSG_HEARTBEAT, &hb) {
                     if write_tx_heartbeat.send(Message::Binary(frame)).await.is_err() {
@@ -433,6 +435,7 @@ impl Coordinator for HttpCoordinator {
         if let Some(handle) = handle_opt {
             let hb = HeartbeatPayload {
                 replica_id: replica_id.to_string(),
+                namespace: namespace.to_string(),
             };
             if let Ok(frame) = encode_frame(MSG_HEARTBEAT, &hb) {
                 if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {

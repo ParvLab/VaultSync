@@ -6,3 +6,5 @@ pub mod memory;
 pub mod mock;
 #[cfg(feature = "coordinator-http")]
 pub mod http;
+#[cfg(feature = "coordinator-http")]
+pub mod mux_coordinator;

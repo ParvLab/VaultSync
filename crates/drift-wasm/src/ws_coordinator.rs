@@ -215,6 +215,7 @@ impl WasmWsCoordinator {
                 drift_core::time_utils::sleep(std::time::Duration::from_secs(30)).await;
                 let hb = HeartbeatPayload {
                     replica_id: replica_id_hb.clone(),
+                    namespace: "".to_string(),
                 };
                 if let Ok(frame) = encode_frame(MSG_HEARTBEAT, &hb) {
                     if ws_clone.send_with_u8_array(&frame).is_err() {
@@ -404,6 +405,7 @@ impl Coordinator for WasmWsCoordinator {
     async fn heartbeat(&self, _namespace: &str, replica_id: &str) -> Result<(), CoordinatorError> {
         let hb = HeartbeatPayload {
             replica_id: replica_id.to_string(),
+            namespace: "".to_string(),
         };
         let frame = encode_frame(MSG_HEARTBEAT, &hb)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
