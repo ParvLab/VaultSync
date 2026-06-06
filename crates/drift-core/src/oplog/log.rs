@@ -21,6 +21,14 @@ impl OpLog {
         self.storage.read_pending_oplog(&self.namespace, limit).await
     }
 
+    pub async fn pending_entries(&self, namespace: &str) -> Result<Vec<OplogEntry>, DriftError> {
+        self.storage.read_pending_oplog(namespace, usize::MAX).await
+    }
+
+    pub async fn update_blob(&self, id: &str, new_blob: &[u8]) -> Result<(), DriftError> {
+        self.storage.update_oplog_encrypted_blob(id, new_blob).await
+    }
+
     pub async fn read_after_sequence(&self, seq: u64, limit: usize) -> Result<Vec<OplogEntry>, DriftError> {
         let entries = self.storage.read_oplog_after_sequence(&self.namespace, seq).await?;
         Ok(entries.into_iter().take(limit).collect())

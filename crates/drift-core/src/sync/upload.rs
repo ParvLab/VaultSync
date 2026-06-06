@@ -58,15 +58,27 @@ impl UploadQueue {
             return Ok(0);
         }
 
-        let mutations: Vec<EncryptedMutation> = entries.iter().map(|e| EncryptedMutation {
-            id: e.id.clone(),
-            namespace: e.namespace.clone(),
-            replica_id: e.replica_id.clone(),
-            doc_id: e.doc_id.clone(),
-            record_id: e.record_id.clone(),
-            encrypted_blob: e.encrypted_blob.clone().unwrap_or_default(),
-            timestamp: e.timestamp,
-            schema_version: 0,
+        let mutations: Vec<EncryptedMutation> = entries.iter().map(|e| {
+            let key_version = if let Some(ref blob) = e.encrypted_blob {
+                if blob.len() >= 8 {
+                    u64::from_le_bytes(blob[..8].try_into().unwrap())
+                } else {
+                    1
+                }
+            } else {
+                1
+            };
+            EncryptedMutation {
+                id: e.id.clone(),
+                namespace: e.namespace.clone(),
+                replica_id: e.replica_id.clone(),
+                doc_id: e.doc_id.clone(),
+                record_id: e.record_id.clone(),
+                encrypted_blob: e.encrypted_blob.clone().unwrap_or_default(),
+                timestamp: e.timestamp,
+                schema_version: 0,
+                key_version,
+            }
         }).collect();
 
         let span = tracing::info_span!("transport.send", batch_size = mutations.len(), namespace = self.oplog.namespace());

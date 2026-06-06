@@ -70,11 +70,12 @@ impl Coordinator for PostgresCoordinator {
                 &m.record_id,
                 &m.encrypted_blob,
                 &(m.timestamp as i64),
+                &(m.key_version as i64),
             ];
             
             let row = tx.query_one(
-                "INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  RETURNING sequence",
                 params,
             ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
@@ -103,7 +104,7 @@ impl Coordinator for PostgresCoordinator {
         ];
         
         let rows = client_guard.query(
-            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp
+            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
              FROM mutations
              WHERE namespace = $1 AND sequence > $2
              ORDER BY sequence ASC
@@ -115,6 +116,7 @@ impl Coordinator for PostgresCoordinator {
         for row in rows {
             let seq: i64 = row.get(2);
             let ts: i64 = row.get(6);
+            let kv: i64 = row.get(7);
             res.push(PendingMutation {
                 id: row.get(0),
                 namespace: row.get(1),
@@ -123,6 +125,7 @@ impl Coordinator for PostgresCoordinator {
                 record_id: row.get(4),
                 encrypted_blob: row.get(5),
                 timestamp: ts as u64,
+                key_version: kv as u64,
             });
         }
         Ok(res)
@@ -149,7 +152,7 @@ impl Coordinator for PostgresCoordinator {
                     &pull_limit_i64,
                 ];
                 let rows_res = client_guard.query(
-                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp
+                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
                      FROM mutations
                      WHERE namespace = $1 AND sequence > $2
                      ORDER BY sequence ASC
@@ -167,6 +170,7 @@ impl Coordinator for PostgresCoordinator {
                         for row in &rows {
                             let seq: i64 = row.get(2);
                             let ts: i64 = row.get(6);
+                            let kv: i64 = row.get(7);
                             let pm = PendingMutation {
                                 id: row.get(0),
                                 namespace: row.get(1),
@@ -175,6 +179,7 @@ impl Coordinator for PostgresCoordinator {
                                 record_id: row.get(4),
                                 encrypted_blob: row.get(5),
                                 timestamp: ts as u64,
+                                key_version: kv as u64,
                             };
                             last_sent = last_sent.max(pm.sequence);
                             if tx_mpsc.send(pm).await.is_err() {
@@ -202,7 +207,7 @@ impl Coordinator for PostgresCoordinator {
                             &pull_limit_i64,
                         ];
                         let rows_res = client_guard.query(
-                            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp
+                            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
                              FROM mutations
                              WHERE namespace = $1 AND sequence > $2
                              ORDER BY sequence ASC
@@ -220,6 +225,7 @@ impl Coordinator for PostgresCoordinator {
                                 for row in &rows {
                                     let seq: i64 = row.get(2);
                                     let ts: i64 = row.get(6);
+                                    let kv: i64 = row.get(7);
                                     let pm = PendingMutation {
                                         id: row.get(0),
                                         namespace: row.get(1),
@@ -228,6 +234,7 @@ impl Coordinator for PostgresCoordinator {
                                         record_id: row.get(4),
                                         encrypted_blob: row.get(5),
                                         timestamp: ts as u64,
+                                        key_version: kv as u64,
                                     };
                                     last_sent = last_sent.max(pm.sequence);
                                     if tx_mpsc.send(pm).await.is_err() {
@@ -328,6 +335,51 @@ impl Coordinator for PostgresCoordinator {
             Ok(v as u64)
         } else {
             Ok(0)
+        }
+    }
+
+    async fn update_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+        public_key: Vec<u8>,
+        key_version: u64,
+    ) -> Result<(), CoordinatorError> {
+        let client_guard = self.client.lock().await;
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &public_key,
+            &(key_version as i64),
+            &namespace,
+            &replica_id,
+        ];
+        client_guard.execute(
+            "UPDATE replicas SET public_key = $1, key_version = $2 WHERE namespace = $3 AND replica_id = $4",
+            params,
+        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
+        let client_guard = self.client.lock().await;
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &namespace,
+            &replica_id,
+        ];
+        let row_opt = client_guard.query_opt(
+            "SELECT public_key, key_version FROM replicas WHERE namespace = $1 AND replica_id = $2",
+            params,
+        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        
+        if let Some(row) = row_opt {
+            let pk: Vec<u8> = row.get(0);
+            let kv: i64 = row.get(1);
+            Ok(Some((pk, kv as u64)))
+        } else {
+            Ok(None)
         }
     }
 }

@@ -59,6 +59,16 @@ impl DownloadQueue {
                 self.metrics.set_connection_status(&self.namespace, true);
                 let count = mutations.len();
                 for m in &mutations {
+                    if m.encrypted_blob.len() >= 8 {
+                        let header_version = u64::from_le_bytes(m.encrypted_blob[..8].try_into().unwrap());
+                        if header_version != m.key_version {
+                            tracing::warn!(
+                                blob_version = header_version,
+                                mutation_version = m.key_version,
+                                "Key version mismatch in mutation payload"
+                            );
+                        }
+                    }
                     let decrypted_bytes = self.decryptor.decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
                     let entry = OplogEntry {

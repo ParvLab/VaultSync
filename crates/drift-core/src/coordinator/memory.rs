@@ -13,6 +13,7 @@ pub struct InMemoryCoordinator {
     ops: Arc<RwLock<BTreeMap<(String, u64), PendingMutation>>>,
     schema_versions: Arc<RwLock<std::collections::HashMap<String, u64>>>,
     replicas: Arc<RwLock<std::collections::HashMap<(String, String), ReplicaInfo>>>,
+    replica_keys: Arc<RwLock<std::collections::HashMap<(String, String), (Vec<u8>, u64)>>>,
     tx: broadcast::Sender<PendingMutation>,
 }
 
@@ -24,6 +25,7 @@ impl InMemoryCoordinator {
             ops: Arc::new(RwLock::new(BTreeMap::new())),
             schema_versions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             replicas: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            replica_keys: Arc::new(RwLock::new(std::collections::HashMap::new())),
             tx,
         }
     }
@@ -45,6 +47,7 @@ impl Coordinator for InMemoryCoordinator {
                 record_id: m.record_id,
                 encrypted_blob: m.encrypted_blob,
                 timestamp: m.timestamp,
+                key_version: m.key_version,
             };
             ops.insert((namespace.to_string(), seq), pm.clone());
             seqs.push(seq);
@@ -110,10 +113,35 @@ impl Coordinator for InMemoryCoordinator {
         let mut reps = self.replicas.write().map_err(|_| CoordinatorError::NotAvailable)?;
         reps.insert((namespace.to_string(), info.replica_id.clone()), info.clone());
         
+        let mut keys = self.replica_keys.write().map_err(|_| CoordinatorError::NotAvailable)?;
+        keys.entry((namespace.to_string(), info.replica_id.clone()))
+            .or_insert_with(|| (info.public_key.clone(), 1));
+        
         let mut versions = self.schema_versions.write().map_err(|_| CoordinatorError::NotAvailable)?;
         let current = versions.entry(namespace.to_string()).or_insert(0);
         *current = (*current).max(info.schema_version);
         Ok(())
+    }
+
+    async fn update_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+        public_key: Vec<u8>,
+        key_version: u64,
+    ) -> Result<(), CoordinatorError> {
+        let mut keys = self.replica_keys.write().map_err(|_| CoordinatorError::NotAvailable)?;
+        keys.insert((namespace.to_string(), replica_id.to_string()), (public_key, key_version));
+        Ok(())
+    }
+
+    async fn get_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
+        let keys = self.replica_keys.read().map_err(|_| CoordinatorError::NotAvailable)?;
+        Ok(keys.get(&(namespace.to_string(), replica_id.to_string())).cloned())
     }
 
     async fn heartbeat(&self, _namespace: &str, _replica_id: &str) -> Result<(), CoordinatorError> { Ok(()) }

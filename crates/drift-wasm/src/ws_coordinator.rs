@@ -141,6 +141,7 @@ impl WasmWsCoordinator {
             public_key: vec![],
             schema_version: 0,
             last_sequence: after,
+            key_version: 1,
         };
         let reg_frame = encode_frame(MSG_REGISTER, &reg)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
@@ -388,6 +389,7 @@ impl Coordinator for WasmWsCoordinator {
             public_key: info.public_key.clone(),
             schema_version: info.schema_version,
             last_sequence: 0,
+            key_version: 1,
         };
         let frame = encode_frame(MSG_REGISTER, &reg)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;

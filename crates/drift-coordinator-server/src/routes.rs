@@ -295,6 +295,52 @@ pub async fn admin_get_snapshot(
 }
 
 // ----------------------------------------------------
+// Replica Key Management Endpoints
+// ----------------------------------------------------
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct UpdateReplicaKeyPayload {
+    pub public_key: Vec<u8>,
+    pub key_version: u64,
+}
+
+pub async fn update_replica_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((ns, replica_id)): Path<(String, String)>,
+    Json(payload): Json<UpdateReplicaKeyPayload>,
+) -> Result<StatusCode, StatusCode> {
+    authorize_namespace(&state, &headers, &ns).await?;
+
+    state.coordinator.update_replica_key(&ns, &replica_id, payload.public_key, payload.key_version).await
+        .map_err(|e| {
+            tracing::error!("Failed to update replica key: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(StatusCode::OK)
+}
+
+pub async fn get_replica_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((ns, replica_id)): Path<(String, String)>,
+) -> Result<Json<Option<UpdateReplicaKeyPayload>>, StatusCode> {
+    authorize_namespace(&state, &headers, &ns).await?;
+
+    let result = state.coordinator.get_replica_key(&ns, &replica_id).await
+        .map_err(|e| {
+            tracing::error!("Failed to get replica key: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(result.map(|(public_key, key_version)| UpdateReplicaKeyPayload {
+        public_key,
+        key_version,
+    })))
+}
+
+// ----------------------------------------------------
 // Health Check Endpoint
 // ----------------------------------------------------
 

@@ -46,6 +46,8 @@ pub struct RegisterPayload {
     pub public_key: Vec<u8>,
     pub schema_version: u64,
     pub last_sequence: u64,
+    #[serde(default)]
+    pub key_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +109,8 @@ pub struct NamespaceAddPayload {
     pub public_key: Vec<u8>,
     pub schema_version: u64,
     pub last_sequence: u64,
+    #[serde(default)]
+    pub key_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,4 +213,10 @@ pub struct SnapshotPayload {
     pub checksum: u32,
     #[serde(default)]
     pub namespace: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateReplicaKeyPayload {
+    pub public_key: Vec<u8>,
+    pub key_version: u64,
 }

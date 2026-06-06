@@ -14,6 +14,7 @@ pub struct EncryptedMutation {
     pub encrypted_blob: Vec<u8>,
     pub timestamp: u64,
     pub schema_version: u64,
+    pub key_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +26,7 @@ pub struct PendingMutation {
     pub record_id: String,
     pub encrypted_blob: Vec<u8>,
     pub timestamp: u64,
+    pub key_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +54,22 @@ pub trait Coordinator: Send + Sync + std::fmt::Debug {
     async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError>;
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError>;
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError>;
+    async fn update_replica_key(
+        &self,
+        _namespace: &str,
+        _replica_id: &str,
+        _public_key: Vec<u8>,
+        _key_version: u64,
+    ) -> Result<(), CoordinatorError> {
+        Ok(())
+    }
+    async fn get_replica_key(
+        &self,
+        _namespace: &str,
+        _replica_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
+        Ok(None)
+    }
     async fn list_replicas(&self, _namespace: &str) -> Result<Vec<ReplicaInfo>, CoordinatorError> {
         Ok(vec![])
     }

@@ -11,7 +11,8 @@ pub async fn initialize(client: &Client) -> Result<(), CoordinatorError> {
             doc_id VARCHAR(255) NOT NULL,
             record_id VARCHAR(255) NOT NULL,
             encrypted_blob BYTEA NOT NULL,
-            timestamp BIGINT NOT NULL
+            timestamp BIGINT NOT NULL,
+            key_version BIGINT NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS replicas (
@@ -19,7 +20,8 @@ pub async fn initialize(client: &Client) -> Result<(), CoordinatorError> {
             namespace VARCHAR(255) NOT NULL,
             public_key BYTEA NOT NULL,
             schema_version BIGINT NOT NULL,
-            last_seen BIGINT NOT NULL
+            last_seen BIGINT NOT NULL,
+            key_version BIGINT NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS schema_versions (

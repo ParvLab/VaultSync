@@ -99,6 +99,7 @@ impl HttpCoordinator {
             public_key: vec![],
             schema_version: current_version,
             last_sequence: after,
+            key_version: 1,
         };
 
         let reg_frame = encode_frame(MSG_REGISTER, &reg)
@@ -537,6 +538,7 @@ impl Coordinator for HttpCoordinator {
                     public_key: info.public_key.clone(),
                     schema_version: info.schema_version,
                     last_sequence: 0,
+                    key_version: 1,
                 };
                 if let Ok(frame) = encode_frame(MSG_REGISTER, &reg) {
                     if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
@@ -558,6 +560,53 @@ impl Coordinator for HttpCoordinator {
             return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
         }
         Ok(())
+    }
+
+    async fn update_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+        public_key: Vec<u8>,
+        key_version: u64,
+    ) -> Result<(), CoordinatorError> {
+        let url = format!("{}/namespace/{}/replicas/{}/key", self.config.url.trim_end_matches('/'), namespace, replica_id);
+        let payload = crate::coordinator::ws_proto::UpdateReplicaKeyPayload {
+            public_key,
+            key_version,
+        };
+        let mut builder = self.client.put(&url).json(&payload);
+        if let Some(ref token) = self.config.auth_token {
+            builder = builder.bearer_auth(token);
+        }
+        let resp = builder.send().await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    async fn get_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
+        let url = format!("{}/namespace/{}/replicas/{}/key", self.config.url.trim_end_matches('/'), namespace, replica_id);
+        let mut builder = self.client.get(&url);
+        if let Some(ref token) = self.config.auth_token {
+            builder = builder.bearer_auth(token);
+        }
+        let resp = builder.send().await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+        }
+        let payload: Option<crate::coordinator::ws_proto::UpdateReplicaKeyPayload> = resp.json().await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        Ok(payload.map(|p| (p.public_key, p.key_version)))
     }
 
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError> {

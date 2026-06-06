@@ -335,6 +335,7 @@ impl Coordinator for PeerCoordinator {
                             record_id: m.record_id.clone(),
                             encrypted_blob: m.encrypted_blob.clone(),
                             timestamp: m.timestamp,
+                            key_version: m.key_version,
                         };
                         if let Ok(s) = serde_json::from_str::<serde_json::Value>(&serde_json::to_string(&pm).unwrap()) {
                             let _ = dc.send_with_str(&s.to_string());

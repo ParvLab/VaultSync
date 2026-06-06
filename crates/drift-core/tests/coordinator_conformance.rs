@@ -38,6 +38,7 @@ pub async fn run_coordinator_conformance_suite(coord: Arc<dyn Coordinator>) {
             encrypted_blob: vec![10, 20],
             timestamp: 1000,
             schema_version: 0,
+            key_version: 1,
         },
         EncryptedMutation {
             id: "m-2".to_string(),
@@ -48,6 +49,7 @@ pub async fn run_coordinator_conformance_suite(coord: Arc<dyn Coordinator>) {
             encrypted_blob: vec![30, 40],
             timestamp: 2000,
             schema_version: 0,
+            key_version: 1,
         },
     ];
 
@@ -86,6 +88,7 @@ struct MockMutation {
     encrypted_blob: Vec<u8>,
     timestamp: u64,
     schema_version: u64,
+    key_version: u64,
     stream_id: String,
 }
 
@@ -205,6 +208,7 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                     let mut encrypted_blob = Vec::new();
                                     let mut timestamp = 0;
                                     let mut s_version = 0;
+                                    let mut k_version = 1;
                                     
                                     for chunk in args[3..].chunks_exact(2) {
                                         let key = std::str::from_utf8(&chunk[0]).unwrap_or("");
@@ -216,6 +220,7 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                             "blob" => encrypted_blob = chunk[1].clone(),
                                             "ts" => timestamp = std::str::from_utf8(&chunk[1]).unwrap_or("").parse().unwrap_or(0),
                                             "schema_version" => s_version = std::str::from_utf8(&chunk[1]).unwrap_or("").parse().unwrap_or(0),
+                                            "key_version" => k_version = std::str::from_utf8(&chunk[1]).unwrap_or("").parse().unwrap_or(1),
                                             _ => {}
                                         }
                                     }
@@ -244,6 +249,7 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                             encrypted_blob,
                                             timestamp,
                                             schema_version: s_version,
+                                            key_version: k_version,
                                             stream_id: stream_id.clone(),
                                         });
                                     }
@@ -273,7 +279,7 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                         entry_bytes.extend_from_slice(b"*2\r\n");
                                         entry_bytes.extend_from_slice(&serialize_string(&m.stream_id));
                                         
-                                        entry_bytes.extend_from_slice(b"*12\r\n");
+                                        entry_bytes.extend_from_slice(b"*14\r\n");
                                         entry_bytes.extend_from_slice(&serialize_string("id"));
                                         entry_bytes.extend_from_slice(&serialize_string(&m.id));
                                         entry_bytes.extend_from_slice(&serialize_string("doc_id"));
@@ -286,6 +292,8 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                         entry_bytes.extend_from_slice(&serialize_string(&m.timestamp.to_string()));
                                         entry_bytes.extend_from_slice(&serialize_string("schema_version"));
                                         entry_bytes.extend_from_slice(&serialize_string(&m.schema_version.to_string()));
+                                        entry_bytes.extend_from_slice(&serialize_string("key_version"));
+                                        entry_bytes.extend_from_slice(&serialize_string(&m.key_version.to_string()));
                                         
                                         entries_bytes.extend_from_slice(&entry_bytes);
                                     }
@@ -330,7 +338,7 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                             entry_bytes.extend_from_slice(b"*2\r\n");
                                             entry_bytes.extend_from_slice(&serialize_string(&m.stream_id));
                                             
-                                            entry_bytes.extend_from_slice(b"*12\r\n");
+                                            entry_bytes.extend_from_slice(b"*14\r\n");
                                             entry_bytes.extend_from_slice(&serialize_string("id"));
                                             entry_bytes.extend_from_slice(&serialize_string(&m.id));
                                             entry_bytes.extend_from_slice(&serialize_string("doc_id"));
@@ -343,6 +351,8 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                             entry_bytes.extend_from_slice(&serialize_string(&m.timestamp.to_string()));
                                             entry_bytes.extend_from_slice(&serialize_string("schema_version"));
                                             entry_bytes.extend_from_slice(&serialize_string(&m.schema_version.to_string()));
+                                            entry_bytes.extend_from_slice(&serialize_string("key_version"));
+                                            entry_bytes.extend_from_slice(&serialize_string(&m.key_version.to_string()));
                                             
                                             entries_bytes.extend_from_slice(&entry_bytes);
                                         }

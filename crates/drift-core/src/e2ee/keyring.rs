@@ -122,6 +122,29 @@ impl KeyRing {
             .expect("32 bytes is a valid length for HKDF output");
         okm
     }
+
+    pub fn prune_old_versions(&self, current_version: u64) {
+        let mut inner = self.inner.write().unwrap();
+        inner.keys.retain(|k| k.version >= current_version.saturating_sub(1));
+    }
+
+    pub fn load_keys(&self, loaded: Vec<NamespaceKeypair>) {
+        if loaded.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write().unwrap();
+        inner.keys = loaded;
+        inner.active_version = inner.keys.iter().map(|k| k.version).max().unwrap_or(1);
+    }
+
+    pub fn derive_namespace_key_for_version(&self, namespace: &str, version: u64) -> Option<[u8; 32]> {
+        let keypair = self.key_by_version(version)?;
+        let hk = Hkdf::<Sha256>::new(Some(b"drift-namespace"), &keypair.private_key);
+        let mut okm = [0u8; 32];
+        hk.expand(namespace.as_bytes(), &mut okm)
+            .expect("32 bytes is a valid length for HKDF output");
+        Some(okm)
+    }
 }
 
 pub struct E2eeEncryptor {
@@ -150,11 +173,13 @@ impl E2eeEncryptor {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         
-        let mut ciphertext = cipher.encrypt(nonce, plaintext)
+        let ciphertext = cipher.encrypt(nonce, plaintext)
             .map_err(|e| DriftError::Encryption(format!("symmetric encrypt failed: {e}")))?;
 
-        let mut result = nonce_bytes.to_vec();
-        result.append(&mut ciphertext);
+        let mut result = Vec::with_capacity(8 + 12 + ciphertext.len());
+        result.extend_from_slice(&active_version.to_le_bytes());
+        result.extend_from_slice(&nonce_bytes);
+        result.extend_from_slice(&ciphertext);
 
         let duration_us = start.elapsed().as_micros() as f64;
         crate::telemetry::metrics::get_metrics().record_encryption_time("encrypt", duration_us);
@@ -181,17 +206,21 @@ impl E2eeDecryptor {
 
     pub fn decrypt_symmetric(&self, ciphertext: &[u8], namespace: &str) -> Result<Vec<u8>, DriftError> {
         let start = crate::time_utils::PlatformInstant::now();
-        let active_version = self.keyring.active_version();
-        let span = tracing::info_span!("e2ee.decrypt", namespace = namespace, key_version = active_version);
+        
+        if ciphertext.len() < 20 {
+            return Err(DriftError::Encryption("invalid ciphertext length (too short)".into()));
+        }
+        let key_version = u64::from_le_bytes(ciphertext[..8].try_into().unwrap());
+        
+        let span = tracing::info_span!("e2ee.decrypt", namespace = namespace, key_version = key_version);
         let _enter = span.enter();
 
-        if ciphertext.len() < 12 {
-            return Err(DriftError::Encryption("invalid ciphertext length (missing nonce)".into()));
-        }
-        let nonce_bytes = &ciphertext[..12];
-        let actual_ciphertext = &ciphertext[12..];
+        let nonce_bytes = &ciphertext[8..20];
+        let actual_ciphertext = &ciphertext[20..];
 
-        let key = self.keyring.derive_namespace_key(namespace);
+        let key = self.keyring.derive_namespace_key_for_version(namespace, key_version)
+            .ok_or_else(|| DriftError::Encryption(format!("unknown key version {key_version}")))?;
+        
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let nonce = Nonce::from_slice(nonce_bytes);
         let res = cipher.decrypt(nonce, actual_ciphertext)

@@ -12,7 +12,8 @@ pub fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             doc_id TEXT NOT NULL,
             record_id TEXT NOT NULL,
             encrypted_blob BLOB NOT NULL,
-            timestamp INTEGER NOT NULL
+            timestamp INTEGER NOT NULL,
+            key_version INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS replicas (
@@ -20,7 +21,8 @@ pub fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             namespace TEXT NOT NULL,
             public_key BLOB NOT NULL,
             schema_version INTEGER NOT NULL,
-            last_seen INTEGER NOT NULL
+            last_seen INTEGER NOT NULL,
+            key_version INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS schema_versions (

@@ -98,6 +98,7 @@ async fn test_push_pull_flow() {
         encrypted_blob: vec![100, 101, 102],
         timestamp: 99999,
         schema_version: 42,
+        key_version: 1,
     }];
     let seqs = coord.push(ns, mutations).await.unwrap();
     assert_eq!(seqs, vec![1]);
@@ -204,6 +205,7 @@ async fn test_sse_events() {
         encrypted_blob: vec![7, 7, 7],
         timestamp: 12345,
         schema_version: 1,
+        key_version: 1,
     }]).await.unwrap();
 
     // Read from the subscription stream

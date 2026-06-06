@@ -53,6 +53,7 @@ fn parse_stream_entry(entry_val: &redis::Value, namespace: &str) -> Option<Pendi
     let mut record_id = None;
     let mut encrypted_blob = None;
     let mut timestamp = None;
+    let mut key_version = None;
     
     for chunk in fields.chunks_exact(2) {
         let key = match &chunk[0] {
@@ -88,6 +89,14 @@ fn parse_stream_entry(entry_val: &redis::Value, namespace: &str) -> Option<Pendi
                     timestamp = Some(*i as u64);
                 }
             }
+            "key_version" => {
+                if let redis::Value::Data(d) = &chunk[1] {
+                    let kv_str = std::str::from_utf8(d).ok()?;
+                    key_version = Some(kv_str.parse::<u64>().ok()?);
+                } else if let redis::Value::Int(i) = &chunk[1] {
+                    key_version = Some(*i as u64);
+                }
+            }
             _ => {}
         }
     }
@@ -100,6 +109,7 @@ fn parse_stream_entry(entry_val: &redis::Value, namespace: &str) -> Option<Pendi
         record_id: record_id?,
         encrypted_blob: encrypted_blob?,
         timestamp: timestamp.unwrap_or(0),
+        key_version: key_version.unwrap_or(1),
     })
 }
 
@@ -121,6 +131,7 @@ impl Coordinator for RedisCoordinator {
                 .arg("blob").arg(&mutation.encrypted_blob)
                 .arg("ts").arg(mutation.timestamp.to_string())
                 .arg("schema_version").arg(mutation.schema_version.to_string())
+                .arg("key_version").arg(mutation.key_version.to_string())
                 .query_async(&mut conn)
                 .await
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
@@ -313,6 +324,49 @@ impl Coordinator for RedisCoordinator {
             }
         }
         Ok(replicas)
+    }
+
+    async fn update_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+        public_key: Vec<u8>,
+        key_version: u64,
+    ) -> Result<(), CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let key = format!("drift:{}:replica_keys", namespace);
+        let val = serde_json::to_string(&(public_key, key_version))
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        redis::cmd("HSET")
+            .arg(&key)
+            .arg(replica_id)
+            .arg(&val)
+            .query_async::<_, ()>(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let key = format!("drift:{}:replica_keys", namespace);
+        let res: Option<String> = redis::cmd("HGET")
+            .arg(&key)
+            .arg(replica_id)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        if let Some(s) = res {
+            let parsed: (Vec<u8>, u64) = serde_json::from_str(&s)
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            Ok(Some(parsed))
+        } else {
+            Ok(None)
+        }
     }
 }
 

@@ -89,6 +89,7 @@ async fn test_ws_push_pull_flow() {
         encrypted_blob: vec![200, 201, 202],
         timestamp: 100000,
         schema_version: 100,
+        key_version: 1,
     }];
     let seqs = coord.push(ns, mutations).await.unwrap();
     assert_eq!(seqs, vec![1]);
@@ -173,6 +174,7 @@ async fn test_mux_connect_single_namespace() {
         encrypted_blob: vec![200, 201, 202],
         timestamp: 100000,
         schema_version: 1,
+        key_version: 1,
     }];
     let seqs = coord.push(ns, mutations).await.unwrap();
     assert_eq!(seqs, vec![1]);
@@ -238,6 +240,7 @@ async fn test_mux_two_namespaces_isolated() {
         encrypted_blob: vec![100],
         timestamp: 100000,
         schema_version: 1,
+        key_version: 1,
     }];
     coord1.push(ns1, mutations1).await.unwrap();
 
@@ -251,6 +254,7 @@ async fn test_mux_two_namespaces_isolated() {
         encrypted_blob: vec![200],
         timestamp: 100000,
         schema_version: 1,
+        key_version: 1,
     }];
     coord2.push(ns2, mutations2).await.unwrap();
 
@@ -336,6 +340,7 @@ async fn test_mux_reconnect() {
         encrypted_blob: vec![1],
         timestamp: 100000,
         schema_version: 1,
+        key_version: 1,
     }]).await.unwrap();
 
     let mut_before = stream.next().await.unwrap();
@@ -366,6 +371,7 @@ async fn test_mux_reconnect() {
         encrypted_blob: vec![2],
         timestamp: 100001,
         schema_version: 1,
+        key_version: 1,
     }]).await.unwrap();
 
     // Check if the stream receives it
@@ -407,6 +413,7 @@ async fn test_mux_namespace_drop() {
         encrypted_blob: vec![3],
         timestamp: 100002,
         schema_version: 1,
+        key_version: 1,
     }]).await.unwrap();
 
     // The stream should be disconnected (returns None) or timeout without receiving any new mutations.

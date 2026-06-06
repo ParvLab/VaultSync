@@ -263,6 +263,7 @@ impl MuxCoordinator {
                                     public_key: cfg.public_key,
                                     schema_version: cfg.schema_version,
                                     last_sequence: cfg.last_sequence,
+                                    key_version: 1,
                                 };
                                 if let Ok(frame) = encode_frame(MSG_NAMESPACE_ADD, &add_payload) {
                                     let _ = tx.send(Message::Binary(frame)).await;
@@ -305,6 +306,7 @@ impl MuxCoordinator {
             public_key: public_key.clone(),
             schema_version,
             last_sequence,
+            key_version: 1,
         };
 
         let add_frame = encode_frame(MSG_NAMESPACE_ADD, &add_payload)

@@ -20,6 +20,8 @@ struct D1MutationRow {
     encrypted_blob: Vec<u8>,
     timestamp: i64,
     sequence: i64,
+    #[serde(default)]
+    key_version: i64,
 }
 
 #[derive(Deserialize)]
@@ -101,7 +103,7 @@ impl DurableObject for NamespaceDurableObject {
                 
                 let mut sequences = Vec::new();
                 for m in mutations {
-                    let stmt = db.prepare("INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)");
+                    let stmt = db.prepare("INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)");
                     let blob_js = js_sys::Uint8Array::from(m.encrypted_blob.as_slice());
                     stmt.bind(&[
                         m.id.clone().into(),
@@ -111,6 +113,7 @@ impl DurableObject for NamespaceDurableObject {
                         m.record_id.clone().into(),
                         blob_js.into(),
                         (m.timestamp as i64).into(),
+                        (m.key_version as i64).into(),
                     ])?.run().await?;
                     
                     let last_row: serde_json::Value = db.prepare("SELECT last_insert_rowid() as seq")
@@ -131,7 +134,7 @@ impl DurableObject for NamespaceDurableObject {
                 let limit: i64 = limit_str.parse().unwrap_or(100);
 
                 let stmt = db.prepare(
-                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence
+                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence, key_version
                      FROM mutations
                      WHERE namespace = ?1 AND sequence > ?2
                      ORDER BY sequence ASC
@@ -151,6 +154,7 @@ impl DurableObject for NamespaceDurableObject {
                         record_id: r.record_id,
                         encrypted_blob: r.encrypted_blob,
                         timestamp: r.timestamp as u64,
+                        key_version: r.key_version as u64,
                     }
                 }).collect();
                 
@@ -583,7 +587,7 @@ impl DurableObject for NamespaceDurableObject {
                 let mut pending_to_broadcast = Vec::new();
 
                 for m in push.mutations {
-                    let stmt = db.prepare("INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)");
+                    let stmt = db.prepare("INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)");
                     let blob_js = js_sys::Uint8Array::from(m.encrypted_blob.as_slice());
                     stmt.bind(&[
                         m.id.clone().into(),
@@ -593,6 +597,7 @@ impl DurableObject for NamespaceDurableObject {
                         m.record_id.clone().into(),
                         blob_js.into(),
                         (m.timestamp as i64).into(),
+                        (m.key_version as i64).into(),
                     ])?.run().await?;
 
                     let last_row: serde_json::Value = db.prepare("SELECT last_insert_rowid() as seq")
@@ -609,6 +614,7 @@ impl DurableObject for NamespaceDurableObject {
                         record_id: m.record_id,
                         encrypted_blob: m.encrypted_blob,
                         timestamp: m.timestamp,
+                        key_version: m.key_version,
                     });
                 }
 
@@ -654,7 +660,7 @@ impl DurableObject for NamespaceDurableObject {
                 let ns = if !pull.namespace.is_empty() { pull.namespace.clone() } else { attachment.namespace.clone() };
 
                 let stmt = db.prepare(
-                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence
+                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence, key_version
                      FROM mutations
                      WHERE namespace = ?1 AND sequence > ?2
                      ORDER BY sequence ASC
@@ -675,6 +681,7 @@ impl DurableObject for NamespaceDurableObject {
                         record_id: r.record_id,
                         encrypted_blob: r.encrypted_blob,
                         timestamp: r.timestamp as u64,
+                        key_version: r.key_version as u64,
                     }
                 }).collect();
 
@@ -702,7 +709,7 @@ impl DurableObject for NamespaceDurableObject {
                 let ns = if !sub.namespace.is_empty() { sub.namespace.clone() } else { attachment.namespace.clone() };
 
                 let stmt = db.prepare(
-                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence
+                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence, key_version
                      FROM mutations
                      WHERE namespace = ?1 AND sequence > ?2
                      ORDER BY sequence ASC"
@@ -721,6 +728,7 @@ impl DurableObject for NamespaceDurableObject {
                         record_id: r.record_id,
                         encrypted_blob: r.encrypted_blob,
                         timestamp: r.timestamp as u64,
+                        key_version: r.key_version as u64,
                     };
                     if let Ok(frame) = drift_core::coordinator::ws_proto::encode_frame(
                         drift_core::coordinator::ws_proto::MSG_MUTATION_PUSH,

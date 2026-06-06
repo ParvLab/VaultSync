@@ -129,6 +129,35 @@ impl DriftClient {
         runner.run_pending().await?;
         let schema_version = runner.current_version().await;
 
+        let stored_keys = storage.read_keys(&config.namespace).await?;
+        if stored_keys.is_empty() {
+            let active = keyring.active_key();
+            let key_rec = crate::storage::traits::KeyRecord {
+                namespace: config.namespace.clone(),
+                key_bytes: active.private_key.to_vec(),
+                version: active.version,
+            };
+            storage.write_key(&key_rec).await?;
+        } else {
+            let mut loaded_keypairs = Vec::new();
+            for key_rec in stored_keys {
+                if key_rec.key_bytes.len() == 32 {
+                    let mut private_key = [0u8; 32];
+                    private_key.copy_from_slice(&key_rec.key_bytes);
+                    let public_key = x25519_dalek::x25519(private_key, x25519_dalek::X25519_BASEPOINT_BYTES);
+                    loaded_keypairs.push(crate::e2ee::keyring::NamespaceKeypair {
+                        public_key,
+                        private_key,
+                        version: key_rec.version,
+                        created_at: crate::time_utils::system_time_now_secs(),
+                    });
+                }
+            }
+            if !loaded_keypairs.is_empty() {
+                keyring.load_keys(loaded_keypairs);
+            }
+        }
+
         let encryptor = Arc::new(E2eeEncryptor::new(keyring.clone()));
         let decryptor = Arc::new(E2eeDecryptor::new(keyring.clone()));
 
@@ -614,23 +643,30 @@ impl DriftClient {
     }
 
     pub async fn rotate_keys(&self) -> Result<(), DriftError> {
-        let old_active_key = self.keyring.active_key();
+        let span = tracing::info_span!("drift.rotate_keys", namespace = self.config.namespace.as_str());
+        let _enter = span.enter();
 
+        let old_active_key = self.keyring.active_key();
         let new_pair = self.keyring.rotate();
+        tracing::info!(key_version = new_pair.version, "Key rotated locally");
 
         let old_keyring = Arc::new(KeyRing::from_key(old_active_key));
         let old_decryptor = E2eeDecryptor::new(old_keyring);
         let new_encryptor = self.encryptor.clone();
 
         let pending = self.storage.read_pending_oplog(&self.config.namespace, 10000).await?;
-
+        let mut re_encrypted = 0usize;
         for entry in pending {
             if let Some(encrypted_blob) = entry.encrypted_blob {
                 let plaintext = old_decryptor.decrypt_symmetric(&encrypted_blob, &self.config.namespace)?;
                 let new_encrypted_blob = new_encryptor.encrypt_symmetric(&plaintext, &self.config.namespace)?;
                 self.storage.update_oplog_encrypted_blob(&entry.id, &new_encrypted_blob).await?;
+                re_encrypted += 1;
             }
         }
+        tracing::info!(re_encrypted, "Pending oplog entries re-encrypted");
+
+        self.keyring.prune_old_versions(new_pair.version);
 
         let key_rec = crate::storage::traits::KeyRecord {
             namespace: self.config.namespace.clone(),
@@ -639,13 +675,21 @@ impl DriftClient {
         };
         self.storage.write_key(&key_rec).await?;
 
+        self.coordinator.update_replica_key(
+            &self.config.namespace,
+            &self.config.replica_id,
+            new_pair.public_key.to_vec(),
+            new_pair.version,
+        ).await.map_err(|e| DriftError::Coordinator(format!("key update failed: {e:?}")))?;
+
         self.coordinator.register(&self.config.namespace, ReplicaInfo {
             replica_id: self.config.replica_id.clone(),
             namespace: self.config.namespace.clone(),
             public_key: new_pair.public_key.to_vec(),
-            schema_version: 0,
+            schema_version: self.schema_version,
         }).await.map_err(|e| DriftError::Coordinator(format!("re-register failed: {e:?}")))?;
 
+        self.metrics.record_key_rotation(&self.config.namespace);
         Ok(())
     }
 

@@ -44,8 +44,8 @@ impl Coordinator for SQLiteCoordinator {
             let mut pending_to_broadcast = Vec::new();
             {
                 let mut stmt = tx.prepare(
-                    "INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                    "INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
                 ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
                 
                 for m in mutations {
@@ -56,7 +56,8 @@ impl Coordinator for SQLiteCoordinator {
                         m.doc_id,
                         m.record_id,
                         m.encrypted_blob,
-                        m.timestamp as i64
+                        m.timestamp as i64,
+                        m.key_version as i64
                     ]).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
                     let seq = tx.last_insert_rowid() as u64;
                     seq_ids.push(seq);
@@ -68,6 +69,7 @@ impl Coordinator for SQLiteCoordinator {
                         record_id: m.record_id,
                         encrypted_blob: m.encrypted_blob,
                         timestamp: m.timestamp,
+                        key_version: m.key_version,
                     });
                 }
             }
@@ -89,7 +91,7 @@ impl Coordinator for SQLiteCoordinator {
         tokio::task::spawn_blocking(move || {
             let conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
             let mut stmt = conn_guard.prepare(
-                "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp
+                "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
                  FROM mutations
                  WHERE namespace = ?1 AND sequence > ?2
                  ORDER BY sequence ASC
@@ -105,6 +107,7 @@ impl Coordinator for SQLiteCoordinator {
                     record_id: row.get(4)?,
                     encrypted_blob: row.get(5)?,
                     timestamp: row.get(6)?,
+                    key_version: row.get(7)?,
                 })
             }).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
             
@@ -130,7 +133,7 @@ impl Coordinator for SQLiteCoordinator {
             let db_res = tokio::task::spawn_blocking(move || {
                 let conn_guard = conn.lock().ok()?;
                 let mut stmt = conn_guard.prepare(
-                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp
+                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
                      FROM mutations
                      WHERE namespace = ?1 AND sequence > ?2
                      ORDER BY sequence ASC"
@@ -144,6 +147,7 @@ impl Coordinator for SQLiteCoordinator {
                         record_id: row.get(4)?,
                         encrypted_blob: row.get(5)?,
                         timestamp: row.get(6)?,
+                        key_version: row.get(7)?,
                     })
                 }).ok()?;
                 let mut res = Vec::new();
@@ -249,6 +253,53 @@ impl Coordinator for SQLiteCoordinator {
                 Ok(v as u64)
             } else {
                 Ok(0)
+            }
+        }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
+    }
+
+    async fn update_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+        public_key: Vec<u8>,
+        key_version: u64,
+    ) -> Result<(), CoordinatorError> {
+        let conn = self.conn.clone();
+        let namespace_str = namespace.to_string();
+        let replica_id_str = replica_id.to_string();
+        
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            conn_guard.execute(
+                "UPDATE replicas SET public_key = ?1, key_version = ?2 WHERE namespace = ?3 AND replica_id = ?4",
+                params![public_key, key_version as i64, namespace_str, replica_id_str]
+            ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            Ok(())
+        }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
+    }
+
+    async fn get_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
+        let conn = self.conn.clone();
+        let namespace_str = namespace.to_string();
+        let replica_id_str = replica_id.to_string();
+        
+        tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            let mut stmt = conn_guard.prepare(
+                "SELECT public_key, key_version FROM replicas WHERE namespace = ?1 AND replica_id = ?2"
+            ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            
+            let mut rows = stmt.query(params![namespace_str, replica_id_str]).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            if let Some(row) = rows.next().map_err(|e| CoordinatorError::Internal(e.to_string()))? {
+                let pk: Vec<u8> = row.get(0).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                let kv: i64 = row.get(1).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                Ok(Some((pk, kv as u64)))
+            } else {
+                Ok(None)
             }
         }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
     }
@@ -467,6 +518,7 @@ mod tests {
                 encrypted_blob: vec![4, 5, 6],
                 timestamp: 1000,
                 schema_version: 5,
+                key_version: 1,
             }
         ];
         let seqs = coord.push(ns, mutations).await.unwrap();
@@ -527,6 +579,7 @@ mod tests {
                 encrypted_blob: vec![4, 5, 6],
                 timestamp: 1000,
                 schema_version: 1,
+                key_version: 1,
             }
         ];
         coord.push(ns, mutations).await.unwrap(); // sequence 1

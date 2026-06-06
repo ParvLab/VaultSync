@@ -191,6 +191,10 @@ impl DriftMetrics {
         self.crdt_merge_time_us.with_label_values(&[doc_id]).observe(us);
     }
 
+    pub fn record_key_rotation(&self, _namespace: &str) {
+        // No-op or we can increment key rotation counters if registry exists.
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             mutations_uploaded: self.mutations_total.with_label_values(&["success", "default"]).get(),
@@ -271,6 +275,7 @@ impl DriftMetrics {
     pub fn record_download_lag(&self, _namespace: &str, _ms: f64) {}
     pub fn record_encryption_time(&self, _operation: &str, _us: f64) {}
     pub fn record_crdt_merge_time(&self, _doc_id: &str, _us: f64) {}
+    pub fn record_key_rotation(&self, _namespace: &str) {}
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {

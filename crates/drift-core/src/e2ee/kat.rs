@@ -105,4 +105,74 @@ mod tests {
 
         assert_eq!(&plaintext, msg);
     }
+
+    #[test]
+    fn test_versioned_blob_roundtrip() {
+        use crate::e2ee::keyring::{E2eeEncryptor, E2eeDecryptor};
+        let keyring = std::sync::Arc::new(KeyRing::generate());
+        let encryptor = E2eeEncryptor::new(keyring.clone());
+        let decryptor = E2eeDecryptor::new(keyring.clone());
+
+        let msg = b"test message for versioning";
+        let ciphertext = encryptor.encrypt_symmetric(msg, "ns").unwrap();
+
+        assert!(ciphertext.len() >= 20);
+        let version = u64::from_le_bytes(ciphertext[..8].try_into().unwrap());
+        assert_eq!(version, 1);
+
+        let decrypted = decryptor.decrypt_symmetric(&ciphertext, "ns").unwrap();
+        assert_eq!(&decrypted, msg);
+    }
+
+    #[test]
+    fn test_rotation_new_version_decryptable() {
+        use crate::e2ee::keyring::{E2eeEncryptor, E2eeDecryptor};
+        let keyring_alice = std::sync::Arc::new(KeyRing::generate());
+        let alice_key_v1 = keyring_alice.active_key();
+
+        // Bob starts with only Alice's v1 key
+        let keyring_bob = std::sync::Arc::new(KeyRing::from_key(alice_key_v1));
+
+        let encryptor_alice = E2eeEncryptor::new(keyring_alice.clone());
+        let decryptor_bob = E2eeDecryptor::new(keyring_bob.clone());
+
+        let msg1 = b"message 1";
+        let ct1 = encryptor_alice.encrypt_symmetric(msg1, "ns").unwrap();
+
+        // Alice rotates to v2
+        let alice_key_v2 = keyring_alice.rotate();
+
+        let msg2 = b"message 2";
+        let ct2 = encryptor_alice.encrypt_symmetric(msg2, "ns").unwrap();
+
+        // Decrypting ct2 should fail on Bob's side because Bob doesn't have Alice's v2 key yet
+        let decrypt_res = decryptor_bob.decrypt_symmetric(&ct2, "ns");
+        assert!(decrypt_res.is_err());
+
+        // Now Bob receives Alice's updated key and loads it
+        keyring_bob.add_key(alice_key_v2);
+
+        // Bob should now be able to decrypt both messages successfully
+        let dec1 = decryptor_bob.decrypt_symmetric(&ct1, "ns").unwrap();
+        let dec2 = decryptor_bob.decrypt_symmetric(&ct2, "ns").unwrap();
+        assert_eq!(&dec1, msg1);
+        assert_eq!(&dec2, msg2);
+
+        // Prune Alice's old keys to only keep v2 (since current is v2, saturating_sub(1) keeps v1 too)
+        keyring_alice.prune_old_versions(2);
+        assert!(keyring_alice.key_by_version(1).is_some()); // still kept
+        keyring_alice.prune_old_versions(3); // should drop v1
+        assert!(keyring_alice.key_by_version(1).is_none());
+    }
+
+    #[test]
+    fn test_blob_too_short_rejected() {
+        use crate::e2ee::keyring::E2eeDecryptor;
+        let keyring = std::sync::Arc::new(KeyRing::generate());
+        let decryptor = E2eeDecryptor::new(keyring.clone());
+
+        let short_ct = vec![0u8; 19];
+        let res = decryptor.decrypt_symmetric(&short_ct, "ns");
+        assert!(res.is_err());
+    }
 }
