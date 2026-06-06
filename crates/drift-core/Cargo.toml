@@ -37,6 +37,7 @@ sha2 = "0.10"
 hkdf = "0.12"
 hex = "0.4"
 rand = "0.8"
+zeroize = { version = "1.8", features = ["derive"] }
 
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
@@ -64,6 +65,7 @@ libc = "0.2"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["full"], optional = true }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
+drift-transport-libp2p = { path = "../drift-transport-libp2p" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt", "time"], optional = true }
@@ -82,4 +84,12 @@ drift-coordinator-redis = { path = "../drift-coordinator-redis" }
 
 [[bench]]
 name = "crdt_bench"
+harness = false
+
+[[bench]]
+name = "sync_bench"
+harness = false
+
+[[bench]]
+name = "coordinator_bench"
 harness = false

@@ -340,6 +340,54 @@ pub async fn get_replica_key(
     })))
 }
 
+pub async fn get_snapshot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((ns, doc_id, record_id)): Path<(String, String, String)>,
+) -> Result<Json<Option<drift_core::crdt::snapshot::Snapshot>>, StatusCode> {
+    authorize_namespace(&state, &headers, &ns).await?;
+    let snapshot = state.coordinator.get_snapshot(&ns, &doc_id, &record_id).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(snapshot))
+}
+
+pub async fn store_snapshot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((ns, _doc_id, _record_id)): Path<(String, String, String)>,
+    Json(snapshot): Json<drift_core::crdt::snapshot::Snapshot>,
+) -> Result<StatusCode, StatusCode> {
+    authorize_namespace(&state, &headers, &ns).await?;
+    state.coordinator.store_snapshot(&ns, &snapshot).await
+        .map_err(|e| {
+            println!("DEBUG ERROR in store_snapshot: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::OK)
+}
+
+pub async fn list_snapshots(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(ns): Path<String>,
+) -> Result<Json<Vec<drift_core::crdt::snapshot::Snapshot>>, StatusCode> {
+    authorize_namespace(&state, &headers, &ns).await?;
+    let snapshots = state.coordinator.list_snapshots(&ns).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(snapshots))
+}
+
+pub async fn compact_oplog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(ns): Path<String>,
+) -> Result<Json<drift_core::sync::compaction::CompactionStats>, StatusCode> {
+    authorize_namespace(&state, &headers, &ns).await?;
+    let stats = state.coordinator.compact_oplog(&ns).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(stats))
+}
+
 // ----------------------------------------------------
 // Health Check Endpoint
 // ----------------------------------------------------

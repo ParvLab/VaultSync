@@ -254,3 +254,213 @@ async fn test_chaos_corrupt_oplog_entry() {
 
     client_reborn.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_chaos_clock_skew() {
+    let shared = Arc::new(InMemoryCoordinator::new());
+    let keyring = Arc::new(drift_core::e2ee::keyring::KeyRing::generate());
+    let ns = "skew-ns";
+
+    let mut config_alice = DriftConfig::default();
+    config_alice.namespace = ns.to_string();
+    config_alice.replica_id = "alice".to_string();
+    config_alice.storage = StorageConfig::InMemory;
+    config_alice.sync_interval = Duration::from_secs(3600);
+    let client_alice = DriftClient::new_with_keyring(config_alice, shared.clone(), keyring.clone()).await.unwrap();
+
+    let mut config_bob = DriftConfig::default();
+    config_bob.namespace = ns.to_string();
+    config_bob.replica_id = "bob".to_string();
+    config_bob.storage = StorageConfig::InMemory;
+    config_bob.sync_interval = Duration::from_secs(3600);
+    let client_bob = DriftClient::new_with_keyring(config_bob, shared.clone(), keyring.clone()).await.unwrap();
+
+    let mut fields_a = HashMap::new();
+    fields_a.insert("k1".to_string(), CrdtValue::String("val-a".to_string()));
+    client_alice.insert("doc-1", "rec-1", fields_a).await.unwrap();
+
+    let mut fields_b = HashMap::new();
+    fields_b.insert("k2".to_string(), CrdtValue::String("val-b".to_string()));
+    client_bob.insert("doc-1", "rec-1", fields_b).await.unwrap();
+
+    // Force sync
+    client_alice.force_sync().await.unwrap();
+    client_bob.force_sync().await.unwrap();
+    client_alice.force_sync().await.unwrap();
+
+    // Assert convergence
+    let map_a = client_alice.get("doc-1", "rec-1").await.unwrap().unwrap();
+    let map_b = client_bob.get("doc-1", "rec-1").await.unwrap().unwrap();
+    assert_eq!(map_a, map_b);
+}
+
+#[tokio::test]
+async fn test_chaos_massive_oplog() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("massive.db").to_string_lossy().to_string();
+
+    let mut config = DriftConfig::default();
+    config.namespace = "massive-ns".to_string();
+    config.storage = StorageConfig::Sqlite { path: db_path.clone() };
+    config.sync_interval = Duration::from_secs(3600);
+
+    let client = DriftClient::new(config).await.unwrap();
+
+    for i in 0..100 {
+        let mut fields = HashMap::new();
+        fields.insert("val".to_string(), CrdtValue::Number(i as f64));
+        client.update("doc-1", "rec-1", fields).await.unwrap();
+    }
+
+    let pending = client.pending_uploads().await.unwrap();
+    assert_eq!(pending, 100);
+
+    let engine = drift_core::sync::compaction::CompactionEngine::new(
+        client.debug_api.storage.clone(),
+        drift_core::sync::compaction::CompactionConfig::default(),
+    );
+    engine.run_compaction("massive-ns").await.unwrap();
+    engine.run_snapshot_compaction("massive-ns").await.unwrap();
+
+    let map = client.get("doc-1", "rec-1").await.unwrap().unwrap();
+    assert_eq!(map.get("val").unwrap(), &CrdtValue::Number(99.0));
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_chaos_key_rotation_mid_sync() {
+    let shared = Arc::new(InMemoryCoordinator::new());
+    let ns = "rotation-mid-sync-ns";
+    let keyring = Arc::new(drift_core::e2ee::keyring::KeyRing::generate());
+
+    let mut config = DriftConfig::default();
+    config.namespace = ns.to_string();
+    config.replica_id = "replica-1".to_string();
+    config.storage = StorageConfig::InMemory;
+    config.sync_interval = Duration::from_secs(3600);
+
+    let client = Arc::new(DriftClient::new_with_keyring(config, shared.clone(), keyring.clone()).await.unwrap());
+
+    let client_c = client.clone();
+    let update_handle = tokio::spawn(async move {
+        for i in 0..20 {
+            let mut fields = HashMap::new();
+            fields.insert("val".to_string(), CrdtValue::Number(i as f64));
+            let _ = client_c.update("doc-1", "rec-1", fields).await;
+            let _ = client_c.force_sync().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    });
+
+    let client_r = client.clone();
+    let rotate_handle = tokio::spawn(async move {
+        for _ in 0..3 {
+            let _ = client_r.rotate_keys().await;
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    });
+
+    let _ = tokio::join!(update_handle, rotate_handle);
+
+    client.force_sync().await.unwrap();
+    let map = client.get("doc-1", "rec-1").await.unwrap().unwrap();
+    assert!(map.contains_key("val"));
+
+    client.shutdown().await.unwrap();
+}
+
+#[derive(Debug)]
+struct PanickingCoordinator {
+    inner: Arc<InMemoryCoordinator>,
+    should_fail: Arc<AtomicBool>,
+}
+
+impl PanickingCoordinator {
+    fn new(inner: Arc<InMemoryCoordinator>) -> Self {
+        Self {
+            inner,
+            should_fail: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    fn set_fail(&self, fail: bool) {
+        self.should_fail.store(fail, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Coordinator for PanickingCoordinator {
+    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+        if self.should_fail.load(Ordering::SeqCst) {
+            return Err(CoordinatorError::NotAvailable);
+        }
+        self.inner.push(namespace, mutations).await
+    }
+    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+        if self.should_fail.load(Ordering::SeqCst) {
+            return Err(CoordinatorError::NotAvailable);
+        }
+        self.inner.pull(namespace, after, limit).await
+    }
+    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+        if self.should_fail.load(Ordering::SeqCst) {
+            return Err(CoordinatorError::NotAvailable);
+        }
+        self.inner.subscribe(namespace, from_sequence).await
+    }
+    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+        if self.should_fail.load(Ordering::SeqCst) {
+            return Err(CoordinatorError::NotAvailable);
+        }
+        self.inner.register(namespace, info).await
+    }
+    async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError> {
+        if self.should_fail.load(Ordering::SeqCst) {
+            return Err(CoordinatorError::NotAvailable);
+        }
+        self.inner.heartbeat(namespace, replica_id).await
+    }
+    async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError> {
+        if self.should_fail.load(Ordering::SeqCst) {
+            return Err(CoordinatorError::NotAvailable);
+        }
+        self.inner.schema_version(namespace).await
+    }
+}
+
+#[tokio::test]
+async fn test_chaos_failover_during_push() {
+    let primary_inner = Arc::new(InMemoryCoordinator::new());
+    let fallback_inner = Arc::new(InMemoryCoordinator::new());
+
+    let primary = Arc::new(PanickingCoordinator::new(primary_inner));
+    let fallback = Arc::new(PanickingCoordinator::new(fallback_inner));
+
+    let failover = Arc::new(drift_core::coordinator::failover::FailoverCoordinator::new(vec![
+        primary.clone(),
+        fallback.clone(),
+    ]).with_max_failures(1));
+
+    let ns = "chaos-failover-push-ns";
+    let keyring = Arc::new(drift_core::e2ee::keyring::KeyRing::generate());
+
+    let mut config = DriftConfig::default();
+    config.namespace = ns.to_string();
+    config.replica_id = "replica-1".to_string();
+    config.storage = StorageConfig::InMemory;
+    config.sync_interval = Duration::from_secs(3600);
+
+    let client = DriftClient::new_with_keyring(config, failover.clone(), keyring.clone()).await.unwrap();
+
+    let mut fields = HashMap::new();
+    fields.insert("k".to_string(), CrdtValue::String("v".to_string()));
+    client.insert("doc-1", "rec-1", fields).await.unwrap();
+
+    primary.set_fail(true);
+
+    let synced = client.force_sync().await.unwrap();
+    assert!(synced > 0);
+    assert_eq!(failover.active_index(), 1);
+
+    client.shutdown().await.unwrap();
+}

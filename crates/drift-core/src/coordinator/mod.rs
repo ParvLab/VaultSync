@@ -8,3 +8,4 @@ pub mod mock;
 pub mod http;
 #[cfg(feature = "coordinator-http")]
 pub mod mux_coordinator;
+pub mod failover;

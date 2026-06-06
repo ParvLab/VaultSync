@@ -15,6 +15,7 @@ pub struct HttpCoordinatorConfig {
 
 #[derive(Debug, Clone)]
 struct WsClientHandle {
+    namespace: String,
     tx: tokio::sync::mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
     pending_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
 }
@@ -163,6 +164,7 @@ impl HttpCoordinator {
         let ws_client_to_clear = self.ws_client.clone();
         let mut client_lock = self.ws_client.lock().await;
         *client_lock = Some(WsClientHandle {
+            namespace: namespace.to_string(),
             tx: write_tx,
             pending_requests: pending_requests_clone,
         });
@@ -223,28 +225,30 @@ impl Coordinator for HttpCoordinator {
     async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
         let handle_opt = self.ws_client.lock().await.clone();
         if let Some(handle) = handle_opt {
-            let req_id = uuid::Uuid::new_v4().to_string();
-            let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
-            {
-                let mut reqs = handle.pending_requests.lock().await;
-                reqs.insert(req_id.clone(), tx);
-            }
+            if handle.namespace == namespace {
+                let req_id = uuid::Uuid::new_v4().to_string();
+                let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+                {
+                    let mut reqs = handle.pending_requests.lock().await;
+                    reqs.insert(req_id.clone(), tx);
+                }
 
-            let push = PushPayload {
-                request_id: req_id,
-                mutations: mutations.clone(),
-            };
+                let push = PushPayload {
+                    request_id: req_id,
+                    mutations: mutations.clone(),
+                };
 
-            if let Ok(frame) = encode_frame(MSG_PUSH, &push) {
-                if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
-                    if let Ok(resp_bin) = rx.await {
-                        if let Ok((msg_type, payload)) = decode_frame(&resp_bin) {
-                            if msg_type == MSG_PUSH_ACK {
-                                if let Ok(ack) = serde_json::from_slice::<PushAckPayload>(payload) {
-                                    if let Some(err) = ack.error {
-                                        return Err(CoordinatorError::Internal(err));
+                if let Ok(frame) = encode_frame(MSG_PUSH, &push) {
+                    if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                        if let Ok(resp_bin) = rx.await {
+                            if let Ok((msg_type, payload)) = decode_frame(&resp_bin) {
+                                if msg_type == MSG_PUSH_ACK {
+                                    if let Ok(ack) = serde_json::from_slice::<PushAckPayload>(payload) {
+                                        if let Some(err) = ack.error {
+                                            return Err(CoordinatorError::Internal(err));
+                                        }
+                                        return Ok(ack.sequences);
                                     }
-                                    return Ok(ack.sequences);
                                 }
                             }
                         }
@@ -268,31 +272,32 @@ impl Coordinator for HttpCoordinator {
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(seq_ids)
     }
-
     async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
         let handle_opt = self.ws_client.lock().await.clone();
         if let Some(handle) = handle_opt {
-            let req_id = uuid::Uuid::new_v4().to_string();
-            let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
-            {
-                let mut reqs = handle.pending_requests.lock().await;
-                reqs.insert(req_id.clone(), tx);
-            }
+            if handle.namespace == namespace {
+                let req_id = uuid::Uuid::new_v4().to_string();
+                let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+                {
+                    let mut reqs = handle.pending_requests.lock().await;
+                    reqs.insert(req_id.clone(), tx);
+                }
 
-            let pull = PullPayload {
-                request_id: req_id,
-                namespace: namespace.to_string(),
-                after,
-                limit,
-            };
+                let pull = PullPayload {
+                    request_id: req_id,
+                    namespace: namespace.to_string(),
+                    after,
+                    limit,
+                };
 
-            if let Ok(frame) = encode_frame(MSG_PULL, &pull) {
-                if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
-                    if let Ok(resp_bin) = rx.await {
-                        if let Ok((msg_type, payload)) = decode_frame(&resp_bin) {
-                            if msg_type == MSG_PULL_RESPONSE {
-                                if let Ok(resp) = serde_json::from_slice::<PullResponsePayload>(payload) {
-                                    return Ok(resp.mutations);
+                if let Ok(frame) = encode_frame(MSG_PULL, &pull) {
+                    if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                        if let Ok(resp_bin) = rx.await {
+                            if let Ok((msg_type, payload)) = decode_frame(&resp_bin) {
+                                if msg_type == MSG_PULL_RESPONSE {
+                                    if let Ok(resp) = serde_json::from_slice::<PullResponsePayload>(payload) {
+                                        return Ok(resp.mutations);
+                                    }
                                 }
                             }
                         }
@@ -526,6 +531,86 @@ impl Coordinator for HttpCoordinator {
         let version = resp.json::<u64>().await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(version)
+    }
+
+    async fn get_snapshot(&self, namespace: &str, doc_id: &str, record_id: &str)
+        -> Result<Option<drift_core::crdt::snapshot::Snapshot>, CoordinatorError> {
+        let url = format!(
+            "{}/namespace/{}/snapshot/{}/{}",
+            self.config.url.trim_end_matches('/'),
+            namespace,
+            doc_id,
+            record_id
+        );
+        let mut builder = self.client.get(&url);
+        if let Some(ref token) = self.config.auth_token {
+            builder = builder.bearer_auth(token);
+        }
+        let resp = builder.send().await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+        }
+        let snapshot = resp.json::<Option<drift_core::crdt::snapshot::Snapshot>>().await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        Ok(snapshot)
+    }
+
+    async fn store_snapshot(&self, namespace: &str, snapshot: &drift_core::crdt::snapshot::Snapshot)
+        -> Result<(), CoordinatorError> {
+        let url = format!(
+            "{}/namespace/{}/snapshot/{}/{}",
+            self.config.url.trim_end_matches('/'),
+            namespace,
+            snapshot.doc_id,
+            snapshot.record_id
+        );
+        let mut builder = self.client.post(&url).json(snapshot);
+        if let Some(ref token) = self.config.auth_token {
+            builder = builder.bearer_auth(token);
+        }
+        let resp = builder.send().await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    async fn list_snapshots(&self, namespace: &str)
+        -> Result<Vec<drift_core::crdt::snapshot::Snapshot>, CoordinatorError> {
+        let url = format!("{}/namespace/{}/snapshots", self.config.url.trim_end_matches('/'), namespace);
+        let mut builder = self.client.get(&url);
+        if let Some(ref token) = self.config.auth_token {
+            builder = builder.bearer_auth(token);
+        }
+        let resp = builder.send().await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+        }
+        let snapshots = resp.json::<Vec<drift_core::crdt::snapshot::Snapshot>>().await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        Ok(snapshots)
+    }
+
+    async fn compact_oplog(&self, namespace: &str) -> Result<drift_core::sync::compaction::CompactionStats, CoordinatorError> {
+        let url = format!("{}/namespace/{}/compact", self.config.url.trim_end_matches('/'), namespace);
+        let mut builder = self.client.post(&url);
+        if let Some(ref token) = self.config.auth_token {
+            builder = builder.bearer_auth(token);
+        }
+        let resp = builder.send().await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+        }
+        let stats = resp.json::<drift_core::sync::compaction::CompactionStats>().await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        Ok(stats)
     }
 }
 

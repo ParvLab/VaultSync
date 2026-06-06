@@ -7,9 +7,16 @@ pub fn decrypt(
     sk: &[u8; 32],
     sender_pk: &[u8; 32],
 ) -> Result<Vec<u8>, DriftError> {
+    if ciphertext.len() < 12 {
+        return Err(DriftError::Encryption("invalid ciphertext length (too short)".into()));
+    }
     let shared_secret = x25519_dalek::x25519(*sk, *sender_pk);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&shared_secret));
-    let nonce = Nonce::from_slice(&[0u8; 12]);
-    cipher.decrypt(nonce, ciphertext)
+    
+    let nonce_bytes = &ciphertext[..12];
+    let actual_ciphertext = &ciphertext[12..];
+    
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher.decrypt(nonce, actual_ciphertext)
         .map_err(|e| DriftError::Encryption(format!("decrypt failed: {e}")))
 }

@@ -140,4 +140,37 @@ impl DownloadQueue {
     pub fn last_sequence(&self) -> u64 {
         self.last_sequence.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    pub async fn process_p2p_mutation(&self, m: crate::coordinator::traits::PendingMutation) -> Result<(), DriftError> {
+        if m.encrypted_blob.len() >= 8 {
+            let header_version = u64::from_le_bytes(m.encrypted_blob[..8].try_into().unwrap());
+            if header_version != m.key_version {
+                tracing::warn!(
+                    blob_version = header_version,
+                    mutation_version = m.key_version,
+                    "Key version mismatch in P2P mutation payload"
+                );
+            }
+        }
+        let decrypted_bytes = self.decryptor.decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
+
+        let entry = OplogEntry {
+            id: m.id.clone(),
+            namespace: m.namespace.clone(),
+            replica_id: "".to_string(),
+            mutation_type: MutationType::CrdtUpdate,
+            doc_id: m.doc_id.clone(),
+            record_id: m.record_id.clone(),
+            yrs_update: decrypted_bytes,
+            encrypted_blob: Some(m.encrypted_blob.clone()),
+            timestamp: m.timestamp,
+            sequence: None,
+            sync_status: SyncStatus::Synced,
+            synced_at: None,
+            created_at: m.timestamp,
+        };
+
+        self.reconciler.apply_remote_update(&entry).await?;
+        Ok(())
+    }
 }

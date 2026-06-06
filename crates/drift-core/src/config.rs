@@ -15,6 +15,9 @@ pub struct DriftConfig {
     pub retry: RetryConfig,
     pub sync_interval: std::time::Duration,
     pub debug_port: Option<u16>,
+    pub fallback_coordinator_urls: Vec<String>,
+    pub enable_p2p: bool,
+    pub p2p_listen_addr: Option<String>,
 }
 
 impl Default for DriftConfig {
@@ -30,6 +33,9 @@ impl Default for DriftConfig {
             retry: RetryConfig::default(),
             sync_interval: std::time::Duration::from_secs(5),
             debug_port: None,
+            fallback_coordinator_urls: Vec::new(),
+            enable_p2p: false,
+            p2p_listen_addr: Some("/ip4/0.0.0.0/udp/0/quic-v1".to_string()),
         }
     }
 }

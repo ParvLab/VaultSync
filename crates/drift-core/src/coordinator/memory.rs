@@ -14,6 +14,7 @@ pub struct InMemoryCoordinator {
     schema_versions: Arc<RwLock<std::collections::HashMap<String, u64>>>,
     replicas: Arc<RwLock<std::collections::HashMap<(String, String), ReplicaInfo>>>,
     replica_keys: Arc<RwLock<std::collections::HashMap<(String, String), (Vec<u8>, u64)>>>,
+    snapshots: Arc<RwLock<std::collections::HashMap<(String, String, String), crate::crdt::snapshot::Snapshot>>>,
     tx: broadcast::Sender<PendingMutation>,
 }
 
@@ -26,6 +27,7 @@ impl InMemoryCoordinator {
             schema_versions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             replicas: Arc::new(RwLock::new(std::collections::HashMap::new())),
             replica_keys: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            snapshots: Arc::new(RwLock::new(std::collections::HashMap::new())),
             tx,
         }
     }
@@ -38,6 +40,18 @@ impl Coordinator for InMemoryCoordinator {
         let mut to_broadcast = Vec::new();
         let mut ops = self.ops.write().map_err(|_| CoordinatorError::NotAvailable)?;
         for m in mutations {
+            let mut existing_seq = None;
+            for ((ns_key, _), pm) in ops.iter() {
+                if ns_key == namespace && pm.id == m.id {
+                    existing_seq = Some(pm.sequence);
+                    break;
+                }
+            }
+            if let Some(seq) = existing_seq {
+                seqs.push(seq);
+                continue;
+            }
+
             let seq = self.next_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let pm = PendingMutation {
                 id: m.id,
@@ -65,7 +79,11 @@ impl Coordinator for InMemoryCoordinator {
     async fn pull(&self, namespace: &str, after: SequenceId, _limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
         let ops = self.ops.read().map_err(|_| CoordinatorError::NotAvailable)?;
         let range = ops.range((namespace.to_string(), after + 1)..);
-        Ok(range.take(_limit).map(|(_, v)| v.clone()).collect())
+        Ok(range
+            .filter(|((ns, _), _)| ns == namespace)
+            .take(_limit)
+            .map(|(_, v)| v.clone())
+            .collect())
     }
 
     async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
@@ -82,8 +100,10 @@ impl Coordinator for InMemoryCoordinator {
             let mut existing = Vec::new();
             if let Ok(ops_guard) = ops.read() {
                 let range = ops_guard.range((namespace_str.clone(), from_sequence + 1)..);
-                for ((_, _), v) in range {
-                    existing.push(v.clone());
+                for ((ns, _), v) in range {
+                    if ns == &namespace_str {
+                        existing.push(v.clone());
+                    }
                 }
             } // lock is released here
             
@@ -157,6 +177,65 @@ impl Coordinator for InMemoryCoordinator {
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError> {
         Ok(self.schema_versions.read().map_err(|_| CoordinatorError::NotAvailable)?
             .get(namespace).copied().unwrap_or(0))
+    }
+
+    async fn get_snapshot(&self, namespace: &str, doc_id: &str, record_id: &str)
+        -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+        let snaps = self.snapshots.read().map_err(|_| CoordinatorError::NotAvailable)?;
+        Ok(snaps.get(&(namespace.to_string(), doc_id.to_string(), record_id.to_string())).cloned())
+    }
+
+    async fn store_snapshot(&self, namespace: &str, snapshot: &crate::crdt::snapshot::Snapshot)
+        -> Result<(), CoordinatorError> {
+        let mut snaps = self.snapshots.write().map_err(|_| CoordinatorError::NotAvailable)?;
+        snaps.insert((namespace.to_string(), snapshot.doc_id.clone(), snapshot.record_id.clone()), snapshot.clone());
+        Ok(())
+    }
+
+    async fn list_snapshots(&self, namespace: &str)
+        -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+        let snaps = self.snapshots.read().map_err(|_| CoordinatorError::NotAvailable)?;
+        let res = snaps.iter()
+            .filter(|((ns, _, _), _)| ns == namespace)
+            .map(|(_, v)| v.clone())
+            .collect();
+        Ok(res)
+    }
+
+    async fn compact_oplog(&self, namespace: &str) -> Result<crate::sync::compaction::CompactionStats, CoordinatorError> {
+        let snaps = self.snapshots.read().map_err(|_| CoordinatorError::NotAvailable)?;
+        let namespace_snaps: Vec<crate::crdt::snapshot::Snapshot> = snaps.iter()
+            .filter(|((ns, _, _), _)| ns == namespace)
+            .map(|(_, v)| v.clone())
+            .collect();
+        drop(snaps);
+
+        let mut ops = self.ops.write().map_err(|_| CoordinatorError::NotAvailable)?;
+        let mut oplog_removed = 0;
+        let mut snapshots_collapsed = 0;
+
+        for snap in namespace_snaps {
+            let mut keys_to_remove = Vec::new();
+            for ((ns, seq), pm) in ops.iter() {
+                if ns == namespace && pm.doc_id == snap.doc_id && pm.record_id == snap.record_id && *seq <= snap.sequence {
+                    keys_to_remove.push((ns.clone(), *seq));
+                }
+            }
+            if !keys_to_remove.is_empty() {
+                snapshots_collapsed += 1;
+                for key in keys_to_remove {
+                    if ops.remove(&key).is_some() {
+                        oplog_removed += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(crate::sync::compaction::CompactionStats {
+            oplog_removed,
+            docs_removed: 0,
+            snapshots_collapsed,
+        })
     }
 }
 

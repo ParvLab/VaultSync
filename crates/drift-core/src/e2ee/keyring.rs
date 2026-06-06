@@ -5,11 +5,15 @@ use sha2::{Sha256, Digest};
 use hkdf::Hkdf;
 use crate::error::DriftError;
 
-#[derive(Debug, Clone)]
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct NamespaceKeypair {
     pub public_key: [u8; 32],
     pub private_key: [u8; 32],
+    #[zeroize(skip)]
     pub version: u64,
+    #[zeroize(skip)]
     pub created_at: u64,
 }
 

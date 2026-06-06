@@ -1,0 +1,16 @@
+[package]
+name = "drift-transport-libp2p"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+libp2p = { version = "0.53", features = ["gossipsub", "mdns", "quic", "identify", "noise", "yamux", "tokio", "macros", "tcp"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+futures = "0.3"
+tracing = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# empty stub on WASM

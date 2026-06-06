@@ -44,6 +44,8 @@ pub struct DriftClient {
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(not(target_arch = "wasm32"))]
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    #[cfg(not(target_arch = "wasm32"))]
+    p2p_handle: Option<drift_transport_libp2p::LibP2pTransportHandle>,
     pub metrics: Arc<crate::telemetry::metrics::DriftMetrics>,
     pub debug_api: Arc<crate::telemetry::debug::DebugApi>,
     pub leader_election: Arc<crate::ipc::leader_election::LeaderElection>,
@@ -62,7 +64,7 @@ impl DriftClient {
     ///   "http(s)://"    → HttpCoordinator (speaks REST to any conforming HTTP endpoint)
     ///   <anything else> → InMemoryCoordinator (safe fallback)
     pub async fn connect(config: DriftConfig) -> Result<Self, DriftError> {
-        let coordinator: Arc<dyn Coordinator> =
+        let primary_coordinator: Arc<dyn Coordinator> =
             if config.coordinator_endpoint.starts_with("memory://") {
                 Arc::new(InMemoryCoordinator::new())
             } else if config.coordinator_endpoint.starts_with("http://")
@@ -83,6 +85,36 @@ impl DriftClient {
             } else {
                 Arc::new(InMemoryCoordinator::new())
             };
+
+        let coordinator: Arc<dyn Coordinator> = if config.fallback_coordinator_urls.is_empty() {
+            primary_coordinator
+        } else {
+            let mut candidates: Vec<Arc<dyn Coordinator>> = vec![primary_coordinator];
+            for url in &config.fallback_coordinator_urls {
+                let coord: Arc<dyn Coordinator> = if url.starts_with("memory://") {
+                    Arc::new(InMemoryCoordinator::new())
+                } else if url.starts_with("http://") || url.starts_with("https://") {
+                    #[cfg(feature = "coordinator-http")]
+                    {
+                        Arc::new(crate::coordinator::http::HttpCoordinator::new(
+                            crate::coordinator::http::HttpCoordinatorConfig {
+                                url: url.clone(),
+                                auth_token: config.auth_token.clone(),
+                            }
+                        ))
+                    }
+                    #[cfg(not(feature = "coordinator-http"))]
+                    {
+                        return Err(DriftError::Config("HTTP coordinator feature is not enabled for fallbacks".into()));
+                    }
+                } else {
+                    Arc::new(InMemoryCoordinator::new())
+                };
+                candidates.push(coord);
+            }
+            Arc::new(crate::coordinator::failover::FailoverCoordinator::new(candidates))
+        };
+
         let keyring = Arc::new(KeyRing::generate());
         Self::new_with_keyring(config, coordinator, keyring).await
     }
@@ -210,6 +242,45 @@ impl DriftClient {
 
         let leader_election = Arc::new(crate::ipc::leader_election::LeaderElection::new(&config.namespace, &config.storage));
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut p2p_handle = None;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if config.enable_p2p {
+            let (incoming_tx, mut incoming_rx) = tokio::sync::mpsc::channel(100);
+            let listen_addr = config.p2p_listen_addr.clone();
+            let ns = config.namespace.clone();
+            match drift_transport_libp2p::LibP2pTransport::new(&ns, listen_addr, incoming_tx).await {
+                Ok((transport, handle)) => {
+                    p2p_handle = Some(handle);
+                    crate::time_utils::spawn(async move {
+                        transport.run().await;
+                    });
+                    let dq = download_queue.clone();
+                    crate::time_utils::spawn(async move {
+                        while let Some(m) = incoming_rx.recv().await {
+                            let core_mutation = crate::coordinator::traits::PendingMutation {
+                                id: m.id,
+                                namespace: m.namespace,
+                                sequence: m.sequence,
+                                doc_id: m.doc_id,
+                                record_id: m.record_id,
+                                encrypted_blob: m.encrypted_blob,
+                                timestamp: m.timestamp,
+                                key_version: m.key_version,
+                            };
+                            if let Err(e) = dq.process_p2p_mutation(core_mutation).await {
+                                tracing::error!(error = %e, "Failed to process P2P mutation");
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to initialize P2P transport");
+                }
+            }
+        }
+
         let client = Self {
             config,
             storage,
@@ -228,6 +299,8 @@ impl DriftClient {
             shutdown_flag: shutdown_flag.clone(),
             #[cfg(not(target_arch = "wasm32"))]
             shutdown_tx,
+            #[cfg(not(target_arch = "wasm32"))]
+            p2p_handle,
             metrics,
             debug_api,
             leader_election: leader_election.clone(),
@@ -425,6 +498,8 @@ impl DriftClient {
 
         match res {
             Ok(_) => {
+                let key_version = self.keyring.active_key().version;
+                self.broadcast_p2p(&entry, key_version).await;
                 self.metrics.record_mutation_attempt(&self.config.namespace, "success");
                 let pending = self.pending_uploads().await.unwrap_or(0);
                 self.metrics.set_mutations_pending(&self.config.namespace, pending as i64);
@@ -490,6 +565,8 @@ impl DriftClient {
 
         match res {
             Ok(_) => {
+                let key_version = self.keyring.active_key().version;
+                self.broadcast_p2p(&entry, key_version).await;
                 self.metrics.record_mutation_attempt(&self.config.namespace, "success");
                 let pending = self.pending_uploads().await.unwrap_or(0);
                 self.metrics.set_mutations_pending(&self.config.namespace, pending as i64);
@@ -551,6 +628,8 @@ impl DriftClient {
 
             match res {
                 Ok(_) => {
+                    let key_version = self.keyring.active_key().version;
+                    self.broadcast_p2p(&entry, key_version).await;
                     self.metrics.record_mutation_attempt(&self.config.namespace, "success");
                     let pending = self.pending_uploads().await.unwrap_or(0);
                     self.metrics.set_mutations_pending(&self.config.namespace, pending as i64);
@@ -731,4 +810,75 @@ impl DriftClient {
         self.storage.write_migration(&record).await?;
         Ok(())
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn enable_p2p(&mut self) -> Result<(), DriftError> {
+        if self.p2p_handle.is_some() {
+            return Ok(());
+        }
+        let (incoming_tx, mut incoming_rx) = tokio::sync::mpsc::channel(100);
+        let listen_addr = self.config.p2p_listen_addr.clone();
+        let ns = self.config.namespace.clone();
+        match drift_transport_libp2p::LibP2pTransport::new(&ns, listen_addr, incoming_tx).await {
+            Ok((transport, handle)) => {
+                self.p2p_handle = Some(handle);
+                crate::time_utils::spawn(async move {
+                    transport.run().await;
+                });
+                let dq = self.download_queue.clone();
+                crate::time_utils::spawn(async move {
+                    while let Some(m) = incoming_rx.recv().await {
+                        let core_mutation = crate::coordinator::traits::PendingMutation {
+                            id: m.id,
+                            namespace: m.namespace,
+                            sequence: m.sequence,
+                            doc_id: m.doc_id,
+                            record_id: m.record_id,
+                            encrypted_blob: m.encrypted_blob,
+                            timestamp: m.timestamp,
+                            key_version: m.key_version,
+                        };
+                        if let Err(e) = dq.process_p2p_mutation(core_mutation).await {
+                            tracing::error!(error = %e, "Failed to process P2P mutation");
+                        }
+                    }
+                });
+                Ok(())
+            }
+            Err(e) => Err(DriftError::Config(format!("Failed to enable P2P: {}", e))),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn enable_p2p(&mut self) -> Result<(), DriftError> {
+        Err(DriftError::Config("P2P transport is not supported on WebAssembly".into()))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn disable_p2p(&mut self) {
+        self.p2p_handle = None;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn disable_p2p(&mut self) {}
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn broadcast_p2p(&self, entry: &OplogEntry, key_version: u64) {
+        if let Some(ref p2p) = self.p2p_handle {
+            let m = drift_transport_libp2p::PendingMutation {
+                id: entry.id.clone(),
+                namespace: entry.namespace.clone(),
+                sequence: 0,
+                doc_id: entry.doc_id.clone(),
+                record_id: entry.record_id.clone(),
+                encrypted_blob: entry.encrypted_blob.clone().unwrap_or_default(),
+                timestamp: entry.timestamp,
+                key_version,
+            };
+            let _ = p2p.broadcast_mutation(m).await;
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn broadcast_p2p(&self, _entry: &OplogEntry, _key_version: u64) {}
 }
