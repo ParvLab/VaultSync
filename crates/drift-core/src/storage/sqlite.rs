@@ -608,6 +608,25 @@ impl Storage for SQLiteStorage {
         .await
         .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
     }
+
+    async fn delete_synced_before(
+        &self,
+        namespace: &str,
+        cutoff_ms: u64,
+    ) -> Result<usize, DriftError> {
+        let namespace = namespace.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let count = conn.execute(
+                "DELETE FROM oplog WHERE namespace = ?1 AND sync_status = 'Synced' AND created_at < ?2",
+                params![namespace, cutoff_ms as i64],
+            )?;
+            Ok(count)
+        })
+        .await
+        .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
+    }
 }
 
 impl SQLiteStorage {

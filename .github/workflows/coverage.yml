@@ -1,0 +1,54 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+
+      - name: Run coverage
+        run: >
+          cargo tarpaulin
+          --workspace
+          --exclude drift-fuzz drift-coordinator-cf drift-transport-libp2p drift-transport-webrtc
+          --features telemetry
+          --out Xml Html
+          --output-dir coverage/
+          --skip-clean
+          --timeout 300
+
+      - name: Enforce critical module thresholds (100%)
+        run: |
+          python3 scripts/check_coverage.py \
+            --xml coverage/cobertura.xml \
+            --require "crdt=100" \
+            --require "e2ee=100" \
+            --require "ipc=100"
+
+      - name: Enforce overall threshold (94%)
+        run: |
+          python3 scripts/check_coverage.py \
+            --xml coverage/cobertura.xml \
+            --require "drift_core=94"
+
+      - name: Upload HTML report artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-html
+          path: coverage/
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage/cobertura.xml
+        continue-on-error: true

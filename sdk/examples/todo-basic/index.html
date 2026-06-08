@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Drift — E2E Test App</title>
+</head>
+<body>
+  <div id="app">
+    <form id="todo-form">
+      <input data-testid="todo-input" id="todo-input" placeholder="Add todo..." />
+      <button data-testid="todo-submit" type="submit">Add</button>
+    </form>
+    <ul data-testid="todo-list" id="todo-list"></ul>
+    <div data-testid="sync-status" id="sync-status">offline</div>
+    <div data-testid="leader-status" id="leader-status">unknown</div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

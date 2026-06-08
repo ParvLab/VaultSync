@@ -1,0 +1,15 @@
+[package]
+name = "drift-loadtest"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "drift-loadtest"
+path = "src/main.rs"
+
+[dependencies]
+drift-core = { path = "../../crates/drift-core" }
+drift-coordinator-memory = { path = "../../crates/drift-coordinator-memory" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }

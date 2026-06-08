@@ -16,3 +16,9 @@ export type SyncStatus = {
 
 export type SubscriptionCallback = (recordId: string, fields: RecordFields) => void;
 export type UnsubscribeFn = () => void;
+
+export interface KeyInfo {
+  version: number;
+  createdAt: number;
+  isActive: boolean;
+}

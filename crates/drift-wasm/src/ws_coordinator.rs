@@ -10,6 +10,16 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{BinaryType, WebSocket};
 
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = log)]
+    fn console_log_str(s: &str);
+}
+
+macro_rules! console_log {
+    ($($t:tt)*) => (console_log_str(&format!($($t)*)));
+}
+
 #[derive(Debug, Clone)]
 pub struct WasmWsCoordinator {
     inner: Arc<WasmWsCoordinatorInner>,
@@ -50,8 +60,10 @@ impl WasmWsCoordinator {
         }
     }
 
-    async fn connect_and_handshake(&self, namespace: &str, after: SequenceId) -> Result<(), CoordinatorError> {
+    async fn connect_and_handshake(&self, namespace: &str, after: SequenceId, info: Option<&ReplicaInfo>) -> Result<(), CoordinatorError> {
+        console_log!("[WasmWs] connect_and_handshake starting for namespace={}", namespace);
         let ws_url = get_ws_url(&self.inner.url, namespace);
+        console_log!("[WasmWs] connecting to url={}", ws_url);
         let ws = WebSocket::new(&ws_url)
             .map_err(|e| CoordinatorError::Internal(format!("Failed to create WebSocket: {:?}", e)))?;
         ws.set_binary_type(BinaryType::Arraybuffer);
@@ -61,6 +73,7 @@ impl WasmWsCoordinator {
             let (open_tx, open_rx) = oneshot::channel::<()>();
             let mut open_tx_opt = Some(open_tx);
             let open_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
+                console_log!("[WasmWs] WebSocket opened!");
                 if let Some(tx) = open_tx_opt.take() {
                     let _ = tx.send(());
                 }
@@ -71,7 +84,8 @@ impl WasmWsCoordinator {
             // Also setup onclose/onerror to abort if open fails
             let (close_tx, close_rx) = oneshot::channel::<()>();
             let mut close_tx_opt = Some(close_tx);
-            let close_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
+            let close_callback = Closure::wrap(Box::new(move |e: web_sys::Event| {
+                console_log!("[WasmWs] WebSocket closed/failed: {:?}", e);
                 if let Some(tx) = close_tx_opt.take() {
                     let _ = tx.send(());
                 }
@@ -83,8 +97,13 @@ impl WasmWsCoordinator {
         };
 
         futures::select! {
-            _ = open_rx.fuse() => {}
-            _ = close_rx.fuse() => return Err(CoordinatorError::NotAvailable),
+            _ = open_rx.fuse() => {
+                console_log!("[WasmWs] open_rx resolved, connected!");
+            }
+            _ = close_rx.fuse() => {
+                console_log!("[WasmWs] close_rx resolved, connection failed!");
+                return Err(CoordinatorError::NotAvailable);
+            }
         }
 
         // Setup message handler
@@ -104,11 +123,13 @@ impl WasmWsCoordinator {
         };
 
         // 2. Perform AUTH
+        console_log!("[WasmWs] sending auth...");
         let token = self.inner.auth_token.clone().unwrap_or_default();
+        let replica_id = info.map(|i| i.replica_id.clone()).unwrap_or_else(|| format!("client-wasm-{}", uuid::Uuid::new_v4()));
         let auth = AuthPayload {
             token,
             protocol_version: 1,
-            replica_id: format!("client-wasm-{}", uuid::Uuid::new_v4()),
+            replica_id: replica_id.clone(),
             namespace: namespace.to_string(),
         };
         let auth_frame = encode_frame(MSG_AUTH, &auth)
@@ -117,6 +138,7 @@ impl WasmWsCoordinator {
             .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
 
         // Wait for AUTH_ACK
+        console_log!("[WasmWs] waiting for auth ack...");
         let auth_resp = msg_rx.next().await
             .ok_or_else(|| CoordinatorError::Internal("Connection closed during AUTH".to_string()))?;
 
@@ -124,6 +146,7 @@ impl WasmWsCoordinator {
             .map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type != MSG_AUTH_ACK {
+            console_log!("[WasmWs] auth failed: expected MSG_AUTH_ACK, got {:02X}", msg_type);
             return Err(CoordinatorError::Internal(format!("Expected MSG_AUTH_ACK, got {:02X}", msg_type)));
         }
 
@@ -131,15 +154,18 @@ impl WasmWsCoordinator {
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         if auth_ack.status != "ok" {
+            console_log!("[WasmWs] auth ack status is not ok: {:?}", auth_ack.error);
             return Err(CoordinatorError::AuthFailed);
         }
+        console_log!("[WasmWs] auth successful!");
 
         // 3. Perform REGISTER
+        console_log!("[WasmWs] sending register...");
         let reg = RegisterPayload {
-            replica_id: auth.replica_id.clone(),
+            replica_id: replica_id.clone(),
             namespace: namespace.to_string(),
-            public_key: vec![],
-            schema_version: 0,
+            public_key: info.map(|i| i.public_key.clone()).unwrap_or_default(),
+            schema_version: info.map(|i| i.schema_version).unwrap_or(0),
             last_sequence: after,
             key_version: 1,
         };
@@ -149,6 +175,7 @@ impl WasmWsCoordinator {
             .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
 
         // Wait for REGISTER_ACK
+        console_log!("[WasmWs] waiting for register ack...");
         let reg_resp = msg_rx.next().await
             .ok_or_else(|| CoordinatorError::Internal("Connection closed during REGISTER".to_string()))?;
 
@@ -156,10 +183,13 @@ impl WasmWsCoordinator {
             .map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type != MSG_REGISTER_ACK {
+            console_log!("[WasmWs] register failed: expected MSG_REGISTER_ACK, got {:02X}", msg_type);
             return Err(CoordinatorError::Internal(format!("Expected MSG_REGISTER_ACK, got {:02X}", msg_type)));
         }
+        console_log!("[WasmWs] register successful!");
 
         // 4. Perform SUBSCRIBE
+        console_log!("[WasmWs] sending subscribe...");
         let sub = SubscribePayload {
             request_id: uuid::Uuid::new_v4().to_string(),
             namespace: namespace.to_string(),
@@ -179,6 +209,7 @@ impl WasmWsCoordinator {
                 if let Ok((msg_type, payload)) = decode_frame(&bin) {
                     if msg_type == MSG_MUTATION_PUSH {
                         if let Ok(mutat) = serde_json::from_slice::<PendingMutation>(payload) {
+                            console_log!("[WasmWs] received MSG_MUTATION_PUSH: seq={}", mutat.sequence);
                             let mut subs = inner_clone.subscribers.lock().unwrap();
                             subs.retain_mut(|sub| {
                                 sub.try_send(mutat.clone()).is_ok()
@@ -251,17 +282,17 @@ impl WasmWsCoordinator {
             });
 
             // Register with PeerCoordinator
-            let info = ReplicaInfo {
+            let peer_info = ReplicaInfo {
                 replica_id: auth.replica_id.clone(),
                 namespace: namespace.to_string(),
-                public_key: vec![],
-                schema_version: 0,
+                public_key: info.map(|i| i.public_key.clone()).unwrap_or_default(),
+                schema_version: info.map(|i| i.schema_version).unwrap_or(0),
             };
             
             let peer_coord_clone = peer_coord.clone();
             let ns_str_clone = ns_str.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = peer_coord_clone.register(&ns_str_clone, info).await;
+                let _ = peer_coord_clone.register(&ns_str_clone, peer_info).await;
             });
 
             // Spawn discovery loop
@@ -325,7 +356,8 @@ fn get_ws_url(http_url: &str, namespace: &str) -> String {
 
 #[async_trait]
 impl Coordinator for WasmWsCoordinator {
-    async fn push(&self, _namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+        console_log!("[WasmWs] push called for namespace={}, mutations count={}", namespace, mutations.len());
         let req_id = uuid::Uuid::new_v4().to_string();
         let payload = PushPayload {
             request_id: req_id.clone(),
@@ -340,15 +372,19 @@ impl Coordinator for WasmWsCoordinator {
             let ack: PushAckPayload = serde_json::from_slice(payload)
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
             if let Some(err) = ack.error {
+                console_log!("[WasmWs] push failed with error: {}", err);
                 return Err(CoordinatorError::Internal(err));
             }
+            console_log!("[WasmWs] push ack success, returned sequences={:?}", ack.sequences);
             Ok(ack.sequences)
         } else {
+            console_log!("[WasmWs] push got invalid response type: {:02X}", msg_type);
             Err(CoordinatorError::Internal("Invalid response type".to_string()))
         }
     }
 
     async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+        console_log!("[WasmWs] pull called for namespace={}, after={}, limit={}", namespace, after, limit);
         let req_id = uuid::Uuid::new_v4().to_string();
         let payload = PullPayload {
             request_id: req_id.clone(),
@@ -364,14 +400,36 @@ impl Coordinator for WasmWsCoordinator {
         if msg_type == MSG_PULL_RESPONSE {
             let resp: PullResponsePayload = serde_json::from_slice(payload)
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            console_log!("[WasmWs] pull returned {} mutations, has_more={}", resp.mutations.len(), resp.has_more);
             Ok(resp.mutations)
         } else {
+            console_log!("[WasmWs] pull got invalid response type: {:02X}", msg_type);
             Err(CoordinatorError::Internal("Invalid response type".to_string()))
         }
     }
 
     async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
-        self.connect_and_handshake(namespace, from_sequence).await?;
+        let is_connected = {
+            let ws_lock = self.inner.ws.lock().unwrap();
+            ws_lock.is_some()
+        };
+
+        if !is_connected {
+            self.connect_and_handshake(namespace, from_sequence, None).await?;
+        } else {
+            let sub = SubscribePayload {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                namespace: namespace.to_string(),
+                after: from_sequence,
+            };
+            let sub_frame = encode_frame(MSG_SUBSCRIBE, &sub)
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            let ws_lock = self.inner.ws.lock().unwrap();
+            if let Some(ref ws) = *ws_lock {
+                ws.send_with_u8_array(&sub_frame)
+                    .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+            }
+        }
         
         let (tx, rx) = mpsc::channel::<PendingMutation>(100);
         {
@@ -383,25 +441,31 @@ impl Coordinator for WasmWsCoordinator {
     }
 
     async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
-        let reg = RegisterPayload {
-            replica_id: info.replica_id.clone(),
-            namespace: namespace.to_string(),
-            public_key: info.public_key.clone(),
-            schema_version: info.schema_version,
-            last_sequence: 0,
-            key_version: 1,
+        let is_connected = {
+            let ws_lock = self.inner.ws.lock().unwrap();
+            ws_lock.is_some()
         };
-        let frame = encode_frame(MSG_REGISTER, &reg)
-            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
-        let ws_lock = self.inner.ws.lock().unwrap();
-        if let Some(ref ws) = *ws_lock {
-            ws.send_with_u8_array(&frame)
-                .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
-            Ok(())
+        if !is_connected {
+            self.connect_and_handshake(namespace, 0, Some(&info)).await?;
         } else {
-            Err(CoordinatorError::NotAvailable)
+            let reg = RegisterPayload {
+                replica_id: info.replica_id.clone(),
+                namespace: namespace.to_string(),
+                public_key: info.public_key.clone(),
+                schema_version: info.schema_version,
+                last_sequence: 0,
+                key_version: 1,
+            };
+            let frame = encode_frame(MSG_REGISTER, &reg)
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            let ws_lock = self.inner.ws.lock().unwrap();
+            if let Some(ref ws) = *ws_lock {
+                ws.send_with_u8_array(&frame)
+                    .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+            }
         }
+        Ok(())
     }
 
     async fn heartbeat(&self, _namespace: &str, replica_id: &str) -> Result<(), CoordinatorError> {

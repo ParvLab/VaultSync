@@ -16,6 +16,7 @@ members = [
     "crates/drift-coordinator-cf",
     "crates/drift-conformance",
     "crates/drift-transport-libp2p",
+    "scripts/loadtest",
 ]
 
 [workspace.package]

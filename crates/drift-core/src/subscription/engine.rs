@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use crate::error::DriftError;
 use crate::crdt::types::CrdtValue;
 
@@ -16,6 +17,7 @@ pub struct Subscription {
 pub struct SubscriptionEngine {
     subscriptions: HashMap<u64, Subscription>,
     next_handle: u64,
+    global_listener: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
 }
 
 impl SubscriptionEngine {
@@ -23,7 +25,12 @@ impl SubscriptionEngine {
         Self {
             subscriptions: HashMap::new(),
             next_handle: 1,
+            global_listener: None,
         }
+    }
+
+    pub fn set_global_listener(&mut self, listener: Arc<dyn Fn(&str, &str) + Send + Sync>) {
+        self.global_listener = Some(listener);
     }
 
     pub fn register(&mut self, doc_id: &str, callback: Callback) -> SubscriptionHandle {
@@ -44,6 +51,13 @@ impl SubscriptionEngine {
     }
 
     pub fn fire(&self, doc_id: &str, record_id: &str, state: &HashMap<String, CrdtValue>) {
+        if let Some(ref listener) = self.global_listener {
+            listener(doc_id, record_id);
+        }
+        self.fire_local(doc_id, record_id, state);
+    }
+
+    pub fn fire_local(&self, doc_id: &str, record_id: &str, state: &HashMap<String, CrdtValue>) {
         for sub in self.subscriptions.values() {
             if sub.doc_id == doc_id {
                 (sub.callback)(doc_id, record_id, state);
@@ -55,3 +69,4 @@ impl SubscriptionEngine {
         self.subscriptions.len()
     }
 }
+

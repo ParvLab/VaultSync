@@ -3,7 +3,7 @@ use clap::Parser;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "drift-coordinator-server", about = "Drift Coordinator HTTP Server")]
 pub struct ServerConfig {
-    #[arg(short, long, default_value = "127.0.0.1", env = "DRIFT_HOST")]
+    #[arg(long, default_value = "127.0.0.1", env = "DRIFT_HOST")]
     pub host: String,
 
     #[arg(short, long, default_value_t = 9876, env = "DRIFT_PORT")]

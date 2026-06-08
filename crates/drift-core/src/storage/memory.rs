@@ -247,4 +247,19 @@ impl Storage for InMemoryStorage {
         });
         Ok(initial_len - oplog.len())
     }
+
+    async fn delete_synced_before(
+        &self,
+        namespace: &str,
+        cutoff_ms: u64,
+    ) -> Result<usize, DriftError> {
+        let mut store = self.oplog.write().map_err(|e| DriftError::Storage(e.to_string()))?;
+        let before = store.len();
+        store.retain(|entry| {
+            !(entry.namespace == namespace
+                && entry.sync_status == crate::oplog::entry::SyncStatus::Synced
+                && entry.created_at < cutoff_ms)
+        });
+        Ok(before - store.len())
+    }
 }

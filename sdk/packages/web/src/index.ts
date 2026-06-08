@@ -1,13 +1,23 @@
 import init, { WasmDriftClient } from '../wasm/drift_wasm.js';
 import type { DriftConfig, RecordFields, SyncStatus, SubscriptionCallback, UnsubscribeFn } from './types.js';
+import { KeyManager } from './keys.js';
 
 export * from './types.js';
+export { KeyManager };
 
 export class DriftClient {
   private inner: any;
+  private _keys?: KeyManager;
 
   private constructor(inner: any) {
     this.inner = inner;
+  }
+
+  get keys(): KeyManager {
+    if (!this._keys) {
+      this._keys = new KeyManager(this.inner);
+    }
+    return this._keys;
   }
 
   static async create(config: DriftConfig): Promise<DriftClient> {

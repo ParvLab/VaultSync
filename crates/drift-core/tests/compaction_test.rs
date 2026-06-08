@@ -193,3 +193,140 @@ async fn test_key_rotation_uses_random_nonces() {
     assert_eq!(dec1, plaintext);
     assert_eq!(dec2, plaintext);
 }
+
+mod oplog_cleanup {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use drift_core::{
+        oplog::cleanup::OplogCleanup,
+        storage::memory::InMemoryStorage,
+        storage::traits::Storage,
+        oplog::entry::{OplogEntry, SyncStatus, MutationType},
+    };
+
+    #[tokio::test]
+    async fn test_cleanup_removes_old_synced_entries() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let cleanup = OplogCleanup::new(storage.clone());
+
+        // Insert old synced entry (timestamp 0 = very old)
+        let old_entry = OplogEntry {
+            id: "old-synced".to_string(),
+            replica_id: "replica-1".to_string(),
+            namespace: "ns".to_string(),
+            mutation_type: MutationType::CrdtInsert,
+            doc_id: "doc-1".to_string(),
+            record_id: "rec-1".to_string(),
+            yrs_update: vec![1, 2, 3],
+            encrypted_blob: None,
+            timestamp: 0,
+            sequence: Some(1),
+            sync_status: SyncStatus::Synced,
+            synced_at: Some(0),
+            created_at: 0, // epoch
+        };
+        storage.append_oplog(&old_entry).await.unwrap();
+
+        // Run compaction with 1-day retention
+        let removed = cleanup.compact("ns", Duration::from_secs(86400)).await.unwrap();
+        assert_eq!(removed, 1, "Should have removed 1 old synced entry");
+
+        let remaining = storage.read_pending_oplog("ns", 100).await.unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_never_removes_pending_entries() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let cleanup = OplogCleanup::new(storage.clone());
+
+        // Insert very old pending entry
+        let old_pending = OplogEntry {
+            id: "old-pending".to_string(),
+            replica_id: "replica-1".to_string(),
+            namespace: "ns".to_string(),
+            mutation_type: MutationType::CrdtInsert,
+            doc_id: "doc-1".to_string(),
+            record_id: "rec-1".to_string(),
+            yrs_update: vec![1, 2, 3],
+            encrypted_blob: None,
+            timestamp: 0,
+            sequence: None,
+            sync_status: SyncStatus::Pending,
+            synced_at: None,
+            created_at: 0,
+        };
+        storage.append_oplog(&old_pending).await.unwrap();
+
+        let removed = cleanup.compact("ns", Duration::from_millis(1)).await.unwrap();
+        assert_eq!(removed, 0, "Pending entries must NEVER be removed");
+
+        let pending = storage.read_pending_oplog("ns", 100).await.unwrap();
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_returns_correct_count() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let cleanup = OplogCleanup::new(storage.clone());
+
+        // 5 old synced + 3 old pending + 2 new synced
+        for i in 0..5 {
+            let e = OplogEntry {
+                id: format!("synced-old-{i}"),
+                replica_id: "replica-1".to_string(),
+                namespace: "ns".to_string(),
+                mutation_type: MutationType::CrdtInsert,
+                doc_id: "doc-1".to_string(),
+                record_id: "rec-1".to_string(),
+                yrs_update: vec![1, 2, 3],
+                encrypted_blob: None,
+                timestamp: 0,
+                sequence: Some(i),
+                sync_status: SyncStatus::Synced,
+                synced_at: Some(0),
+                created_at: 0,
+            };
+            storage.append_oplog(&e).await.unwrap();
+        }
+        for i in 5..8 {
+            let e = OplogEntry {
+                id: format!("pending-old-{i}"),
+                replica_id: "replica-1".to_string(),
+                namespace: "ns".to_string(),
+                mutation_type: MutationType::CrdtInsert,
+                doc_id: "doc-1".to_string(),
+                record_id: "rec-1".to_string(),
+                yrs_update: vec![1, 2, 3],
+                encrypted_blob: None,
+                timestamp: 0,
+                sequence: None,
+                sync_status: SyncStatus::Pending,
+                synced_at: None,
+                created_at: 0,
+            };
+            storage.append_oplog(&e).await.unwrap();
+        }
+        for i in 8..10 {
+            let e = OplogEntry {
+                id: format!("synced-new-{i}"),
+                replica_id: "replica-1".to_string(),
+                namespace: "ns".to_string(),
+                mutation_type: MutationType::CrdtInsert,
+                doc_id: "doc-1".to_string(),
+                record_id: "rec-1".to_string(),
+                yrs_update: vec![1, 2, 3],
+                encrypted_blob: None,
+                timestamp: u64::MAX,
+                sequence: Some(i),
+                sync_status: SyncStatus::Synced,
+                synced_at: Some(u64::MAX),
+                created_at: u64::MAX, // future
+            };
+            storage.append_oplog(&e).await.unwrap();
+        }
+
+        let removed = cleanup.compact("ns", Duration::from_millis(1)).await.unwrap();
+        assert_eq!(removed, 5, "Only old synced entries should be removed");
+    }
+}

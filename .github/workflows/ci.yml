@@ -124,3 +124,46 @@ jobs:
           else
             echo "WASM bundle size is $size bytes, within 5MB limit."
           fi
+
+  benchmarks:
+    runs-on: ubuntu-latest
+    needs: [lint, build-rust]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Criterion benchmarks
+        run: cargo bench -p drift-core 2>&1 | tee bench_output.txt
+      - name: Benchmark regression gate (>10% fails build)
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Drift Core
+          tool: cargo
+          output-file-path: bench_output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: "110%"
+          fail-on-alert: true
+          comment-on-alert: true
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [lint, build-rust]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build coordinator server
+        run: cargo build -p drift-coordinator-server --release
+      - name: Start coordinator server
+        run: ./target/release/drift-coordinator-server --backend memory --port 9876 &
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build WASM
+        run: wasm-pack build crates/drift-wasm --target web
+      - name: Install deps
+        run: npm ci --prefix sdk
+      - name: Install Playwright
+        run: npx --prefix sdk playwright install --with-deps chromium
+      - name: Run E2E
+        run: npm run e2e --prefix sdk
+        env:
+          CI: true

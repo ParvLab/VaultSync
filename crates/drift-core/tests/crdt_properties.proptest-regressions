@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c716c85bffb78c5e9752385657153129c0a2c6687cc3f756605e68302463e3f8 # shrinks to mutations = [("u", String("")), ("u", String("a")), ("a", String("")), ("a", String(""))], seed = 559947628130409234

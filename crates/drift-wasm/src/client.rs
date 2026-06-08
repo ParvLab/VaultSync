@@ -8,9 +8,11 @@ use crate::storage::BrowserStorage;
 use drift_core::coordinator::memory::InMemoryCoordinator;
 use drift_core::e2ee::keyring::KeyRing;
 
+use wasm_bindgen::JsCast;
+
 #[wasm_bindgen]
 pub struct WasmDriftClient {
-    client: DriftClient,
+    client: Arc<DriftClient>,
 }
 
 #[wasm_bindgen]
@@ -19,6 +21,8 @@ impl WasmDriftClient {
         let mut config = DriftConfig::default();
         config.namespace = namespace.to_string();
         config.replica_id = replica_id.to_string();
+        config.sync_interval = std::time::Duration::from_millis(200);
+        config.retry.initial_delay = std::time::Duration::from_millis(50);
         
         let db_name = format!("{}_db", namespace);
         let storage = Arc::new(BrowserStorage::new(&db_name).await
@@ -27,14 +31,52 @@ impl WasmDriftClient {
         let coordinator = Arc::new(InMemoryCoordinator::new());
         let keyring = Arc::new(KeyRing::generate());
 
-        let client = DriftClient::new_with_storage(
+        let client = Arc::new(DriftClient::new_with_storage(
             config,
             coordinator,
             keyring,
             storage,
         )
         .await
-        .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?;
+        .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?);
+
+        // Setup BroadcastChannel for cross-tab sync
+        let channel_name = format!("drift-ipc-{}", namespace);
+        let channel = web_sys::BroadcastChannel::new(&channel_name)
+            .map_err(|e| JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e)))?;
+
+        let client_clone = client.clone();
+        let onmessage = wasm_bindgen::closure::Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
+            if let Some(msg_str) = e.data().as_string() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg_str) {
+                    if let (Some(doc_id), Some(record_id)) = (
+                        val.get("doc_id").and_then(|v| v.as_str()),
+                        val.get("record_id").and_then(|v| v.as_str())
+                    ) {
+                        let doc_id = doc_id.to_string();
+                        let record_id = record_id.to_string();
+                        let client = client_clone.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Ok(Some(state)) = client.get(&doc_id, &record_id).await {
+                                client.fire_local_subscription(&doc_id, &record_id, &state);
+                            }
+                        });
+                    }
+                }
+            }
+        }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+
+        channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        onmessage.forget();
+
+        let channel_send = channel.clone();
+        client.set_change_listener(Arc::new(move |doc_id, record_id| {
+            let msg = serde_json::json!({
+                "doc_id": doc_id,
+                "record_id": record_id,
+            }).to_string();
+            let _ = channel_send.post_message(&JsValue::from_str(&msg));
+        }));
 
         Ok(Self { client })
     }
@@ -48,6 +90,8 @@ impl WasmDriftClient {
         let mut config = DriftConfig::default();
         config.namespace = namespace.to_string();
         config.replica_id = replica_id.to_string();
+        config.sync_interval = std::time::Duration::from_millis(200);
+        config.retry.initial_delay = std::time::Duration::from_millis(50);
         
         let db_name = format!("{}_db", namespace);
         let storage = Arc::new(BrowserStorage::new(&db_name).await
@@ -59,14 +103,52 @@ impl WasmDriftClient {
         ));
         let keyring = Arc::new(KeyRing::generate());
 
-        let client = DriftClient::new_with_storage(
+        let client = Arc::new(DriftClient::new_with_storage(
             config,
             coordinator,
             keyring,
             storage,
         )
         .await
-        .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?;
+        .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?);
+
+        // Setup BroadcastChannel for cross-tab sync
+        let channel_name = format!("drift-ipc-{}", namespace);
+        let channel = web_sys::BroadcastChannel::new(&channel_name)
+            .map_err(|e| JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e)))?;
+
+        let client_clone = client.clone();
+        let onmessage = wasm_bindgen::closure::Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
+            if let Some(msg_str) = e.data().as_string() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg_str) {
+                    if let (Some(doc_id), Some(record_id)) = (
+                        val.get("doc_id").and_then(|v| v.as_str()),
+                        val.get("record_id").and_then(|v| v.as_str())
+                    ) {
+                        let doc_id = doc_id.to_string();
+                        let record_id = record_id.to_string();
+                        let client = client_clone.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Ok(Some(state)) = client.get(&doc_id, &record_id).await {
+                                client.fire_local_subscription(&doc_id, &record_id, &state);
+                            }
+                        });
+                    }
+                }
+            }
+        }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+
+        channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        onmessage.forget();
+
+        let channel_send = channel.clone();
+        client.set_change_listener(Arc::new(move |doc_id, record_id| {
+            let msg = serde_json::json!({
+                "doc_id": doc_id,
+                "record_id": record_id,
+            }).to_string();
+            let _ = channel_send.post_message(&JsValue::from_str(&msg));
+        }));
 
         Ok(Self { client })
     }
@@ -180,6 +262,38 @@ impl WasmDriftClient {
 
     pub fn unsubscribe(&self, handle: &mut WasmSubscriptionHandle) -> Result<(), JsValue> {
         handle.cancel(self)
+    }
+
+    pub async fn rotate_keys(&self) -> Result<JsValue, JsValue> {
+        self.client.rotate_keys().await
+            .map_err(|e| JsValue::from_str(&format!("Rotate keys failed: {:?}", e)))?;
+        let active = self.client.active_key_version();
+        Ok(JsValue::from_f64(active as f64))
+    }
+
+    pub fn active_key_version(&self) -> u64 {
+        self.client.active_key_version()
+    }
+
+    pub fn list_key_versions(&self) -> Result<JsValue, JsValue> {
+        let keys = self.client.list_key_versions();
+        let active = self.client.active_key_version();
+        let mut list = Vec::new();
+        for key in keys {
+            list.push(serde_json::json!({
+                "version": key.version,
+                "createdAt": key.created_at * 1000, // convert to ms for JS Date
+                "isActive": key.version == active,
+            }));
+        }
+        let json_str = serde_json::to_string(&list)
+            .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))?;
+        Ok(JsValue::from_str(&json_str))
+    }
+
+    pub fn prune_key_versions(&self, keep_versions: u32) -> Result<(), JsValue> {
+        self.client.prune_key_versions(keep_versions as u64);
+        Ok(())
     }
 }
 

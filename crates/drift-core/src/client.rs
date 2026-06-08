@@ -161,7 +161,15 @@ impl DriftClient {
         runner.run_pending().await?;
         let schema_version = runner.current_version().await;
 
-        let stored_keys = storage.read_keys(&config.namespace).await?;
+        let mut stored_keys = storage.read_keys(&config.namespace).await?;
+        if stored_keys.is_empty() {
+            // Introduce a small random delay and re-read, to handle concurrent initialization races
+            // in multi-tab environments.
+            let delay_ms = 50 + (rand::Rng::gen_range(&mut rand::thread_rng(), 0..100));
+            crate::time_utils::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            stored_keys = storage.read_keys(&config.namespace).await?;
+        }
+
         if stored_keys.is_empty() {
             let active = keyring.active_key();
             let key_rec = crate::storage::traits::KeyRecord {
@@ -170,6 +178,30 @@ impl DriftClient {
                 version: active.version,
             };
             storage.write_key(&key_rec).await?;
+
+            // Read-back verification to handle concurrent initialization races.
+            let ver_keys = storage.read_keys(&config.namespace).await?;
+            if let Some(first_key) = ver_keys.iter().find(|k| k.version == active.version) {
+                if first_key.key_bytes != key_rec.key_bytes {
+                    let mut loaded_keypairs = Vec::new();
+                    for k_rec in ver_keys {
+                        if k_rec.key_bytes.len() == 32 {
+                            let mut private_key = [0u8; 32];
+                            private_key.copy_from_slice(&k_rec.key_bytes);
+                            let public_key = x25519_dalek::x25519(private_key, x25519_dalek::X25519_BASEPOINT_BYTES);
+                            loaded_keypairs.push(crate::e2ee::keyring::NamespaceKeypair {
+                                public_key,
+                                private_key,
+                                version: k_rec.version,
+                                created_at: crate::time_utils::system_time_now_secs(),
+                            });
+                        }
+                    }
+                    if !loaded_keypairs.is_empty() {
+                        keyring.load_keys(loaded_keypairs);
+                    }
+                }
+            }
         } else {
             let mut loaded_keypairs = Vec::new();
             for key_rec in stored_keys {
@@ -314,6 +346,21 @@ impl DriftClient {
         let namespace_clone = client.config.namespace.clone();
         let storage_clone = client.storage.clone();
 
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cleanup = crate::oplog::cleanup::OplogCleanup::new(storage_clone.clone());
+            let ns = namespace_clone.clone();
+            let rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                cleanup.run_scheduled(
+                    &ns,
+                    std::time::Duration::from_secs(7 * 24 * 3600), // 7-day retention
+                    std::time::Duration::from_secs(3600),            // run every hour
+                    rx,
+                ).await;
+            });
+        }
+
         crate::time_utils::spawn(async move {
             let mut is_leader = match leader_election_clone.try_acquire() {
                 Ok(status) => status,
@@ -354,8 +401,12 @@ impl DriftClient {
                     }
 
                     if is_leader {
-                        let _ = upload_queue_clone.process_batch().await;
-                        let _ = download_queue_clone.process_batch().await;
+                        if let Err(e) = upload_queue_clone.process_batch().await {
+                            tracing::error!("Upload queue batch failed: {:?}", e);
+                        }
+                        if let Err(e) = download_queue_clone.process_batch().await {
+                            tracing::error!("Download queue batch failed: {:?}", e);
+                        }
 
                         sync_cycles += 1;
                         if sync_cycles % 100 == 0 {
@@ -392,8 +443,12 @@ impl DriftClient {
                             }
 
                             if is_leader {
-                                let _ = upload_queue_clone.process_batch().await;
-                                let _ = download_queue_clone.process_batch().await;
+                                if let Err(e) = upload_queue_clone.process_batch().await {
+                                    tracing::error!("Upload queue batch failed: {:?}", e);
+                                }
+                                if let Err(e) = download_queue_clone.process_batch().await {
+                                    tracing::error!("Download queue batch failed: {:?}", e);
+                                }
 
                                 sync_cycles += 1;
                                 if sync_cycles % 100 == 0 {
@@ -691,6 +746,14 @@ impl DriftClient {
         self.subscriptions.lock().unwrap().unregister(handle)
     }
 
+    pub fn set_change_listener(&self, listener: Arc<dyn Fn(&str, &str) + Send + Sync>) {
+        self.subscriptions.lock().unwrap().set_global_listener(listener);
+    }
+
+    pub fn fire_local_subscription(&self, doc_id: &str, record_id: &str, state: &HashMap<String, CrdtValue>) {
+        self.subscriptions.lock().unwrap().fire_local(doc_id, record_id, state);
+    }
+
     pub async fn force_sync(&self) -> Result<usize, DriftError> {
         let uploaded = self.upload_queue.process_batch().await?;
         let downloaded = self.download_queue.process_batch().await?;
@@ -774,6 +837,18 @@ impl DriftClient {
 
     pub async fn export_public_key(&self) -> Result<Vec<u8>, DriftError> {
         Ok(self.keyring.active_key().public_key.to_vec())
+    }
+
+    pub fn active_key_version(&self) -> u64 {
+        self.keyring.active_version()
+    }
+
+    pub fn list_key_versions(&self) -> Vec<crate::e2ee::keyring::NamespaceKeypair> {
+        self.keyring.all_keys()
+    }
+
+    pub fn prune_key_versions(&self, keep_versions: u64) {
+        self.keyring.prune_to_keep(keep_versions);
     }
 
     pub async fn define_schema(&self, doc_id: &str, schema: DocumentSchema) -> Result<(), DriftError> {

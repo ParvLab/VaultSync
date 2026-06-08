@@ -1,5 +1,6 @@
 pub mod inspect;
 pub mod replay;
+pub mod bench;
 
 use clap::{Parser, Subcommand};
 
@@ -14,6 +15,7 @@ pub struct Cli {
 pub enum Commands {
     Inspect(inspect::InspectArgs),
     Replay(replay::ReplayArgs),
+    Bench(bench::BenchArgs),
 }
 
 pub fn run() {
@@ -21,5 +23,6 @@ pub fn run() {
     match cli.command {
         Commands::Inspect(args) => inspect::run(args),
         Commands::Replay(args) => replay::run(args),
+        Commands::Bench(args) => bench::run(args),
     }
 }

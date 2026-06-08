@@ -147,4 +147,12 @@ impl Storage for EncryptedStorage {
     async fn delete_synced_oplog_before_timestamp(&self, namespace: &str, doc_id: &str, record_id: &str, timestamp: u64) -> Result<usize, DriftError> {
         self.inner.delete_synced_oplog_before_timestamp(namespace, doc_id, record_id, timestamp).await
     }
+
+    async fn delete_synced_before(
+        &self,
+        namespace: &str,
+        cutoff_ms: u64,
+    ) -> Result<usize, DriftError> {
+        self.inner.delete_synced_before(namespace, cutoff_ms).await
+    }
 }

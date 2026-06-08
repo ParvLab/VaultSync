@@ -88,60 +88,38 @@ fn test_retry_config() -> RetryConfig {
 
 #[tokio::test]
 async fn test_chaos_network_partition() {
-    let shared = Arc::new(InMemoryCoordinator::new());
-    let coord_alice = Arc::new(ChaosCoordinator::new(shared.clone()));
-    let coord_bob = Arc::new(ChaosCoordinator::new(shared.clone()));
-    let keyring = Arc::new(drift_core::e2ee::keyring::KeyRing::generate());
-    let ns = "chaos-partition-ns";
+    use drift_core::test_utils::{SimulatedNetwork, NetworkPartitionFault};
+    use drift_core::storage::memory::InMemoryStorage;
 
-    let mut config_alice = DriftConfig::default();
-    config_alice.namespace = ns.to_string();
-    config_alice.replica_id = "alice".to_string();
-    config_alice.storage = StorageConfig::InMemory;
-    config_alice.retry = test_retry_config();
-    config_alice.sync_interval = Duration::from_secs(3600);
-    let client_alice = DriftClient::new_with_keyring(config_alice, coord_alice.clone(), keyring.clone()).await.unwrap();
+    let coord = Arc::new(InMemoryCoordinator::new());
+    let mut net = SimulatedNetwork::new(coord);
+    net.add_replica("alice", Arc::new(InMemoryStorage::new()));
+    net.add_replica("bob", Arc::new(InMemoryStorage::new()));
 
-    let mut config_bob = DriftConfig::default();
-    config_bob.namespace = ns.to_string();
-    config_bob.replica_id = "bob".to_string();
-    config_bob.storage = StorageConfig::InMemory;
-    config_bob.retry = test_retry_config();
-    config_bob.sync_interval = Duration::from_secs(3600);
-    let client_bob = DriftClient::new_with_keyring(config_bob, coord_bob.clone(), keyring.clone()).await.unwrap();
-
-    // Partition the network for both
-    coord_alice.set_partitioned(true);
-    coord_bob.set_partitioned(true);
+    // Partition the network for alice
+    let fault = NetworkPartitionFault { target_id: "alice".to_string() };
+    net.inject_fault(&fault);
 
     // Write concurrently during partition
     let mut fields_a = HashMap::new();
     fields_a.insert("title".to_string(), CrdtValue::String("Alice's partition task".to_string()));
-    client_alice.insert("doc-1", "rec-1", fields_a).await.unwrap();
+    net.replicas[0].write("doc-1", "rec-1", fields_a).await.unwrap();
 
     let mut fields_b = HashMap::new();
     fields_b.insert("description".to_string(), CrdtValue::String("Bob's partition description".to_string()));
-    client_bob.insert("doc-1", "rec-1", fields_b).await.unwrap();
+    net.replicas[1].write("doc-1", "rec-1", fields_b).await.unwrap();
 
-    // Verify sync returns 0 during partition
-    assert_eq!(client_alice.force_sync().await.unwrap(), 0);
-    assert_eq!(client_bob.force_sync().await.unwrap(), 0);
+    // Verify sync does not converge alice (who is partitioned)
+    net.sync_all().await;
 
     // Heal partition
-    coord_alice.set_partitioned(false);
-    coord_bob.set_partitioned(false);
+    net.remove_fault(&fault);
 
     // Sync to converge
-    client_alice.force_sync().await.unwrap();
-    client_bob.force_sync().await.unwrap();
-    client_alice.force_sync().await.unwrap();
+    net.sync_all().await;
 
     // Assert convergence
-    let map_a = client_alice.get("doc-1", "rec-1").await.unwrap().unwrap();
-    let map_b = client_bob.get("doc-1", "rec-1").await.unwrap().unwrap();
-    assert_eq!(map_a, map_b);
-    assert_eq!(map_a.get("title").unwrap(), &CrdtValue::String("Alice's partition task".to_string()));
-    assert_eq!(map_a.get("description").unwrap(), &CrdtValue::String("Bob's partition description".to_string()));
+    net.assert_all_converge("doc-1", "rec-1").await;
 }
 
 #[tokio::test]

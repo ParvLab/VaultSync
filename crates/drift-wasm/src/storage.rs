@@ -59,6 +59,7 @@ impl Default for OpfsIndex {
 #[derive(Debug)]
 pub struct OpfsStorage {
     inner: Mutex<OpfsInner>,
+    tx_lock: futures::lock::Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -86,10 +87,11 @@ impl OpfsStorage {
         Self::ensure_dir(&root_handle, "_system").await?;
         Self::ensure_dir(&root_handle, "docs").await?;
 
-        let index = Self::load_index(&root_handle).await.unwrap_or_default();
+        let index = Self::load_index(&root_handle).await?;
 
         Ok(Self {
             inner: Mutex::new(OpfsInner { root: root_val, index }),
+            tx_lock: futures::lock::Mutex::new(()),
         })
     }
 
@@ -115,88 +117,191 @@ impl OpfsStorage {
         Ok(dir)
     }
 
+    async fn sleep(ms: u64) {
+        let mut cb = |resolve: js_sys::Function, _reject: js_sys::Function| {
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms as i32);
+            }
+        };
+        let p = js_sys::Promise::new(&mut cb);
+        let _ = SendJsFuture::from(p).await;
+    }
+
     async fn write_doc_file(root: &FileSystemDirectoryHandle, doc_id: &str, record_id: &str, data: &[u8]) -> Result<(), DriftError> {
         let dir = Self::get_dir(root, &["docs", doc_id]).await?;
         let opts = FileSystemGetFileOptions::new();
         opts.set_create(true);
-        let promise = dir.get_file_handle_with_options(record_id, &opts);
-        let file_val = SendJsFuture::from(promise).await
-            .map_err(|e| DriftError::Storage(format!("get_file_handle failed: {:?}", e)))?;
-        let file_handle: FileSystemFileHandle = file_val.into();
 
-        let writable_promise = file_handle.create_writable();
-        let writable_val = SendJsFuture::from(writable_promise).await
-            .map_err(|e| DriftError::Storage(format!("create_writable failed: {:?}", e)))?;
-        let writable: FileSystemWritableFileStream = writable_val.into();
+        let mut attempts = 0;
+        let max_attempts = 15;
+        loop {
+            let res = async {
+                let promise = dir.get_file_handle_with_options(record_id, &opts);
+                let file_val = SendJsFuture::from(promise).await
+                    .map_err(|e| DriftError::Storage(format!("get_file_handle failed: {:?}", e)))?;
+                let file_handle: FileSystemFileHandle = file_val.into();
 
-        let write_promise = writable.write_with_u8_array(data)
-            .map_err(|e| DriftError::Storage(format!("write error: {:?}", e)))?;
-        SendJsFuture::from(write_promise).await
-            .map_err(|e| DriftError::Storage(format!("write failed: {:?}", e)))?;
+                let writable_promise = file_handle.create_writable();
+                let writable_val = SendJsFuture::from(writable_promise).await
+                    .map_err(|e| DriftError::Storage(format!("create_writable failed: {:?}", e)))?;
+                let writable: FileSystemWritableFileStream = writable_val.into();
 
-        let close: WritableStream = writable.into();
-        SendJsFuture::from(close.close()).await
-            .map_err(|e| DriftError::Storage(format!("close failed: {:?}", e)))?;
+                let write_promise = writable.write_with_u8_array(data)
+                    .map_err(|e| DriftError::Storage(format!("write error: {:?}", e)))?;
+                SendJsFuture::from(write_promise).await
+                    .map_err(|e| DriftError::Storage(format!("write failed: {:?}", e)))?;
 
-        Ok(())
+                let close: WritableStream = writable.into();
+                SendJsFuture::from(close.close()).await
+                    .map_err(|e| DriftError::Storage(format!("close failed: {:?}", e)))?;
+
+                Ok(())
+            }.await;
+
+            match res {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= max_attempts {
+                        return Err(e);
+                    }
+                    let delay = 15 + (js_sys::Math::random() * 15.0) as u64;
+                    Self::sleep(delay).await;
+                }
+            }
+        }
     }
 
     async fn read_doc_file(root: &FileSystemDirectoryHandle, doc_id: &str, record_id: &str) -> Result<Option<Vec<u8>>, DriftError> {
         let dir = Self::get_dir(root, &["docs", doc_id]).await?;
-
         let opts = FileSystemGetFileOptions::new();
         opts.set_create(false);
-        let file_val = match SendJsFuture::from(dir.get_file_handle_with_options(record_id, &opts)).await {
-            Ok(val) => val,
-            Err(_) => return Ok(None),
-        };
-        let file_handle: FileSystemFileHandle = file_val.into();
 
-        let file_val = SendJsFuture::from(file_handle.get_file()).await
-            .map_err(|e| DriftError::Storage(format!("get_file failed: {:?}", e)))?;
-        let file: File = file_val.into();
+        let mut attempts = 0;
+        let max_attempts = 15;
+        loop {
+            let res = async {
+                let file_val = match SendJsFuture::from(dir.get_file_handle_with_options(record_id, &opts)).await {
+                    Ok(val) => val,
+                    Err(e) => {
+                        let is_not_found = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
+                            .ok()
+                            .and_then(|v| v.as_string())
+                            .map_or(false, |s| s == "NotFoundError");
+                        if is_not_found {
+                            return Ok(None);
+                        } else {
+                            return Err(DriftError::Storage(format!("get_file_handle failed: {:?}", e)));
+                        }
+                    }
+                };
+                let file_handle: FileSystemFileHandle = file_val.into();
 
-        let blob: &Blob = file.as_ref();
-        let buf_promise = blob.array_buffer();
-        let buf_val = SendJsFuture::from(buf_promise).await
-            .map_err(|e| DriftError::Storage(format!("array_buffer failed: {:?}", e)))?;
+                let file_val = SendJsFuture::from(file_handle.get_file()).await
+                    .map_err(|e| DriftError::Storage(format!("get_file failed: {:?}", e)))?;
+                let file: File = file_val.into();
 
-        let uint8 = Uint8Array::new(&buf_val);
-        let mut bytes = vec![0u8; uint8.length() as usize];
-        uint8.copy_to(&mut bytes);
-        Ok(Some(bytes))
+                let blob: &Blob = file.as_ref();
+                let buf_promise = blob.array_buffer();
+                let buf_val = SendJsFuture::from(buf_promise).await
+                    .map_err(|e| DriftError::Storage(format!("array_buffer failed: {:?}", e)))?;
+
+                let uint8 = Uint8Array::new(&buf_val);
+                let mut bytes = vec![0u8; uint8.length() as usize];
+                uint8.copy_to(&mut bytes);
+                Ok(Some(bytes))
+            }.await;
+
+            match res {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= max_attempts {
+                        return Err(e);
+                    }
+                    let delay = 15 + (js_sys::Math::random() * 15.0) as u64;
+                    Self::sleep(delay).await;
+                }
+            }
+        }
     }
 
     async fn delete_doc_file(root: &FileSystemDirectoryHandle, doc_id: &str, record_id: &str) -> Result<(), DriftError> {
         let dir = Self::get_dir(root, &["docs", doc_id]).await?;
-        let promise = dir.remove_entry(record_id);
-        let _ = SendJsFuture::from(promise).await;
-        Ok(())
+        let mut attempts = 0;
+        let max_attempts = 15;
+        loop {
+            let promise = dir.remove_entry(record_id);
+            match SendJsFuture::from(promise).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= max_attempts {
+                        return Err(DriftError::Storage(format!("remove_entry failed: {:?}", e)));
+                    }
+                    let delay = 15 + (js_sys::Math::random() * 15.0) as u64;
+                    Self::sleep(delay).await;
+                }
+            }
+        }
     }
 
     async fn load_index(root: &FileSystemDirectoryHandle) -> Result<OpfsIndex, DriftError> {
         let opts = FileSystemGetFileOptions::new();
         opts.set_create(false);
         let dir = Self::get_dir(root, &["_system"]).await?;
-        let file_val = match SendJsFuture::from(dir.get_file_handle_with_options("index.json", &opts)).await {
-            Ok(val) => val,
-            Err(_) => return Ok(OpfsIndex::default()),
-        };
-        let file_handle: FileSystemFileHandle = file_val.into();
-        let file_val = SendJsFuture::from(file_handle.get_file()).await
-            .map_err(|e| DriftError::Storage(format!("get_file: {:?}", e)))?;
-        let file: File = file_val.into();
-        let blob: &Blob = file.as_ref();
-        let buf_promise = blob.array_buffer();
-        let buf_val = SendJsFuture::from(buf_promise).await
-            .map_err(|e| DriftError::Storage(format!("array_buffer: {:?}", e)))?;
-        let uint8 = Uint8Array::new(&buf_val);
-        let mut bytes = vec![0u8; uint8.length() as usize];
-        uint8.copy_to(&mut bytes);
 
-        let index: OpfsIndex = serde_json::from_slice(&bytes)
-            .map_err(|e| DriftError::Storage(format!("json parse: {:?}", e)))?;
-        Ok(index)
+        let mut attempts = 0;
+        let max_attempts = 15;
+        loop {
+            let res = async {
+                let file_val = match SendJsFuture::from(dir.get_file_handle_with_options("index.json", &opts)).await {
+                    Ok(val) => val,
+                    Err(e) => {
+                        let is_not_found = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
+                            .ok()
+                            .and_then(|v| v.as_string())
+                            .map_or(false, |s| s == "NotFoundError");
+                        if is_not_found {
+                            return Ok(OpfsIndex::default());
+                        } else {
+                            return Err(DriftError::Storage(format!("get_file_handle: {:?}", e)));
+                        }
+                    }
+                };
+                let file_handle: FileSystemFileHandle = file_val.into();
+                let file_val = SendJsFuture::from(file_handle.get_file()).await
+                    .map_err(|e| DriftError::Storage(format!("get_file: {:?}", e)))?;
+                let file: File = file_val.into();
+                let blob: &Blob = file.as_ref();
+                let buf_promise = blob.array_buffer();
+                let buf_val = SendJsFuture::from(buf_promise).await
+                    .map_err(|e| DriftError::Storage(format!("array_buffer: {:?}", e)))?;
+                let uint8 = Uint8Array::new(&buf_val);
+                let mut bytes = vec![0u8; uint8.length() as usize];
+                uint8.copy_to(&mut bytes);
+
+                if bytes.is_empty() {
+                    return Err(DriftError::Storage("empty index file".into()));
+                }
+
+                let index: OpfsIndex = serde_json::from_slice(&bytes)
+                    .map_err(|e| DriftError::Storage(format!("json parse: {:?}", e)))?;
+                Ok(index)
+            }.await;
+
+            match res {
+                Ok(index) => return Ok(index),
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= max_attempts {
+                        return Err(e);
+                    }
+                    let delay = 15 + (js_sys::Math::random() * 15.0) as u64;
+                    Self::sleep(delay).await;
+                }
+            }
+        }
     }
 
     async fn flush_index(root: &FileSystemDirectoryHandle, index: &OpfsIndex) -> Result<(), DriftError> {
@@ -205,34 +310,60 @@ impl OpfsStorage {
         let sys_dir = Self::get_dir(root, &["_system"]).await?;
         let opts = FileSystemGetFileOptions::new();
         opts.set_create(true);
-        let promise = sys_dir.get_file_handle_with_options("index.json", &opts);
-        let file_val = SendJsFuture::from(promise).await
-            .map_err(|e| DriftError::Storage(format!("get_file_handle: {:?}", e)))?;
-        let file_handle: FileSystemFileHandle = file_val.into();
-        let writable_promise = file_handle.create_writable();
-        let writable_val = SendJsFuture::from(writable_promise).await
-            .map_err(|e| DriftError::Storage(format!("create_writable: {:?}", e)))?;
-        let writable: FileSystemWritableFileStream = writable_val.into();
-        let write_promise = writable.write_with_u8_array(&json)
-            .map_err(|e| DriftError::Storage(format!("write: {:?}", e)))?;
-        SendJsFuture::from(write_promise).await
-            .map_err(|e| DriftError::Storage(format!("write done: {:?}", e)))?;
-        let close: WritableStream = writable.into();
-        SendJsFuture::from(close.close()).await
-            .map_err(|e| DriftError::Storage(format!("close: {:?}", e)))?;
-        Ok(())
+
+        let mut attempts = 0;
+        let max_attempts = 15;
+        loop {
+            let res = async {
+                let promise = sys_dir.get_file_handle_with_options("index.json", &opts);
+                let file_val = SendJsFuture::from(promise).await
+                    .map_err(|e| DriftError::Storage(format!("get_file_handle: {:?}", e)))?;
+                let file_handle: FileSystemFileHandle = file_val.into();
+                let writable_promise = file_handle.create_writable();
+                let writable_val = SendJsFuture::from(writable_promise).await
+                    .map_err(|e| DriftError::Storage(format!("create_writable: {:?}", e)))?;
+                let writable: FileSystemWritableFileStream = writable_val.into();
+                let write_promise = writable.write_with_u8_array(&json)
+                    .map_err(|e| DriftError::Storage(format!("write: {:?}", e)))?;
+                SendJsFuture::from(write_promise).await
+                    .map_err(|e| DriftError::Storage(format!("write done: {:?}", e)))?;
+                let close: WritableStream = writable.into();
+                SendJsFuture::from(close.close()).await
+                    .map_err(|e| DriftError::Storage(format!("close: {:?}", e)))?;
+                Ok(())
+            }.await;
+
+            match res {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= max_attempts {
+                        return Err(e);
+                    }
+                    let delay = 15 + (js_sys::Math::random() * 15.0) as u64;
+                    Self::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    async fn get_fresh_index(&self) -> Result<(FileSystemDirectoryHandle, OpfsIndex), DriftError> {
+        let root = { let inner = self.inner.lock().unwrap(); inner.root_handle() };
+        let index = Self::load_index(&root).await?;
+        Ok((root, index))
     }
 }
 
 #[async_trait]
 impl Storage for OpfsStorage {
     async fn insert_document(&self, doc_id: &str, record_id: &str, bytes: &[u8]) -> Result<(), DriftError> {
-        let (root, mut index) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.root_handle(), inner.index.clone())
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
         Self::write_doc_file(&root, doc_id, record_id, bytes).await?;
-        index.doc_listing.entry(doc_id.to_string()).or_default().push(record_id.to_string());
+        let listing = index.doc_listing.entry(doc_id.to_string()).or_default();
+        if !listing.contains(&record_id.to_string()) {
+            listing.push(record_id.to_string());
+        }
         Self::flush_index(&root, &index).await?;
         let mut inner = self.inner.lock().unwrap();
         inner.index = index;
@@ -245,10 +376,8 @@ impl Storage for OpfsStorage {
     }
 
     async fn delete_document(&self, doc_id: &str, record_id: &str) -> Result<(), DriftError> {
-        let (root, mut index) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.root_handle(), inner.index.clone())
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
         Self::delete_doc_file(&root, doc_id, record_id).await?;
         if let Some(listing) = index.doc_listing.get_mut(doc_id) {
             listing.retain(|r| r != record_id);
@@ -260,12 +389,13 @@ impl Storage for OpfsStorage {
     }
 
     async fn write_document_and_oplog(&self, doc_id: &str, record_id: &str, bytes: &[u8], entry: &OplogEntry) -> Result<(), DriftError> {
-        let (root, mut index) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.root_handle(), inner.index.clone())
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
         Self::write_doc_file(&root, doc_id, record_id, bytes).await?;
-        index.doc_listing.entry(doc_id.to_string()).or_default().push(record_id.to_string());
+        let listing = index.doc_listing.entry(doc_id.to_string()).or_default();
+        if !listing.contains(&record_id.to_string()) {
+            listing.push(record_id.to_string());
+        }
         index.oplog.push(entry.clone());
         Self::flush_index(&root, &index).await?;
         let mut inner = self.inner.lock().unwrap();
@@ -274,10 +404,8 @@ impl Storage for OpfsStorage {
     }
 
     async fn delete_document_and_oplog(&self, doc_id: &str, record_id: &str, entry: &OplogEntry) -> Result<(), DriftError> {
-        let (root, mut index) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.root_handle(), inner.index.clone())
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
         Self::delete_doc_file(&root, doc_id, record_id).await?;
         if let Some(listing) = index.doc_listing.get_mut(doc_id) {
             listing.retain(|r| r != record_id);
@@ -290,11 +418,9 @@ impl Storage for OpfsStorage {
     }
 
     async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, DriftError> {
-        let (root, record_ids) = {
-            let inner = self.inner.lock().unwrap();
-            let ids = inner.index.doc_listing.get(doc_id).cloned().unwrap_or_default();
-            (inner.root_handle(), ids)
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, index) = self.get_fresh_index().await?;
+        let record_ids = index.doc_listing.get(doc_id).cloned().unwrap_or_default();
         let mut results = Vec::new();
         for rid in &record_ids {
             if let Some(data) = Self::read_doc_file(&root, doc_id, rid).await? {
@@ -305,10 +431,8 @@ impl Storage for OpfsStorage {
     }
 
     async fn append_oplog(&self, entry: &OplogEntry) -> Result<(), DriftError> {
-        let (root, mut index) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.root_handle(), inner.index.clone())
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
         index.oplog.push(entry.clone());
         Self::flush_index(&root, &index).await?;
         let mut inner = self.inner.lock().unwrap();
@@ -317,8 +441,9 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_pending_oplog(&self, namespace: &str, limit: usize) -> Result<Vec<OplogEntry>, DriftError> {
-        let inner = self.inner.lock().unwrap();
-        let results: Vec<OplogEntry> = inner.index.oplog.iter()
+        let _guard = self.tx_lock.lock().await;
+        let (_, index) = self.get_fresh_index().await?;
+        let results: Vec<OplogEntry> = index.oplog.iter()
             .filter(|e| e.namespace == namespace && matches!(e.sync_status, SyncStatus::Pending))
             .take(limit)
             .cloned()
@@ -327,10 +452,8 @@ impl Storage for OpfsStorage {
     }
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), DriftError> {
-        let (root, mut index) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.root_handle(), inner.index.clone())
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
         if let Some(entry) = index.oplog.iter_mut().find(|e| e.id == id) {
             entry.sync_status = SyncStatus::Synced;
             entry.sequence = Some(sequence);
@@ -342,10 +465,8 @@ impl Storage for OpfsStorage {
     }
 
     async fn mark_failed(&self, id: &str, _error: &str) -> Result<(), DriftError> {
-        let (root, mut index) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.root_handle(), inner.index.clone())
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
         if let Some(entry) = index.oplog.iter_mut().find(|e| e.id == id) {
             entry.sync_status = SyncStatus::Failed;
         }
@@ -356,8 +477,9 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_oplog_after_sequence(&self, namespace: &str, seq: u64) -> Result<Vec<OplogEntry>, DriftError> {
-        let inner = self.inner.lock().unwrap();
-        let results: Vec<OplogEntry> = inner.index.oplog.iter()
+        let _guard = self.tx_lock.lock().await;
+        let (_, index) = self.get_fresh_index().await?;
+        let results: Vec<OplogEntry> = index.oplog.iter()
             .filter(|e| e.namespace == namespace && e.sequence.map_or(false, |s| s > seq))
             .cloned()
             .collect();
@@ -365,15 +487,14 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_sync_state(&self, namespace: &str) -> Result<Option<SyncState>, DriftError> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner.index.sync_states.get(namespace).cloned())
+        let _guard = self.tx_lock.lock().await;
+        let (_, index) = self.get_fresh_index().await?;
+        Ok(index.sync_states.get(namespace).cloned())
     }
 
     async fn write_sync_state(&self, state: &SyncState) -> Result<(), DriftError> {
-        let (root, mut index) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.root_handle(), inner.index.clone())
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
         index.sync_states.insert(state.namespace.clone(), state.clone());
         Self::flush_index(&root, &index).await?;
         let mut inner = self.inner.lock().unwrap();
@@ -382,15 +503,14 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_schema(&self, doc_id: &str) -> Result<Option<SchemaMeta>, DriftError> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner.index.schemas.get(doc_id).cloned())
+        let _guard = self.tx_lock.lock().await;
+        let (_, index) = self.get_fresh_index().await?;
+        Ok(index.schemas.get(doc_id).cloned())
     }
 
     async fn write_schema(&self, meta: &SchemaMeta) -> Result<(), DriftError> {
-        let (root, mut index) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.root_handle(), inner.index.clone())
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
         index.schemas.insert(meta.doc_id.clone(), meta.clone());
         Self::flush_index(&root, &index).await?;
         let mut inner = self.inner.lock().unwrap();
@@ -399,15 +519,14 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, DriftError> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner.index.migrations.clone())
+        let _guard = self.tx_lock.lock().await;
+        let (_, index) = self.get_fresh_index().await?;
+        Ok(index.migrations.clone())
     }
 
     async fn write_migration(&self, record: &MigrationRecord) -> Result<(), DriftError> {
-        let (root, mut index) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.root_handle(), inner.index.clone())
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
         let pos = index.migrations.iter().position(|m| m.version == record.version);
         if let Some(i) = pos {
             index.migrations[i] = record.clone();
@@ -421,8 +540,9 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_keys(&self, namespace: &str) -> Result<Vec<KeyRecord>, DriftError> {
-        let inner = self.inner.lock().unwrap();
-        let results: Vec<KeyRecord> = inner.index.keys.iter()
+        let _guard = self.tx_lock.lock().await;
+        let (_, index) = self.get_fresh_index().await?;
+        let results: Vec<KeyRecord> = index.keys.iter()
             .filter(|k| k.namespace == namespace)
             .cloned()
             .collect();
@@ -430,10 +550,8 @@ impl Storage for OpfsStorage {
     }
 
     async fn write_key(&self, key: &KeyRecord) -> Result<(), DriftError> {
-        let (root, mut index) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.root_handle(), inner.index.clone())
-        };
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
         let pos = index.keys.iter().position(|k| k.namespace == key.namespace && k.version == key.version);
         if let Some(i) = pos {
             index.keys[i] = key.clone();
@@ -459,10 +577,6 @@ impl Storage for OpfsStorage {
     }
 
     async fn update_oplog_encrypted_blob(&self, _id: &str, _new_blob: &[u8]) -> Result<(), DriftError> {
-        // Find in oplog files or index?
-        // Wait, for WASM key rotation, we can stub it as Ok(()) or search/update the entry in the index if oplog is in index.
-        // Let's check how append_oplog works for OpfsStorage to see where oplogs are stored.
-        // Actually, we can just stub it since key rotation is a desktop client priority.
         Ok(())
     }
 
@@ -476,6 +590,28 @@ impl Storage for OpfsStorage {
 
     async fn delete_synced_oplog_before_timestamp(&self, _namespace: &str, _doc_id: &str, _record_id: &str, _timestamp: u64) -> Result<usize, DriftError> {
         Ok(0)
+    }
+
+    async fn delete_synced_before(
+        &self,
+        namespace: &str,
+        cutoff_ms: u64,
+    ) -> Result<usize, DriftError> {
+        let _guard = self.tx_lock.lock().await;
+        let (root, mut index) = self.get_fresh_index().await?;
+        let before = index.oplog.len();
+        index.oplog.retain(|entry| {
+            !(entry.namespace == namespace
+                && entry.sync_status == SyncStatus::Synced
+                && entry.created_at < cutoff_ms)
+        });
+        let removed = before - index.oplog.len();
+        if removed > 0 {
+            Self::flush_index(&root, &index).await?;
+            let mut inner = self.inner.lock().unwrap();
+            inner.index = index;
+        }
+        Ok(removed)
     }
 }
 
@@ -684,6 +820,17 @@ impl Storage for BrowserStorage {
         match self {
             Self::Opfs(s) => s.delete_synced_oplog_before_timestamp(namespace, doc_id, record_id, timestamp).await,
             Self::Idb(s) => s.delete_synced_oplog_before_timestamp(namespace, doc_id, record_id, timestamp).await,
+        }
+    }
+
+    async fn delete_synced_before(
+        &self,
+        namespace: &str,
+        cutoff_ms: u64,
+    ) -> Result<usize, DriftError> {
+        match self {
+            Self::Opfs(s) => s.delete_synced_before(namespace, cutoff_ms).await,
+            Self::Idb(s) => s.delete_synced_before(namespace, cutoff_ms).await,
         }
     }
 }

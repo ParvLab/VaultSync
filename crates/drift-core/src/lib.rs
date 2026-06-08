@@ -17,6 +17,9 @@ mod client;
 mod config;
 mod error;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
+
 #[cfg(feature = "async-runtime")]
 pub use client::DriftClient;
 pub use config::DriftConfig;

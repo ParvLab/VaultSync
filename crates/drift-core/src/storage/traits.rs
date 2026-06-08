@@ -67,4 +67,13 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn list_active_documents(&self, namespace: &str) -> Result<Vec<(String, String)>, DriftError>;
     async fn read_synced_oplog_for_document(&self, namespace: &str, doc_id: &str, record_id: &str) -> Result<Vec<OplogEntry>, DriftError>;
     async fn delete_synced_oplog_before_timestamp(&self, namespace: &str, doc_id: &str, record_id: &str, timestamp: u64) -> Result<usize, DriftError>;
+
+    /// Delete all Synced oplog entries created before `cutoff_ms`.
+    /// MUST NOT delete Pending entries regardless of age.
+    /// Returns count of entries deleted.
+    async fn delete_synced_before(
+        &self,
+        namespace: &str,
+        cutoff_ms: u64,
+    ) -> Result<usize, DriftError>;
 }

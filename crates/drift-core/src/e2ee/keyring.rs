@@ -118,6 +118,11 @@ impl KeyRing {
         inner.active_version
     }
 
+    pub fn all_keys(&self) -> Vec<NamespaceKeypair> {
+        let inner = self.inner.read().unwrap();
+        inner.keys.clone()
+    }
+
     pub fn derive_namespace_key(&self, namespace: &str) -> [u8; 32] {
         let active = self.active_key();
         let hk = Hkdf::<Sha256>::new(Some(b"drift-namespace"), &active.private_key);
@@ -130,6 +135,13 @@ impl KeyRing {
     pub fn prune_old_versions(&self, current_version: u64) {
         let mut inner = self.inner.write().unwrap();
         inner.keys.retain(|k| k.version >= current_version.saturating_sub(1));
+    }
+
+    pub fn prune_to_keep(&self, keep_versions: u64) {
+        let mut inner = self.inner.write().unwrap();
+        let active = inner.active_version;
+        let cutoff = active.saturating_sub(keep_versions).saturating_add(1);
+        inner.keys.retain(|k| k.version >= cutoff);
     }
 
     pub fn load_keys(&self, loaded: Vec<NamespaceKeypair>) {

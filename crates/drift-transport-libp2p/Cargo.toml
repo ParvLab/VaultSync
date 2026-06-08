@@ -14,3 +14,7 @@ tracing = "0.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # empty stub on WASM
+
+[dev-dependencies]
+drift-core = { path = "../drift-core" }
+drift-coordinator-memory = { path = "../drift-coordinator-memory" }

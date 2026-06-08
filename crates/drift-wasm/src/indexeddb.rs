@@ -179,6 +179,11 @@ impl IndexedDbStorage {
         request_to_future(&req).await
             .map_err(|e| DriftError::Storage(format!("flush failed: {:?}", e)))?;
         Ok(())
+     }
+
+    async fn get_fresh_index(&self) -> Result<IdbIndex, DriftError> {
+        let index = Self::load_index_from_db(&self.db).await?.unwrap_or_default();
+        Ok(index)
     }
 }
 
@@ -199,7 +204,7 @@ impl Storage for IndexedDbStorage {
             .map_err(|e| DriftError::Storage(format!("insert doc failed: {:?}", e)))?;
 
         // Update doc listing index
-        let mut index = self.index.lock().unwrap().clone();
+        let mut index = self.get_fresh_index().await?;
         let listing = index.doc_listing.entry(doc_id.to_string()).or_default();
         if !listing.contains(&record_id.to_string()) {
             listing.push(record_id.to_string());
@@ -247,7 +252,7 @@ impl Storage for IndexedDbStorage {
             .map_err(|e| DriftError::Storage(format!("delete doc failed: {:?}", e)))?;
 
         // Update doc listing index
-        let mut index = self.index.lock().unwrap().clone();
+        let mut index = self.get_fresh_index().await?;
         if let Some(listing) = index.doc_listing.get_mut(doc_id) {
             listing.retain(|r| r != record_id);
         }
@@ -258,10 +263,8 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, DriftError> {
-        let listing = {
-            let index = self.index.lock().unwrap();
-            index.doc_listing.get(doc_id).cloned().unwrap_or_default()
-        };
+        let index = self.get_fresh_index().await?;
+        let listing = index.doc_listing.get(doc_id).cloned().unwrap_or_default();
 
         let mut results = Vec::new();
         for record_id in &listing {
@@ -287,7 +290,7 @@ impl Storage for IndexedDbStorage {
             .map_err(|e| DriftError::Storage(format!("write doc failed: {:?}", e)))?;
 
         // Update doc listing index and oplog
-        let mut index = self.index.lock().unwrap().clone();
+        let mut index = self.get_fresh_index().await?;
         let listing = index.doc_listing.entry(doc_id.to_string()).or_default();
         if !listing.contains(&record_id.to_string()) {
             listing.push(record_id.to_string());
@@ -313,7 +316,7 @@ impl Storage for IndexedDbStorage {
             .map_err(|e| DriftError::Storage(format!("delete doc failed: {:?}", e)))?;
 
         // Update doc listing index and oplog
-        let mut index = self.index.lock().unwrap().clone();
+        let mut index = self.get_fresh_index().await?;
         if let Some(listing) = index.doc_listing.get_mut(doc_id) {
             listing.retain(|r| r != record_id);
         }
@@ -325,7 +328,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn append_oplog(&self, entry: &OplogEntry) -> Result<(), DriftError> {
-        let mut index = self.index.lock().unwrap().clone();
+        let mut index = self.get_fresh_index().await?;
         index.oplog.push(entry.clone());
         self.flush_index(&index).await?;
         *self.index.lock().unwrap() = index;
@@ -333,7 +336,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn read_pending_oplog(&self, namespace: &str, limit: usize) -> Result<Vec<OplogEntry>, DriftError> {
-        let index = self.index.lock().unwrap();
+        let index = self.get_fresh_index().await?;
         let pending: Vec<OplogEntry> = index.oplog.iter()
             .filter(|e| e.namespace == namespace && matches!(e.sync_status, drift_core::oplog::entry::SyncStatus::Pending))
             .take(limit)
@@ -343,7 +346,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), DriftError> {
-        let mut index = self.index.lock().unwrap().clone();
+        let mut index = self.get_fresh_index().await?;
         if let Some(entry) = index.oplog.iter_mut().find(|e| e.id == id) {
             entry.sync_status = drift_core::oplog::entry::SyncStatus::Synced;
             entry.sequence = Some(sequence);
@@ -354,7 +357,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn mark_failed(&self, id: &str, _error: &str) -> Result<(), DriftError> {
-        let mut index = self.index.lock().unwrap().clone();
+        let mut index = self.get_fresh_index().await?;
         if let Some(entry) = index.oplog.iter_mut().find(|e| e.id == id) {
             entry.sync_status = drift_core::oplog::entry::SyncStatus::Failed;
         }
@@ -364,7 +367,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn read_oplog_after_sequence(&self, namespace: &str, seq: u64) -> Result<Vec<OplogEntry>, DriftError> {
-        let index = self.index.lock().unwrap();
+        let index = self.get_fresh_index().await?;
         let entries: Vec<OplogEntry> = index.oplog.iter()
             .filter(|e| e.namespace == namespace && e.sequence.unwrap_or(0) > seq)
             .cloned()
@@ -373,12 +376,12 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn read_sync_state(&self, namespace: &str) -> Result<Option<SyncState>, DriftError> {
-        let index = self.index.lock().unwrap();
+        let index = self.get_fresh_index().await?;
         Ok(index.sync_states.get(namespace).cloned())
     }
 
     async fn write_sync_state(&self, state: &SyncState) -> Result<(), DriftError> {
-        let mut index = self.index.lock().unwrap().clone();
+        let mut index = self.get_fresh_index().await?;
         index.sync_states.insert(state.namespace.clone(), state.clone());
         self.flush_index(&index).await?;
         *self.index.lock().unwrap() = index;
@@ -386,12 +389,12 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn read_schema(&self, doc_id: &str) -> Result<Option<SchemaMeta>, DriftError> {
-        let index = self.index.lock().unwrap();
+        let index = self.get_fresh_index().await?;
         Ok(index.schemas.get(doc_id).cloned())
     }
 
     async fn write_schema(&self, meta: &SchemaMeta) -> Result<(), DriftError> {
-        let mut index = self.index.lock().unwrap().clone();
+        let mut index = self.get_fresh_index().await?;
         index.schemas.insert(meta.doc_id.clone(), meta.clone());
         self.flush_index(&index).await?;
         *self.index.lock().unwrap() = index;
@@ -399,12 +402,12 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, DriftError> {
-        let index = self.index.lock().unwrap();
+        let index = self.get_fresh_index().await?;
         Ok(index.migrations.clone())
     }
 
     async fn write_migration(&self, record: &MigrationRecord) -> Result<(), DriftError> {
-        let mut index = self.index.lock().unwrap().clone();
+        let mut index = self.get_fresh_index().await?;
         let pos = index.migrations.iter().position(|m| m.version == record.version);
         if let Some(i) = pos {
             index.migrations[i] = record.clone();
@@ -417,7 +420,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn read_keys(&self, namespace: &str) -> Result<Vec<KeyRecord>, DriftError> {
-        let index = self.index.lock().unwrap();
+        let index = self.get_fresh_index().await?;
         let results: Vec<KeyRecord> = index.keys.iter()
             .filter(|k| k.namespace == namespace)
             .cloned()
@@ -426,7 +429,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn write_key(&self, key: &KeyRecord) -> Result<(), DriftError> {
-        let mut index = self.index.lock().unwrap().clone();
+        let mut index = self.get_fresh_index().await?;
         let pos = index.keys.iter().position(|k| k.namespace == key.namespace && k.version == key.version);
         if let Some(i) = pos {
             index.keys[i] = key.clone();
@@ -464,5 +467,25 @@ impl Storage for IndexedDbStorage {
 
     async fn delete_synced_oplog_before_timestamp(&self, _namespace: &str, _doc_id: &str, _record_id: &str, _timestamp: u64) -> Result<usize, DriftError> {
         Ok(0)
+    }
+
+    async fn delete_synced_before(
+        &self,
+        namespace: &str,
+        cutoff_ms: u64,
+    ) -> Result<usize, DriftError> {
+        let mut index = self.get_fresh_index().await?;
+        let before = index.oplog.len();
+        index.oplog.retain(|entry| {
+            !(entry.namespace == namespace
+                && entry.sync_status == drift_core::oplog::entry::SyncStatus::Synced
+                && entry.created_at < cutoff_ms)
+        });
+        let removed = before - index.oplog.len();
+        if removed > 0 {
+            self.flush_index(&index).await?;
+            *self.index.lock().unwrap() = index;
+        }
+        Ok(removed)
     }
 }
