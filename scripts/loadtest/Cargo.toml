@@ -13,3 +13,4 @@ drift-coordinator-memory = { path = "../../crates/drift-coordinator-memory" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
+rand = "0.8"

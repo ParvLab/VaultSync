@@ -24,6 +24,7 @@ pub struct DownloadQueue {
     reconciler: Arc<Reconciler>,
     decryptor: Arc<E2eeDecryptor>,
     metrics: Arc<DriftMetrics>,
+    max_clock_skew: std::time::Duration,
 }
 
 impl DownloadQueue {
@@ -36,6 +37,7 @@ impl DownloadQueue {
         reconciler: Arc<Reconciler>,
         decryptor: Arc<E2eeDecryptor>,
         metrics: Arc<DriftMetrics>,
+        max_clock_skew: std::time::Duration,
     ) -> Self {
         Self {
             coordinator,
@@ -46,6 +48,7 @@ impl DownloadQueue {
             reconciler,
             decryptor,
             metrics,
+            max_clock_skew,
         }
     }
 
@@ -58,7 +61,25 @@ impl DownloadQueue {
             Ok(mutations) => {
                 self.metrics.set_connection_status(&self.namespace, true);
                 let count = mutations.len();
+                let mut entries = Vec::with_capacity(count);
+
                 for m in &mutations {
+                    let local_time = crate::time_utils::system_time_now_ms();
+                    let skew = if m.timestamp > local_time {
+                        m.timestamp - local_time
+                    } else {
+                        local_time - m.timestamp
+                    };
+                    if skew > self.max_clock_skew.as_millis() as u64 {
+                        tracing::warn!(
+                            mutation_id = m.id.as_str(),
+                            timestamp = m.timestamp,
+                            local_time = local_time,
+                            "Rejecting mutation due to clock skew exceeding threshold"
+                        );
+                        continue;
+                    }
+
                     if m.encrypted_blob.len() >= 8 {
                         let header_version = u64::from_le_bytes(m.encrypted_blob[..8].try_into().unwrap());
                         if header_version != m.key_version {
@@ -86,10 +107,13 @@ impl DownloadQueue {
                         synced_at: None,
                         created_at: m.timestamp,
                     };
+                    entries.push(entry);
+                }
 
-                    let merge_remote_span = tracing::info_span!("crdt.merge_remote", sequence = m.sequence);
+                if !entries.is_empty() {
+                    let merge_remote_span = tracing::info_span!("crdt.merge_remote_batch", count = entries.len());
                     let _merge_guard = merge_remote_span.enter();
-                    self.reconciler.apply_remote_update(&entry).await?;
+                    self.reconciler.apply_batch(&entries).await?;
                 }
 
                 if let Some(last) = mutations.last() {
@@ -142,6 +166,16 @@ impl DownloadQueue {
     }
 
     pub async fn process_p2p_mutation(&self, m: crate::coordinator::traits::PendingMutation) -> Result<(), DriftError> {
+        let local_time = crate::time_utils::system_time_now_ms();
+        let skew = if m.timestamp > local_time {
+            m.timestamp - local_time
+        } else {
+            local_time - m.timestamp
+        };
+        if skew > self.max_clock_skew.as_millis() as u64 {
+            return Err(DriftError::ClockSkew(m.timestamp, local_time));
+        }
+
         if m.encrypted_blob.len() >= 8 {
             let header_version = u64::from_le_bytes(m.encrypted_blob[..8].try_into().unwrap());
             if header_version != m.key_version {

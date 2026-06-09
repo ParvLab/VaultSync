@@ -1,0 +1,13 @@
+{
+  "entryPoints": [
+    "packages/web/src/index.ts",
+    "packages/react/src/index.ts",
+    "packages/node/src/index.ts"
+  ],
+  "out": "../docs/api",
+  "name": "Drift TypeScript SDK API Documentation",
+  "excludePrivate": true,
+  "excludeProtected": true,
+  "hideGenerator": true,
+  "theme": "default"
+}

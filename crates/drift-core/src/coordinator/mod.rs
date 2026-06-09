@@ -9,3 +9,5 @@ pub mod http;
 #[cfg(feature = "coordinator-http")]
 pub mod mux_coordinator;
 pub mod failover;
+pub mod migration;
+

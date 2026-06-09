@@ -135,9 +135,19 @@ impl NapiDriftClient {
     pub async fn sync_status(&self) -> napi::Result<String> {
         let state = self.client.sync_status().await
             .map_err(|e| napi::Error::from_reason(format!("Sync status failed: {:?}", e)))?;
-        let json = serde_json::to_string(&state)
+        let pending = self.client.pending_uploads().await
+            .map_err(|e| napi::Error::from_reason(format!("Pending uploads failed: {:?}", e)))?;
+
+        let connected = state.connection_status != drift_core::sync::state::ConnectionStatus::Disconnected;
+
+        let mut map = serde_json::Map::new();
+        map.insert("connected".to_string(), serde_json::Value::Bool(connected));
+        map.insert("pendingMutations".to_string(), serde_json::Value::Number(serde_json::Number::from(pending)));
+        map.insert("lastSyncedSequence".to_string(), serde_json::Value::Number(serde_json::Number::from(state.last_synced_sequence)));
+
+        let json_str = serde_json::to_string(&serde_json::Value::Object(map))
             .map_err(|e| napi::Error::from_reason(format!("Serialize failed: {:?}", e)))?;
-        Ok(json)
+        Ok(json_str)
     }
 
     #[napi]

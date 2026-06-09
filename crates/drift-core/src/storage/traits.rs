@@ -76,4 +76,15 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
         namespace: &str,
         cutoff_ms: u64,
     ) -> Result<usize, DriftError>;
+
+    /// Write a batch of document updates in a single operation.
+    async fn write_batch_reconciliation(
+        &self,
+        documents: Vec<(String, String, Vec<u8>)>,
+    ) -> Result<(), DriftError> {
+        for (doc_id, record_id, bytes) in documents {
+            self.insert_document(&doc_id, &record_id, &bytes).await?;
+        }
+        Ok(())
+    }
 }

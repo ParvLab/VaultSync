@@ -155,4 +155,16 @@ impl Storage for EncryptedStorage {
     ) -> Result<usize, DriftError> {
         self.inner.delete_synced_before(namespace, cutoff_ms).await
     }
+
+    async fn write_batch_reconciliation(
+        &self,
+        documents: Vec<(String, String, Vec<u8>)>,
+    ) -> Result<(), DriftError> {
+        let mut encrypted_documents = Vec::with_capacity(documents.len());
+        for (doc_id, record_id, bytes) in documents {
+            let encrypted = self.encrypt(&bytes)?;
+            encrypted_documents.push((doc_id, record_id, encrypted));
+        }
+        self.inner.write_batch_reconciliation(encrypted_documents).await
+    }
 }

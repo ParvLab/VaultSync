@@ -14,6 +14,8 @@ pub struct CRDTDocument {
 }
 
 impl CRDTDocument {
+    pub const MAX_SNAPSHOT_SIZE: usize = 100 * 1024 * 1024; // 100 MB
+
     pub fn new(doc_id: &str, record_id: &str, schema_version: u64) -> Self {
         let doc = Doc::new();
         let mut txn = doc.transact_mut();
@@ -32,6 +34,9 @@ impl CRDTDocument {
     }
 
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, DriftError> {
+        if bytes.len() > Self::MAX_SNAPSHOT_SIZE {
+            return Err(DriftError::DocumentTooLarge(bytes.len(), Self::MAX_SNAPSHOT_SIZE));
+        }
         let doc = Doc::new();
         let mut txn = doc.transact_mut();
         let root = txn.get_or_insert_map("root");
@@ -70,6 +75,9 @@ impl CRDTDocument {
     }
 
     pub fn apply_update(&mut self, update: &[u8]) -> Result<(), DriftError> {
+        if update.len() > Self::MAX_SNAPSHOT_SIZE {
+            return Err(DriftError::DocumentTooLarge(update.len(), Self::MAX_SNAPSHOT_SIZE));
+        }
         let start = crate::time_utils::PlatformInstant::now();
         let span = tracing::info_span!("crdt.merge", doc_id = self.doc_id.as_str());
         let _enter = span.enter();

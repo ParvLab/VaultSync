@@ -231,9 +231,19 @@ impl WasmDriftClient {
     pub async fn sync_status(&self) -> Result<JsValue, JsValue> {
         let state = self.client.sync_status().await
             .map_err(|e| JsValue::from_str(&format!("Sync status failed: {:?}", e)))?;
-        let json = serde_json::to_string(&state)
+        let pending = self.client.pending_uploads().await
+            .map_err(|e| JsValue::from_str(&format!("Pending uploads failed: {:?}", e)))?;
+
+        let connected = state.connection_status != drift_core::sync::state::ConnectionStatus::Disconnected;
+
+        let mut map = serde_json::Map::new();
+        map.insert("connected".to_string(), serde_json::Value::Bool(connected));
+        map.insert("pendingMutations".to_string(), serde_json::Value::Number(serde_json::Number::from(pending)));
+        map.insert("lastSyncedSequence".to_string(), serde_json::Value::Number(serde_json::Number::from(state.last_synced_sequence)));
+
+        let json_str = serde_json::to_string(&serde_json::Value::Object(map))
             .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))?;
-        Ok(JsValue::from_str(&json))
+        Ok(JsValue::from_str(&json_str))
     }
 
     pub fn subscribe(&self, doc_id: &str, callback: js_sys::Function) -> WasmSubscriptionHandle {
@@ -293,6 +303,14 @@ impl WasmDriftClient {
 
     pub fn prune_key_versions(&self, keep_versions: u32) -> Result<(), JsValue> {
         self.client.prune_key_versions(keep_versions as u64);
+        Ok(())
+    }
+
+    pub async fn define_schema(&self, doc_id: &str, schema_json: &str) -> Result<(), JsValue> {
+        let schema: drift_core::schema::registry::DocumentSchema = serde_json::from_str(schema_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid schema JSON: {:?}", e)))?;
+        self.client.define_schema(doc_id, schema).await
+            .map_err(|e| JsValue::from_str(&format!("Define schema failed: {:?}", e)))?;
         Ok(())
     }
 }

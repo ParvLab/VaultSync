@@ -627,6 +627,29 @@ impl Storage for SQLiteStorage {
         .await
         .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
     }
+
+    async fn write_batch_reconciliation(
+        &self,
+        documents: Vec<(String, String, Vec<u8>)>,
+    ) -> Result<(), DriftError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().unwrap();
+            let tx = conn.transaction()?;
+
+            for (doc_id, record_id, bytes) in documents {
+                tx.execute(
+                    "INSERT OR REPLACE INTO documents (doc_id, record_id, bytes) VALUES (?1, ?2, ?3)",
+                    params![doc_id, record_id, bytes],
+                )?;
+            }
+
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| DriftError::Storage(format!("spawn_blocking error: {e}")))?
+    }
 }
 
 impl SQLiteStorage {

@@ -22,7 +22,7 @@ impl OpLog {
     }
 
     pub async fn pending_entries(&self, namespace: &str) -> Result<Vec<OplogEntry>, DriftError> {
-        self.storage.read_pending_oplog(namespace, usize::MAX).await
+        self.storage.read_pending_oplog(namespace, 50000).await
     }
 
     pub async fn update_blob(&self, id: &str, new_blob: &[u8]) -> Result<(), DriftError> {
@@ -43,7 +43,7 @@ impl OpLog {
     }
 
     pub async fn count_pending(&self) -> Result<usize, DriftError> {
-        Ok(self.storage.read_pending_oplog(&self.namespace, usize::MAX).await?.len())
+        Ok(self.storage.read_pending_oplog(&self.namespace, 50000).await?.len())
     }
 
     pub async fn delete_compacted(&self, _before_sequence: u64) -> Result<usize, DriftError> {

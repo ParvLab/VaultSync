@@ -29,7 +29,14 @@ pub fn encrypt(
     recipient_pk: &[u8; 32],
 ) -> Result<Vec<u8>, DriftError> {
     let shared_secret = x25519_dalek::x25519(*sk, *recipient_pk);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&shared_secret));
+    encrypt_with_shared_secret(plaintext, &shared_secret)
+}
+
+pub fn encrypt_with_shared_secret(
+    plaintext: &[u8],
+    shared_secret: &[u8; 32],
+) -> Result<Vec<u8>, DriftError> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(shared_secret));
     
     let nonce_bytes = get_unique_nonce();
     let nonce = Nonce::from_slice(&nonce_bytes);

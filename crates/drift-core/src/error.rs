@@ -25,6 +25,12 @@ pub enum DriftError {
 
     #[error("SQLite error: {0}")]
     Sqlite(String),
+
+    #[error("Document too large: {0} bytes, limit is {1} bytes")]
+    DocumentTooLarge(usize, usize),
+
+    #[error("Clock skew error: mutation timestamp {0} is skewed compared to system time {1}")]
+    ClockSkew(u64, u64),
 }
 
 #[cfg(feature = "storage-sqlite")]

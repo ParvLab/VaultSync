@@ -18,6 +18,8 @@ pub struct DriftConfig {
     pub fallback_coordinator_urls: Vec<String>,
     pub enable_p2p: bool,
     pub p2p_listen_addr: Option<String>,
+    pub max_clock_skew: std::time::Duration,
+    pub max_document_size: usize,
 }
 
 impl Default for DriftConfig {
@@ -36,6 +38,8 @@ impl Default for DriftConfig {
             fallback_coordinator_urls: Vec::new(),
             enable_p2p: false,
             p2p_listen_addr: Some("/ip4/0.0.0.0/udp/0/quic-v1".to_string()),
+            max_clock_skew: std::time::Duration::from_secs(24 * 3600), // 24 hours
+            max_document_size: 100 * 1024 * 1024, // 100 MB
         }
     }
 }

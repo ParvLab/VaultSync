@@ -1,16 +1,26 @@
 import init, { WasmDriftClient } from '../wasm/drift_wasm.js';
 import type { DriftConfig, RecordFields, SyncStatus, SubscriptionCallback, UnsubscribeFn } from './types.js';
 import { KeyManager } from './keys.js';
+import { createDbProxy, DbProxy, Collection } from './db.js';
+import { defineSchema, FieldDef, SchemaDefinition } from './schema.js';
 
 export * from './types.js';
-export { KeyManager };
+export { KeyManager, DbProxy, Collection, defineSchema, FieldDef, SchemaDefinition, createDbProxy };
 
 export class DriftClient {
   private inner: any;
   private _keys?: KeyManager;
+  private _db?: any;
 
   private constructor(inner: any) {
     this.inner = inner;
+  }
+
+  get db(): DbProxy & Record<string, Collection<any>> {
+    if (!this._db) {
+      this._db = createDbProxy(this);
+    }
+    return this._db;
   }
 
   get keys(): KeyManager {

@@ -276,9 +276,10 @@ async fn test_chaos_clock_skew() {
 async fn test_chaos_massive_oplog() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("massive.db").to_string_lossy().to_string();
+    let namespace = format!("massive-ns-{}", uuid::Uuid::new_v4());
 
     let mut config = DriftConfig::default();
-    config.namespace = "massive-ns".to_string();
+    config.namespace = namespace.clone();
     config.storage = StorageConfig::Sqlite { path: db_path.clone() };
     config.sync_interval = Duration::from_secs(3600);
 
@@ -297,13 +298,18 @@ async fn test_chaos_massive_oplog() {
         client.debug_api.storage.clone(),
         drift_core::sync::compaction::CompactionConfig::default(),
     );
-    engine.run_compaction("massive-ns").await.unwrap();
-    engine.run_snapshot_compaction("massive-ns").await.unwrap();
+    engine.run_compaction(&namespace).await.unwrap();
+    engine.run_snapshot_compaction(&namespace).await.unwrap();
 
     let map = client.get("doc-1", "rec-1").await.unwrap().unwrap();
     assert_eq!(map.get("val").unwrap(), &CrdtValue::Number(99.0));
 
     client.shutdown().await.unwrap();
+
+    let shm_path = std::env::temp_dir().join(format!("drift_shm_{}.bin", namespace));
+    if shm_path.exists() {
+        let _ = std::fs::remove_file(shm_path);
+    }
 }
 
 #[tokio::test]
@@ -442,3 +448,22 @@ async fn test_chaos_failover_during_push() {
 
     client.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_unicode_text_field_convergence() {
+    let base = drift_core::crdt::document::CRDTDocument::new("doc-unicode", "rec-unicode", 1);
+    let mut replica_a = drift_core::crdt::document::CRDTDocument::from_snapshot(&base.to_snapshot()).unwrap();
+    let mut replica_b = drift_core::crdt::document::CRDTDocument::from_snapshot(&base.to_snapshot()).unwrap();
+
+    let text_a = "Hello, 🦀! Greetings from Munich 🇩🇪 and Tokyo 🇯🇵.";
+    let text_b = "Hello, 🦀! Greetings from Munich 🇩🇪 and Cairo 🇪🇬.";
+
+    let update_a = replica_a.set_field("content", CrdtValue::String(text_a.to_string()));
+    let update_b = replica_b.set_field("content", CrdtValue::String(text_b.to_string()));
+
+    replica_a.apply_update(&update_b).unwrap();
+    replica_b.apply_update(&update_a).unwrap();
+
+    assert_eq!(replica_a.to_map(), replica_b.to_map());
+}
+

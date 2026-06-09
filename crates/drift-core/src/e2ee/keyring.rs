@@ -24,6 +24,7 @@ pub struct KeyRing {
 struct KeyRingInner {
     keys: Vec<NamespaceKeypair>,
     active_version: u64,
+    derived_keys_cache: std::collections::HashMap<(String, u64), [u8; 32]>,
 }
 
 impl KeyRing {
@@ -33,6 +34,7 @@ impl KeyRing {
             inner: std::sync::RwLock::new(KeyRingInner {
                 keys: vec![keypair],
                 active_version: 1,
+                derived_keys_cache: std::collections::HashMap::new(),
             }),
         }
     }
@@ -43,6 +45,7 @@ impl KeyRing {
             inner: std::sync::RwLock::new(KeyRingInner {
                 keys: vec![key],
                 active_version: version,
+                derived_keys_cache: std::collections::HashMap::new(),
             }),
         }
     }
@@ -124,17 +127,26 @@ impl KeyRing {
     }
 
     pub fn derive_namespace_key(&self, namespace: &str) -> [u8; 32] {
+        let active_version = self.active_version();
+        if let Some(key) = self.get_cached_key(namespace, active_version) {
+            return key;
+        }
+
         let active = self.active_key();
         let hk = Hkdf::<Sha256>::new(Some(b"drift-namespace"), &active.private_key);
         let mut okm = [0u8; 32];
         hk.expand(namespace.as_bytes(), &mut okm)
             .expect("32 bytes is a valid length for HKDF output");
+
+        self.insert_cached_key(namespace, active_version, okm);
         okm
     }
 
     pub fn prune_old_versions(&self, current_version: u64) {
         let mut inner = self.inner.write().unwrap();
-        inner.keys.retain(|k| k.version >= current_version.saturating_sub(1));
+        let keep_from = current_version.saturating_sub(1);
+        inner.keys.retain(|k| k.version >= keep_from);
+        inner.derived_keys_cache.retain(|(_, v), _| *v >= keep_from);
     }
 
     pub fn prune_to_keep(&self, keep_versions: u64) {
@@ -142,6 +154,7 @@ impl KeyRing {
         let active = inner.active_version;
         let cutoff = active.saturating_sub(keep_versions).saturating_add(1);
         inner.keys.retain(|k| k.version >= cutoff);
+        inner.derived_keys_cache.retain(|(_, v), _| *v >= cutoff);
     }
 
     pub fn load_keys(&self, loaded: Vec<NamespaceKeypair>) {
@@ -151,29 +164,69 @@ impl KeyRing {
         let mut inner = self.inner.write().unwrap();
         inner.keys = loaded;
         inner.active_version = inner.keys.iter().map(|k| k.version).max().unwrap_or(1);
+        inner.derived_keys_cache.clear(); // Clear all cache since keys are completely reloaded
     }
 
     pub fn derive_namespace_key_for_version(&self, namespace: &str, version: u64) -> Option<[u8; 32]> {
+        if let Some(key) = self.get_cached_key(namespace, version) {
+            return Some(key);
+        }
+
         let keypair = self.key_by_version(version)?;
         let hk = Hkdf::<Sha256>::new(Some(b"drift-namespace"), &keypair.private_key);
         let mut okm = [0u8; 32];
         hk.expand(namespace.as_bytes(), &mut okm)
             .expect("32 bytes is a valid length for HKDF output");
+
+        self.insert_cached_key(namespace, version, okm);
         Some(okm)
+    }
+
+    fn get_cached_key(&self, namespace: &str, version: u64) -> Option<[u8; 32]> {
+        let inner = self.inner.read().unwrap();
+        inner.derived_keys_cache.get(&(namespace.to_string(), version)).cloned()
+    }
+
+    fn insert_cached_key(&self, namespace: &str, version: u64, key: [u8; 32]) {
+        let mut inner = self.inner.write().unwrap();
+        inner.derived_keys_cache.insert((namespace.to_string(), version), key);
     }
 }
 
 pub struct E2eeEncryptor {
     keyring: Arc<KeyRing>,
+    shared_secrets: std::sync::RwLock<std::collections::HashMap<(u64, [u8; 32]), [u8; 32]>>,
 }
 
 impl E2eeEncryptor {
     pub fn new(keyring: Arc<KeyRing>) -> Self {
-        Self { keyring }
+        Self {
+            keyring,
+            shared_secrets: std::sync::RwLock::new(std::collections::HashMap::new()),
+        }
     }
 
     pub fn encrypt(&self, plaintext: &[u8], recipient_pk: &[u8; 32]) -> Result<Vec<u8>, DriftError> {
-        super::encrypt::encrypt(plaintext, &self.keyring.active_key().private_key, recipient_pk)
+        let active = self.keyring.active_key();
+        let key_version = active.version;
+        let cache_key = (key_version, *recipient_pk);
+
+        let shared_secret = {
+            let read_cache = self.shared_secrets.read().unwrap();
+            read_cache.get(&cache_key).cloned()
+        };
+
+        let shared_secret = match shared_secret {
+            Some(secret) => secret,
+            None => {
+                let secret = x25519_dalek::x25519(active.private_key, *recipient_pk);
+                let mut write_cache = self.shared_secrets.write().unwrap();
+                write_cache.insert(cache_key, secret);
+                secret
+            }
+        };
+
+        super::encrypt::encrypt_with_shared_secret(plaintext, &shared_secret)
     }
 
     pub fn encrypt_symmetric(&self, plaintext: &[u8], namespace: &str) -> Result<Vec<u8>, DriftError> {
@@ -209,15 +262,38 @@ impl E2eeEncryptor {
 
 pub struct E2eeDecryptor {
     keyring: Arc<KeyRing>,
+    shared_secrets: std::sync::RwLock<std::collections::HashMap<(u64, [u8; 32]), [u8; 32]>>,
 }
 
 impl E2eeDecryptor {
     pub fn new(keyring: Arc<KeyRing>) -> Self {
-        Self { keyring }
+        Self {
+            keyring,
+            shared_secrets: std::sync::RwLock::new(std::collections::HashMap::new()),
+        }
     }
 
     pub fn decrypt(&self, ciphertext: &[u8], sender_pk: &[u8; 32]) -> Result<Vec<u8>, DriftError> {
-        super::decrypt::decrypt(ciphertext, &self.keyring.active_key().private_key, sender_pk)
+        let active = self.keyring.active_key();
+        let key_version = active.version;
+        let cache_key = (key_version, *sender_pk);
+
+        let shared_secret = {
+            let read_cache = self.shared_secrets.read().unwrap();
+            read_cache.get(&cache_key).cloned()
+        };
+
+        let shared_secret = match shared_secret {
+            Some(secret) => secret,
+            None => {
+                let secret = x25519_dalek::x25519(active.private_key, *sender_pk);
+                let mut write_cache = self.shared_secrets.write().unwrap();
+                write_cache.insert(cache_key, secret);
+                secret
+            }
+        };
+
+        super::decrypt::decrypt_with_shared_secret(ciphertext, &shared_secret)
     }
 
     pub fn decrypt_symmetric(&self, ciphertext: &[u8], namespace: &str) -> Result<Vec<u8>, DriftError> {

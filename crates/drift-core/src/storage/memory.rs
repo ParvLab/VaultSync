@@ -262,4 +262,15 @@ impl Storage for InMemoryStorage {
         });
         Ok(before - store.len())
     }
+
+    async fn write_batch_reconciliation(
+        &self,
+        documents: Vec<(String, String, Vec<u8>)>,
+    ) -> Result<(), DriftError> {
+        let mut docs = self.documents.write().map_err(|e| DriftError::Storage(e.to_string()))?;
+        for (doc_id, record_id, bytes) in documents {
+            docs.insert((doc_id, record_id), bytes);
+        }
+        Ok(())
+    }
 }

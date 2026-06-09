@@ -87,8 +87,9 @@ async fn test_crash_recovery_requeues_stale_pending() {
     storage.append_oplog(&fresh_entry).await.unwrap();
 
     // 3. Run recovery
+    let keyring = Arc::new(drift_core::e2ee::keyring::KeyRing::generate());
     let recovery = CrashRecovery::new(storage.clone(), ns.to_string());
-    let recovered_count = recovery.recover().await.expect("recovery runs");
+    let recovered_count = recovery.recover(keyring).await.expect("recovery runs");
     assert_eq!(recovered_count, 1);
 
     // 4. Verify stale entry is Pending, fresh entry is still Failed

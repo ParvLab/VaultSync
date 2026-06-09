@@ -15,17 +15,17 @@ export default defineConfig({
   ],
   webServer: [
     {
-      command: "cargo run -p drift-coordinator-server -- --backend memory --port 9876",
+      command: "cargo run -p drift-coordinator-server --jobs 1 -- --backend memory --port 9876",
       port: 9876,
       reuseExistingServer: !process.env.CI,
-      timeout: 60_000,
+      timeout: 180_000,
       cwd: "../../..",
     },
     {
       command: "npx vite --port 3000",
       port: 3000,
       reuseExistingServer: !process.env.CI,
-      timeout: 60_000,
+      timeout: 180_000,
       cwd: ".",
     },
   ],

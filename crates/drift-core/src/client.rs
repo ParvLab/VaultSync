@@ -50,6 +50,7 @@ pub struct DriftClient {
     pub debug_api: Arc<crate::telemetry::debug::DebugApi>,
     pub leader_election: Arc<crate::ipc::leader_election::LeaderElection>,
     pub schema_version: u64,
+    pub shared_memory: Arc<crate::ipc::shared_memory::SharedMemory>,
 }
 
 impl DriftClient {
@@ -255,6 +256,7 @@ impl DriftClient {
             reconciler.clone(),
             decryptor.clone(),
             metrics.clone(),
+            config.max_clock_skew,
         ));
 
         let schema = Arc::new(std::sync::Mutex::new(SchemaRegistry::new()));
@@ -268,7 +270,7 @@ impl DriftClient {
 
         // Perform crash recovery on startup before starting the sync loop
         let crash_recovery = crate::ipc::crash_recovery::CrashRecovery::new(storage.clone(), config.namespace.clone());
-        if let Err(e) = crash_recovery.recover().await {
+        if let Err(e) = crash_recovery.recover(keyring.clone()).await {
             tracing::error!(error = %e, "Crash recovery failed during startup");
         }
 
@@ -313,11 +315,13 @@ impl DriftClient {
             }
         }
 
+        let shared_memory = Arc::new(crate::ipc::shared_memory::SharedMemory::create_with_namespace(&config.namespace, 64 * 1024)?);
+
         let client = Self {
             config,
             storage,
             coordinator,
-            keyring,
+            keyring: keyring.clone(),
             encryptor,
             _decryptor: decryptor,
             _oplog: oplog,
@@ -337,6 +341,7 @@ impl DriftClient {
             debug_api,
             leader_election: leader_election.clone(),
             schema_version,
+            shared_memory,
         };
 
         let leader_election_clone = leader_election.clone();
@@ -360,6 +365,8 @@ impl DriftClient {
                 ).await;
             });
         }
+
+        let keyring_clone = keyring.clone();
 
         crate::time_utils::spawn(async move {
             let mut is_leader = match leader_election_clone.try_acquire() {
@@ -429,13 +436,20 @@ impl DriftClient {
                     tokio::select! {
                         _ = interval.tick() => {
                             if !is_leader {
-                                is_leader = match leader_election_clone.try_acquire() {
+                                let promoted = match leader_election_clone.try_acquire() {
                                     Ok(status) => status,
                                     Err(e) => {
                                         tracing::error!(error = %e, "Leader election try_acquire failed");
                                         false
                                     }
                                 };
+                                if promoted {
+                                    is_leader = true;
+                                    let crash_recovery = crate::ipc::crash_recovery::CrashRecovery::new(storage_clone.clone(), namespace_clone.clone());
+                                    if let Err(e) = crash_recovery.recover(keyring_clone.clone()).await {
+                                        tracing::error!(error = %e, "Crash recovery failed on leader promotion");
+                                    }
+                                }
                                 if let Ok(Some(mut state)) = storage_clone.read_sync_state(&namespace_clone).await {
                                     state.leader_status = Some(is_leader);
                                     let _ = storage_clone.write_sync_state(&state).await;
@@ -525,6 +539,9 @@ impl DriftClient {
             doc.set_field(field, value.clone());
         }
         let update_bytes = doc.to_snapshot();
+        if update_bytes.len() > self.config.max_document_size {
+            return Err(DriftError::DocumentTooLarge(update_bytes.len(), self.config.max_document_size));
+        }
         let snapshot = update_bytes.clone();
 
         let encrypted_blob = self.encryptor.encrypt_symmetric(&update_bytes, &self.config.namespace)?;
@@ -553,6 +570,7 @@ impl DriftClient {
 
         match res {
             Ok(_) => {
+                let _ = self.shared_memory.write_entry(&entry.id, &entry.yrs_update);
                 let key_version = self.keyring.active_key().version;
                 self.broadcast_p2p(&entry, key_version).await;
                 self.metrics.record_mutation_attempt(&self.config.namespace, "success");
@@ -592,6 +610,9 @@ impl DriftClient {
             doc.set_field(field, value.clone());
         }
         let update_bytes = doc.to_snapshot();
+        if update_bytes.len() > self.config.max_document_size {
+            return Err(DriftError::DocumentTooLarge(update_bytes.len(), self.config.max_document_size));
+        }
         let snapshot = update_bytes.clone();
 
         let encrypted_blob = self.encryptor.encrypt_symmetric(&update_bytes, &self.config.namespace)?;
@@ -620,6 +641,7 @@ impl DriftClient {
 
         match res {
             Ok(_) => {
+                let _ = self.shared_memory.write_entry(&entry.id, &entry.yrs_update);
                 let key_version = self.keyring.active_key().version;
                 self.broadcast_p2p(&entry, key_version).await;
                 self.metrics.record_mutation_attempt(&self.config.namespace, "success");
@@ -683,6 +705,7 @@ impl DriftClient {
 
             match res {
                 Ok(_) => {
+                    let _ = self.shared_memory.write_entry(&entry.id, &entry.yrs_update);
                     let key_version = self.keyring.active_key().version;
                     self.broadcast_p2p(&entry, key_version).await;
                     self.metrics.record_mutation_attempt(&self.config.namespace, "success");
