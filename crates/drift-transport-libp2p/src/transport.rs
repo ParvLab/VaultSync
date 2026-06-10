@@ -37,10 +37,11 @@ pub struct DriftBehaviour {
     pub identify: identify::Behaviour,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct LibP2pTransportHandle {
     outgoing_tx: mpsc::Sender<Command>,
     listen_addresses: Arc<Mutex<Vec<Multiaddr>>>,
+    incoming_broadcast_tx: tokio::sync::broadcast::Sender<PendingMutation>,
 }
 
 impl LibP2pTransportHandle {
@@ -55,12 +56,17 @@ impl LibP2pTransportHandle {
     pub fn listen_addresses(&self) -> Vec<Multiaddr> {
         self.listen_addresses.lock().unwrap().clone()
     }
+
+    pub fn incoming_broadcast(&self) -> tokio::sync::broadcast::Receiver<PendingMutation> {
+        self.incoming_broadcast_tx.subscribe()
+    }
 }
 
 pub struct LibP2pTransport {
     namespace: String,
     swarm: Swarm<DriftBehaviour>,
     incoming_tx: mpsc::Sender<PendingMutation>,
+    incoming_broadcast_tx: tokio::sync::broadcast::Sender<PendingMutation>,
     outgoing_rx: mpsc::Receiver<Command>,
     listen_addresses: Arc<Mutex<Vec<Multiaddr>>>,
 }
@@ -136,18 +142,21 @@ impl LibP2pTransport {
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel(100);
         let listen_addresses = Arc::new(Mutex::new(Vec::new()));
+        let (incoming_broadcast_tx, _) = tokio::sync::broadcast::channel(100);
 
         Ok((
             Self {
                 namespace: namespace.to_string(),
                 swarm,
                 incoming_tx,
+                incoming_broadcast_tx: incoming_broadcast_tx.clone(),
                 outgoing_rx,
                 listen_addresses: listen_addresses.clone(),
             },
             LibP2pTransportHandle {
                 outgoing_tx,
                 listen_addresses,
+                incoming_broadcast_tx,
             },
         ))
     }
@@ -155,6 +164,7 @@ impl LibP2pTransport {
     pub async fn run(self) {
         let namespace = self.namespace;
         let incoming_tx = self.incoming_tx;
+        let incoming_broadcast_tx = self.incoming_broadcast_tx;
         let mut outgoing_rx = self.outgoing_rx;
         let mut swarm = self.swarm;
         let listen_addresses = self.listen_addresses;
@@ -183,7 +193,8 @@ impl LibP2pTransport {
                             if let Ok(m) = rmp_serde::from_slice::<PendingMutation>(&message.data) {
                                 if m.namespace == namespace {
                                     tracing::debug!("P2P message received, mutation ID: {}", m.id);
-                                    let _ = incoming_tx.send(m).await;
+                                    let _ = incoming_tx.send(m.clone()).await;
+                                    let _ = incoming_broadcast_tx.send(m);
                                 }
                             }
                         }

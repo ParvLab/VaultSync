@@ -43,6 +43,7 @@ pub enum CoordinatorError {
     AuthFailed,
     SchemaMismatch,
     Timeout,
+    NotSupported(String),
     Internal(String),
 }
 
@@ -87,5 +88,83 @@ pub trait Coordinator: Send + Sync + std::fmt::Debug {
     async fn list_snapshots(&self, _namespace: &str)
         -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
         Ok(vec![])
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct LibP2pSubscription {
+    rx: tokio::sync::broadcast::Receiver<drift_transport_libp2p::PendingMutation>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Stream for LibP2pSubscription {
+    type Item = PendingMutation;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
+        let fut = self.rx.recv();
+        tokio::pin!(fut);
+        match fut.poll(cx) {
+            std::task::Poll::Ready(Ok(m)) => std::task::Poll::Ready(Some(PendingMutation {
+                id: m.id,
+                namespace: m.namespace,
+                sequence: m.sequence,
+                doc_id: m.doc_id,
+                record_id: m.record_id,
+                encrypted_blob: m.encrypted_blob,
+                timestamp: m.timestamp,
+                key_version: m.key_version,
+            })),
+            std::task::Poll::Ready(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
+impl Coordinator for drift_transport_libp2p::LibP2pTransportHandle {
+    async fn push(&self, _namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+        for m in mutations {
+            let pm = drift_transport_libp2p::PendingMutation {
+                id: m.id,
+                namespace: m.namespace,
+                sequence: 0,
+                doc_id: m.doc_id,
+                record_id: m.record_id,
+                encrypted_blob: m.encrypted_blob,
+                timestamp: m.timestamp,
+                key_version: m.key_version,
+            };
+            self.broadcast_mutation(pm).await
+                .map_err(CoordinatorError::Internal)?;
+        }
+        Ok(vec![])
+    }
+
+    async fn pull(&self, _namespace: &str, _after: SequenceId, _limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+        Ok(vec![])
+    }
+
+    async fn subscribe(&self, _namespace: &str, _from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+        Ok(Box::new(LibP2pSubscription { rx: self.incoming_broadcast() }))
+    }
+
+    async fn register(&self, _namespace: &str, _info: ReplicaInfo) -> Result<(), CoordinatorError> {
+        Ok(())
+    }
+
+    async fn heartbeat(&self, _namespace: &str, _replica_id: &str) -> Result<(), CoordinatorError> {
+        Ok(())
+    }
+
+    async fn schema_version(&self, _namespace: &str) -> Result<u64, CoordinatorError> {
+        Ok(0)
     }
 }

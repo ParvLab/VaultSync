@@ -156,6 +156,47 @@ impl NapiDriftClient {
             .map_err(|e| napi::Error::from_reason(format!("Shutdown failed: {:?}", e)))?;
         Ok(())
     }
+
+    #[napi]
+    pub fn is_leader(&self) -> bool {
+        self.client.leader_election.is_leader()
+    }
+
+    #[napi]
+    pub async fn rotate_keys(&self) -> napi::Result<i64> {
+        self.client.rotate_keys().await
+            .map_err(|e| napi::Error::from_reason(format!("Rotate keys failed: {:?}", e)))?;
+        let active = self.client.active_key_version();
+        Ok(active as i64)
+    }
+
+    #[napi]
+    pub fn active_key_version(&self) -> i64 {
+        self.client.active_key_version() as i64
+    }
+
+    #[napi]
+    pub fn list_key_versions(&self) -> napi::Result<String> {
+        let keys = self.client.list_key_versions();
+        let active = self.client.active_key_version();
+        let mut list = Vec::new();
+        for key in keys {
+            list.push(serde_json::json!({
+                "version": key.version,
+                "createdAt": key.created_at * 1000,
+                "isActive": key.version == active,
+            }));
+        }
+        let json_str = serde_json::to_string(&list)
+            .map_err(|e| napi::Error::from_reason(format!("Serialize failed: {:?}", e)))?;
+        Ok(json_str)
+    }
+
+    #[napi]
+    pub fn prune_key_versions(&self, keep_versions: i32) -> napi::Result<()> {
+        self.client.prune_key_versions(keep_versions as u64);
+        Ok(())
+    }
 }
 
 #[napi]

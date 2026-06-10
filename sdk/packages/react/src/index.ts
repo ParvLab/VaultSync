@@ -7,3 +7,9 @@ export { useDriftOne } from './useDriftOne.js';
 export { useDriftMutations } from './useDriftMutations.js';
 export { SyncIndicator } from './SyncIndicator.js';
 
+// Plan compatibility aliases
+export * from './provider.js';
+export * from './hooks.js';
+export * from './mutations.js';
+export * from './sync-indicator.js';
+

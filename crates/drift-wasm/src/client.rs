@@ -313,6 +313,10 @@ impl WasmDriftClient {
             .map_err(|e| JsValue::from_str(&format!("Define schema failed: {:?}", e)))?;
         Ok(())
     }
+
+    pub fn is_leader(&self) -> bool {
+        self.client.leader_election.is_leader()
+    }
 }
 
 #[wasm_bindgen]

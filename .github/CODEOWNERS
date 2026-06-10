@@ -1,0 +1,14 @@
+# .github/CODEOWNERS
+# Governing review workflows for Drift repository.
+
+# Global default owners
+*       @drift-labs/maintainers
+
+# SDK-specific paths
+/sdk/   @drift-labs/sdk-team
+
+# Rust core engines
+/crates/ @drift-labs/core-team
+
+# Infrastructure & CI
+/.github/workflows/ @drift-labs/infra-team

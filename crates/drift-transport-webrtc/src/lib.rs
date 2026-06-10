@@ -1,3 +1,7 @@
+//! WebRTC P2P transport — WASM (browser) only.
+//!
+//! Native targets are stubbed and will return `CoordinatorError::NotSupported` for all operations.
+
 use async_trait::async_trait;
 use drift_core::coordinator::traits::*;
 use futures::Stream;
@@ -35,11 +39,11 @@ impl PeerCoordinator {
     }
 
     pub async fn initiate_connection(&self, _peer_id: &str) -> Result<(), String> {
-        Ok(())
+        Err("WebRTC P2P transport is only supported in WASM (browser) targets. Use libp2p for native.".into())
     }
 
     pub async fn handle_signaling_message(&self, _sender_id: &str, _signal_type: &str, _data: &str) -> Result<(), String> {
-        Ok(())
+        Err("WebRTC P2P transport is only supported in WASM (browser) targets. Use libp2p for native.".into())
     }
 }
 
@@ -47,43 +51,50 @@ impl PeerCoordinator {
 #[async_trait]
 impl Coordinator for PeerCoordinator {
     async fn push(&self, _namespace: &str, _mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
-        Ok(vec![])
+        Err(CoordinatorError::NotSupported(
+            "WebRTC P2P transport is only supported in WASM (browser) targets. \
+             For server-to-server P2P, use drift-transport-libp2p instead.".into()
+        ))
     }
 
     async fn pull(&self, _namespace: &str, _after: SequenceId, _limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
-        Ok(vec![])
+        Err(CoordinatorError::NotSupported(
+            "WebRTC P2P transport is only supported in WASM (browser) targets. \
+             For server-to-server P2P, use drift-transport-libp2p instead.".into()
+        ))
     }
 
     async fn subscribe(&self, _namespace: &str, _from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        Ok(Box::new(StubSubscription { rx }))
+        Err(CoordinatorError::NotSupported(
+            "WebRTC P2P transport is only supported in WASM (browser) targets. \
+             For server-to-server P2P, use drift-transport-libp2p instead.".into()
+        ))
     }
 
     async fn register(&self, _namespace: &str, _info: ReplicaInfo) -> Result<(), CoordinatorError> {
-        Ok(())
+        Err(CoordinatorError::NotSupported(
+            "WebRTC P2P transport is only supported in WASM (browser) targets. \
+             For server-to-server P2P, use drift-transport-libp2p instead.".into()
+        ))
     }
 
     async fn heartbeat(&self, _namespace: &str, _replica_id: &str) -> Result<(), CoordinatorError> {
-        Ok(())
+        Err(CoordinatorError::NotSupported(
+            "WebRTC P2P transport is only supported in WASM (browser) targets. \
+             For server-to-server P2P, use drift-transport-libp2p instead.".into()
+        ))
     }
 
     async fn schema_version(&self, _namespace: &str) -> Result<u64, CoordinatorError> {
-        Ok(0)
+        Err(CoordinatorError::NotSupported(
+            "WebRTC P2P transport is only supported in WASM (browser) targets. \
+             For server-to-server P2P, use drift-transport-libp2p instead.".into()
+        ))
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-struct StubSubscription {
-    rx: tokio::sync::mpsc::Receiver<PendingMutation>,
-}
 
-#[cfg(not(target_arch = "wasm32"))]
-impl Stream for StubSubscription {
-    type Item = PendingMutation;
-    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
-    }
-}
+
 
 // -----------------------------------------------------------------------------
 // WebAssembly (Browser-side) WebRTC implementation
@@ -397,18 +408,33 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_native_peer_coordinator_stub() {
+    async fn test_native_peer_coordinator_returns_not_supported() {
         let config = WebRtcConfig {
             ice_servers: vec!["stun:stun.l.google.com:19302".to_string()],
         };
         let coord = PeerCoordinator::new(config);
         
         let push_res = coord.push("test", vec![]).await;
-        assert!(push_res.is_ok());
-        assert!(push_res.unwrap().is_empty());
+        assert!(matches!(push_res, Err(CoordinatorError::NotSupported(_))));
 
         let pull_res = coord.pull("test", 0, 10).await;
-        assert!(pull_res.is_ok());
-        assert!(pull_res.unwrap().is_empty());
+        assert!(matches!(pull_res, Err(CoordinatorError::NotSupported(_))));
+
+        let sub_res = coord.subscribe("test", 0).await;
+        assert!(matches!(sub_res, Err(CoordinatorError::NotSupported(_))));
+
+        let reg_res = coord.register("test", ReplicaInfo {
+            replica_id: "test".into(),
+            namespace: "test".into(),
+            public_key: vec![],
+            schema_version: 1,
+        }).await;
+        assert!(matches!(reg_res, Err(CoordinatorError::NotSupported(_))));
+
+        let init_res = coord.initiate_connection("peer").await;
+        assert!(init_res.is_err());
+
+        let sig_res = coord.handle_signaling_message("peer", "offer", "data").await;
+        assert!(sig_res.is_err());
     }
 }

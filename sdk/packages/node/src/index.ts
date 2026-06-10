@@ -3,8 +3,13 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { fileURLToPath } from 'url';
 import type { DriftConfig, RecordFields, SyncStatus, SubscriptionCallback, UnsubscribeFn } from './types.js';
+import { createDbProxy, DbProxy, Collection } from './db.js';
 
 export * from './types.js';
+export { DbProxy, Collection, createDbProxy };
+export { Drift } from './drift.js';
+export { NodeStorage } from './storage.js';
+export * from './coordinator/index.js';
 
 const nodeRequire = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -50,18 +55,37 @@ for (const p of paths) {
   }
 }
 
-if (!nativeModule) {
-  throw new Error("Could not find or load drift-napi native addon");
+export function isNativeAvailable(): boolean {
+  return nativeModule !== null;
+}
+
+export function createNativeClient(config: DriftConfig): Promise<DriftClient> {
+  return DriftClient.create(config);
 }
 
 export class DriftClient {
-  private inner: any;
+  // Marked as public so Drift facade can access it
+  public inner: any;
+  private _db?: any;
 
   private constructor(inner: any) {
     this.inner = inner;
   }
 
+  get db(): DbProxy & Record<string, Collection<any>> {
+    if (!this._db) {
+      this._db = createDbProxy(this);
+    }
+    return this._db;
+  }
+
   static async create(config: DriftConfig): Promise<DriftClient> {
+    if (!nativeModule) {
+      throw new Error(
+        "Could not find or load drift-napi native addon. " +
+        "Make sure the native addon is built and available in your path."
+      );
+    }
     const inner = await nativeModule.createClient(
       config.namespace,
       config.replicaId,
@@ -104,6 +128,10 @@ export class DriftClient {
     return JSON.parse(statusStr);
   }
 
+  isLeader(): boolean {
+    return this.inner.is_leader();
+  }
+
   subscribe(docId: string, callback: SubscriptionCallback): UnsubscribeFn {
     const wasmCallback = (err: any, recordId: string, jsonStr: string) => {
       if (err) {
@@ -120,84 +148,5 @@ export class DriftClient {
 
   async shutdown(): Promise<void> {
     await this.inner.shutdown();
-  }
-}
-
-export class InMemoryCoordinator {
-  private nextSeq = 1n;
-  private ops: Map<string, Array<{
-    id: string;
-    namespace: string;
-    sequence: string;
-    encryptedBlob: any;
-    timestamp: number;
-    schemaVersion: number;
-    keyVersion: number;
-  }>> = new Map();
-  private replicas: Map<string, any[]> = new Map();
-
-  async push(namespace: string, mutations: any[]): Promise<string[]> {
-    if (!this.ops.has(namespace)) {
-      this.ops.set(namespace, []);
-    }
-    const list = this.ops.get(namespace)!;
-    const seqs: string[] = [];
-    for (const m of mutations) {
-      const existing = list.find(x => x.id === m.id);
-      if (existing) {
-        seqs.push(existing.sequence);
-        continue;
-      }
-      const seq = this.nextSeq++;
-      const seqStr = seq.toString();
-      list.push({
-        id: m.id,
-        namespace,
-        sequence: seqStr,
-        encryptedBlob: m.encryptedBlob || m.encrypted_blob,
-        timestamp: m.timestamp,
-        schemaVersion: m.schemaVersion || m.schema_version || 0,
-        keyVersion: m.keyVersion || m.key_version || 0,
-      });
-      seqs.push(seqStr);
-    }
-    return seqs;
-  }
-
-  async pull(namespace: string, after: string | bigint, limit: number): Promise<any[]> {
-    const list = this.ops.get(namespace) || [];
-    const afterBig = BigInt(after);
-    const filtered = list.filter(x => BigInt(x.sequence) > afterBig);
-    const sliced = filtered.slice(0, limit);
-    return sliced.map(x => ({
-      id: x.id,
-      namespace: x.namespace,
-      sequence: BigInt(x.sequence),
-      encrypted_blob: x.encryptedBlob,
-      timestamp: x.timestamp,
-      schema_version: x.schemaVersion,
-      key_version: x.keyVersion,
-    }));
-  }
-
-  async register(namespace: string, info: any): Promise<void> {
-    if (!this.replicas.has(namespace)) {
-      this.replicas.set(namespace, []);
-    }
-    this.replicas.get(namespace)!.push(info);
-  }
-
-  async heartbeat(namespace: string, replicaId: string): Promise<void> {
-    // No-op
-  }
-
-  async schema_version(namespace: string): Promise<bigint> {
-    const list = this.replicas.get(namespace) || [];
-    let max = 0n;
-    for (const r of list) {
-      const v = BigInt(r.schemaVersion || r.schema_version || 0);
-      if (v > max) max = v;
-    }
-    return max;
   }
 }

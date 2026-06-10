@@ -451,3 +451,81 @@ async fn test_redis_coordinator_conformance() {
     let coord = Arc::new(RedisCoordinator::new(&redis_url).await.unwrap());
     run_coordinator_conformance_suite(coord).await;
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+async fn test_libp2p_coordinator_implementation() {
+    use drift_core::coordinator::traits::{EncryptedMutation, ReplicaInfo};
+    use futures::StreamExt;
+    use tokio::sync::mpsc;
+
+    let ns = "libp2p-coord-ns";
+    let (incoming_tx1, _incoming_rx1) = mpsc::channel(10);
+    let (incoming_tx2, _incoming_rx2) = mpsc::channel(10);
+
+    // Node 1
+    let (node1, handle1) = drift_transport_libp2p::LibP2pTransport::new(
+        ns,
+        Some("/ip4/127.0.0.1/tcp/0".to_string()),
+        incoming_tx1,
+    ).await.unwrap();
+
+    // Node 2
+    let (node2, handle2) = drift_transport_libp2p::LibP2pTransport::new(
+        ns,
+        Some("/ip4/127.0.0.1/tcp/0".to_string()),
+        incoming_tx2,
+    ).await.unwrap();
+
+    tokio::spawn(node1.run());
+    tokio::spawn(node2.run());
+
+    // Wait for listening address
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Node 2 dials Node 1
+    let addr1 = handle1.listen_addresses()[0].clone();
+    handle2.dial(addr1).await.unwrap();
+
+    // Wait for connection/gossipsub mesh link
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Test register, heartbeat, schema_version on handle1 (should succeed as no-ops)
+    let replica = ReplicaInfo {
+        replica_id: "rep-1".to_string(),
+        namespace: ns.to_string(),
+        public_key: vec![1, 2, 3],
+        schema_version: 0,
+    };
+    handle1.register(ns, replica).await.unwrap();
+    handle1.heartbeat(ns, "rep-1").await.unwrap();
+    assert_eq!(handle1.schema_version(ns).await.unwrap(), 0);
+
+    // Node 2 subscribes
+    let stream = handle2.subscribe(ns, 0).await.unwrap();
+    let mut pinned_stream = Box::into_pin(stream);
+
+    // Node 1 pushes a mutation
+    let mutations = vec![EncryptedMutation {
+        id: "mut-1".to_string(),
+        namespace: ns.to_string(),
+        replica_id: "rep-1".to_string(),
+        doc_id: "doc-1".to_string(),
+        record_id: "rec-1".to_string(),
+        encrypted_blob: vec![5, 6, 7],
+        timestamp: 12345,
+        schema_version: 1,
+        key_version: 1,
+    }];
+
+    handle1.push(ns, mutations).await.unwrap();
+
+    // Node 2's subscription should receive it
+    let received = tokio::time::timeout(std::time::Duration::from_secs(5), pinned_stream.next())
+        .await
+        .expect("Timeout waiting for mutation from libp2p coordinator")
+        .expect("Stream closed");
+
+    assert_eq!(received.id, "mut-1");
+    assert_eq!(received.encrypted_blob, vec![5, 6, 7]);
+}

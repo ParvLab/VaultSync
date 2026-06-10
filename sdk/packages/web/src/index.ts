@@ -6,6 +6,12 @@ import { defineSchema, FieldDef, SchemaDefinition } from './schema.js';
 
 export * from './types.js';
 export { KeyManager, DbProxy, Collection, defineSchema, FieldDef, SchemaDefinition, createDbProxy };
+export { Drift } from './drift.js';
+export { Subscription } from './subscription.js';
+export { SyncStatusObservable } from './sync.js';
+export { PostgresCoordinator } from './coordinator/postgres.js';
+export { RedisCoordinator } from './coordinator/redis.js';
+export { CustomCoordinator } from './coordinator/custom.js';
 
 export class DriftClient {
   private inner: any;
@@ -89,6 +95,10 @@ export class DriftClient {
     return () => {
       this.inner.unsubscribe(handle);
     };
+  }
+
+  isLeader(): boolean {
+    return this.inner.is_leader();
   }
 
   async shutdown(): Promise<void> {
