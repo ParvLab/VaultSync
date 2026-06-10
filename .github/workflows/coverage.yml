@@ -19,7 +19,7 @@ jobs:
         run: >
           cargo tarpaulin
           --workspace
-          --exclude vaultsync-fuzz vaultsync-coordinator-cf vaultsync-transport-libp2p vaultsync-transport-webrtc
+          --exclude vaultsync-fuzz vaultsync-coordinator-cf vaultsync-transport-libp2p vaultsync-transport-webrtc vaultsync-napi
           --features telemetry
           --out Xml Html
           --output-dir coverage/
