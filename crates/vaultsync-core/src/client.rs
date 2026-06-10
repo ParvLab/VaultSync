@@ -769,6 +769,7 @@ impl VaultSyncClient {
         self.subscriptions.lock().unwrap().unregister(handle)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn set_change_listener(&self, listener: Arc<dyn Fn(&str, &str) + Send + Sync>) {
         self.subscriptions.lock().unwrap().set_global_listener(listener);
     }
