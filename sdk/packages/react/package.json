@@ -5,6 +5,14 @@
   "publishConfig": {
     "access": "public"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/parv68/VaultSync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/parv68/VaultSync/issues"
+  },
+  "homepage": "https://github.com/parv68/VaultSync#readme",
   "files": [
     "dist"
   ],

@@ -1,6 +1,6 @@
 # 🌌 VaultSync
 
-[![CI Status](https://github.com/vaultsync-sync/vaultsync/actions/workflows/ci.yml/badge.svg)](https://github.com/vaultsync-sync/vaultsync/actions)
+[![CI Status](https://github.com/parv68/VaultSync/actions/workflows/ci.yml/badge.svg)](https://github.com/parv68/VaultSync/actions)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![crates.io](https://img.shields.io/crates/v/vaultsync-core.svg)](https://crates.io/crates/vaultsync-core)
 [![npm](https://img.shields.io/npm/v/@vaultsync/web.svg)](https://www.npmjs.com/package/@vaultsync/web)
@@ -1224,7 +1224,7 @@ We welcome contributions from the community! See [CONTRIBUTING.md](CONTRIBUTING.
 
 ```bash
 # Get started
-git clone https://github.com/vaultsync-sync/vaultsync.git
+git clone https://github.com/parv68/VaultSync.git
 cd vaultsync
 ./scripts/setup-dev.sh
 
