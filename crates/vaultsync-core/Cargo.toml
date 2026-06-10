@@ -1,0 +1,97 @@
+[package]
+name = "vaultsync-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["async-runtime", "telemetry", "storage-sqlite", "coordinator-http", "test-utils"]
+async-runtime = ["dep:tokio"]
+telemetry = [
+    "dep:tracing-subscriber",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:axum",
+    "dep:prometheus"
+]
+storage-sqlite = ["dep:rusqlite"]
+coordinator-http = ["dep:reqwest", "dep:tokio-tungstenite"]
+test-utils = []
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
+# CRDT
+yrs = "0.19"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+
+# Encryption
+aead = "0.5"
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["reusable_secrets"] }
+sha2 = "0.10"
+hkdf = "0.12"
+hex = "0.4"
+rand = "0.8"
+zeroize = { version = "1.8", features = ["derive"] }
+
+# Storage
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+
+# Telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optional = true }
+opentelemetry = { version = "0.22", optional = true }
+opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.15", features = ["grpc-tonic"], optional = true }
+tracing-opentelemetry = { version = "0.23", optional = true }
+axum = { version = "0.6", optional = true }
+prometheus = { version = "0.13", features = ["process"], optional = true }
+
+# Utilities
+crc32fast = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "js"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+futures = "0.3"
+windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_Security"] }
+libc = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["full"], optional = true }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
+vaultsync-transport-libp2p = { path = "../vaultsync-transport-libp2p" }
+memmap2 = "0.9"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", features = ["sync", "macros", "rt", "time"], optional = true }
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Window"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+vaultsync-coordinator-sqlite = { path = "../vaultsync-coordinator-sqlite" }
+vaultsync-coordinator-http = { path = "../vaultsync-coordinator-http" }
+vaultsync-coordinator-redis = { path = "../vaultsync-coordinator-redis" }
+
+[[bench]]
+name = "crdt_bench"
+harness = false
+
+[[bench]]
+name = "sync_bench"
+harness = false
+
+[[bench]]
+name = "coordinator_bench"
+harness = false

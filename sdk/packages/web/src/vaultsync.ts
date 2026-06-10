@@ -1,0 +1,47 @@
+import { VaultSyncClient } from './index.js';
+import { SyncStatusObservable } from './sync.js';
+import { KeyManager } from './keys.js';
+import type { VaultSyncConfig } from './types.js';
+
+export class VaultSync {
+  private client: VaultSyncClient;
+  private syncObservable: SyncStatusObservable;
+
+  private constructor(client: VaultSyncClient) {
+    this.client = client;
+    this.syncObservable = new SyncStatusObservable(client);
+  }
+
+  static async create(config: VaultSyncConfig): Promise<VaultSync> {
+    const client = await VaultSyncClient.create(config);
+    return new VaultSync(client);
+  }
+
+  static detectStorage(): 'opfs' | 'indexeddb' {
+    if (typeof navigator !== 'undefined' && navigator.storage && typeof (navigator.storage as any).getDirectory === 'function') {
+      return 'opfs';
+    }
+    return 'indexeddb';
+  }
+
+  get db() {
+    return this.client.db;
+  }
+
+  get sync(): SyncStatusObservable {
+    return this.syncObservable;
+  }
+
+  get keys(): KeyManager {
+    return this.client.keys;
+  }
+
+  get leader(): boolean {
+    return this.client.isLeader();
+  }
+
+  async shutdown(): Promise<void> {
+    this.syncObservable.destroy();
+    await this.client.shutdown();
+  }
+}

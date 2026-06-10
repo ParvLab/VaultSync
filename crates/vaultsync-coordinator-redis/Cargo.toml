@@ -1,0 +1,16 @@
+[package]
+name = "vaultsync-coordinator-redis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vaultsync-core = { path = "../vaultsync-core" }
+redis = { version = "0.25", features = ["tokio-comp", "streams"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tracing = "0.1"
+thiserror = "1"
+futures = "0.3"

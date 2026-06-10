@@ -1,0 +1,44 @@
+[package]
+name = "vaultsync-transport-webrtc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.vaultsync]
+wasm-only = true
+
+[dependencies]
+vaultsync-core = { path = "../vaultsync-core", default-features = false, features = ["async-runtime"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tracing = "0.1"
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["sync", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "RtcPeerConnection",
+    "RtcPeerConnectionState",
+    "RtcSignalingState",
+    "RtcIceConnectionState",
+    "RtcIceGatheringState",
+    "RtcDataChannel",
+    "RtcDataChannelInit",
+    "RtcDataChannelState",
+    "RtcConfiguration",
+    "RtcSessionDescription",
+    "RtcSessionDescriptionInit",
+    "RtcSdpType",
+    "RtcIceCandidate",
+    "RtcIceCandidateInit",
+    "RtcDataChannelEvent",
+    "RtcPeerConnectionIceEvent",
+    "MessageEvent",
+    "Event",
+    "Window"
+] }

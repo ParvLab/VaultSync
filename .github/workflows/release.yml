@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --workspace -j 4
+      - run: cargo check --all-targets
+
+  publish-crates:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p vaultsync-core
+          sleep 30
+          cargo publish -p vaultsync-coordinator-memory
+          sleep 15
+          cargo publish -p vaultsync-coordinator-sqlite
+          sleep 15
+          cargo publish -p vaultsync-coordinator-postgres
+          sleep 15
+          cargo publish -p vaultsync-coordinator-redis
+          sleep 15
+          cargo publish -p vaultsync-coordinator-http
+          sleep 15
+          cargo publish -p vaultsync-conformance
+          sleep 15
+          cargo publish -p vaultsync-cli
+
+  publish-wasm:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - run: wasm-pack build crates/vaultsync-wasm --target web --release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm publish sdk/packages/web/
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-sdks:
+    needs: publish-wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm ci --prefix sdk
+      - run: npm publish sdk/packages/react/
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish sdk/packages/node/
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish sdk/packages/next/
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  github-release:
+    needs: [publish-crates, publish-sdks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: softprops/action-gh-release@v1
+        with:
+          generate_release_notes: true

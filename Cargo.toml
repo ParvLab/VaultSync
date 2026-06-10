@@ -1,17 +1,26 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/drift-core",
-    "crates/drift-wasm",
-    "crates/drift-coordinator-postgres",
-    "crates/drift-coordinator-redis",
-    "crates/drift-coordinator-sqlite",
-    "crates/drift-coordinator-memory",
-    "crates/drift-cli",
+    "crates/vaultsync-core",
+    "crates/vaultsync-wasm",
+    "crates/vaultsync-coordinator-postgres",
+    "crates/vaultsync-coordinator-redis",
+    "crates/vaultsync-coordinator-sqlite",
+    "crates/vaultsync-coordinator-memory",
+    "crates/vaultsync-coordinator-http",
+    "crates/vaultsync-coordinator-server",
+    "crates/vaultsync-cli",
+    "crates/vaultsync-fuzz",
+    "crates/vaultsync-napi",
+    "crates/vaultsync-transport-webrtc",
+    "crates/vaultsync-coordinator-cf",
+    "crates/vaultsync-conformance",
+    "crates/vaultsync-transport-libp2p",
+    "scripts/loadtest",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["Drift Contributors"]
+authors = ["VaultSync Contributors"]

@@ -1,0 +1,20 @@
+[package]
+name = "vaultsync-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vaultsync-core = { path = "../vaultsync-core" }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+[dev-dependencies]
+axum = "0.6"
+vaultsync-coordinator-sqlite = { path = "../vaultsync-coordinator-sqlite" }
+vaultsync-coordinator-postgres = { path = "../vaultsync-coordinator-postgres" }
+vaultsync-coordinator-redis = { path = "../vaultsync-coordinator-redis" }
+vaultsync-coordinator-memory = { path = "../vaultsync-coordinator-memory" }
+vaultsync-coordinator-http = { path = "../vaultsync-coordinator-http" }
+vaultsync-coordinator-server = { path = "../vaultsync-coordinator-server" }
