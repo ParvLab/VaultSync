@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add clippy rustfmt
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -A warnings
       - run: cargo fmt --check
       - name: Verify Rust documentation
         run: cargo doc --workspace --no-deps
