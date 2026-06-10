@@ -1,0 +1,20 @@
+name = "vaultsync-coordinator-cf"
+main = "build/worker/shim.mjs"
+compatibility_date = "2023-10-30"
+
+[build]
+command = "cd crates/vaultsync-coordinator-cf && worker-build --no-opt"
+
+
+[[d1_databases]]
+binding = "DB"
+database_name = "vaultsync-d1"
+database_id = "vaultsync-d1-local"
+
+[[durable_objects.bindings]]
+name = "NAMESPACE_DO"
+class_name = "NamespaceDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["NamespaceDurableObject"]

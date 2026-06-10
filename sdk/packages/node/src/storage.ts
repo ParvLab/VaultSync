@@ -10,7 +10,7 @@ export class NodeStorage {
     if (config.inMemory) {
       this.path = null;
     } else {
-      this.path = config.path || './drift.db';
+      this.path = config.path || './vaultsync.db';
     }
   }
 }

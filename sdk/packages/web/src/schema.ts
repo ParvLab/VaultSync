@@ -1,4 +1,4 @@
-import type { DriftClient } from './index.js';
+import type { VaultSyncClient } from './index.js';
 
 export interface FieldDef {
   type: "string" | "number" | "boolean" | "array" | "object";
@@ -14,7 +14,7 @@ export interface SchemaDefinition {
 }
 
 export async function defineSchema(
-  client: DriftClient,
+  client: VaultSyncClient,
   docId: string,
   schemaDef: SchemaDefinition
 ): Promise<void> {

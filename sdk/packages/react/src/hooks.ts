@@ -1,4 +1,4 @@
-export { useQuery, useQuery as useDriftQuery } from './useQuery.js';
-export { useDriftOne } from './useDriftOne.js';
+export { useQuery, useQuery as useVaultSyncQuery } from './useQuery.js';
+export { useVaultSyncOne } from './useVaultSyncOne.js';
 export { useSyncStatus } from './useSyncStatus.js';
-export { useDriftMutations } from './useDriftMutations.js';
+export { useVaultSyncMutations } from './useVaultSyncMutations.js';

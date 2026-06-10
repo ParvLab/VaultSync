@@ -1,25 +1,25 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { DriftClient } from '@drift/web';
-import type { DriftConfig } from '@drift/web';
+import { VaultSyncClient } from '@vaultsync/web';
+import type { VaultSyncConfig } from '@vaultsync/web';
 
-const DriftContext = createContext<DriftClient | null>(null);
+const VaultSyncContext = createContext<VaultSyncClient | null>(null);
 
-export interface DriftProviderProps {
-  config: DriftConfig;
+export interface VaultSyncProviderProps {
+  config: VaultSyncConfig;
   children: React.ReactNode;
 }
 
-export function DriftProvider({ config, children }: DriftProviderProps) {
-  const [client, setClient] = useState<DriftClient | null>(null);
+export function VaultSyncProvider({ config, children }: VaultSyncProviderProps) {
+  const [client, setClient] = useState<VaultSyncClient | null>(null);
   const [error, setError] = useState<Error | null>(null);
 
   useEffect(() => {
     let active = true;
-    let currentClient: DriftClient | null = null;
+    let currentClient: VaultSyncClient | null = null;
 
     async function init() {
       try {
-        const c = await DriftClient.create(config);
+        const c = await VaultSyncClient.create(config);
         if (active) {
           currentClient = c;
           setClient(c);
@@ -46,7 +46,7 @@ export function DriftProvider({ config, children }: DriftProviderProps) {
   if (error) {
     return (
       <div style={{ color: 'red', padding: '1rem', border: '1px solid red' }}>
-        <h4>Failed to initialize Drift Client</h4>
+        <h4>Failed to initialize VaultSync Client</h4>
         <pre>{error.message}</pre>
       </div>
     );
@@ -57,16 +57,16 @@ export function DriftProvider({ config, children }: DriftProviderProps) {
   }
 
   return (
-    <DriftContext.Provider value={client}>
+    <VaultSyncContext.Provider value={client}>
       {children}
-    </DriftContext.Provider>
+    </VaultSyncContext.Provider>
   );
 }
 
-export function useDriftClient(): DriftClient {
-  const client = useContext(DriftContext);
+export function useVaultSyncClient(): VaultSyncClient {
+  const client = useContext(VaultSyncContext);
   if (!client) {
-    throw new Error('useDriftClient must be used within a DriftProvider');
+    throw new Error('useVaultSyncClient must be used within a VaultSyncProvider');
   }
   return client;
 }

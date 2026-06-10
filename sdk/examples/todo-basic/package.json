@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@drift/web": "*"
+    "@vaultsync/web": "*"
   },
   "devDependencies": {
     "@playwright/test": "^1.44.0",

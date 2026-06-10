@@ -24,8 +24,8 @@ export function SyncIndicator({ className = '', showText = true }: SyncIndicator
 
   return (
     <div
-      id="drift-sync-indicator"
-      className={`drift-sync-indicator ${className}`}
+      id="vaultsync-sync-indicator"
+      className={`vaultsync-sync-indicator ${className}`}
       style={{
         display: 'inline-flex',
         alignItems: 'center',

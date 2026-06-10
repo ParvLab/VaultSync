@@ -1,10 +1,10 @@
-import type { DriftClient } from './index.js';
+import type { VaultSyncClient } from './index.js';
 import type { RecordFields } from './types.js';
 
 export class Collection<T extends { id: string }> {
   constructor(
     private name: string,
-    private client: DriftClient
+    private client: VaultSyncClient
   ) {}
 
   async insert(record: T): Promise<void> {
@@ -64,7 +64,7 @@ export class Collection<T extends { id: string }> {
 export class DbProxy {
   private collections: Record<string, Collection<any>> = {};
 
-  constructor(private client: DriftClient) {}
+  constructor(private client: VaultSyncClient) {}
 
   getCollection<T extends { id: string }>(name: string): Collection<T> {
     if (!this.collections[name]) {
@@ -74,7 +74,7 @@ export class DbProxy {
   }
 }
 
-export function createDbProxy(client: DriftClient): DbProxy & Record<string, Collection<any>> {
+export function createDbProxy(client: VaultSyncClient): DbProxy & Record<string, Collection<any>> {
   const db = new DbProxy(client);
   return new Proxy(db, {
     get(target, prop) {

@@ -9,8 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@drift/web": "*",
-    "@drift/react": "*",
+    "@vaultsync/web": "*",
+    "@vaultsync/react": "*",
     "react": "^18.0.0",
     "react-dom": "^18.0.0"
   },

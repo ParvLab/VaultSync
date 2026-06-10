@@ -1,4 +1,4 @@
-export interface DriftConfig {
+export interface VaultSyncConfig {
   namespace: string;
   replicaId: string;
   coordinatorUrl?: string;

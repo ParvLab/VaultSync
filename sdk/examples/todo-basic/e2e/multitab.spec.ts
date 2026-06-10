@@ -14,14 +14,14 @@ test.describe("Multi-tab sync", () => {
     const ns = "e2e-multi-" + Math.random().toString(36).substring(7);
     await Promise.all([pageA.goto(`/?ns=${ns}`), pageB.goto(`/?ns=${ns}`)])
     await Promise.all([
-      pageA.waitForFunction(() => typeof window.__DRIFT__ !== 'undefined'),
-      pageB.waitForFunction(() => typeof window.__DRIFT__ !== 'undefined'),
+      pageA.waitForFunction(() => typeof window.__VAULTSYNC__ !== 'undefined'),
+      pageB.waitForFunction(() => typeof window.__VAULTSYNC__ !== 'undefined'),
     ])
   })
 
   test("Tab A write appears in Tab B within 5 seconds", async () => {
     await pageA.evaluate(() =>
-      window.__DRIFT__.insert("sync-test-1", "buy milk"))
+      window.__VAULTSYNC__.insert("sync-test-1", "buy milk"))
     await expect(pageB.locator("[data-testid='todo-item'][data-id='sync-test-1']"))
       .toBeVisible({ timeout: 5000 })
     await expect(pageB.locator("[data-testid='todo-item'][data-id='sync-test-1']"))
@@ -29,14 +29,14 @@ test.describe("Multi-tab sync", () => {
   })
 
   test("Conflict-free edit — CRDT preserves both field changes", async () => {
-    await pageA.evaluate(() => window.__DRIFT__.insert("conflict-1", "original"))
+    await pageA.evaluate(() => window.__VAULTSYNC__.insert("conflict-1", "original"))
     await pageA.waitForTimeout(500)
     await Promise.all([
-      pageA.evaluate(() => window.__DRIFT__.update("conflict-1", { title: "from A" })),
-      pageB.evaluate(() => window.__DRIFT__.update("conflict-1", { done: true })),
+      pageA.evaluate(() => window.__VAULTSYNC__.update("conflict-1", { title: "from A" })),
+      pageB.evaluate(() => window.__VAULTSYNC__.update("conflict-1", { done: true })),
     ])
     await pageA.waitForTimeout(3000)
-    const items = await pageA.evaluate(() => window.__DRIFT__.findAll())
+    const items = await pageA.evaluate(() => window.__VAULTSYNC__.findAll())
     const item = items.find((t: any) => t.id === "conflict-1")
     expect(item).toBeDefined()
   })
@@ -45,7 +45,7 @@ test.describe("Multi-tab sync", () => {
     await pageA.route("**/*push*", route => route.abort())
     for (let i = 0; i < 5; i++) {
       await pageA.evaluate((idx) =>
-        window.__DRIFT__.insert(`offline-${idx}`, `offline todo ${idx}`), i)
+        window.__VAULTSYNC__.insert(`offline-${idx}`, `offline todo ${idx}`), i)
     }
     await pageA.unroute("**/*push*")
     for (let i = 0; i < 5; i++) {

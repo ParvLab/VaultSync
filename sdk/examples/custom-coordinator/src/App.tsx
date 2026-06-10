@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { useQuery, useDriftMutations } from '@drift/react';
-import { Drift, CustomCoordinator } from '@drift/web';
+import { useQuery, useVaultSyncMutations } from '@vaultsync/react';
+import { VaultSync, CustomCoordinator } from '@vaultsync/web';
 
-export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
+export function App({ replicaId, vaultsync }: { replicaId: string; vaultsync: VaultSync }) {
   const [authToken, setAuthToken] = useState('secret-token-123');
   const [headers, setHeaders] = useState('{"X-Client-Version": "1.0.0"}');
   
@@ -30,23 +30,23 @@ export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
 
   // Load keyring info
   const loadKeyring = async () => {
-    const list = await drift.keys.listVersions();
+    const list = await vaultsync.keys.listVersions();
     setKeys(list);
-    setActiveVersion(drift.keys.activeVersion());
+    setActiveVersion(vaultsync.keys.activeVersion());
   };
 
   useEffect(() => {
     loadKeyring();
-  }, [drift]);
+  }, [vaultsync]);
 
   const handleRotateKey = async () => {
-    await drift.keys.rotate();
+    await vaultsync.keys.rotate();
     await loadKeyring();
   };
 
   const handleDefineSchema = async () => {
     // Define a custom schema for 'posts' doc
-    await (drift as any).client.defineSchema('posts', JSON.stringify({
+    await (vaultsync as any).client.defineSchema('posts', JSON.stringify({
       fields: {
         title: { type: 'String' },
         likes: { type: 'Number' },
@@ -59,7 +59,7 @@ export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
   return (
     <div style={styles.container}>
       <header style={styles.header}>
-        <h1>Drift Custom Coordinator</h1>
+        <h1>VaultSync Custom Coordinator</h1>
         <p style={styles.subtitle}>Fine-grained coordinator settings & key management</p>
       </header>
 
@@ -95,7 +95,7 @@ export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
         <div style={styles.card}>
           <h2>Key Management (E2EE)</h2>
           <p style={styles.cardText}>
-            Drift encrypts all mutations before sending them to the coordinator. You can rotate keys locally at any time.
+            VaultSync encrypts all mutations before sending them to the coordinator. You can rotate keys locally at any time.
           </p>
           <div style={styles.keyRow}>
             <span>Active Key Version:</span>

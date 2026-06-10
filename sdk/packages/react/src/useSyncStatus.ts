@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
-import { useDriftClient } from './context.js';
-import type { SyncStatus } from '@drift/web';
+import { useVaultSyncClient } from './context.js';
+import type { SyncStatus } from '@vaultsync/web';
 
 export function useSyncStatus() {
-  const client = useDriftClient();
+  const client = useVaultSyncClient();
   const [status, setStatus] = useState<SyncStatus>({
     connected: false,
     pendingMutations: 0,

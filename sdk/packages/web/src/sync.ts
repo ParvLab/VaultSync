@@ -1,15 +1,15 @@
-import type { DriftClient } from './index.js';
+import type { VaultSyncClient } from './index.js';
 import type { SyncStatus } from './types.js';
 
 export type SyncStatusListener = (status: SyncStatus) => void;
 
 export class SyncStatusObservable {
-  private client: DriftClient;
+  private client: VaultSyncClient;
   private listeners: Set<SyncStatusListener> = new Set();
   private intervalId: any = null;
   private lastStatus: SyncStatus | null = null;
 
-  constructor(client: DriftClient, pollIntervalMs: number = 1000) {
+  constructor(client: VaultSyncClient, pollIntervalMs: number = 1000) {
     this.client = client;
     this.startPolling(pollIntervalMs);
   }

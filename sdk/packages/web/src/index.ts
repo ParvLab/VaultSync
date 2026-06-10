@@ -1,19 +1,19 @@
-import init, { WasmDriftClient } from '../wasm/drift_wasm.js';
-import type { DriftConfig, RecordFields, SyncStatus, SubscriptionCallback, UnsubscribeFn } from './types.js';
+import init, { WasmVaultSyncClient } from '../wasm/vaultsync_wasm.js';
+import type { VaultSyncConfig, RecordFields, SyncStatus, SubscriptionCallback, UnsubscribeFn } from './types.js';
 import { KeyManager } from './keys.js';
 import { createDbProxy, DbProxy, Collection } from './db.js';
 import { defineSchema, FieldDef, SchemaDefinition } from './schema.js';
 
 export * from './types.js';
 export { KeyManager, DbProxy, Collection, defineSchema, FieldDef, SchemaDefinition, createDbProxy };
-export { Drift } from './drift.js';
+export { VaultSync } from './vaultsync.js';
 export { Subscription } from './subscription.js';
 export { SyncStatusObservable } from './sync.js';
 export { PostgresCoordinator } from './coordinator/postgres.js';
 export { RedisCoordinator } from './coordinator/redis.js';
 export { CustomCoordinator } from './coordinator/custom.js';
 
-export class DriftClient {
+export class VaultSyncClient {
   private inner: any;
   private _keys?: KeyManager;
   private _db?: any;
@@ -36,23 +36,23 @@ export class DriftClient {
     return this._keys;
   }
 
-  static async create(config: DriftConfig): Promise<DriftClient> {
+  static async create(config: VaultSyncConfig): Promise<VaultSyncClient> {
     // Initialize the WebAssembly module
     await init();
 
     let inner: any;
     if (config.coordinatorUrl) {
-      inner = await WasmDriftClient.new_with_coordinator(
+      inner = await WasmVaultSyncClient.new_with_coordinator(
         config.namespace,
         config.replicaId,
         config.coordinatorUrl,
         config.authToken || null
       );
     } else {
-      inner = await WasmDriftClient.new(config.namespace, config.replicaId);
+      inner = await WasmVaultSyncClient.new(config.namespace, config.replicaId);
     }
 
-    return new DriftClient(inner);
+    return new VaultSyncClient(inner);
   }
 
   async insert(docId: string, recordId: string, fields: RecordFields): Promise<void> {

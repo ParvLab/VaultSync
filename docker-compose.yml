@@ -32,12 +32,12 @@ services:
   coordinator:
     build:
       context: .
-      dockerfile: crates/drift-coordinator-server/Dockerfile
+      dockerfile: crates/vaultsync-coordinator-server/Dockerfile
     environment:
-      - DRIFT_HOST=0.0.0.0
-      - DRIFT_PORT=9876
-      - DRIFT_BACKEND=redis
-      - DRIFT_DB_URL=redis://redis:6379
+      - VAULTSYNC_HOST=0.0.0.0
+      - VAULTSYNC_PORT=9876
+      - VAULTSYNC_BACKEND=redis
+      - VAULTSYNC_DB_URL=redis://redis:6379
     ports:
       - "9876:9876"
     depends_on:

@@ -1,13 +1,13 @@
 {
-  "name": "drift-sdk-root",
+  "name": "vaultsync-sdk-root",
   "private": true,
   "workspaces": [
     "packages/*",
     "examples/*"
   ],
   "scripts": {
-    "build:wasm": "wasm-pack build ../crates/drift-wasm --target web --out-dir ../../sdk/packages/web/wasm -- --jobs 1",
-    "build": "npm run build:wasm && npm -w @drift/web run build && npm -w todo-basic run build",
+    "build:wasm": "wasm-pack build ../crates/vaultsync-wasm --target web --out-dir ../../sdk/packages/web/wasm -- --jobs 1",
+    "build": "npm run build:wasm && npm -w @vaultsync/web run build && npm -w todo-basic run build",
     "dev": "npm -w examples/react-collab-editor run dev",
     "e2e": "playwright test --config examples/todo-basic/playwright.config.ts",
     "docs": "typedoc"

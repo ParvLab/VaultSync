@@ -80,8 +80,8 @@ export function createCoordinatorHandler(coordinator: any, options?: NextCoordin
 }
 
 export async function queryServerDatabase(dbPath: string, namespace: string, docId: string) {
-  const { DriftClient } = await import('@drift/node');
-  const client = await DriftClient.create({
+  const { VaultSyncClient } = await import('@vaultsync/node');
+  const client = await VaultSyncClient.create({
     namespace,
     replicaId: 'nextjs-server',
     storagePath: dbPath,

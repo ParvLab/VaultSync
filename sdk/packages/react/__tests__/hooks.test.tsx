@@ -17,27 +17,27 @@ const mockClientInstance: any = {
   shutdown: (jest.fn() as any).mockImplementation(() => Promise.resolve(undefined)),
 };
 
-const mockDriftClientClass: any = {
+const mockVaultSyncClientClass: any = {
   create: (jest.fn() as any).mockImplementation(() => {
     return Promise.resolve(mockClientInstance);
   }),
 };
 
-jest.unstable_mockModule('@drift/web', () => {
+jest.unstable_mockModule('@vaultsync/web', () => {
   return {
-    DriftClient: mockDriftClientClass,
+    VaultSyncClient: mockVaultSyncClientClass,
   };
 });
 
-let DriftProvider: any;
-let useDriftClient: any;
+let VaultSyncProvider: any;
+let useVaultSyncClient: any;
 let useQuery: any;
 let useSyncStatus: any;
-let useDriftOne: any;
-let useDriftMutations: any;
+let useVaultSyncOne: any;
+let useVaultSyncMutations: any;
 let SyncIndicator: any;
 
-describe('@drift/react hooks & provider', () => {
+describe('@vaultsync/react hooks & provider', () => {
   const config = {
     namespace: 'test-ns',
     replicaId: 'replica-1',
@@ -45,8 +45,8 @@ describe('@drift/react hooks & provider', () => {
 
   beforeAll(async () => {
     const context = await import('../src/context.js');
-    DriftProvider = context.DriftProvider;
-    useDriftClient = context.useDriftClient;
+    VaultSyncProvider = context.VaultSyncProvider;
+    useVaultSyncClient = context.useVaultSyncClient;
 
     const query = await import('../src/useQuery.js');
     useQuery = query.useQuery;
@@ -54,33 +54,33 @@ describe('@drift/react hooks & provider', () => {
     const status = await import('../src/useSyncStatus.js');
     useSyncStatus = status.useSyncStatus;
 
-    const one = await import('../src/useDriftOne.js');
-    useDriftOne = one.useDriftOne;
+    const one = await import('../src/useVaultSyncOne.js');
+    useVaultSyncOne = one.useVaultSyncOne;
 
-    const mutations = await import('../src/useDriftMutations.js');
-    useDriftMutations = mutations.useDriftMutations;
+    const mutations = await import('../src/useVaultSyncMutations.js');
+    useVaultSyncMutations = mutations.useVaultSyncMutations;
 
     const indicator = await import('../src/SyncIndicator.js');
     SyncIndicator = indicator.SyncIndicator;
   });
 
-  test('DriftProvider and useDriftClient', async () => {
+  test('VaultSyncProvider and useVaultSyncClient', async () => {
     let clientRef: any = null;
     const Child = () => {
-      const client = useDriftClient();
+      const client = useVaultSyncClient();
       clientRef = client;
       return <div>Client Loaded</div>;
     };
 
     await act(async () => {
       render(
-        <DriftProvider config={config}>
+        <VaultSyncProvider config={config}>
           <Child />
-        </DriftProvider>
+        </VaultSyncProvider>
       );
     });
 
-    expect(mockDriftClientClass.create).toHaveBeenCalledWith(config);
+    expect(mockVaultSyncClientClass.create).toHaveBeenCalledWith(config);
     expect(screen.queryByText('Client Loaded')).not.toBeNull();
     expect(clientRef).toBe(mockClientInstance);
   });
@@ -94,9 +94,9 @@ describe('@drift/react hooks & provider', () => {
 
     await act(async () => {
       render(
-        <DriftProvider config={config}>
+        <VaultSyncProvider config={config}>
           <QueryChild />
-        </DriftProvider>
+        </VaultSyncProvider>
       );
     });
 
@@ -116,9 +116,9 @@ describe('@drift/react hooks & provider', () => {
 
     await act(async () => {
       render(
-        <DriftProvider config={config}>
+        <VaultSyncProvider config={config}>
           <StatusChild />
-        </DriftProvider>
+        </VaultSyncProvider>
       );
     });
 
@@ -127,18 +127,18 @@ describe('@drift/react hooks & provider', () => {
     expect(mockClientInstance.syncStatus).toHaveBeenCalled();
   });
 
-  test('useDriftOne fetches and subscribes', async () => {
-    const DriftOneChild = () => {
-      const { data, loading } = useDriftOne('tasks', 'task-1');
+  test('useVaultSyncOne fetches and subscribes', async () => {
+    const VaultSyncOneChild = () => {
+      const { data, loading } = useVaultSyncOne('tasks', 'task-1');
       if (loading) return <div>Loading Hook...</div>;
       return <div>Task: {data ? data.title : 'None'}</div>;
     };
 
     await act(async () => {
       render(
-        <DriftProvider config={config}>
-          <DriftOneChild />
-        </DriftProvider>
+        <VaultSyncProvider config={config}>
+          <VaultSyncOneChild />
+        </VaultSyncProvider>
       );
     });
 
@@ -148,19 +148,19 @@ describe('@drift/react hooks & provider', () => {
     expect(mockClientInstance.subscribe).toHaveBeenCalledWith('tasks', expect.any(Function));
   });
 
-  test('useDriftMutations executes insert, update, delete', async () => {
+  test('useVaultSyncMutations executes insert, update, delete', async () => {
     let mut: any = null;
     const MutationsChild = () => {
-      const mutations = useDriftMutations('tasks');
+      const mutations = useVaultSyncMutations('tasks');
       mut = mutations;
       return <div>Mutations Ready</div>;
     };
 
     await act(async () => {
       render(
-        <DriftProvider config={config}>
+        <VaultSyncProvider config={config}>
           <MutationsChild />
-        </DriftProvider>
+        </VaultSyncProvider>
       );
     });
 
@@ -186,9 +186,9 @@ describe('@drift/react hooks & provider', () => {
 
     await act(async () => {
       render(
-        <DriftProvider config={config}>
+        <VaultSyncProvider config={config}>
           <SyncIndicator />
-        </DriftProvider>
+        </VaultSyncProvider>
       );
     });
 
@@ -200,9 +200,9 @@ describe('@drift/react hooks & provider', () => {
     
     await act(async () => {
       render(
-        <DriftProvider config={config}>
+        <VaultSyncProvider config={config}>
           <SyncIndicator />
-        </DriftProvider>
+        </VaultSyncProvider>
       );
     });
 
@@ -214,9 +214,9 @@ describe('@drift/react hooks & provider', () => {
     
     await act(async () => {
       render(
-        <DriftProvider config={config}>
+        <VaultSyncProvider config={config}>
           <SyncIndicator />
-        </DriftProvider>
+        </VaultSyncProvider>
       );
     });
 

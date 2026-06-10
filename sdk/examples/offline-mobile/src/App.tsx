@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { useQuery, useDriftMutations, useSyncStatus } from '@drift/react';
-import { Drift } from '@drift/web';
+import { useQuery, useVaultSyncMutations, useSyncStatus } from '@vaultsync/react';
+import { VaultSync } from '@vaultsync/web';
 
-export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
+export function App({ replicaId, vaultsync }: { replicaId: string; vaultsync: VaultSync }) {
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
   
@@ -11,9 +11,9 @@ export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
   
   // Query notes collection
   const { data: notes, loading } = useQuery('notes');
-  const mutations = useDriftMutations('notes');
+  const mutations = useVaultSyncMutations('notes');
   
-  // Use real-time sync status from Drift
+  // Use real-time sync status from VaultSync
   const syncStatus = useSyncStatus();
 
   // Handle Note insertion
@@ -37,7 +37,7 @@ export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
   return (
     <div style={styles.phoneFrame}>
       <div style={styles.statusBar}>
-        <span>Drift Mobile</span>
+        <span>VaultSync Mobile</span>
         <div style={styles.statusBarStatus}>
           <span style={{
             ...styles.dot,

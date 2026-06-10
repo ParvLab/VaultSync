@@ -11,8 +11,8 @@
   "dependencies": {
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "@drift/web": "*",
-    "@drift/react": "*"
+    "@vaultsync/web": "*",
+    "@vaultsync/react": "*"
   },
   "devDependencies": {
     "vite": "^5.2.0",

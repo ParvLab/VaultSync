@@ -17,7 +17,7 @@ for arg in "$@"; do
 done
 
 echo "================================================="
-echo "  Drift — Benchmark Comparison"
+echo "  VaultSync — Benchmark Comparison"
 echo "  Baseline: $BASELINE_BRANCH  |  Threshold: ${THRESHOLD}%"
 echo "================================================="
 

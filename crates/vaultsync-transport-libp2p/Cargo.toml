@@ -1,0 +1,22 @@
+[package]
+name = "vaultsync-transport-libp2p"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+futures = "0.3"
+tracing = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libp2p = { version = "0.53", features = ["gossipsub", "mdns", "quic", "identify", "noise", "yamux", "tokio", "macros", "tcp"] }
+tokio = { version = "1", features = ["full"] }
+rmp-serde = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# empty stub on WASM
+
+[dev-dependencies]
+vaultsync-core = { path = "../vaultsync-core" }
+vaultsync-coordinator-memory = { path = "../vaultsync-coordinator-memory" }

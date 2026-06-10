@@ -1,27 +1,27 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { useDriftClient, DriftProvider } from '@drift/react';
-import type { RecordFields, DriftConfig } from '@drift/web';
+import { useVaultSyncClient, VaultSyncProvider } from '@vaultsync/react';
+import type { RecordFields, VaultSyncConfig } from '@vaultsync/web';
 
-export const DriftHydrationContext = createContext<Record<string, RecordFields[]> | null>(null);
+export const VaultSyncHydrationContext = createContext<Record<string, RecordFields[]> | null>(null);
 
-export interface DriftHydrationProviderProps {
-  config: DriftConfig;
+export interface VaultSyncHydrationProviderProps {
+  config: VaultSyncConfig;
   initialData: Record<string, RecordFields[]>;
   children: React.ReactNode;
 }
 
-export function DriftHydrationProvider({ config, initialData, children }: DriftHydrationProviderProps) {
+export function VaultSyncHydrationProvider({ config, initialData, children }: VaultSyncHydrationProviderProps) {
   return (
-    <DriftHydrationContext.Provider value={initialData}>
-      <DriftProvider config={config}>
+    <VaultSyncHydrationContext.Provider value={initialData}>
+      <VaultSyncProvider config={config}>
         {children}
-      </DriftProvider>
-    </DriftHydrationContext.Provider>
+      </VaultSyncProvider>
+    </VaultSyncHydrationContext.Provider>
   );
 }
 
 export function useHydratedData(docId: string): RecordFields[] | null {
-  const context = useContext(DriftHydrationContext);
+  const context = useContext(VaultSyncHydrationContext);
   return context ? context[docId] || null : null;
 }
 
@@ -30,7 +30,7 @@ export function useNextQuery(docId: string) {
   
   let client: any = null;
   try {
-    client = useDriftClient();
+    client = useVaultSyncClient();
   } catch (e) {
     // In SSR or loading state
   }

@@ -1,5 +1,5 @@
 {
-  "name": "@drift/react",
+  "name": "@vaultsync/react",
   "version": "0.1.0",
   "type": "module",
   "publishConfig": {
@@ -22,7 +22,7 @@
   },
   "peerDependencies": {
     "react": ">=18",
-    "@drift/web": "*"
+    "@vaultsync/web": "*"
   },
   "devDependencies": {
     "@testing-library/react": "^14.0.0",
@@ -34,7 +34,7 @@
     "react": "^18",
     "react-dom": "^18",
     "ts-jest": "^29.1.0",
-    "@drift/web": "*",
+    "@vaultsync/web": "*",
     "typescript": "^5.4.0"
   }
 }

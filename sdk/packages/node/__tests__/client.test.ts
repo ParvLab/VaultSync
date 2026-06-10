@@ -67,7 +67,7 @@ jest.mock('fs', () => {
   return {
     ...actual,
     existsSync: (p: string) => {
-      if (p.includes('drift_napi') || p.includes('libdrift_napi')) return true;
+      if (p.includes('vaultsync_napi') || p.includes('libvaultsync_napi')) return true;
       return actual.existsSync(p);
     },
   };
@@ -76,7 +76,7 @@ jest.mock('fs', () => {
 jest.mock('module', () => {
   return {
     createRequire: () => (p: string) => {
-      if (p.includes('drift_napi') || p.includes('libdrift_napi')) {
+      if (p.includes('vaultsync_napi') || p.includes('libvaultsync_napi')) {
         return mockNapi;
       }
       throw new Error(`Cannot find module '${p}'`);
@@ -84,14 +84,14 @@ jest.mock('module', () => {
   };
 });
 
-// Import DriftClient & InMemoryCoordinator AFTER mocking
-const { DriftClient, InMemoryCoordinator } = await import('../src/index.js');
+// Import VaultSyncClient & InMemoryCoordinator AFTER mocking
+const { VaultSyncClient, InMemoryCoordinator } = await import('../src/index.js');
 
-describe('DriftClient (Node.js)', () => {
-  let client: DriftClient;
+describe('VaultSyncClient (Node.js)', () => {
+  let client: VaultSyncClient;
 
   beforeEach(async () => {
-    client = await DriftClient.create({
+    client = await VaultSyncClient.create({
       namespace: 'test_namespace',
       replicaId: 'node_replica_1',
       coordinatorUrl: 'memory://test',
@@ -105,7 +105,7 @@ describe('DriftClient (Node.js)', () => {
   test('insert and get', async () => {
     const docId = 'doc1';
     const recordId = 'rec1';
-    const fields = { name: 'Drift Node', version: 1, active: true };
+    const fields = { name: 'VaultSync Node', version: 1, active: true };
 
     await client.insert(docId, recordId, fields);
 

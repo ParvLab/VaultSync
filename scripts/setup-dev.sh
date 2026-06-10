@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "=========================================="
-echo "=== Drift Developer Environment Setup  ==="
+echo "=== VaultSync Developer Environment Setup  ==="
 echo "=========================================="
 
 # 1. Rust tools
@@ -46,7 +46,7 @@ HOOKS_DIR=".git/hooks"
 if [ -d "$HOOKS_DIR" ]; then
     cat > "$HOOKS_DIR/pre-commit" << 'EOF'
 #!/bin/sh
-echo "=== Drift pre-commit hook ==="
+echo "=== VaultSync pre-commit hook ==="
 echo "Running rustfmt..."
 cargo fmt --check || exit 1
 echo "Running clippy..."

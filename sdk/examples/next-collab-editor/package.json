@@ -11,8 +11,8 @@
     "next": "^14.0.0",
     "react": "^18.0.0",
     "react-dom": "^18.0.0",
-    "@drift/web": "*",
-    "@drift/react": "*",
-    "@drift/next": "*"
+    "@vaultsync/web": "*",
+    "@vaultsync/react": "*",
+    "@vaultsync/next": "*"
   }
 }

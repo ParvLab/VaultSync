@@ -2,12 +2,12 @@ import { createRequire } from 'module';
 import * as path from 'path';
 import * as fs from 'fs';
 import { fileURLToPath } from 'url';
-import type { DriftConfig, RecordFields, SyncStatus, SubscriptionCallback, UnsubscribeFn } from './types.js';
+import type { VaultSyncConfig, RecordFields, SyncStatus, SubscriptionCallback, UnsubscribeFn } from './types.js';
 import { createDbProxy, DbProxy, Collection } from './db.js';
 
 export * from './types.js';
 export { DbProxy, Collection, createDbProxy };
-export { Drift } from './drift.js';
+export { VaultSync } from './vaultsync.js';
 export { NodeStorage } from './storage.js';
 export * from './coordinator/index.js';
 
@@ -16,15 +16,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Paths to scan for the native addon
 const paths = [
-  path.join(__dirname, '../drift_napi.node'),
-  path.join(__dirname, '../../../../target/release/drift_napi.node'),
-  path.join(__dirname, '../../../../target/release/drift_napi.dll'),
-  path.join(__dirname, '../../../../target/release/libdrift_napi.so'),
-  path.join(__dirname, '../../../../target/release/libdrift_napi.dylib'),
-  path.join(__dirname, '../../../../target/debug/drift_napi.node'),
-  path.join(__dirname, '../../../../target/debug/drift_napi.dll'),
-  path.join(__dirname, '../../../../target/debug/libdrift_napi.so'),
-  path.join(__dirname, '../../../../target/debug/libdrift_napi.dylib'),
+  path.join(__dirname, '../vaultsync_napi.node'),
+  path.join(__dirname, '../../../../target/release/vaultsync_napi.node'),
+  path.join(__dirname, '../../../../target/release/vaultsync_napi.dll'),
+  path.join(__dirname, '../../../../target/release/libvaultsync_napi.so'),
+  path.join(__dirname, '../../../../target/release/libvaultsync_napi.dylib'),
+  path.join(__dirname, '../../../../target/debug/vaultsync_napi.node'),
+  path.join(__dirname, '../../../../target/debug/vaultsync_napi.dll'),
+  path.join(__dirname, '../../../../target/debug/libvaultsync_napi.so'),
+  path.join(__dirname, '../../../../target/debug/libvaultsync_napi.dylib'),
 ];
 
 let nativeModule: any = null;
@@ -59,12 +59,12 @@ export function isNativeAvailable(): boolean {
   return nativeModule !== null;
 }
 
-export function createNativeClient(config: DriftConfig): Promise<DriftClient> {
-  return DriftClient.create(config);
+export function createNativeClient(config: VaultSyncConfig): Promise<VaultSyncClient> {
+  return VaultSyncClient.create(config);
 }
 
-export class DriftClient {
-  // Marked as public so Drift facade can access it
+export class VaultSyncClient {
+  // Marked as public so VaultSync facade can access it
   public inner: any;
   private _db?: any;
 
@@ -79,10 +79,10 @@ export class DriftClient {
     return this._db;
   }
 
-  static async create(config: DriftConfig): Promise<DriftClient> {
+  static async create(config: VaultSyncConfig): Promise<VaultSyncClient> {
     if (!nativeModule) {
       throw new Error(
-        "Could not find or load drift-napi native addon. " +
+        "Could not find or load vaultsync-napi native addon. " +
         "Make sure the native addon is built and available in your path."
       );
     }
@@ -93,7 +93,7 @@ export class DriftClient {
       config.coordinatorUrl || null,
       config.authToken || null
     );
-    return new DriftClient(inner);
+    return new VaultSyncClient(inner);
   }
 
   async insert(docId: string, recordId: string, fields: RecordFields): Promise<void> {

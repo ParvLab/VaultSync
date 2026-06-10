@@ -39,28 +39,28 @@ const mockClientInstance: any = {
   subscribe: (jest.fn() as any).mockReturnValue(mockUnsubscribe),
 };
 
-const mockDriftClientClass: any = {
+const mockVaultSyncClientClass: any = {
   create: (jest.fn() as any).mockImplementation(() => Promise.resolve(mockClientInstance)),
 };
 
-jest.unstable_mockModule('@drift/web', () => {
+jest.unstable_mockModule('@vaultsync/web', () => {
   return {
-    DriftClient: mockDriftClientClass,
+    VaultSyncClient: mockVaultSyncClientClass,
   };
 });
 
-jest.unstable_mockModule('@drift/react', () => {
+jest.unstable_mockModule('@vaultsync/react', () => {
   return {
-    DriftProvider: ({ children }: any) => <div>{children}</div>,
-    useDriftClient: () => mockClientInstance,
+    VaultSyncProvider: ({ children }: any) => <div>{children}</div>,
+    useVaultSyncClient: () => mockClientInstance,
   };
 });
 
-const { DriftHydrationProvider, useNextQuery } = await import('../src/index.js');
+const { VaultSyncHydrationProvider, useNextQuery } = await import('../src/index.js');
 const { createCoordinatorHandler } = await import('../src/server.js');
 
-describe('@drift/next', () => {
-  test('DriftHydrationProvider and useNextQuery hydration', async () => {
+describe('@vaultsync/next', () => {
+  test('VaultSyncHydrationProvider and useNextQuery hydration', async () => {
     const config = { namespace: 'test', replicaId: '1' };
     const initialData = {
       tasks: [{ id: '1', title: 'Task 1' }],
@@ -77,9 +77,9 @@ describe('@drift/next', () => {
 
     act(() => {
       render(
-        <DriftHydrationProvider config={config} initialData={initialData}>
+        <VaultSyncHydrationProvider config={config} initialData={initialData}>
           <TestComponent />
-        </DriftHydrationProvider>
+        </VaultSyncHydrationProvider>
       );
     });
 
@@ -110,7 +110,7 @@ describe('@drift/next', () => {
 
     // Mock NextRequest and URL parsing
     const req = {
-      url: 'http://localhost:3000/api/drift/namespace/test-ns/pull?after=0&limit=10',
+      url: 'http://localhost:3000/api/vaultsync/namespace/test-ns/pull?after=0&limit=10',
       method: 'GET',
       headers: {
         get: () => '',

@@ -1,6 +1,6 @@
-# Drift Performance Benchmarks
+# VaultSync Performance Benchmarks
 
-This document outlines the performance targets and benchmarks for the Drift synchronization engine.
+This document outlines the performance targets and benchmarks for the VaultSync synchronization engine.
 
 ## Performance Targets
 
@@ -14,7 +14,7 @@ This document outlines the performance targets and benchmarks for the Drift sync
 
 ## Benchmark Suites
 
-The workspace contains three Criterion benchmark suites under `crates/drift-core/benches/`:
+The workspace contains three Criterion benchmark suites under `crates/vaultsync-core/benches/`:
 
 1. **`crdt_bench.rs`**
    - Measures raw Yrs document insert and merge performance.

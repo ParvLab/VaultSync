@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { useQuery, useDriftMutations, SyncIndicator } from '@drift/react';
-import { Drift } from '@drift/web';
+import { useQuery, useVaultSyncMutations, SyncIndicator } from '@vaultsync/react';
+import { VaultSync } from '@vaultsync/web';
 
 interface Todo {
   id: string;
@@ -8,21 +8,21 @@ interface Todo {
   completed: boolean;
 }
 
-export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
+export function App({ replicaId, vaultsync }: { replicaId: string; vaultsync: VaultSync }) {
   const [text, setText] = useState('');
-  const [isLeader, setIsLeader] = useState(drift.leader);
+  const [isLeader, setIsLeader] = useState(vaultsync.leader);
 
   // Poll for leadership changes so tabs update dynamically when the leader changes
   useEffect(() => {
     const timer = setInterval(() => {
-      setIsLeader(drift.leader);
+      setIsLeader(vaultsync.leader);
     }, 500);
     return () => clearInterval(timer);
-  }, [drift]);
+  }, [vaultsync]);
 
   // Query todos collection
   const { data: todos, loading } = useQuery('todos');
-  const mutations = useDriftMutations('todos');
+  const mutations = useVaultSyncMutations('todos');
 
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -50,7 +50,7 @@ export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
     <div style={styles.container}>
       <header style={styles.header}>
         <div style={styles.headerTitle}>
-          <h1>Drift Multi-Tab Todos</h1>
+          <h1>VaultSync Multi-Tab Todos</h1>
           <p style={styles.subtitle}>Symmetric offline-first synchronization across tabs</p>
         </div>
         <SyncIndicator />

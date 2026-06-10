@@ -29,22 +29,22 @@ Call log:
   6  |     page.on('pageerror', err => console.error('BROWSER ERROR:', err.message));
 > 7  |     await page.goto("/")
      |                ^ Error: page.goto: Protocol error (Page.navigate): Cannot navigate to invalid URL
-  8  |     await page.waitForFunction(() => typeof window.__DRIFT__ !== 'undefined')
-  9  |     await page.evaluate(() => window.__DRIFT__.insert("crud-1", "test item"))
+  8  |     await page.waitForFunction(() => typeof window.__VAULTSYNC__ !== 'undefined')
+  9  |     await page.evaluate(() => window.__VAULTSYNC__.insert("crud-1", "test item"))
   10 |     await expect(page.locator("[data-id='crud-1']")).toBeVisible()
-  11 |     await page.evaluate(() => window.__DRIFT__.update("crud-1", { title: "updated" }))
+  11 |     await page.evaluate(() => window.__VAULTSYNC__.update("crud-1", { title: "updated" }))
   12 |     await expect(page.locator("[data-id='crud-1']")).toContainText("updated")
-  13 |     await page.evaluate(() => window.__DRIFT__.delete("crud-1"))
+  13 |     await page.evaluate(() => window.__VAULTSYNC__.delete("crud-1"))
   14 |     await expect(page.locator("[data-id='crud-1']")).not.toBeVisible()
   15 |   })
   16 | 
   17 |   test("Write offline, reconnect — 10 mutations synced", async ({ page }) => {
   18 |     await page.goto("/")
-  19 |     await page.waitForFunction(() => typeof window.__DRIFT__ !== 'undefined')
+  19 |     await page.waitForFunction(() => typeof window.__VAULTSYNC__ !== 'undefined')
   20 |     await page.route("**/*push*", route => route.abort())
   21 |     for (let i = 0; i < 10; i++) {
   22 |       await page.evaluate((idx) =>
-  23 |         window.__DRIFT__.insert(`q-${idx}`, `queued ${idx}`), i)
+  23 |         window.__VAULTSYNC__.insert(`q-${idx}`, `queued ${idx}`), i)
   24 |     }
   25 |     await page.unroute("**/*push*")
   26 |     await page.waitForTimeout(3000)

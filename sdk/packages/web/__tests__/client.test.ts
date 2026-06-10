@@ -25,25 +25,25 @@ const mockWasmClient: any = {
   new_with_coordinator: (jest.fn() as any).mockImplementation(() => mockWasmClientInstance),
 };
 
-jest.unstable_mockModule('../wasm/drift_wasm.js', () => {
+jest.unstable_mockModule('../wasm/vaultsync_wasm.js', () => {
   return {
     default: (jest.fn() as any).mockResolvedValue(true),
-    WasmDriftClient: mockWasmClient,
+    WasmVaultSyncClient: mockWasmClient,
   };
 });
 
-describe('DriftClient (Web)', () => {
-  let DriftClient: any;
+describe('VaultSyncClient (Web)', () => {
+  let VaultSyncClient: any;
   let defineSchema: any;
 
   beforeAll(async () => {
     const mod = await import('../src/index.js');
-    DriftClient = mod.DriftClient;
+    VaultSyncClient = mod.VaultSyncClient;
     defineSchema = mod.defineSchema;
   });
 
   test('create client and run operations', async () => {
-    const client = await DriftClient.create({
+    const client = await VaultSyncClient.create({
       namespace: 'test-web',
       replicaId: 'replica-web-1',
     });
@@ -82,7 +82,7 @@ describe('DriftClient (Web)', () => {
   });
 
   test('Collection API', async () => {
-    const client = await DriftClient.create({
+    const client = await VaultSyncClient.create({
       namespace: 'test-web',
       replicaId: 'replica-web-1',
     });
@@ -159,7 +159,7 @@ describe('DriftClient (Web)', () => {
   });
 
   test('defineSchema validation and mapping', async () => {
-    const client = await DriftClient.create({
+    const client = await VaultSyncClient.create({
       namespace: 'test-web',
       replicaId: 'replica-web-1',
     });
@@ -190,7 +190,7 @@ describe('DriftClient (Web)', () => {
   });
 
   test('KeyManager API', async () => {
-    const client = await DriftClient.create({
+    const client = await VaultSyncClient.create({
       namespace: 'test-web',
       replicaId: 'replica-web-1',
     });

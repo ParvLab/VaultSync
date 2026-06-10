@@ -1,8 +1,8 @@
 import { jsxs as _jsxs, jsx as _jsx } from "react/jsx-runtime";
 import { useState } from 'react';
-import { DriftProvider, useQuery, useDriftClient, useSyncStatus } from '@drift/react';
+import { VaultSyncProvider, useQuery, useVaultSyncClient, useSyncStatus } from '@vaultsync/react';
 function TodoApp({ replicaName }) {
-    const client = useDriftClient();
+    const client = useVaultSyncClient();
     const { data: todos, loading } = useQuery('todos');
     const status = useSyncStatus();
     const [text, setText] = useState('');
@@ -33,6 +33,6 @@ export default function App() {
         replicaId: 'replica-B',
         coordinatorUrl: 'http://127.0.0.1:8080',
     };
-    return (_jsxs("div", { className: "container", children: [_jsx("h1", { children: "Drift Collaborative Sync Demo" }), _jsx("p", { style: { opacity: 0.8, marginBottom: '2rem' }, children: "This demo spawns two independent sync engine instances on the same page. Ensure the Drift Coordinator Server is running on port 8080 (`cargo run -p drift-coordinator-server -- -p 8080`)." }), _jsxs("div", { className: "grid", children: [_jsx(DriftProvider, { config: configA, children: _jsx(TodoApp, { replicaName: "A" }) }), _jsx(DriftProvider, { config: configB, children: _jsx(TodoApp, { replicaName: "B" }) })] })] }));
+    return (_jsxs("div", { className: "container", children: [_jsx("h1", { children: "VaultSync Collaborative Sync Demo" }), _jsx("p", { style: { opacity: 0.8, marginBottom: '2rem' }, children: "This demo spawns two independent sync engine instances on the same page. Ensure the VaultSync Coordinator Server is running on port 8080 (`cargo run -p vaultsync-coordinator-server -- -p 8080`)." }), _jsxs("div", { className: "grid", children: [_jsx(VaultSyncProvider, { config: configA, children: _jsx(TodoApp, { replicaName: "A" }) }), _jsx(VaultSyncProvider, { config: configB, children: _jsx(TodoApp, { replicaName: "B" }) })] })] }));
 }
 //# sourceMappingURL=App.js.map

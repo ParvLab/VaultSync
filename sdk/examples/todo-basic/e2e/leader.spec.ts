@@ -12,11 +12,11 @@ test.describe("Leader election", () => {
     const ns = "e2e-leader-" + Math.random().toString(36).substring(7);
     await Promise.all([tabA.goto(`/?ns=${ns}`), tabB.goto(`/?ns=${ns}`)])
     await Promise.all([
-      tabA.waitForFunction(() => typeof window.__DRIFT__ !== 'undefined'),
-      tabB.waitForFunction(() => typeof window.__DRIFT__ !== 'undefined'),
+      tabA.waitForFunction(() => typeof window.__VAULTSYNC__ !== 'undefined'),
+      tabB.waitForFunction(() => typeof window.__VAULTSYNC__ !== 'undefined'),
     ])
 
-    await tabA.evaluate(() => window.__DRIFT__.insert("pre-crash", "data"))
+    await tabA.evaluate(() => window.__VAULTSYNC__.insert("pre-crash", "data"))
     await expect(tabB.locator("[data-testid='todo-item'][data-id='pre-crash']"))
       .toBeVisible({ timeout: 5000 })
   })

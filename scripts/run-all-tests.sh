@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-all-tests.sh — Run the full Drift test suite locally
+# run-all-tests.sh — Run the full VaultSync test suite locally
 # Usage: ./scripts/run-all-tests.sh [--fast] [--no-e2e] [--no-docker]
 set -euo pipefail
 
@@ -19,7 +19,7 @@ for arg in "$@"; do
 done
 
 echo "================================================="
-echo "  Drift — Full Test Suite"
+echo "  VaultSync — Full Test Suite"
 echo "================================================="
 
 cd "$ROOT_DIR"
@@ -28,16 +28,16 @@ cd "$ROOT_DIR"
 echo ""
 echo ">>> [1/5] Rust unit & integration tests..."
 if [ "$FAST" = true ]; then
-  cargo test --jobs 1 --lib --workspace --exclude drift-fuzz 2>&1
+  cargo test --jobs 1 --lib --workspace --exclude vaultsync-fuzz 2>&1
 else
-  cargo test --jobs 1 --workspace --exclude drift-fuzz 2>&1
+  cargo test --jobs 1 --workspace --exclude vaultsync-fuzz 2>&1
 fi
 echo "    ✅ Rust tests passed"
 
 # ── Step 2: CRDT property tests (must pass before anything else) ──────────────
 echo ""
 echo ">>> [2/5] CRDT property-based tests..."
-cargo test --jobs 1 -p drift-core --test crdt_properties 2>&1
+cargo test --jobs 1 -p vaultsync-core --test crdt_properties 2>&1
 echo "    ✅ CRDT property tests passed"
 
 # ── Step 3: Coordinator conformance (SQLite + Memory, no Docker required) ─────
@@ -45,9 +45,9 @@ echo ""
 echo ">>> [3/5] Coordinator conformance tests..."
 if [ "$NO_DOCKER" = true ]; then
   echo "    Skipping Postgres/Redis (--no-docker). Running SQLite + Memory only."
-  DRIFT_TEST_BACKENDS=sqlite,memory cargo test --jobs 1 -p drift-conformance 2>&1
+  VAULTSYNC_TEST_BACKENDS=sqlite,memory cargo test --jobs 1 -p vaultsync-conformance 2>&1
 else
-  cargo test --jobs 1 -p drift-conformance 2>&1
+  cargo test --jobs 1 -p vaultsync-conformance 2>&1
 fi
 echo "    ✅ Coordinator conformance passed"
 

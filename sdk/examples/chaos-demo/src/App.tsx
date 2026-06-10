@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { useQuery, useDriftMutations } from '@drift/react';
-import { Drift } from '@drift/web';
+import { useQuery, useVaultSyncMutations } from '@vaultsync/react';
+import { VaultSync } from '@vaultsync/web';
 
-export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
+export function App({ replicaId, vaultsync }: { replicaId: string; vaultsync: VaultSync }) {
   const [latency, setLatency] = useState(0); // in ms
   const [packetLoss, setPacketLoss] = useState(0); // percentage
   
@@ -15,7 +15,7 @@ export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
 
   // Query shared doc
   const { data: sharedItems } = useQuery('shared');
-  const mutations = useDriftMutations('shared');
+  const mutations = useVaultSyncMutations('shared');
 
   const addLog = (msg: string) => {
     setLogs((prev) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev].slice(0, 10));
@@ -54,7 +54,7 @@ export function App({ replicaId, drift }: { replicaId: string; drift: Drift }) {
   return (
     <div style={styles.container}>
       <header style={styles.header}>
-        <h1>Drift Chaos Testing Simulator</h1>
+        <h1>VaultSync Chaos Testing Simulator</h1>
         <p style={styles.subtitle}>Simulating latency, packet loss, and concurrent edits</p>
       </header>
 

@@ -1,18 +1,18 @@
-import { DriftClient } from "@drift/web"
+import { VaultSyncClient } from "@vaultsync/web"
 
-declare global { interface Window { __DRIFT__: any } }
+declare global { interface Window { __VAULTSYNC__: any } }
 
 const urlParams = new URLSearchParams(window.location.search);
 const namespace = urlParams.get("ns") || ("e2e-test-" + Date.now());
 const replicaId = "replica-" + Math.random().toString(36).substring(7);
 
-const client = await DriftClient.create({
+const client = await VaultSyncClient.create({
   namespace,
   replicaId,
   coordinatorUrl: "http://localhost:9876",
 })
 
-window.__DRIFT__ = {
+window.__VAULTSYNC__ = {
   client,
   insert: (id: string, title: string) =>
     client.insert("todos", id, { id, title, done: false }),

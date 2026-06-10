@@ -1,21 +1,20 @@
-# 🌌 Drift
+# 🌌 VaultSync
 
-[![CI Status](https://github.com/drift-sync/drift/actions/workflows/ci.yml/badge.svg)](https://github.com/drift-sync/drift/actions)
+[![CI Status](https://github.com/vaultsync-sync/vaultsync/actions/workflows/ci.yml/badge.svg)](https://github.com/vaultsync-sync/vaultsync/actions)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![crates.io](https://img.shields.io/crates/v/drift-core.svg)](https://crates.io/crates/drift-core)
-[![npm](https://img.shields.io/npm/v/@drift/web.svg)](https://www.npmjs.com/package/@drift/web)
-[![WASM](https://img.shields.io/badge/target-wasm32--unknown--unknown-green)](crates/drift-wasm)
-[![Discord](https://img.shields.io/badge/Discord-Join-7289DA)](https://discord.gg/drift)
+[![crates.io](https://img.shields.io/crates/v/vaultsync-core.svg)](https://crates.io/crates/vaultsync-core)
+[![npm](https://img.shields.io/npm/v/@vaultsync/web.svg)](https://www.npmjs.com/package/@vaultsync/web)
+[![WASM](https://img.shields.io/badge/target-wasm32--unknown--unknown-green)](crates/vaultsync-wasm)
 
 > **Conflict-free, end-to-end encrypted, infrastructure-agnostic synchronization for the local-first era.**
 
-Drift is an embedded local-first synchronization and replication runtime with CRDT-native conflict resolution, end-to-end encryption, multi-tab/process safety, and zero-trust coordinator architecture. It makes your application work **instantly offline**, sync **automatically when online**, and feel **0ms fast** — because every read and write hits a local database, never a remote server.
+VaultSync is an embedded local-first synchronization and replication runtime with CRDT-native conflict resolution, end-to-end encryption, multi-tab/process safety, and zero-trust coordinator architecture. It makes your application work **instantly offline**, sync **automatically when online**, and feel **0ms fast** — because every read and write hits a local database, never a remote server.
 
 ---
 
 ## Table of Contents
 
-- [Why Drift?](#-why-drift)
+- [Why VaultSync?](#-why-vaultsync)
 - [The Business Case — Real Benefits](#-the-business-case--real-benefits)
 - [How It Works — High-Level](#-how-it-works--high-level)
 - [Core Architecture](#-core-architecture)
@@ -33,14 +32,14 @@ Drift is an embedded local-first synchronization and replication runtime with CR
 - [Observability & Debuggability](#-observability--debuggability)
 - [Security Model](#-security-model)
 - [Real-World Use Cases](#-real-world-use-cases)
-- [Drift vs The World](#-drift-vs-the-world)
+- [VaultSync vs The World](#-vaultsync-vs-the-world)
 - [Repository Structure](#-repository-structure)
 - [Contributing](#-contributing)
 - [Production Checklist](#-production-checklist)
 
 ---
 
-## 🚀 Why Drift?
+## 🚀 Why VaultSync?
 
 The traditional web architecture forces every user interaction through a server:
 
@@ -67,7 +66,7 @@ This creates a cascade of real problems:
 
 ## 💡 The Business Case — Real Benefits
 
-Drift flips the model: **data lives on the device first, syncs to the coordinator in the background.**
+VaultSync flips the model: **data lives on the device first, syncs to the coordinator in the background.**
 
 ### ⚡ Feel 0ms Fast — Instant Reads and Writes
 
@@ -89,29 +88,29 @@ Other devices receive & merge
 
 ### 📴 Work Fully Offline — Forever
 
-Users can read and write all day on an airplane with no internet. Every mutation is stored locally as an encrypted CRDT entry. When connectivity returns, Drift automatically uploads everything and downloads everything they missed — no manual conflict resolution, no data loss.
+Users can read and write all day on an airplane with no internet. Every mutation is stored locally as an encrypted CRDT entry. When connectivity returns, VaultSync automatically uploads everything and downloads everything they missed — no manual conflict resolution, no data loss.
 
 A user who makes 47 changes offline lands, reconnects, and every change syncs without them lifting a finger.
 
 ### 💸 Dramatically Lower Server Costs
 
-With Drift, **reads no longer touch your API servers.** A user browsing through 1000 records creates 0 server requests — all data is served from local storage. Server load drops to only sync operations (uploads and downloads of CRDT mutations), which are batched and efficient.
+With VaultSync, **reads no longer touch your API servers.** A user browsing through 1000 records creates 0 server requests — all data is served from local storage. Server load drops to only sync operations (uploads and downloads of CRDT mutations), which are batched and efficient.
 
 In real applications, this reduces API call volume by **60–95%**, cutting infrastructure costs proportionally.
 
 ### 🤝 Real-Time Collaboration — Built-In
 
-When two users edit the same record at the same time, Drift's **CRDT merge algorithm** handles it automatically and deterministically. There are no conflicts to resolve, no "someone else changed this" dialogs, no last-write-wins data loss. Both changes are preserved.
+When two users edit the same record at the same time, VaultSync's **CRDT merge algorithm** handles it automatically and deterministically. There are no conflicts to resolve, no "someone else changed this" dialogs, no last-write-wins data loss. Both changes are preserved.
 
 ### 🔒 Zero-Trust Security — Built-In E2EE
 
 The sync server (coordinator) **never sees your data**. Every CRDT mutation is encrypted on-device with X25519 + ChaCha20-Poly1305 before leaving. The coordinator stores only encrypted blobs. Even if your sync infrastructure is breached, no user data is exposed.
 
-This means Drift is **HIPAA-ready by default** — the coordinator literally cannot read patient records.
+This means VaultSync is **HIPAA-ready by default** — the coordinator literally cannot read patient records.
 
 ### 🗂️ Multi-Tab Safety — Built-In
 
-Open the same app in 3 browser tabs. Close the one that was writing. Drift automatically elects a new leader, replays any in-flight mutations, and continues — with **no data loss, no corruption, no stale reads**.
+Open the same app in 3 browser tabs. Close the one that was writing. VaultSync automatically elects a new leader, replays any in-flight mutations, and continues — with **no data loss, no corruption, no stale reads**.
 
 ---
 
@@ -123,12 +122,12 @@ Open the same app in 3 browser tabs. Close the one that was writing. Drift autom
 │                                                                   │
 │  ┌─────────────────────────────────────────────────────────────┐  │
 │  │   Application Layer                                          │  │
-│  │   drift.db.todos.insert({ text: "buy milk" })               │  │
-│  │   drift.db.todos.subscribe(callback)                         │  │
+│  │   vaultsync.db.todos.insert({ text: "buy milk" })               │  │
+│  │   vaultsync.db.todos.subscribe(callback)                         │  │
 │  └─────────────────────────┬───────────────────────────────────┘  │
 │                            │                                      │
 │  ┌─────────────────────────▼───────────────────────────────────┐  │
-│  │   Drift Core Engine (Rust + WASM)                            │  │
+│  │   VaultSync Core Engine (Rust + WASM)                            │  │
 │  │                                                               │  │
 │  │   ┌────────────────────┐  ┌──────────────────────────────┐  │  │
 │  │   │  CRDT Layer (Yrs)  │  │  E2EE Encryption             │  │  │
@@ -171,7 +170,7 @@ Open the same app in 3 browser tabs. Close the one that was writing. Drift autom
 
 ## 🏗️ Core Architecture
 
-Drift is built on three non-negotiable design principles:
+VaultSync is built on three non-negotiable design principles:
 
 ### 1. CRDT-Native From Day One
 
@@ -254,11 +253,11 @@ Deterministic. No data loss for the later write.
 
 ### CRDT Document Structure
 
-Every table in Drift is a Yrs CRDT Map:
+Every table in VaultSync is a Yrs CRDT Map:
 
 ```
 Document: "todos" → record: "todo:123" (Yrs Map)
-├── field: "text"       → LWW-Register("build drift")
+├── field: "text"       → LWW-Register("build vaultsync")
 ├── field: "completed"  → LWW-Register(false)
 ├── field: "priority"   → PN-Counter(3)
 ├── field: "tags"       → OR-Set(["backend", "rust"])
@@ -288,7 +287,7 @@ Every other sync engine (ElectricSQL, Zero, PowerSync, Replicache) stores **plai
 - A coordinator breach exposes every user's data
 - HIPAA, GDPR, SOC2 compliance requires additional layers
 
-Drift's E2EE ensures the **coordinator is zero-trust**. It stores only encrypted blobs and routing metadata. It cannot read any application data — ever.
+VaultSync's E2EE ensures the **coordinator is zero-trust**. It stores only encrypted blobs and routing metadata. It cannot read any application data — ever.
 
 ### Encryption Flow
 
@@ -359,9 +358,9 @@ When multiple browser tabs, Electron windows, or OS processes share the same loc
 - Oplog ordering violations
 - Subscription double-firing
 
-### Drift's Solution: Leader Election
+### VaultSync's Solution: Leader Election
 
-Drift uses **leader election** to coordinate write access. One process writes; all others read via shared memory.
+VaultSync uses **leader election** to coordinate write access. One process writes; all others read via shared memory.
 
 ```
 ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
@@ -390,7 +389,7 @@ Drift uses **leader election** to coordinate write access. One process writes; a
 
 | Platform | Mechanism |
 |---|---|
-| **Browser (tabs)** | `BroadcastChannel` + `navigator.locks.request` on `drift-leader` lock |
+| **Browser (tabs)** | `BroadcastChannel` + `navigator.locks.request` on `vaultsync-leader` lock |
 | **Native (Linux/macOS/Windows)** | `flock()` on SQLite WAL file or `CreateMutex` |
 | **Electron** | Browser mechanism + `net.Server` on local socket for cross-window IPC |
 
@@ -433,7 +432,7 @@ All tabs see the update in **< 5ms** — even the ones that didn't initiate the 
 Network disconnects
        │
        ▼
-Drift detects disconnect (WebSocket close / heartbeat timeout)
+VaultSync detects disconnect (WebSocket close / heartbeat timeout)
        │
        ▼
 Connection status → "disconnected"
@@ -456,7 +455,7 @@ Pending mutations accumulate in the local oplog. The coordinator is not involved
 Network reconnects
        │
        ▼
-Drift reconnects to coordinator (exponential backoff: 1s → 2s → 4s → ... → 30s)
+VaultSync reconnects to coordinator (exponential backoff: 1s → 2s → 4s → ... → 30s)
        │
        ▼
 Step 1: Upload backlog
@@ -497,7 +496,7 @@ A complete, annotated trace of a local write propagating to a remote replica:
 
 ```
 Step 1: Application Write
-  drift.db.todos.insert({ id: "todo:123", text: "build drift" })
+  vaultsync.db.todos.insert({ id: "todo:123", text: "build vaultsync" })
        │
        ▼ CRDT Engine
   Yrs document "todos/123" receives mutation
@@ -508,8 +507,8 @@ Step 1: Application Write
        │
        ▼ Storage (atomic transaction, Leader only)
   BEGIN TRANSACTION
-    INSERT drift_oplog (yrs_update, encrypted_blob, status: "pending")
-    UPDATE drift_documents (new Yrs snapshot for fast queries)
+    INSERT vaultsync_oplog (yrs_update, encrypted_blob, status: "pending")
+    UPDATE vaultsync_documents (new Yrs snapshot for fast queries)
   COMMIT
        │
        ▼ UI
@@ -536,7 +535,7 @@ Step 4: ACK Back to Sender
   Coordinator sends PUSH_ACK { request_id, sequences: [44] }
        │
   Local oplog: sync_status → "synced"
-  drift_sync_state: last_synced_sequence = 44
+  vaultsync_sync_state: last_synced_sequence = 44
 
 Step 5: Remote Replica Receives Mutation
   Replica B receives MUTATION_PUSH (sequence 44, encrypted_blob)
@@ -577,37 +576,37 @@ Key message types: `AUTH`, `REGISTER`, `PUSH`, `PUSH_ACK`, `PULL`, `PULL_RESPONS
 
 ## 📡 Reactive Subscriptions
 
-Drift subscriptions fire on both local writes **and** incoming remote CRDT merges:
+VaultSync subscriptions fire on both local writes **and** incoming remote CRDT merges:
 
 ```typescript
 // Table subscription — fires on any CRDT merge in the collection
-const unsub = drift.db.todos.subscribe((todos) => {
+const unsub = vaultsync.db.todos.subscribe((todos) => {
   renderTodoList(todos)
 })
 
 // Filtered subscription
-const unsub = drift.db.todos.subscribe(
+const unsub = vaultsync.db.todos.subscribe(
   (todos) => renderTodos(todos),
   { where: { assignee: "alice", completed: false } }
 )
 
 // Single record subscription
-const unsub = drift.db.todos.subscribeOne("todo:123", (todo) => {
+const unsub = vaultsync.db.todos.subscribeOne("todo:123", (todo) => {
   if (!todo) renderDeleted()
   else renderTodo(todo)
 })
 
 // Sync status subscription
-drift.subscribe("sync:status", (status) => {
+vaultsync.subscribe("sync:status", (status) => {
   updateConnectionIndicator(status)
   // status: { connected, pendingUploads, lastSyncAt, leaderStatus }
 })
 ```
 
-### React Hooks (via `@drift/react`)
+### React Hooks (via `@vaultsync/react`)
 
 ```tsx
-import { useQuery, useDriftOne, useSyncStatus, useDriftMutations } from "@drift/react"
+import { useQuery, useVaultSyncOne, useSyncStatus, useVaultSyncMutations } from "@vaultsync/react"
 
 function TodoList() {
   // Reactive live query — re-renders whenever any todo changes locally or remotely
@@ -616,7 +615,7 @@ function TodoList() {
     orderBy: { field: "priority", direction: "desc" }
   })
 
-  const { insert } = useDriftMutations("todos")
+  const { insert } = useVaultSyncMutations("todos")
 
   return (
     <div>
@@ -646,24 +645,24 @@ Subscription callbacks fire **once per CRDT merge** — not once per field. A re
 
 ### Why a Trait, Not a Service
 
-Every other sync engine locks you into a specific backend. Drift defines `Coordinator` as a **Rust trait**. You choose the implementation. You can swap backends without changing application code.
+Every other sync engine locks you into a specific backend. VaultSync defines `Coordinator` as a **Rust trait**. You choose the implementation. You can swap backends without changing application code.
 
 ### Built-in Implementations
 
 | Backend | Package | Real-Time | Best For |
 |---|---|---|---|
-| **PostgreSQL** | `drift-coordinator-postgres` | `LISTEN/NOTIFY` (5–50ms) | Production self-hosted |
-| **Redis** | `drift-coordinator-redis` | Pub/Sub (1–10ms) | High throughput, in-memory |
-| **SQLite** | `drift-coordinator-sqlite` | Polling (250ms) | Local dev, single-server |
-| **Cloudflare DO** | `drift-coordinator-cloudflare` | DO WebSocket (10–50ms) | Edge-deployed, global |
-| **Supabase** | `drift-coordinator-supabase` | Supabase Realtime (10–100ms) | Hosted Postgres |
-| **In-Memory** | `drift-coordinator-memory` | Channel (< 1ms) | Testing |
+| **PostgreSQL** | `vaultsync-coordinator-postgres` | `LISTEN/NOTIFY` (5–50ms) | Production self-hosted |
+| **Redis** | `vaultsync-coordinator-redis` | Pub/Sub (1–10ms) | High throughput, in-memory |
+| **SQLite** | `vaultsync-coordinator-sqlite` | Polling (250ms) | Local dev, single-server |
+| **Cloudflare DO** | `vaultsync-coordinator-cloudflare` | DO WebSocket (10–50ms) | Edge-deployed, global |
+| **Supabase** | `vaultsync-coordinator-supabase` | Supabase Realtime (10–100ms) | Hosted Postgres |
+| **In-Memory** | `vaultsync-coordinator-memory` | Channel (< 1ms) | Testing |
 
 ### Switching Coordinators
 
 ```typescript
 // PostgreSQL
-const drift = new Drift({
+const vaultsync = new VaultSync({
   namespace: "workspace:core",
   storage: "opfs",
   coordinator: new PostgresCoordinator({
@@ -672,7 +671,7 @@ const drift = new Drift({
 })
 
 // Cloudflare Durable Objects
-const drift = new Drift({
+const vaultsync = new VaultSync({
   namespace: "workspace:core",
   storage: "opfs",
   coordinator: new CloudflareCoordinator({
@@ -691,19 +690,19 @@ class MyCoordinator implements Coordinator {
 
 ### Coordinator Server — Deployable Binary
 
-Drift ships a production-ready coordinator server you can self-host:
+VaultSync ships a production-ready coordinator server you can self-host:
 
 ```bash
 # Docker with PostgreSQL backend
 docker run -p 8080:8080 \
-  -e DRIFT_DB_URL=postgres://user:pass@db:5432/drift \
-  -e DRIFT_AUTH_JWKS_URL=https://your-auth.example.com/.well-known/jwks.json \
-  driftsync/coordinator:latest
+  -e VAULTSYNC_DB_URL=postgres://user:pass@db:5432/vaultsync \
+  -e VAULTSYNC_AUTH_JWKS_URL=https://your-auth.example.com/.well-known/jwks.json \
+  vaultsyncsync/coordinator:latest
 
 # Or run the binary
-drift-server \
+vaultsync-server \
   --backend postgres \
-  --db-url postgres://user:pass@localhost/drift \
+  --db-url postgres://user:pass@localhost/vaultsync \
   --port 8080
 ```
 
@@ -765,31 +764,31 @@ The UI updates **before** the network is involved. The write is committed to loc
 
 ```bash
 # Browser / React
-npm install @drift/web @drift/react
+npm install @vaultsync/web @vaultsync/react
 
 # Node.js server
-npm install @drift/node
+npm install @vaultsync/node
 
 # Next.js
-npm install @drift/web @drift/react @drift/next
+npm install @vaultsync/web @vaultsync/react @vaultsync/next
 ```
 
 ### Rust
 
 ```toml
 [dependencies]
-drift-core = "0.1"
+vaultsync-core = "0.1"
 ```
 
-### Initialize Drift (Browser + React)
+### Initialize VaultSync (Browser + React)
 
 ```tsx
-import { Drift } from "@drift/web"
-import { DriftProvider } from "@drift/react"
-import { PostgresCoordinator } from "@drift/web/coordinator"
+import { VaultSync } from "@vaultsync/web"
+import { VaultSyncProvider } from "@vaultsync/react"
+import { PostgresCoordinator } from "@vaultsync/web/coordinator"
 
 // Create the client with CRDT schema
-const drift = new Drift({
+const vaultsync = new VaultSync({
   storage:   "opfs",              // OPFS (SQLite via WASM) for browsers
   namespace: "workspace:core",
   replicaId: getDeviceId(),       // stable, unique device identifier
@@ -811,7 +810,7 @@ const drift = new Drift({
 })
 
 // Define CRDT-typed schema
-drift.schema.define("todos", {
+vaultsync.schema.define("todos", {
   fields: {
     id:        { type: "string",  crdtType: "lww",     primaryKey: true },
     text:      { type: "string",  crdtType: "lww",     indexed: true    },
@@ -825,22 +824,22 @@ drift.schema.define("todos", {
 })
 
 // Register migrations
-drift.migration("v1", async (db) => {
+vaultsync.migration("v1", async (db) => {
   await db.defineDocument("todos", { /* initial schema */ })
 })
-drift.migration("v2", async (db) => {
+vaultsync.migration("v2", async (db) => {
   await db.addField("todos", "priority", { type: "number", crdtType: "counter" })
 })
 
 // Initialize — runs migrations, sets up E2EE keys, connects to coordinator
-await drift.initialize()
+await vaultsync.initialize()
 
 // Wrap your app
 export default function App() {
   return (
-    <DriftProvider client={drift}>
+    <VaultSyncProvider client={vaultsync}>
       <MyApp />
-    </DriftProvider>
+    </VaultSyncProvider>
   )
 }
 ```
@@ -848,12 +847,12 @@ export default function App() {
 ### CRUD Operations
 
 ```typescript
-const db = drift.db
+const db = vaultsync.db
 
 // INSERT — creates a new CRDT document (instant local write)
 await db.todos.insert({
   id:        "todo:123",
-  text:      "build drift",
+  text:      "build vaultsync",
   completed: false,
   tags:      ["backend", "rust"],
   priority:  3
@@ -869,7 +868,7 @@ const filtered = await db.todos.findAll({
 })
 
 // UPDATE — produces a Yrs binary CRDT diff, instantly visible in UI
-await db.todos.update("todo:123", { text: "build drift runtime" })
+await db.todos.update("todo:123", { text: "build vaultsync runtime" })
 
 // DELETE — soft delete (tombstone) if softDelete: true in schema
 await db.todos.delete("todo:123")
@@ -887,9 +886,9 @@ await db.batch([
 // Keys are generated automatically on initialize()
 // Manual management for advanced use cases:
 
-await drift.keys.rotate()                // Rotate namespace key
-const pubKey   = await drift.keys.publicKey()   // Export public key
-const keyInfo  = await drift.keys.status()
+await vaultsync.keys.rotate()                // Rotate namespace key
+const pubKey   = await vaultsync.keys.publicKey()   // Export public key
+const keyInfo  = await vaultsync.keys.status()
 // { version: 2, createdAt: ..., algorithm: "X25519+ChaCha20-Poly1305" }
 ```
 
@@ -900,7 +899,7 @@ const keyInfo  = await drift.keys.status()
 ### Schema Definition
 
 ```typescript
-drift.schema.define("projects", {
+vaultsync.schema.define("projects", {
   fields: {
     id:          { type: "string",  crdtType: "lww",     primaryKey: true },
     name:        { type: "string",  crdtType: "lww",     indexed: true    },
@@ -933,23 +932,23 @@ drift.schema.define("projects", {
 Migrations are **additive only**. Existing CRDT fields can never be removed (tombstones handle deletion). CRDT type of a field cannot be changed (use a new field name). This ensures all replicas on any schema version can accept mutations from other versions without data loss.
 
 ```typescript
-drift.migration("v1", async (db) => {
+vaultsync.migration("v1", async (db) => {
   await db.defineDocument("todos", {
     fields: { id: { type: "string", crdtType: "lww", primaryKey: true },
               text: { type: "string", crdtType: "lww" } }
   })
 })
 
-drift.migration("v2", async (db) => {
+vaultsync.migration("v2", async (db) => {
   await db.addField("todos", "priority", { type: "number", crdtType: "counter" })
 })
 
-drift.migration("v3", async (db) => {
+vaultsync.migration("v3", async (db) => {
   await db.addField("todos", "tags", { type: "array", crdtType: "orset" })
 })
 ```
 
-Schema migration checksums are stored in `drift_migrations` and verified on every apply. Tampered migrations are rejected.
+Schema migration checksums are stored in `vaultsync_migrations` and verified on every apply. Tampered migrations are rejected.
 
 ---
 
@@ -958,7 +957,7 @@ Schema migration checksums are stored in `drift_migrations` and verified on ever
 ### OpenTelemetry Traces — Every Operation
 
 ```
-Trace: "drift.write" (trace_id: abc123)
+Trace: "vaultsync.write" (trace_id: abc123)
 ├── Span: "crdt.merge"          →  2.1 µs  — Yrs merge into document
 ├── Span: "e2ee.encrypt"        →  7.3 µs  — ChaCha20-Poly1305 encrypt
 ├── Span: "oplog.append"        →  1.5 µs  — Write to local oplog
@@ -975,42 +974,42 @@ Exportable to Jaeger, Datadog, Grafana Tempo, or any OTLP-compatible backend.
 
 | Metric | Description |
 |---|---|
-| `drift_mutations_total` | Total mutations processed (by status, namespace) |
-| `drift_mutations_pending` | Current upload queue depth |
-| `drift_sync_lag_ms` | Time from local write to coordinator ACK |
-| `drift_download_lag_ms` | Time from coordinator sequence to replica apply |
-| `drift_encryption_time_us` | E2EE encrypt/decrypt duration |
-| `drift_crdt_merge_time_us` | CRDT merge duration per document |
-| `drift_connection_status` | 1=connected, 0=disconnected |
-| `drift_leader_status` | 1=leader, 0=reader |
+| `vaultsync_mutations_total` | Total mutations processed (by status, namespace) |
+| `vaultsync_mutations_pending` | Current upload queue depth |
+| `vaultsync_sync_lag_ms` | Time from local write to coordinator ACK |
+| `vaultsync_download_lag_ms` | Time from coordinator sequence to replica apply |
+| `vaultsync_encryption_time_us` | E2EE encrypt/decrypt duration |
+| `vaultsync_crdt_merge_time_us` | CRDT merge duration per document |
+| `vaultsync_connection_status` | 1=connected, 0=disconnected |
+| `vaultsync_leader_status` | 1=leader, 0=reader |
 
 ### Debug HTTP API
 
 ```bash
-GET  /debug/drift/state           → Full internal state as JSON
-GET  /debug/drift/state/oplog     → Last 1000 oplog entries
-GET  /debug/drift/state/documents → CRDT document snapshot metadata
-GET  /debug/drift/leader          → Current leader status
-GET  /debug/drift/metrics         → Prometheus endpoint
-POST /debug/drift/force-sync      → Trigger immediate sync
-POST /debug/drift/force-election  → Trigger leader re-election
+GET  /debug/vaultsync/state           → Full internal state as JSON
+GET  /debug/vaultsync/state/oplog     → Last 1000 oplog entries
+GET  /debug/vaultsync/state/documents → CRDT document snapshot metadata
+GET  /debug/vaultsync/leader          → Current leader status
+GET  /debug/vaultsync/metrics         → Prometheus endpoint
+POST /debug/vaultsync/force-sync      → Trigger immediate sync
+POST /debug/vaultsync/force-election  → Trigger leader re-election
 ```
 
 ### CLI Tool
 
 ```bash
-# Attach to a running Drift process
-drift inspect --pid 1234
+# Attach to a running VaultSync process
+vaultsync inspect --pid 1234
 
 # Watch live operation stream
-drift inspect --pid 1234 --stream
+vaultsync inspect --pid 1234 --stream
 
 # Dump current CRDT document state
-drift inspect --pid 1234 --state
+vaultsync inspect --pid 1234 --state
 
 # Export and replay a trace file for deterministic debugging
-drift inspect --pid 1234 --export-trace > trace.json
-drift replay trace.json
+vaultsync inspect --pid 1234 --export-trace > trace.json
+vaultsync replay trace.json
 ```
 
 ---
@@ -1031,7 +1030,7 @@ drift replay trace.json
 ### For Regulated Industries
 
 ```typescript
-const drift = new Drift({
+const vaultsync = new VaultSync({
   namespace: "healthcare:patient-records",
   e2ee: {
     keyValidation: "strict",           // Manual approval for new replica keys
@@ -1080,7 +1079,7 @@ User opens app on airplane (no connectivity):
   → Device lost? Oplog encrypted at rest — attacker sees only ciphertext
 
 Plane lands, connectivity returns:
-  → Drift reconnects, uploads 47 mutations in batches
+  → VaultSync reconnects, uploads 47 mutations in batches
   → Downloads 12 mutations from other devices
   → CRDT merges all 12 — no data lost, no conflicts
   → App fully synchronized — coordinator never saw plaintext
@@ -1136,9 +1135,9 @@ Two developers on the same office WiFi:
 
 ---
 
-## ⚔️ Drift vs The World
+## ⚔️ VaultSync vs The World
 
-| Feature | Drift | ElectricSQL | Zero (Rocicorp) | PowerSync | REST + WebSocket |
+| Feature | VaultSync | ElectricSQL | Zero (Rocicorp) | PowerSync | REST + WebSocket |
 |---|---|---|---|---|---|
 | **Offline first** | ✅ Full | ✅ | ✅ | ✅ | ❌ |
 | **Conflict resolution** | ✅ CRDT (no loss) | ⚠️ LWW | ⚠️ LWW | ⚠️ LWW | ❌ Server wins |
@@ -1158,7 +1157,7 @@ Two developers on the same office WiFi:
 ### Mode 1: Local-Only (No Sync)
 
 ```typescript
-const drift = new Drift({
+const vaultsync = new VaultSync({
   storage:   "sqlite",
   namespace: "local",
   sync:      false    // no coordinator — offline-only
@@ -1168,7 +1167,7 @@ const drift = new Drift({
 ### Mode 2: Embedded + Managed Coordinator
 
 ```typescript
-const drift = new Drift({
+const vaultsync = new VaultSync({
   storage:     "opfs",
   namespace:   `user:${userId}`,
   coordinator: new PostgresCoordinator({ connectionString: process.env.DATABASE_URL })
@@ -1178,19 +1177,19 @@ const drift = new Drift({
 ### Mode 3: Self-Hosted Coordinator Binary
 
 ```typescript
-const drift = new Drift({
+const vaultsync = new VaultSync({
   storage:     "sqlite",
   namespace:   "workspace:core",
-  coordinator: new CustomCoordinator({ url: "wss://your-coordinator.example.com/drift" })
+  coordinator: new CustomCoordinator({ url: "wss://your-coordinator.example.com/vaultsync" })
 })
 ```
 
 ### Mode 4: Multi-Instance Server Sync
 
 ```
-App Server A (Drift embedded, namespace: workspace:core)
-App Server B (Drift embedded, namespace: workspace:core)
-App Server C (Drift embedded, namespace: workspace:core)
+App Server A (VaultSync embedded, namespace: workspace:core)
+App Server B (VaultSync embedded, namespace: workspace:core)
+App Server C (VaultSync embedded, namespace: workspace:core)
               │
      Shared Coordinator (Postgres)
 ```
@@ -1198,7 +1197,7 @@ App Server C (Drift embedded, namespace: workspace:core)
 ### Mode 5: Hybrid Client + Server + P2P
 
 ```typescript
-const drift = new Drift({
+const vaultsync = new VaultSync({
   namespace:  "workspace:core",
   coordinator: new PostgresCoordinator({ ... }),
   transports: {
@@ -1225,28 +1224,28 @@ We welcome contributions from the community! See [CONTRIBUTING.md](CONTRIBUTING.
 
 ```bash
 # Get started
-git clone https://github.com/drift-sync/drift.git
-cd drift
+git clone https://github.com/vaultsync-sync/vaultsync.git
+cd vaultsync
 ./scripts/setup-dev.sh
 
 # Run all tests
 ./scripts/run-all-tests.sh
 
 # Run Rust tests only
-cargo test --workspace --exclude drift-fuzz
+cargo test --workspace --exclude vaultsync-fuzz
 
 # Run SDK tests
-npm test -w @drift/web
-npm test -w @drift/node
-npm test -w @drift/react
-npm test -w @drift/next
+npm test -w @vaultsync/web
+npm test -w @vaultsync/node
+npm test -w @vaultsync/react
+npm test -w @vaultsync/next
 ```
 
 ---
 
 ## ✅ Production Checklist
 
-Before deploying Drift to production:
+Before deploying VaultSync to production:
 
 - [ ] **E2EE keys generated** — verify keys are backed up; export public keys for recovery
 - [ ] **Coordinator deployed** — Postgres (recommended), Redis, or self-hosted server
@@ -1259,7 +1258,7 @@ Before deploying Drift to production:
 - [ ] **Multi-tab election tested** — verified 3+ tab crash recovery scenario
 - [ ] **Coordinator backups running** — snapshot + mutation log backup to durable storage
 - [ ] **OpenTelemetry configured** — traces, metrics, logs exported to your observability backend
-- [ ] **Sync lag alerting set up** — alert if `drift_sync_lag_ms` > threshold
+- [ ] **Sync lag alerting set up** — alert if `vaultsync_sync_lag_ms` > threshold
 - [ ] **Offline replica alerts** — alert if a replica hasn't synced within tombstone retention
 - [ ] **Graceful shutdown** — server replicas flush pending uploads before process exit
 - [ ] **Chaos tests passed** — network partition, leader crash, clock skew, key rotation mid-sync
@@ -1269,16 +1268,16 @@ Before deploying Drift to production:
 
 ## 📄 License
 
-Drift is licensed under the **Apache License, Version 2.0**. See [LICENSE](LICENSE) for the full text.
+VaultSync is licensed under the **Apache License, Version 2.0**. See [LICENSE](LICENSE) for the full text.
 
 ---
 
 ## 📖 Further Reading
 
-- [Complete Technical Specification](docs/drift-spec.md) — 158KB deep dive into every design decision
-- [Testing Specification](docs/drift-testing-spec.md) — Conformance tests, chaos scenarios, property tests
-- [Implementation Plan](docs/drift-implementation-plan.md) — Internal build reference
+- [Complete Technical Specification](docs/vaultsync-spec.md) — 158KB deep dive into every design decision
+- [Testing Specification](docs/vaultsync-testing-spec.md) — Conformance tests, chaos scenarios, property tests
+- [Implementation Plan](docs/vaultsync-implementation-plan.md) — Internal build reference
 
 ---
 
-*Drift — Conflict-free, encrypted, infrastructure-agnostic synchronization for the local-first era.*
+*VaultSync — Conflict-free, encrypted, infrastructure-agnostic synchronization for the local-first era.*

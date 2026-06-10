@@ -1,1 +1,1 @@
-export { useDriftMutations } from './useDriftMutations.js';
+export { useVaultSyncMutations } from './useVaultSyncMutations.js';

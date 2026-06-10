@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
-import { DriftProvider, useQuery, useDriftClient, useSyncStatus } from '@drift/react';
-import type { RecordFields } from '@drift/web';
+import { VaultSyncProvider, useQuery, useVaultSyncClient, useSyncStatus } from '@vaultsync/react';
+import type { RecordFields } from '@vaultsync/web';
 
 function TodoApp({ replicaName }: { replicaName: string }) {
-  const client = useDriftClient();
+  const client = useVaultSyncClient();
   const { data: todos, loading } = useQuery('todos');
   const status = useSyncStatus();
   const [text, setText] = useState('');
@@ -82,20 +82,20 @@ export default function App() {
 
   return (
     <div className="container">
-      <h1>Drift Collaborative Sync Demo</h1>
+      <h1>VaultSync Collaborative Sync Demo</h1>
       <p style={{ opacity: 0.8, marginBottom: '2rem' }}>
         This demo spawns two independent sync engine instances on the same page.
-        Ensure the Drift Coordinator Server is running on port 8080 (`cargo run -p drift-coordinator-server -- -p 8080`).
+        Ensure the VaultSync Coordinator Server is running on port 8080 (`cargo run -p vaultsync-coordinator-server -- -p 8080`).
       </p>
 
       <div className="grid">
-        <DriftProvider config={configA}>
+        <VaultSyncProvider config={configA}>
           <TodoApp replicaName="A" />
-        </DriftProvider>
+        </VaultSyncProvider>
 
-        <DriftProvider config={configB}>
+        <VaultSyncProvider config={configB}>
           <TodoApp replicaName="B" />
-        </DriftProvider>
+        </VaultSyncProvider>
       </div>
     </div>
   );

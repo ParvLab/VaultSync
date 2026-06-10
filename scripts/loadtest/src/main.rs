@@ -22,9 +22,9 @@ struct ChaosState {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let coord = Arc::new(drift_coordinator_memory::coordinator::InMemoryCoordinator::new());
+    let coord = Arc::new(vaultsync_coordinator_memory::coordinator::InMemoryCoordinator::new());
     
-    println!("=== Drift Load Test ===");
+    println!("=== VaultSync Load Test ===");
     println!("  replicas:    {}", args.replicas);
     println!("  duration:    {}s", args.duration);
     println!("  ops/sec:     {}", args.ops_per_sec);
@@ -122,7 +122,7 @@ async fn main() {
                     tokio::time::sleep(Duration::from_millis(lat)).await;
                 }
 
-                let mutation = drift_core::coordinator::traits::EncryptedMutation {
+                let mutation = vaultsync_core::coordinator::traits::EncryptedMutation {
                     id: uuid::Uuid::new_v4().to_string(),
                     namespace: "loadtest".to_string(),
                     replica_id: replica_id.clone(),
@@ -134,7 +134,7 @@ async fn main() {
                     key_version: 0,
                 };
 
-                use drift_core::coordinator::traits::Coordinator;
+                use vaultsync_core::coordinator::traits::Coordinator;
                 match coord.push("loadtest", vec![mutation]).await {
                     Ok(_) => {
                         latencies.push(t0.elapsed().as_micros() as u64);
@@ -173,7 +173,7 @@ async fn main() {
     println!("\n[settle] Verifying convergence...");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    use drift_core::coordinator::traits::Coordinator;
+    use vaultsync_core::coordinator::traits::Coordinator;
     let stored = coord.pull("loadtest", 0, 1_000_000).await
         .map(|m| m.len() as u64).unwrap_or(0);
 

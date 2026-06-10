@@ -19,7 +19,7 @@ jobs:
         run: >
           cargo tarpaulin
           --workspace
-          --exclude drift-fuzz drift-coordinator-cf drift-transport-libp2p drift-transport-webrtc
+          --exclude vaultsync-fuzz vaultsync-coordinator-cf vaultsync-transport-libp2p vaultsync-transport-webrtc
           --features telemetry
           --out Xml Html
           --output-dir coverage/
@@ -38,7 +38,7 @@ jobs:
         run: |
           python3 scripts/check_coverage.py \
             --xml coverage/cobertura.xml \
-            --require "drift_core=94"
+            --require "vaultsync_core=94"
 
       - name: Upload HTML report artifact
         uses: actions/upload-artifact@v4

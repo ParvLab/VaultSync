@@ -1,5 +1,5 @@
 {
-  "name": "@drift/next",
+  "name": "@vaultsync/next",
   "version": "0.1.0",
   "type": "module",
   "publishConfig": {
@@ -27,9 +27,9 @@
   "peerDependencies": {
     "react": ">=18",
     "next": ">=13",
-    "@drift/web": "*",
-    "@drift/react": "*",
-    "@drift/node": "*"
+    "@vaultsync/web": "*",
+    "@vaultsync/react": "*",
+    "@vaultsync/node": "*"
   },
   "devDependencies": {
     "@types/jest": "^29.5.0",
@@ -39,9 +39,9 @@
     "next": "^14.0.0",
     "react": "^18.0.0",
     "ts-jest": "^29.1.0",
-    "@drift/web": "*",
-    "@drift/react": "*",
-    "@drift/node": "*",
+    "@vaultsync/web": "*",
+    "@vaultsync/react": "*",
+    "@vaultsync/node": "*",
     "typescript": "^5.4.0"
   }
 }

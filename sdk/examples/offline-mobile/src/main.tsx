@@ -1,12 +1,12 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import { DriftProvider } from '@drift/react';
-import { Drift } from '@drift/web';
+import { VaultSyncProvider } from '@vaultsync/react';
+import { VaultSync } from '@vaultsync/web';
 import { App } from './App.tsx';
 
 async function bootstrap() {
   const replicaId = Math.random().toString(36).substring(2, 9);
-  const drift = await Drift.create({
+  const vaultsync = await VaultSync.create({
     namespace: 'offline-mobile',
     replicaId,
     // Start with a mock coordinator endpoint so we can simulate online/offline
@@ -15,9 +15,9 @@ async function bootstrap() {
 
   ReactDOM.createRoot(document.getElementById('root')!).render(
     <React.StrictMode>
-      <DriftProvider client={(drift as any).client}>
-        <App replicaId={replicaId} drift={drift} />
-      </DriftProvider>
+      <VaultSyncProvider client={(vaultsync as any).client}>
+        <App replicaId={replicaId} vaultsync={vaultsync} />
+      </VaultSyncProvider>
     </React.StrictMode>
   );
 }

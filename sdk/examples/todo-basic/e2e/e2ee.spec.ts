@@ -10,9 +10,9 @@ test.describe("E2EE verification", () => {
     })
 
     await page.goto("/")
-    await page.waitForFunction(() => typeof window.__DRIFT__ !== 'undefined')
+    await page.waitForFunction(() => typeof window.__VAULTSYNC__ !== 'undefined')
     await page.evaluate(() =>
-      window.__DRIFT__.insert("secret-id", "top secret content"))
+      window.__VAULTSYNC__.insert("secret-id", "top secret content"))
     await page.waitForTimeout(2000)
 
     for (const body of bodies) {

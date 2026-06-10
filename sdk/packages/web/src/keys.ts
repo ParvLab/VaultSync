@@ -1,4 +1,4 @@
-import type { WasmDriftClient } from '../wasm/drift_wasm.js';
+import type { WasmVaultSyncClient } from '../wasm/vaultsync_wasm.js';
 
 export interface KeyInfo {
   version: number;

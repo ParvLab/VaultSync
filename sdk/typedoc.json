@@ -5,7 +5,7 @@
     "packages/node/src/index.ts"
   ],
   "out": "../docs/api",
-  "name": "Drift TypeScript SDK API Documentation",
+  "name": "VaultSync TypeScript SDK API Documentation",
   "excludePrivate": true,
   "excludeProtected": true,
   "hideGenerator": true,

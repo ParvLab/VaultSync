@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo install cargo-fuzz
       - run: cargo fuzz run crdt_merge -- -max_total_time=14400
-        working-directory: crates/drift-fuzz
+        working-directory: crates/vaultsync-fuzz
 
   fuzz-decrypt:
     runs-on: ubuntu-latest
@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo install cargo-fuzz
       - run: cargo fuzz run fuzz_decrypt -- -max_total_time=14400
-        working-directory: crates/drift-fuzz
+        working-directory: crates/vaultsync-fuzz
 
   fuzz-ws-frame:
     runs-on: ubuntu-latest
@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo install cargo-fuzz
       - run: cargo fuzz run fuzz_ws_frame -- -max_total_time=14400
-        working-directory: crates/drift-fuzz
+        working-directory: crates/vaultsync-fuzz
 
   fuzz-coordinator-push:
     runs-on: ubuntu-latest
@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo install cargo-fuzz
       - run: cargo fuzz run fuzz_coordinator_push -- -max_total_time=14400
-        working-directory: crates/drift-fuzz
+        working-directory: crates/vaultsync-fuzz
 
   fuzz-oplog:
     runs-on: ubuntu-latest
@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo install cargo-fuzz
       - run: cargo fuzz run fuzz_oplog_deserialize -- -max_total_time=14400
-        working-directory: crates/drift-fuzz
+        working-directory: crates/vaultsync-fuzz
 
   fuzz-sync-state:
     runs-on: ubuntu-latest
@@ -52,24 +52,24 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo install cargo-fuzz
       - run: cargo fuzz run fuzz_sync_state -- -max_total_time=14400
-        working-directory: crates/drift-fuzz
+        working-directory: crates/vaultsync-fuzz
 
   chaos-extended:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - run: cargo test -p drift-core --test chaos -- --test-threads=1
+      - run: cargo test -p vaultsync-core --test chaos -- --test-threads=1
 
   benchmarks-extended:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo bench -p drift-core -- --sample-size 1000
+      - run: cargo bench -p vaultsync-core -- --sample-size 1000
 
   proptest-extended:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Run proptest with 100K cases per property
-        run: PROPTEST_CASES=100000 cargo test -p drift-core --test crdt_properties
+        run: PROPTEST_CASES=100000 cargo test -p vaultsync-core --test crdt_properties

@@ -1,13 +1,13 @@
 import { useEffect, useState } from 'react';
-import { useDriftClient } from './context.js';
-import type { RecordFields } from '@drift/web';
+import { useVaultSyncClient } from './context.js';
+import type { RecordFields } from '@vaultsync/web';
 
 export interface UseQueryOptions {
   filter?: (fields: RecordFields) => boolean;
 }
 
 export function useQuery(docId: string, options?: UseQueryOptions) {
-  const client = useDriftClient();
+  const client = useVaultSyncClient();
   const [data, setData] = useState<RecordFields[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);

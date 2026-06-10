@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# publish.sh — Build and publish Drift crates and npm packages
+# publish.sh — Build and publish VaultSync crates and npm packages
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,7 +14,7 @@ done
 
 echo "================================================="
 # Keep lines short in logs/outputs to avoid wrapping
-echo "  Drift Release & Publication Utility"
+echo "  VaultSync Release & Publication Utility"
 echo "  Dry Run: $DRY_RUN"
 echo "================================================="
 
@@ -36,10 +36,10 @@ cd "$ROOT_DIR"
 echo ""
 echo ">>> Publishing NPM packages..."
 PACKAGES=(
-  "@drift/web"
-  "@drift/node"
-  "@drift/react"
-  "@drift/next"
+  "@vaultsync/web"
+  "@vaultsync/node"
+  "@vaultsync/react"
+  "@vaultsync/next"
 )
 
 for pkg in "${PACKAGES[@]}"; do
@@ -52,21 +52,21 @@ for pkg in "${PACKAGES[@]}"; do
 done
 
 # 4. Publish Rust crates (topological order)
-# drift-core is root dependency
-# drift-wasm/drift-coordinator-* depend on drift-core
-# drift-cli depends on drift-core/coordinators
+# vaultsync-core is root dependency
+# vaultsync-wasm/vaultsync-coordinator-* depend on vaultsync-core
+# vaultsync-cli depends on vaultsync-core/coordinators
 echo ""
 echo ">>> Publishing Rust Crates..."
 CRATES=(
-  "crates/drift-core"
-  "crates/drift-coordinator-memory"
-  "crates/drift-coordinator-sqlite"
-  "crates/drift-coordinator-postgres"
-  "crates/drift-coordinator-redis"
-  "crates/drift-coordinator-http"
-  "crates/drift-coordinator-cf"
-  "crates/drift-coordinator-server"
-  "crates/drift-cli"
+  "crates/vaultsync-core"
+  "crates/vaultsync-coordinator-memory"
+  "crates/vaultsync-coordinator-sqlite"
+  "crates/vaultsync-coordinator-postgres"
+  "crates/vaultsync-coordinator-redis"
+  "crates/vaultsync-coordinator-http"
+  "crates/vaultsync-coordinator-cf"
+  "crates/vaultsync-coordinator-server"
+  "crates/vaultsync-cli"
 )
 
 for crate in "${CRATES[@]}"; do

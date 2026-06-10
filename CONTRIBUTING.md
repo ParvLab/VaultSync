@@ -1,6 +1,6 @@
-# Contributing to Drift
+# Contributing to VaultSync
 
-Thank you for your interest in contributing to Drift! We welcome issues, feature requests, and pull requests from everyone.
+Thank you for your interest in contributing to VaultSync! We welcome issues, feature requests, and pull requests from everyone.
 
 ---
 
@@ -20,8 +20,8 @@ Before setting up your workspace, ensure you have the following installed:
 1.  **Fork** the repository on GitHub.
 2.  **Clone** your fork locally:
     ```bash
-    git clone https://github.com/YOUR-USERNAME/drift.git
-    cd drift
+    git clone https://github.com/YOUR-USERNAME/vaultsync.git
+    cd vaultsync
     ```
 3.  Run the developer environment setup script:
     ```bash
@@ -33,11 +33,11 @@ Before setting up your workspace, ensure you have the following installed:
 
 ## 📂 Project Structure
 
-*   [`crates/drift-core/`](crates/drift-core) — Core Rust sync engine
-*   [`crates/drift-wasm/`](crates/drift-wasm) — WASM browser bindings
-*   [`crates/drift-napi/`](crates/drift-napi) — Node-API native bindings
-*   [`crates/drift-coordinator-*/`](crates/drift-coordinator-memory) — Coordinator protocol implementations
-*   [`crates/drift-cli/`](crates/drift-cli) — Command-line tools
+*   [`crates/vaultsync-core/`](crates/vaultsync-core) — Core Rust sync engine
+*   [`crates/vaultsync-wasm/`](crates/vaultsync-wasm) — WASM browser bindings
+*   [`crates/vaultsync-napi/`](crates/vaultsync-napi) — Node-API native bindings
+*   [`crates/vaultsync-coordinator-*/`](crates/vaultsync-coordinator-memory) — Coordinator protocol implementations
+*   [`crates/vaultsync-cli/`](crates/vaultsync-cli) — Command-line tools
 *   [`sdk/packages/`](sdk/packages) — TypeScript/React SDK packages (`web`, `node`, `react`, `next`)
 *   [`sdk/examples/`](sdk/examples) — Ready-to-run demo apps
 *   [`docs/`](docs) — Specifications
@@ -108,7 +108,7 @@ If you introduce a new feature, you are expected to include corresponding unit o
     ```bash
     git push origin feat/your-awesome-feature
     ```
-4.  Open a Pull Request against the `main` branch of the official Drift repository.
+4.  Open a Pull Request against the `main` branch of the official VaultSync repository.
 5.  Wait for the automated CI suite to run and pass.
 6.  A maintainer will review your pull request shortly!
 
@@ -116,4 +116,4 @@ If you introduce a new feature, you are expected to include corresponding unit o
 
 ## 📄 License
 
-By contributing to Drift, you agree that your contributions will be licensed under the Apache License, Version 2.0.
+By contributing to VaultSync, you agree that your contributions will be licensed under the Apache License, Version 2.0.
