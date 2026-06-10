@@ -2,8 +2,8 @@
 target/
 Cargo.lock
 node_modules/
-package.json
-package-lock.json
+dist/
+*.node
 
 # WASM
 *.wasm

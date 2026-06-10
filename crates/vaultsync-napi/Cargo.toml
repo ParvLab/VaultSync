@@ -1,0 +1,19 @@
+[package]
+name = "vaultsync-napi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2.12.2", default-features = false, features = ["async", "napi4", "serde-json"] }
+napi-derive = "2.12.2"
+vaultsync-core = { path = "../vaultsync-core", default-features = false, features = ["async-runtime", "storage-sqlite", "coordinator-http"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = "1"
+
+[build-dependencies]
+napi-build = "2.0.1"

@@ -1,0 +1,16 @@
+[package]
+name = "vaultsync-loadtest"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "vaultsync-loadtest"
+path = "src/main.rs"
+
+[dependencies]
+vaultsync-core = { path = "../../crates/vaultsync-core" }
+vaultsync-coordinator-memory = { path = "../../crates/vaultsync-coordinator-memory" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"

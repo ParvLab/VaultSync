@@ -1,0 +1,47 @@
+{
+  "name": "@vaultsync/next",
+  "version": "0.1.0",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./server": {
+      "import": "./dist/server.js",
+      "types": "./dist/server.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --experimental-vm-modules ../../node_modules/jest/bin/jest.js"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "next": ">=13",
+    "@vaultsync/web": "*",
+    "@vaultsync/react": "*",
+    "@vaultsync/node": "*"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/react": "^18",
+    "@types/node": "^20.0.0",
+    "jest": "^29.5.0",
+    "next": "^14.0.0",
+    "react": "^18.0.0",
+    "ts-jest": "^29.1.0",
+    "@vaultsync/web": "*",
+    "@vaultsync/react": "*",
+    "@vaultsync/node": "*",
+    "typescript": "^5.4.0"
+  }
+}

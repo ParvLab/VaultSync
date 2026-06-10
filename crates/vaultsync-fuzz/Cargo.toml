@@ -1,0 +1,64 @@
+[package]
+name = "vaultsync-fuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vaultsync-core = { path = "../vaultsync-core" }
+libfuzzer-sys = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+tokio = { version = "1", features = ["full"] }
+
+[[bin]]
+name = "crdt_merge"
+path = "fuzz_targets/crdt_merge.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_decrypt"
+path = "fuzz_targets/fuzz_decrypt.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_oplog_deserialize"
+path = "fuzz_targets/fuzz_oplog_deserialize.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sync_state"
+path = "fuzz_targets/fuzz_sync_state.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ws_frame"
+path = "fuzz_targets/fuzz_ws_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_coordinator_push"
+path = "fuzz_targets/fuzz_coordinator_push.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ipc_message"
+path = "fuzz_targets/ipc_message.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "snapshot"
+path = "fuzz_targets/snapshot.rs"
+test = false
+doc = false
+
+[profile.release]
+debug = 1
