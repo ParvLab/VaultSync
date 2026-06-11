@@ -172,6 +172,7 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
     let schema_version = Arc::new(Mutex::new(0u64));
     let replicas = Arc::new(Mutex::new(HashMap::<String, String>::new()));
     let heartbeats = Arc::new(Mutex::new(HashMap::<String, String>::new()));
+    let pushed_set = Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
 
     let handle = tokio::spawn(async move {
         let mut last_ms = 0u64;
@@ -182,6 +183,7 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
             let schema_version = schema_version.clone();
             let replicas = replicas.clone();
             let heartbeats = heartbeats.clone();
+            let pushed_set = pushed_set.clone();
 
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
@@ -493,6 +495,17 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                         *v = val.parse().unwrap_or(0);
                                     }
                                     b"+OK\r\n".to_vec()
+                                }
+                                "SADD" => {
+                                    let key = std::str::from_utf8(&args[1]).unwrap_or("");
+                                    let val = std::str::from_utf8(&args[2]).unwrap_or("");
+                                    let mut db = pushed_set.lock().unwrap();
+                                    let is_new = db.insert(format!("{}:{}", key, val));
+                                    if is_new {
+                                        b":1\r\n".to_vec()
+                                    } else {
+                                        b":0\r\n".to_vec()
+                                    }
                                 }
                                 _ => b"-ERR unknown command\r\n".to_vec(),
                             };

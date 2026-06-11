@@ -419,7 +419,7 @@ impl Coordinator for RedisCoordinator {
         namespace: &str,
         doc_id: &str,
         record_id: &str,
-    ) -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+    ) -> Result<Option<vaultsync_core::crdt::snapshot::Snapshot>, CoordinatorError> {
         let mut conn = self.conn.clone();
         let key = format!("vaultsync:{}:snapshot:{}:{}", namespace, doc_id, record_id);
         
@@ -430,7 +430,7 @@ impl Coordinator for RedisCoordinator {
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         if let Some(bytes) = res {
-            let snap = crate::crdt::snapshot::Snapshot::decode(&bytes)
+            let snap = vaultsync_core::crdt::snapshot::Snapshot::decode(&bytes)
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
             Ok(Some(snap))
         } else {
@@ -441,7 +441,7 @@ impl Coordinator for RedisCoordinator {
     async fn store_snapshot(
         &self,
         namespace: &str,
-        snapshot: &crate::crdt::snapshot::Snapshot,
+        snapshot: &vaultsync_core::crdt::snapshot::Snapshot,
     ) -> Result<(), CoordinatorError> {
         let mut conn = self.conn.clone();
         let key = format!("vaultsync:{}:snapshot:{}:{}", namespace, snapshot.doc_id, snapshot.record_id);
@@ -470,7 +470,7 @@ impl Coordinator for RedisCoordinator {
     async fn list_snapshots(
         &self,
         namespace: &str,
-    ) -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+    ) -> Result<Vec<vaultsync_core::crdt::snapshot::Snapshot>, CoordinatorError> {
         let mut conn = self.conn.clone();
         let set_key = format!("vaultsync:{}:snapshot_keys", namespace);
 
@@ -497,7 +497,7 @@ impl Coordinator for RedisCoordinator {
         let mut snaps = Vec::new();
         for bytes_opt in res {
             if let Some(bytes) = bytes_opt {
-                if let Ok(snap) = crate::crdt::snapshot::Snapshot::decode(&bytes) {
+                if let Ok(snap) = vaultsync_core::crdt::snapshot::Snapshot::decode(&bytes) {
                     snaps.push(snap);
                 }
             }
@@ -508,7 +508,7 @@ impl Coordinator for RedisCoordinator {
     async fn compact_oplog(
         &self,
         namespace: &str,
-    ) -> Result<crate::sync::compaction::CompactionStats, CoordinatorError> {
+    ) -> Result<vaultsync_core::sync::compaction::CompactionStats, CoordinatorError> {
         let mut conn = self.conn.clone();
         let stream_key = format!("vaultsync:{}:mutations", namespace);
         let snaps = self.list_snapshots(namespace).await?;
@@ -533,7 +533,7 @@ impl Coordinator for RedisCoordinator {
                         if bulk.len() == 2 {
                             if let redis::Value::Data(id_bytes) = &bulk[0] {
                                 if let Ok(stream_id) = std::str::from_utf8(id_bytes) {
-                                    let deleted: u64 = redis::cmd("XDEL")
+                                    let deleted: usize = redis::cmd("XDEL")
                                         .arg(&stream_key)
                                         .arg(stream_id)
                                         .query_async(&mut conn)
@@ -549,7 +549,7 @@ impl Coordinator for RedisCoordinator {
             }
         }
 
-        Ok(crate::sync::compaction::CompactionStats {
+        Ok(vaultsync_core::sync::compaction::CompactionStats {
             oplog_removed,
             docs_removed: 0,
             snapshots_collapsed,
