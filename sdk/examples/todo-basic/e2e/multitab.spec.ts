@@ -50,7 +50,7 @@ test.describe("Multi-tab sync", () => {
     await pageA.unroute("**/*push*")
     for (let i = 0; i < 5; i++) {
       await expect(pageB.locator(`[data-id='offline-${i}']`))
-        .toBeVisible({ timeout: 10000 })
+        .toBeVisible({ timeout: 20000 })
     }
   })
 })

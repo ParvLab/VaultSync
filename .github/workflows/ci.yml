@@ -103,15 +103,18 @@ jobs:
     needs: [lint, build-rust]
     steps:
       - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly
+          rustup default nightly
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
       - name: Run short fuzz campaigns
-        working-directory: crates/vaultsync-fuzz
         run: |
-          cargo fuzz run crdt_merge -- -max_total_time=15
-          cargo fuzz run fuzz_decrypt -- -max_total_time=15
-          cargo fuzz run fuzz_oplog_deserialize -- -max_total_time=15
-          cargo fuzz run fuzz_ws_frame -- -max_total_time=15
+          cargo fuzz run crdt_merge --fuzz-dir crates/vaultsync-fuzz -- -max_total_time=15
+          cargo fuzz run fuzz_decrypt --fuzz-dir crates/vaultsync-fuzz -- -max_total_time=15
+          cargo fuzz run fuzz_oplog_deserialize --fuzz-dir crates/vaultsync-fuzz -- -max_total_time=15
+          cargo fuzz run fuzz_ws_frame --fuzz-dir crates/vaultsync-fuzz -- -max_total_time=15
 
   wasm-pack-verify:
     runs-on: ubuntu-latest
@@ -143,8 +146,10 @@ jobs:
           fetch-depth: 0
       - name: Set up Rust cache
         uses: swatinem/rust-cache@v2
+      - name: Build benchmarks
+        run: cargo bench -p vaultsync-core --no-run
       - name: Run Criterion benchmarks
-        run: cargo bench -p vaultsync-core 2>&1 | tee bench_output.txt
+        run: cargo bench -p vaultsync-core > bench_output.txt
       - name: Benchmark regression gate (>10% fails build)
         uses: benchmark-action/github-action-benchmark@v1
         with:
@@ -168,10 +173,10 @@ jobs:
         run: ./target/release/vaultsync-coordinator-server --backend memory --port 9876 &
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - name: Build WASM
-        run: wasm-pack build crates/vaultsync-wasm --target web
       - name: Install deps
         run: npm ci --prefix sdk
+      - name: Build SDK and WASM
+        run: npm run build --prefix sdk
       - name: Install Playwright
         run: npx --prefix sdk playwright install --with-deps chromium
       - name: Run E2E
