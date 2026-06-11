@@ -537,7 +537,7 @@ impl Coordinator for PostgresCoordinator {
                 &[&namespace_str, &doc_id, &record_id, &sequence],
             ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
             if deleted > 0 {
-                oplog_removed += deleted;
+                oplog_removed += deleted as usize;
                 snapshots_collapsed += 1;
             }
         }
