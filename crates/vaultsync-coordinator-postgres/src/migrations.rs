@@ -28,6 +28,17 @@ pub async fn initialize(client: &Client) -> Result<(), CoordinatorError> {
         CREATE TABLE IF NOT EXISTS schema_versions (
             namespace VARCHAR(255) PRIMARY KEY,
             version BIGINT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS snapshots (
+            namespace VARCHAR(255) NOT NULL,
+            doc_id VARCHAR(255) NOT NULL,
+            record_id VARCHAR(255) NOT NULL,
+            sequence BIGINT NOT NULL,
+            created_at BIGINT NOT NULL,
+            bytes BYTEA NOT NULL,
+            checksum BIGINT NOT NULL,
+            PRIMARY KEY (namespace, doc_id, record_id)
         );",
         )
         .await

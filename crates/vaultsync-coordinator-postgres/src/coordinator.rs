@@ -395,6 +395,163 @@ impl Coordinator for PostgresCoordinator {
             Ok(None)
         }
     }
+
+    async fn list_replicas(&self, namespace: &str) -> Result<Vec<ReplicaInfo>, CoordinatorError> {
+        let client_guard = self.client.lock().await;
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&namespace];
+        let rows = client_guard.query(
+            "SELECT replica_id, namespace, public_key, schema_version
+             FROM replicas
+             WHERE namespace = $1",
+            params,
+        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        let mut replicas = Vec::new();
+        for row in rows {
+            let schema_version: i64 = row.get(3);
+            replicas.push(ReplicaInfo {
+                replica_id: row.get(0),
+                namespace: row.get(1),
+                public_key: row.get(2),
+                schema_version: schema_version as u64,
+            });
+        }
+        Ok(replicas)
+    }
+
+    async fn get_snapshot(
+        &self,
+        namespace: &str,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<Option<vaultsync_core::crdt::snapshot::Snapshot>, CoordinatorError> {
+        let client_guard = self.client.lock().await;
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&namespace, &doc_id, &record_id];
+        let row_opt = client_guard.query_opt(
+            "SELECT bytes FROM snapshots WHERE namespace = $1 AND doc_id = $2 AND record_id = $3",
+            params,
+        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        if let Some(row) = row_opt {
+            let bytes: Vec<u8> = row.get(0);
+            let snap = vaultsync_core::crdt::snapshot::Snapshot::decode(&bytes)
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            Ok(Some(snap))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn store_snapshot(
+        &self,
+        namespace: &str,
+        snapshot: &vaultsync_core::crdt::snapshot::Snapshot,
+    ) -> Result<(), CoordinatorError> {
+        let client_guard = self.client.lock().await;
+        let bytes = snapshot.encode().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        let seq_i64 = snapshot.sequence as i64;
+        let created_at_i64 = snapshot.created_at as i64;
+        let checksum_i64 = snapshot.checksum as i64;
+
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &namespace,
+            &snapshot.doc_id,
+            &snapshot.record_id,
+            &seq_i64,
+            &created_at_i64,
+            &bytes,
+            &checksum_i64,
+        ];
+
+        client_guard.execute(
+            "INSERT INTO snapshots (namespace, doc_id, record_id, sequence, created_at, bytes, checksum)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (namespace, doc_id, record_id) DO UPDATE
+             SET sequence = EXCLUDED.sequence,
+                 created_at = EXCLUDED.created_at,
+                 bytes = EXCLUDED.bytes,
+                 checksum = EXCLUDED.checksum",
+            params,
+        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn list_snapshots(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<vaultsync_core::crdt::snapshot::Snapshot>, CoordinatorError> {
+        let client_guard = self.client.lock().await;
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&namespace];
+        let rows = client_guard.query(
+            "SELECT bytes FROM snapshots WHERE namespace = $1",
+            params,
+        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        let mut snaps = Vec::new();
+        for row in rows {
+            let bytes: Vec<u8> = row.get(0);
+            let snap = vaultsync_core::crdt::snapshot::Snapshot::decode(&bytes)
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            snaps.push(snap);
+        }
+        Ok(snaps)
+    }
+
+    async fn compact_oplog(
+        &self,
+        namespace: &str,
+    ) -> Result<vaultsync_core::sync::compaction::CompactionStats, CoordinatorError> {
+        let mut client_guard = self.client.lock().await;
+        let namespace_str = namespace.to_string();
+
+        let tx = client_guard
+            .transaction()
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        // 1. Get all snapshots for the namespace
+        let rows = tx.query(
+            "SELECT doc_id, record_id, sequence FROM snapshots WHERE namespace = $1",
+            &[&namespace_str],
+        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        let mut snaps = Vec::new();
+        for row in rows {
+            let seq: i64 = row.get(2);
+            snaps.push((
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                seq,
+            ));
+        }
+
+        let mut oplog_removed = 0;
+        let mut snapshots_collapsed = 0;
+
+        // 2. Delete mutations with sequence <= snap.sequence
+        for (doc_id, record_id, sequence) in snaps {
+            let deleted = tx.execute(
+                "DELETE FROM mutations
+                 WHERE namespace = $1 AND doc_id = $2 AND record_id = $3 AND sequence <= $4",
+                &[&namespace_str, &doc_id, &record_id, &sequence],
+            ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            if deleted > 0 {
+                oplog_removed += deleted;
+                snapshots_collapsed += 1;
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        Ok(vaultsync_core::sync::compaction::CompactionStats {
+            oplog_removed,
+            docs_removed: 0,
+            snapshots_collapsed,
+        })
+    }
 }
 
 struct PostgresSubscription {

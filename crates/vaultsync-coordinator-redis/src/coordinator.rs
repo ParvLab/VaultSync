@@ -124,9 +124,24 @@ impl Coordinator for RedisCoordinator {
     ) -> Result<Vec<SequenceId>, CoordinatorError> {
         let mut conn = self.conn.clone();
         let stream_key = format!("vaultsync:{}:mutations", namespace);
+        let pushed_key = format!("vaultsync:{}:pushed", namespace);
         let mut seqs = Vec::with_capacity(mutations.len());
 
         for mutation in mutations {
+            // Deduplicate mutation ID using SADD
+            let is_new: u8 = redis::cmd("SADD")
+                .arg(&pushed_key)
+                .arg(&mutation.id)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+            if is_new == 0 {
+                // Duplicate! We return a dummy sequence id (0)
+                seqs.push(0);
+                continue;
+            }
+
             let res: String = redis::cmd("XADD")
                 .arg(&stream_key)
                 .arg("*")
@@ -397,6 +412,148 @@ impl Coordinator for RedisCoordinator {
         } else {
             Ok(None)
         }
+    }
+
+    async fn get_snapshot(
+        &self,
+        namespace: &str,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let key = format!("vaultsync:{}:snapshot:{}:{}", namespace, doc_id, record_id);
+        
+        let res: Option<Vec<u8>> = redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        if let Some(bytes) = res {
+            let snap = crate::crdt::snapshot::Snapshot::decode(&bytes)
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            Ok(Some(snap))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn store_snapshot(
+        &self,
+        namespace: &str,
+        snapshot: &crate::crdt::snapshot::Snapshot,
+    ) -> Result<(), CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let key = format!("vaultsync:{}:snapshot:{}:{}", namespace, snapshot.doc_id, snapshot.record_id);
+        let set_key = format!("vaultsync:{}:snapshot_keys", namespace);
+        let bytes = snapshot.encode().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        // Store bytes in GET/SET key
+        redis::cmd("SET")
+            .arg(&key)
+            .arg(&bytes)
+            .query_async::<_, ()>(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        // Add key to set of snapshot keys
+        redis::cmd("SADD")
+            .arg(&set_key)
+            .arg(&key)
+            .query_async::<_, ()>(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn list_snapshots(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let set_key = format!("vaultsync:{}:snapshot_keys", namespace);
+
+        let keys: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(&set_key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut cmd = redis::cmd("MGET");
+        for key in &keys {
+            cmd.arg(key);
+        }
+
+        let res: Vec<Option<Vec<u8>>> = cmd
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        let mut snaps = Vec::new();
+        for bytes_opt in res {
+            if let Some(bytes) = bytes_opt {
+                if let Ok(snap) = crate::crdt::snapshot::Snapshot::decode(&bytes) {
+                    snaps.push(snap);
+                }
+            }
+        }
+        Ok(snaps)
+    }
+
+    async fn compact_oplog(
+        &self,
+        namespace: &str,
+    ) -> Result<crate::sync::compaction::CompactionStats, CoordinatorError> {
+        let mut conn = self.conn.clone();
+        let stream_key = format!("vaultsync:{}:mutations", namespace);
+        let snaps = self.list_snapshots(namespace).await?;
+        let mut oplog_removed = 0;
+        let mut snapshots_collapsed = 0;
+
+        for snap in snaps {
+            let start_id = "0-0".to_string();
+            let end_id = seq_to_stream_id(snap.sequence);
+            
+            let res: redis::Value = redis::cmd("XRANGE")
+                .arg(&stream_key)
+                .arg(&start_id)
+                .arg(&end_id)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+            if let redis::Value::Bulk(entries) = res {
+                for entry in entries {
+                    if let redis::Value::Bulk(bulk) = entry {
+                        if bulk.len() == 2 {
+                            if let redis::Value::Data(id_bytes) = &bulk[0] {
+                                if let Ok(stream_id) = std::str::from_utf8(id_bytes) {
+                                    let deleted: u64 = redis::cmd("XDEL")
+                                        .arg(&stream_key)
+                                        .arg(stream_id)
+                                        .query_async(&mut conn)
+                                        .await
+                                        .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                                    oplog_removed += deleted;
+                                }
+                            }
+                        }
+                    }
+                }
+                snapshots_collapsed += 1;
+            }
+        }
+
+        Ok(crate::sync::compaction::CompactionStats {
+            oplog_removed,
+            docs_removed: 0,
+            snapshots_collapsed,
+        })
     }
 }
 

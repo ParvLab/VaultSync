@@ -17,14 +17,14 @@ export default defineConfig({
     {
       command: "cargo run -p vaultsync-coordinator-server --jobs 1 -- --backend memory --port 9876",
       port: 9876,
-      reuseExistingServer: !process.env.CI,
+      reuseExistingServer: true,
       timeout: 180_000,
       cwd: "../../..",
     },
     {
       command: "npx vite --port 3000",
       port: 3000,
-      reuseExistingServer: !process.env.CI,
+      reuseExistingServer: true,
       timeout: 180_000,
       cwd: ".",
     },
