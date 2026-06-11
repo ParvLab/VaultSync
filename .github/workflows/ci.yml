@@ -101,12 +101,12 @@ jobs:
   fuzz-short:
     runs-on: ubuntu-latest
     needs: [lint, build-rust]
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - name: Install nightly toolchain
-        run: |
-          rustup toolchain install nightly
-          rustup default nightly
+        run: rustup toolchain install nightly
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
       - name: Run short fuzz campaigns
@@ -147,9 +147,9 @@ jobs:
       - name: Set up Rust cache
         uses: swatinem/rust-cache@v2
       - name: Build benchmarks
-        run: cargo bench -p vaultsync-core --no-run
+        run: cargo bench -p vaultsync-core --bench coordinator_bench --bench crdt_bench --bench sync_bench --no-run
       - name: Run Criterion benchmarks
-        run: cargo bench -p vaultsync-core > bench_output.txt
+        run: cargo bench -p vaultsync-core --bench coordinator_bench --bench crdt_bench --bench sync_bench -- --output-format bencher > bench_output.txt
       - name: Benchmark regression gate (>10% fails build)
         uses: benchmark-action/github-action-benchmark@v1
         with:
