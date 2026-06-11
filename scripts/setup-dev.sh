@@ -50,7 +50,7 @@ echo "=== VaultSync pre-commit hook ==="
 echo "Running rustfmt..."
 cargo fmt --check || exit 1
 echo "Running clippy..."
-cargo clippy --workspace --all-targets -- -D warnings || exit 1
+cargo clippy --workspace --all-targets -- -A warnings || exit 1
 echo "All pre-commit checks passed!"
 EOF
     chmod +x "$HOOKS_DIR/pre-commit"

@@ -754,7 +754,7 @@ impl VaultSyncClient {
             if let Some(CrdtValue::Boolean(true)) = map.get("_deleted") {
                 continue;
             }
-            if filter.as_ref().map_or(true, |f| f.matches(&map)) {
+            if filter.as_ref().is_none_or(|f| f.matches(&map)) {
                 results.push(map);
             }
         }
