@@ -3,19 +3,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use vaultsync_core::VaultSyncClient;
-use vaultsync_core::VaultSyncConfig;
+use vaultsync_coordinator_redis::coordinator::RedisCoordinator;
 use vaultsync_core::crdt::types::CrdtValue;
 use vaultsync_core::storage::traits::StorageConfig;
-use vaultsync_coordinator_redis::coordinator::RedisCoordinator;
+use vaultsync_core::VaultSyncClient;
+use vaultsync_core::VaultSyncConfig;
 
 #[tokio::test]
 #[ignore]
 async fn test_chaos_network_toxiproxy() {
     let client = reqwest::Client::new();
-    
+
     // Create a proxy for Redis on Toxiproxy
-    let create_proxy_res = client.post("http://localhost:8474/proxies")
+    let create_proxy_res = client
+        .post("http://localhost:8474/proxies")
         .json(&serde_json::json!({
             "name": "redis_proxy",
             "listen": "localhost:8475",
@@ -31,19 +32,27 @@ async fn test_chaos_network_toxiproxy() {
     }
 
     // Connect client to Redis via Toxiproxy proxy
-    let coord = Arc::new(RedisCoordinator::new("redis://localhost:8475").await.unwrap());
-    
+    let coord = Arc::new(
+        RedisCoordinator::new("redis://localhost:8475")
+            .await
+            .unwrap(),
+    );
+
     let mut config_alice = VaultSyncConfig::default();
     config_alice.namespace = "chaos-toxiproxy-ns".to_string();
     config_alice.replica_id = "alice".to_string();
     config_alice.storage = StorageConfig::InMemory;
     config_alice.sync_interval = Duration::from_millis(50);
-    
+
     let keyring = Arc::new(vaultsync_core::e2ee::keyring::KeyRing::generate());
-    let client_alice = VaultSyncClient::new_with_keyring(config_alice, coord.clone(), keyring.clone()).await.unwrap();
+    let client_alice =
+        VaultSyncClient::new_with_keyring(config_alice, coord.clone(), keyring.clone())
+            .await
+            .unwrap();
 
     // Inject latency toxic
-    let latency_res = client.post("http://localhost:8474/proxies/redis_proxy/toxics")
+    let latency_res = client
+        .post("http://localhost:8474/proxies/redis_proxy/toxics")
         .json(&serde_json::json!({
             "name": "latency_toxic",
             "type": "latency",
@@ -60,12 +69,16 @@ async fn test_chaos_network_toxiproxy() {
 
     // Do write with latency
     let mut fields = HashMap::new();
-    fields.insert("latency_key".to_string(), CrdtValue::String("val".to_string()));
+    fields.insert(
+        "latency_key".to_string(),
+        CrdtValue::String("val".to_string()),
+    );
     client_alice.insert("doc-1", "rec-1", fields).await.unwrap();
     client_alice.force_sync().await.unwrap();
 
     // Disable the proxy (simulate complete partition)
-    let disable_res = client.post("http://localhost:8474/proxies/redis_proxy")
+    let disable_res = client
+        .post("http://localhost:8474/proxies/redis_proxy")
         .json(&serde_json::json!({
             "enabled": false
         }))
@@ -75,14 +88,21 @@ async fn test_chaos_network_toxiproxy() {
 
     // Write offline
     let mut fields_off = HashMap::new();
-    fields_off.insert("offline_key".to_string(), CrdtValue::String("written_offline".to_string()));
-    client_alice.update("doc-1", "rec-1", fields_off).await.unwrap();
+    fields_off.insert(
+        "offline_key".to_string(),
+        CrdtValue::String("written_offline".to_string()),
+    );
+    client_alice
+        .update("doc-1", "rec-1", fields_off)
+        .await
+        .unwrap();
 
     // Force sync should time out or return early
     let _ = client_alice.force_sync().await;
 
     // Enable the proxy back (heal partition)
-    let enable_res = client.post("http://localhost:8474/proxies/redis_proxy")
+    let enable_res = client
+        .post("http://localhost:8474/proxies/redis_proxy")
         .json(&serde_json::json!({
             "enabled": true
         }))
@@ -91,12 +111,18 @@ async fn test_chaos_network_toxiproxy() {
     assert!(enable_res.is_ok());
 
     // Remove latency toxic
-    let _ = client.delete("http://localhost:8474/proxies/redis_proxy/toxics/latency_toxic").send().await;
+    let _ = client
+        .delete("http://localhost:8474/proxies/redis_proxy/toxics/latency_toxic")
+        .send()
+        .await;
 
     // Force sync now should succeed
     let _ = client_alice.force_sync().await;
 
     // Clean up
-    let _ = client.delete("http://localhost:8474/proxies/redis_proxy").send().await;
+    let _ = client
+        .delete("http://localhost:8474/proxies/redis_proxy")
+        .send()
+        .await;
     client_alice.shutdown().await.unwrap();
 }

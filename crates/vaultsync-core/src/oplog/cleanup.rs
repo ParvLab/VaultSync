@@ -1,8 +1,8 @@
-use std::time::Duration;
-use std::sync::Arc;
 use crate::error::VaultSyncError;
 use crate::storage::traits::Storage;
 use crate::time_utils::system_time_now_ms;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub struct OplogCleanup {
     storage: Arc<dyn Storage>,
@@ -21,7 +21,10 @@ impl OplogCleanup {
         retention: Duration,
     ) -> Result<usize, VaultSyncError> {
         let cutoff_ms = system_time_now_ms().saturating_sub(retention.as_millis() as u64);
-        let removed = self.storage.delete_synced_before(namespace, cutoff_ms).await?;
+        let removed = self
+            .storage
+            .delete_synced_before(namespace, cutoff_ms)
+            .await?;
         if removed > 0 {
             tracing::info!(
                 namespace = namespace,

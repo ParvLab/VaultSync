@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -41,7 +41,10 @@ impl TokenStore for MemoryTokenStore {
 
     async fn set_token(&self, namespace: &str, token: &str) -> Result<(), String> {
         let hash = hash_token(token);
-        self.tokens.write().await.insert(namespace.to_string(), hash);
+        self.tokens
+            .write()
+            .await
+            .insert(namespace.to_string(), hash);
         Ok(())
     }
 
@@ -69,7 +72,8 @@ impl SqliteTokenStore {
             rusqlite::Connection::open_in_memory()
         } else {
             rusqlite::Connection::open(path)
-        }.map_err(|e| e.to_string())?;
+        }
+        .map_err(|e| e.to_string())?;
 
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
@@ -109,7 +113,9 @@ impl TokenStore for SqliteTokenStore {
         let mut stmt = conn
             .prepare("SELECT token_hash FROM namespace_tokens WHERE namespace = ?1")
             .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query(rusqlite::params![namespace]).map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query(rusqlite::params![namespace])
+            .map_err(|e| e.to_string())?;
         if let Some(row) = rows.next().map_err(|e| e.to_string())? {
             let stored_hash: String = row.get(0).map_err(|e| e.to_string())?;
             Ok(stored_hash == hash)
@@ -141,7 +147,11 @@ impl TokenStore for RedisTokenStore {
 
     async fn set_token(&self, namespace: &str, token: &str) -> Result<(), String> {
         let hash = hash_token(token);
-        let mut conn = self.client.get_multiplexed_async_connection().await.map_err(|e| e.to_string())?;
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
         let key = format!("vaultsync:ns_token:{}", namespace);
         redis::cmd("SET")
             .arg(&key)
@@ -154,7 +164,11 @@ impl TokenStore for RedisTokenStore {
 
     async fn validate_token(&self, namespace: &str, token: &str) -> Result<bool, String> {
         let hash = hash_token(token);
-        let mut conn = self.client.get_multiplexed_async_connection().await.map_err(|e| e.to_string())?;
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
         let key = format!("vaultsync:ns_token:{}", namespace);
         let stored_hash: Option<String> = redis::cmd("GET")
             .arg(&key)

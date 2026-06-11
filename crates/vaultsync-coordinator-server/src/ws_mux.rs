@@ -10,23 +10,20 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use tracing::{error, info, warn};
 
+use crate::state::AppState;
 use vaultsync_core::coordinator::traits::ReplicaInfo;
 use vaultsync_core::coordinator::ws_proto::*;
-use crate::state::AppState;
 
-pub async fn ws_mux_handler(
-    State(state): State<AppState>,
-    ws: WebSocketUpgrade,
-) -> Response {
+pub async fn ws_mux_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_ws_mux_session(state, socket))
 }
 
 async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
-    
+
     // Dedicated channel for outgoing messages
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(128);
-    
+
     // Spawn writer task
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -42,10 +39,8 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
 
     // Main message processing loop with 90s heartbeat timeout
     loop {
-        let next_msg = tokio::time::timeout(
-            std::time::Duration::from_secs(90),
-            ws_receiver.next()
-        ).await;
+        let next_msg =
+            tokio::time::timeout(std::time::Duration::from_secs(90), ws_receiver.next()).await;
 
         let msg = match next_msg {
             Ok(Some(Ok(m))) => m,
@@ -59,10 +54,12 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
             }
             Err(_) => {
                 warn!("Mux WS connection timed out (no heartbeat for 90s)");
-                let _ = tx.send(Message::Close(Some(CloseFrame {
-                    code: 4000,
-                    reason: Cow::Borrowed("Heartbeat timeout"),
-                }))).await;
+                let _ = tx
+                    .send(Message::Close(Some(CloseFrame {
+                        code: 4000,
+                        reason: Cow::Borrowed("Heartbeat timeout"),
+                    })))
+                    .await;
                 break;
             }
         };
@@ -79,19 +76,21 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
 
                 match msg_type {
                     MSG_NAMESPACE_ADD => {
-                        if let Ok(add_payload) = serde_json::from_slice::<NamespaceAddPayload>(payload) {
+                        if let Ok(add_payload) =
+                            serde_json::from_slice::<NamespaceAddPayload>(payload)
+                        {
                             let ns = add_payload.namespace.clone();
                             let replica_id = add_payload.replica_id.clone();
-                            
+
                             let replica_info = ReplicaInfo {
                                 replica_id: replica_id.clone(),
                                 namespace: ns.clone(),
                                 public_key: add_payload.public_key,
                                 schema_version: add_payload.schema_version,
                             };
-                            
+
                             let reg_result = state.coordinator.register(&ns, replica_info).await;
-                            
+
                             let mut ack = NamespaceAckPayload {
                                 namespace: ns.clone(),
                                 status: "ok".to_string(),
@@ -100,7 +99,7 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
                                 snapshot_sequence: 0,
                                 error: None,
                             };
-                            
+
                             let mut available_snapshots = Vec::new();
                             if let Err(e) = reg_result {
                                 error!("Failed to register replica for namespace {}: {:?}", ns, e);
@@ -111,21 +110,27 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
                                     ack.coordinator_sequence = seq;
                                 }
                                 if let Ok(snaps) = state.coordinator.list_snapshots(&ns).await {
-                                    available_snapshots = snaps.into_iter()
+                                    available_snapshots = snaps
+                                        .into_iter()
                                         .filter(|s| s.sequence > add_payload.last_sequence)
                                         .collect::<Vec<_>>();
                                     if !available_snapshots.is_empty() {
                                         ack.snapshot_available = true;
-                                        ack.snapshot_sequence = available_snapshots.iter().map(|s| s.sequence).max().unwrap_or(0);
+                                        ack.snapshot_sequence = available_snapshots
+                                            .iter()
+                                            .map(|s| s.sequence)
+                                            .max()
+                                            .unwrap_or(0);
                                     }
                                 }
                             }
-                            
-                            let ack_frame = encode_frame(MSG_NAMESPACE_ACK, &ack).expect("Failed to encode MSG_NAMESPACE_ACK");
+
+                            let ack_frame = encode_frame(MSG_NAMESPACE_ACK, &ack)
+                                .expect("Failed to encode MSG_NAMESPACE_ACK");
                             if tx.send(Message::Binary(ack_frame)).await.is_err() {
                                 break;
                             }
-                            
+
                             for snap in available_snapshots {
                                 let snap_payload = SnapshotPayload {
                                     doc_id: snap.doc_id,
@@ -141,20 +146,32 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
                                     }
                                 }
                             }
-                            
+
                             // Register session in app state
-                            state.sessions.sessions.write().await.insert((ns.clone(), replica_id.clone()), tx.clone());
+                            state
+                                .sessions
+                                .sessions
+                                .write()
+                                .await
+                                .insert((ns.clone(), replica_id.clone()), tx.clone());
                             registered_namespaces.insert(ns, replica_id);
                         }
                     }
                     MSG_NAMESPACE_DROP => {
-                        if let Ok(drop_payload) = serde_json::from_slice::<NamespaceDropPayload>(payload) {
+                        if let Ok(drop_payload) =
+                            serde_json::from_slice::<NamespaceDropPayload>(payload)
+                        {
                             let ns = drop_payload.namespace.clone();
                             if let Some(cancel) = active_subs.remove(&ns) {
                                 let _ = cancel.send(());
                             }
                             if let Some(replica_id) = registered_namespaces.remove(&ns) {
-                                state.sessions.sessions.write().await.remove(&(ns, replica_id));
+                                state
+                                    .sessions
+                                    .sessions
+                                    .write()
+                                    .await
+                                    .remove(&(ns, replica_id));
                             }
                         }
                     }
@@ -218,7 +235,8 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
                     MSG_SCHEMA_SYNC => {
                         if let Ok(sync) = serde_json::from_slice::<SchemaSyncPayload>(payload) {
                             let ns = sync.namespace.clone();
-                            let current_v = state.coordinator.schema_version(&ns).await.unwrap_or(0);
+                            let current_v =
+                                state.coordinator.schema_version(&ns).await.unwrap_or(0);
                             let status = if sync.version == current_v {
                                 "ok".to_string()
                             } else {
@@ -289,7 +307,10 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
                     MSG_HEARTBEAT => {
                         if let Ok(hb) = serde_json::from_slice::<HeartbeatPayload>(payload) {
                             if !hb.namespace.is_empty() {
-                                let _ = state.coordinator.heartbeat(&hb.namespace, &hb.replica_id).await;
+                                let _ = state
+                                    .coordinator
+                                    .heartbeat(&hb.namespace, &hb.replica_id)
+                                    .await;
                             } else {
                                 for (ns, rep_id) in &registered_namespaces {
                                     if rep_id == &hb.replica_id {
@@ -323,7 +344,9 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
                             let sessions_guard = state.sessions.sessions.read().await;
                             let mut sent = false;
                             for (ns, sender_replica_id) in &registered_namespaces {
-                                if let Some(target_tx) = sessions_guard.get(&(ns.clone(), sig.target_replica_id.clone())) {
+                                if let Some(target_tx) =
+                                    sessions_guard.get(&(ns.clone(), sig.target_replica_id.clone()))
+                                {
                                     let ack = P2PSignalAckPayload {
                                         sender_replica_id: sender_replica_id.clone(),
                                         signal_type: sig.signal_type.clone(),
@@ -337,12 +360,18 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
                                 }
                             }
                             if !sent {
-                                warn!("WebRTC signaling target replica not found: {}", sig.target_replica_id);
+                                warn!(
+                                    "WebRTC signaling target replica not found: {}",
+                                    sig.target_replica_id
+                                );
                             }
                         }
                     }
                     _ => {
-                        warn!("Received unexpected message type over Mux WS: 0x{:02X}", msg_type);
+                        warn!(
+                            "Received unexpected message type over Mux WS: 0x{:02X}",
+                            msg_type
+                        );
                     }
                 }
             }

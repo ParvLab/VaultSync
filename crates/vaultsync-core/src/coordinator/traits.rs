@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use serde::{Serialize, Deserialize};
 use futures::Stream;
+use serde::{Deserialize, Serialize};
 
 pub type SequenceId = u64;
 
@@ -49,9 +49,22 @@ pub enum CoordinatorError {
 
 #[async_trait]
 pub trait Coordinator: Send + Sync + std::fmt::Debug {
-    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError>;
-    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError>;
-    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError>;
+    async fn push(
+        &self,
+        namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError>;
+    async fn pull(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError>;
+    async fn subscribe(
+        &self,
+        namespace: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError>;
     async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError>;
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError>;
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError>;
@@ -74,19 +87,31 @@ pub trait Coordinator: Send + Sync + std::fmt::Debug {
     async fn list_replicas(&self, _namespace: &str) -> Result<Vec<ReplicaInfo>, CoordinatorError> {
         Ok(vec![])
     }
-    async fn get_snapshot(&self, _namespace: &str, _doc_id: &str, _record_id: &str)
-        -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+    async fn get_snapshot(
+        &self,
+        _namespace: &str,
+        _doc_id: &str,
+        _record_id: &str,
+    ) -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
         Ok(None)
     }
-    async fn store_snapshot(&self, _namespace: &str, _snapshot: &crate::crdt::snapshot::Snapshot)
-        -> Result<(), CoordinatorError> {
+    async fn store_snapshot(
+        &self,
+        _namespace: &str,
+        _snapshot: &crate::crdt::snapshot::Snapshot,
+    ) -> Result<(), CoordinatorError> {
         Ok(())
     }
-    async fn compact_oplog(&self, _namespace: &str) -> Result<crate::sync::compaction::CompactionStats, CoordinatorError> {
+    async fn compact_oplog(
+        &self,
+        _namespace: &str,
+    ) -> Result<crate::sync::compaction::CompactionStats, CoordinatorError> {
         Ok(crate::sync::compaction::CompactionStats::default())
     }
-    async fn list_snapshots(&self, _namespace: &str)
-        -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+    async fn list_snapshots(
+        &self,
+        _namespace: &str,
+    ) -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
         Ok(vec![])
     }
 }
@@ -100,7 +125,10 @@ struct LibP2pSubscription {
 impl Stream for LibP2pSubscription {
     type Item = PendingMutation;
 
-    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
         use std::future::Future;
         let fut = self.rx.recv();
         tokio::pin!(fut);
@@ -130,7 +158,11 @@ impl Stream for LibP2pSubscription {
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl Coordinator for vaultsync_transport_libp2p::LibP2pTransportHandle {
-    async fn push(&self, _namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        _namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         for m in mutations {
             let pm = vaultsync_transport_libp2p::PendingMutation {
                 id: m.id,
@@ -142,18 +174,30 @@ impl Coordinator for vaultsync_transport_libp2p::LibP2pTransportHandle {
                 timestamp: m.timestamp,
                 key_version: m.key_version,
             };
-            self.broadcast_mutation(pm).await
+            self.broadcast_mutation(pm)
+                .await
                 .map_err(CoordinatorError::Internal)?;
         }
         Ok(vec![])
     }
 
-    async fn pull(&self, _namespace: &str, _after: SequenceId, _limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        _namespace: &str,
+        _after: SequenceId,
+        _limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         Ok(vec![])
     }
 
-    async fn subscribe(&self, _namespace: &str, _from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
-        Ok(Box::new(LibP2pSubscription { rx: self.incoming_broadcast() }))
+    async fn subscribe(
+        &self,
+        _namespace: &str,
+        _from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+        Ok(Box::new(LibP2pSubscription {
+            rx: self.incoming_broadcast(),
+        }))
     }
 
     async fn register(&self, _namespace: &str, _info: ReplicaInfo) -> Result<(), CoordinatorError> {

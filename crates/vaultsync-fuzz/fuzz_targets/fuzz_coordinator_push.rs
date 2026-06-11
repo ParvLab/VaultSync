@@ -1,7 +1,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation};
 use vaultsync_core::coordinator::memory::InMemoryCoordinator;
+use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation};
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(mutations) = serde_json::from_slice::<Vec<EncryptedMutation>>(data) {

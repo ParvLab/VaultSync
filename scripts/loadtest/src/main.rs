@@ -1,5 +1,8 @@
 use clap::Parser;
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -23,7 +26,7 @@ struct ChaosState {
 async fn main() {
     let args = Args::parse();
     let coord = Arc::new(vaultsync_coordinator_memory::coordinator::InMemoryCoordinator::new());
-    
+
     println!("=== VaultSync Load Test ===");
     println!("  replicas:    {}", args.replicas);
     println!("  duration:    {}s", args.duration);
@@ -46,13 +49,13 @@ async fn main() {
     let chaos_state_clone = chaos_state.clone();
     let chaos_active = args.chaos;
     let duration_secs = args.duration;
-    
+
     if chaos_active {
         tokio::spawn(async move {
             let start = Instant::now();
             let end = start + Duration::from_secs(duration_secs);
             let num_replicas = chaos_state_clone.partitioned.len();
-            
+
             while Instant::now() < end {
                 // Randomly partition 10% of replicas
                 let part_count = (num_replicas / 10).max(1);
@@ -108,7 +111,7 @@ async fn main() {
 
             while Instant::now() < deadline {
                 let t0 = Instant::now();
-                
+
                 // Simulate partition
                 if chaos_state.partitioned[i].load(Ordering::SeqCst) {
                     failed_count += 1;
@@ -174,13 +177,19 @@ async fn main() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     use vaultsync_core::coordinator::traits::Coordinator;
-    let stored = coord.pull("loadtest", 0, 1_000_000).await
-        .map(|m| m.len() as u64).unwrap_or(0);
+    let stored = coord
+        .pull("loadtest", 0, 1_000_000)
+        .await
+        .map(|m| m.len() as u64)
+        .unwrap_or(0);
 
     println!("\n=== Results ===");
     println!("  completed    : {total_completed}");
     println!("  failed       : {total_failed}");
-    println!("  throughput   : {:.1} ops/sec", total_completed as f64 / elapsed);
+    println!(
+        "  throughput   : {:.1} ops/sec",
+        total_completed as f64 / elapsed
+    );
     println!("  p50 latency  : {:.3} ms", p50 as f64 / 1000.0);
     println!("  p90 latency  : {:.3} ms", p90 as f64 / 1000.0);
     println!("  p99 latency  : {:.3} ms", p99 as f64 / 1000.0);
@@ -196,13 +205,22 @@ async fn main() {
     let fail_rate = (total_failed as f64 / total_attempts.max(1) as f64) * 100.0;
     if args.chaos {
         if fail_rate > 35.0 {
-            eprintln!("\n❌ FAIL: Failure rate {:.1}% too high even for chaos mode!", fail_rate);
+            eprintln!(
+                "\n❌ FAIL: Failure rate {:.1}% too high even for chaos mode!",
+                fail_rate
+            );
             std::process::exit(1);
         }
-        println!("\n✅ PASS: Zero data loss under chaos conditions. Failure rate was {:.1}%.", fail_rate);
+        println!(
+            "\n✅ PASS: Zero data loss under chaos conditions. Failure rate was {:.1}%.",
+            fail_rate
+        );
     } else {
         if fail_rate > 5.0 {
-            eprintln!("\n❌ FAIL: Failure rate {:.1}% exceeds 5% limit!", fail_rate);
+            eprintln!(
+                "\n❌ FAIL: Failure rate {:.1}% exceeds 5% limit!",
+                fail_rate
+            );
             std::process::exit(1);
         }
         println!("\n✅ PASS: Zero data loss. Healthy throughput and latencies.");
@@ -210,7 +228,9 @@ async fn main() {
 }
 
 fn percentile(v: &[u64], p: f64) -> u64 {
-    if v.is_empty() { return 0; }
+    if v.is_empty() {
+        return 0;
+    }
     let idx = ((v.len() - 1) as f64 * p).round() as usize;
     v[idx]
 }

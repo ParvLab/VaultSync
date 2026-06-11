@@ -1,9 +1,9 @@
+use crate::error::VaultSyncError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use crate::error::VaultSyncError;
 
 use crate::storage::traits::StorageConfig;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 #[cfg(windows)]
 type LockHandle = windows_sys::Win32::Foundation::HANDLE;
@@ -34,7 +34,11 @@ export function release_web_lock(lock_name) {
 }
 "#)]
 extern "C" {
-    fn acquire_web_lock(lock_name: &str, on_acquired: &js_sys::Function, on_released: &js_sys::Function);
+    fn acquire_web_lock(
+        lock_name: &str,
+        on_acquired: &js_sys::Function,
+        on_released: &js_sys::Function,
+    );
     fn release_web_lock(lock_name: &str);
 }
 
@@ -82,7 +86,7 @@ impl LeaderElection {
 
     pub fn try_acquire(&self) -> Result<bool, VaultSyncError> {
         let mut handle_guard = self.lock_handle.lock().unwrap();
-        
+
         #[cfg(target_arch = "wasm32")]
         {
             use wasm_bindgen::JsCast;
@@ -98,15 +102,21 @@ impl LeaderElection {
             let on_acquired = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
                 is_leader_clone.store(true, Ordering::SeqCst);
                 tracing::info!("[LeaderElection] Acquired lock for {}", name_clone);
-            }) as Box<dyn FnMut()>);
+            })
+                as Box<dyn FnMut()>);
 
             let name_clone2 = name.clone();
             let on_released = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
                 is_leader_clone2.store(false, Ordering::SeqCst);
                 tracing::info!("[LeaderElection] Released lock for {}", name_clone2);
-            }) as Box<dyn FnMut()>);
+            })
+                as Box<dyn FnMut()>);
 
-            acquire_web_lock(&name, on_acquired.as_ref().unchecked_ref(), on_released.as_ref().unchecked_ref());
+            acquire_web_lock(
+                &name,
+                on_acquired.as_ref().unchecked_ref(),
+                on_released.as_ref().unchecked_ref(),
+            );
 
             *handle_guard = Some(WasmLockState {
                 name,
@@ -126,9 +136,11 @@ impl LeaderElection {
 
             #[cfg(windows)]
             {
+                use windows_sys::Win32::Foundation::{
+                    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS,
+                };
                 use windows_sys::Win32::System::Threading::CreateMutexW;
-                use windows_sys::Win32::Foundation::{GetLastError, CloseHandle, ERROR_ALREADY_EXISTS};
-                
+
                 let name = format!("Global\\vaultsync-{}-{}", self.namespace, self.unique_key);
                 let mut name_u16: Vec<u16> = name.encode_utf16().collect();
                 name_u16.push(0);
@@ -139,7 +151,9 @@ impl LeaderElection {
                 }
                 let last_err = unsafe { GetLastError() };
                 if last_err == ERROR_ALREADY_EXISTS {
-                    unsafe { CloseHandle(handle); }
+                    unsafe {
+                        CloseHandle(handle);
+                    }
                     return Ok(false);
                 }
                 *handle_guard = Some(handle);
@@ -150,13 +164,18 @@ impl LeaderElection {
             #[cfg(unix)]
             {
                 use std::os::unix::io::AsRawFd;
-                let lock_path = std::env::temp_dir().join(format!("vaultsync-{}-{}.lock", self.namespace, self.unique_key));
+                let lock_path = std::env::temp_dir().join(format!(
+                    "vaultsync-{}-{}.lock",
+                    self.namespace, self.unique_key
+                ));
                 let file = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
                     .open(&lock_path)
-                    .map_err(|e| VaultSyncError::Storage(format!("failed to open lock file: {e}")))?;
+                    .map_err(|e| {
+                        VaultSyncError::Storage(format!("failed to open lock file: {e}"))
+                    })?;
                 let fd = file.as_raw_fd();
                 let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
                 if ret == 0 {
@@ -165,10 +184,16 @@ impl LeaderElection {
                     Ok(true)
                 } else {
                     let last_error = std::io::Error::last_os_error();
-                    if last_error.kind() == std::io::ErrorKind::WouldBlock || last_error.raw_os_error() == Some(libc::EWOULDBLOCK) || last_error.raw_os_error() == Some(libc::EAGAIN) {
+                    if last_error.kind() == std::io::ErrorKind::WouldBlock
+                        || last_error.raw_os_error() == Some(libc::EWOULDBLOCK)
+                        || last_error.raw_os_error() == Some(libc::EAGAIN)
+                    {
                         Ok(false)
                     } else {
-                        Err(VaultSyncError::Storage(format!("flock failed: {}", last_error)))
+                        Err(VaultSyncError::Storage(format!(
+                            "flock failed: {}",
+                            last_error
+                        )))
                     }
                 }
             }
@@ -187,8 +212,8 @@ impl LeaderElection {
         if let Some(handle) = handle_guard.take() {
             #[cfg(windows)]
             {
-                use windows_sys::Win32::System::Threading::ReleaseMutex;
                 use windows_sys::Win32::Foundation::CloseHandle;
+                use windows_sys::Win32::System::Threading::ReleaseMutex;
                 unsafe {
                     ReleaseMutex(handle);
                     CloseHandle(handle);
@@ -220,4 +245,3 @@ impl Drop for LeaderElection {
         self.release();
     }
 }
-

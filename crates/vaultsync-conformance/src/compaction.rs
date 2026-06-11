@@ -5,7 +5,10 @@ use vaultsync_core::crdt::snapshot::Snapshot;
 pub async fn run_compaction_tests(coord: Arc<dyn Coordinator>, ns: &str) {
     // 1. compact_empty_namespace
     let empty_ns = format!("{}-empty", ns);
-    let stats = coord.compact_oplog(&empty_ns).await.expect("compact empty namespace");
+    let stats = coord
+        .compact_oplog(&empty_ns)
+        .await
+        .expect("compact empty namespace");
     assert_eq!(stats.oplog_removed, 0, "compact empty should remove 0");
 
     // 2. compact_removes_snapshotted_entries & compact_preserves_unsnapshotted_entries
@@ -32,7 +35,10 @@ pub async fn run_compaction_tests(coord: Arc<dyn Coordinator>, ns: &str) {
         key_version: 1,
     };
 
-    let seqs = coord.push(ns, vec![mut1.clone(), mut2.clone()]).await.expect("push two mutations");
+    let seqs = coord
+        .push(ns, vec![mut1.clone(), mut2.clone()])
+        .await
+        .expect("push two mutations");
     let seq1 = seqs[0];
     let _seq2 = seqs[1];
 
@@ -56,7 +62,10 @@ pub async fn run_compaction_tests(coord: Arc<dyn Coordinator>, ns: &str) {
     // Seq2 must survive because it's newer than snapshot.
     // Note: depends on coordinator implementation, seq1 might be removed or retained depending on backend capability,
     // but seq2 MUST survive.
-    assert!(pulled.iter().any(|m| m.id == mut2.id), "unsnapshotted entry must survive compaction");
+    assert!(
+        pulled.iter().any(|m| m.id == mut2.id),
+        "unsnapshotted entry must survive compaction"
+    );
 
     // 3. double_compact_idempotent
     let _stats2 = coord.compact_oplog(ns).await.expect("compact second time");

@@ -1,28 +1,28 @@
-use serde::{Serialize, Deserialize};
 use crate::coordinator::traits::{EncryptedMutation, PendingMutation};
+use serde::{Deserialize, Serialize};
 
 // Message Type Enum Values
-pub const MSG_AUTH: u8           = 0x01;
-pub const MSG_AUTH_ACK: u8       = 0x02;
-pub const MSG_REGISTER: u8       = 0x03;
-pub const MSG_REGISTER_ACK: u8   = 0x04;
-pub const MSG_PUSH: u8           = 0x05;
-pub const MSG_PUSH_ACK: u8       = 0x06;
-pub const MSG_PULL: u8           = 0x07;
-pub const MSG_PULL_RESPONSE: u8  = 0x08;
-pub const MSG_SUBSCRIBE: u8      = 0x09;
-pub const MSG_MUTATION_PUSH: u8  = 0x0A;
-pub const MSG_HEARTBEAT: u8      = 0x0B;
-pub const MSG_HEARTBEAT_ACK: u8  = 0x0C;
-pub const MSG_ERROR: u8          = 0x0F;
-pub const MSG_SCHEMA_SYNC: u8       = 0x10;
-pub const MSG_SCHEMA_MIGRATION: u8  = 0x11;
-pub const MSG_SNAPSHOT: u8          = 0x12;
-pub const MSG_P2P_SIGNAL: u8        = 0x13;
-pub const MSG_P2P_SIGNAL_ACK: u8    = 0x14;
-pub const MSG_NAMESPACE_ADD: u8     = 0x22;
-pub const MSG_NAMESPACE_ACK: u8     = 0x23;
-pub const MSG_NAMESPACE_DROP: u8    = 0x24;
+pub const MSG_AUTH: u8 = 0x01;
+pub const MSG_AUTH_ACK: u8 = 0x02;
+pub const MSG_REGISTER: u8 = 0x03;
+pub const MSG_REGISTER_ACK: u8 = 0x04;
+pub const MSG_PUSH: u8 = 0x05;
+pub const MSG_PUSH_ACK: u8 = 0x06;
+pub const MSG_PULL: u8 = 0x07;
+pub const MSG_PULL_RESPONSE: u8 = 0x08;
+pub const MSG_SUBSCRIBE: u8 = 0x09;
+pub const MSG_MUTATION_PUSH: u8 = 0x0A;
+pub const MSG_HEARTBEAT: u8 = 0x0B;
+pub const MSG_HEARTBEAT_ACK: u8 = 0x0C;
+pub const MSG_ERROR: u8 = 0x0F;
+pub const MSG_SCHEMA_SYNC: u8 = 0x10;
+pub const MSG_SCHEMA_MIGRATION: u8 = 0x11;
+pub const MSG_SNAPSHOT: u8 = 0x12;
+pub const MSG_P2P_SIGNAL: u8 = 0x13;
+pub const MSG_P2P_SIGNAL_ACK: u8 = 0x14;
+pub const MSG_NAMESPACE_ADD: u8 = 0x22;
+pub const MSG_NAMESPACE_ACK: u8 = 0x23;
+pub const MSG_NAMESPACE_DROP: u8 = 0x24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthPayload {
@@ -144,12 +144,12 @@ pub struct ErrorPayload {
 pub fn encode_frame<T: Serialize>(msg_type: u8, payload: &T) -> Result<Vec<u8>, serde_json::Error> {
     let payload_bytes = serde_json::to_vec(payload)?;
     let length = payload_bytes.len() as u32;
-    
+
     let mut frame = Vec::with_capacity(5 + payload_bytes.len());
     frame.push(msg_type);
     frame.extend_from_slice(&length.to_be_bytes());
     frame.extend_from_slice(&payload_bytes);
-    
+
     Ok(frame)
 }
 
@@ -158,12 +158,12 @@ pub fn decode_frame(data: &[u8]) -> Result<(u8, &[u8]), String> {
     if data.len() < 5 {
         return Err("Frame too short".to_string());
     }
-    
+
     let msg_type = data[0];
     let mut len_bytes = [0u8; 4];
     len_bytes.copy_from_slice(&data[1..5]);
     let length = u32::from_be_bytes(len_bytes) as usize;
-    
+
     if data.len() < 5 + length {
         return Err(format!(
             "Frame incomplete: expected {} bytes payload, got {} bytes",
@@ -171,7 +171,7 @@ pub fn decode_frame(data: &[u8]) -> Result<(u8, &[u8]), String> {
             data.len() - 5
         ));
     }
-    
+
     Ok((msg_type, &data[5..5 + length]))
 }
 

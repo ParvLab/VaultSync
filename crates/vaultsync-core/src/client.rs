@@ -1,28 +1,28 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use crate::config::VaultSyncConfig;
-use crate::error::VaultSyncError;
+#[cfg(feature = "async-runtime")]
+use crate::coordinator::memory::InMemoryCoordinator;
+use crate::coordinator::traits::{Coordinator, ReplicaInfo};
 use crate::crdt::document::CRDTDocument;
 use crate::crdt::types::CrdtValue;
-use crate::e2ee::keyring::{KeyRing, E2eeEncryptor, E2eeDecryptor};
-use crate::storage::traits::{Storage, StorageConfig};
+use crate::e2ee::keyring::{E2eeDecryptor, E2eeEncryptor, KeyRing};
+use crate::error::VaultSyncError;
+use crate::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+use crate::oplog::log::OpLog;
+use crate::schema::migration::MigrationDefinition;
+use crate::schema::registry::{DocumentSchema, SchemaRegistry};
+use crate::storage::memory::InMemoryStorage;
 #[cfg(feature = "storage-sqlite")]
 use crate::storage::sqlite::SQLiteStorage;
-use crate::storage::memory::InMemoryStorage;
-use crate::oplog::log::OpLog;
-use crate::oplog::entry::{OplogEntry, MutationType, SyncStatus};
-use crate::schema::registry::{SchemaRegistry, DocumentSchema};
-use crate::schema::migration::MigrationDefinition;
+use crate::storage::traits::{Storage, StorageConfig};
 use crate::subscription::engine::SubscriptionEngine;
 use crate::subscription::filter::Filter;
-use crate::sync::upload::UploadQueue;
 use crate::sync::download::DownloadQueue;
 use crate::sync::reconciler::Reconciler;
 use crate::sync::state::SyncState;
-use crate::coordinator::traits::{Coordinator, ReplicaInfo};
-#[cfg(feature = "async-runtime")]
-use crate::coordinator::memory::InMemoryCoordinator;
+use crate::sync::upload::UploadQueue;
 use crate::telemetry::tracing::VaultSyncTelemetry;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 pub type Callback = Box<dyn Fn(&str, &str, &HashMap<String, CrdtValue>) + Send>;
 
@@ -69,19 +69,22 @@ impl VaultSyncClient {
             if config.coordinator_endpoint.starts_with("memory://") {
                 Arc::new(InMemoryCoordinator::new())
             } else if config.coordinator_endpoint.starts_with("http://")
-                   || config.coordinator_endpoint.starts_with("https://") {
+                || config.coordinator_endpoint.starts_with("https://")
+            {
                 #[cfg(feature = "coordinator-http")]
                 {
                     Arc::new(crate::coordinator::http::HttpCoordinator::new(
                         crate::coordinator::http::HttpCoordinatorConfig {
                             url: config.coordinator_endpoint.clone(),
                             auth_token: config.auth_token.clone(),
-                        }
+                        },
                     ))
                 }
                 #[cfg(not(feature = "coordinator-http"))]
                 {
-                    return Err(VaultSyncError::Config("HTTP coordinator feature 'coordinator-http' is not enabled".into()));
+                    return Err(VaultSyncError::Config(
+                        "HTTP coordinator feature 'coordinator-http' is not enabled".into(),
+                    ));
                 }
             } else {
                 Arc::new(InMemoryCoordinator::new())
@@ -101,26 +104,33 @@ impl VaultSyncClient {
                             crate::coordinator::http::HttpCoordinatorConfig {
                                 url: url.clone(),
                                 auth_token: config.auth_token.clone(),
-                            }
+                            },
                         ))
                     }
                     #[cfg(not(feature = "coordinator-http"))]
                     {
-                        return Err(VaultSyncError::Config("HTTP coordinator feature is not enabled for fallbacks".into()));
+                        return Err(VaultSyncError::Config(
+                            "HTTP coordinator feature is not enabled for fallbacks".into(),
+                        ));
                     }
                 } else {
                     Arc::new(InMemoryCoordinator::new())
                 };
                 candidates.push(coord);
             }
-            Arc::new(crate::coordinator::failover::FailoverCoordinator::new(candidates))
+            Arc::new(crate::coordinator::failover::FailoverCoordinator::new(
+                candidates,
+            ))
         };
 
         let keyring = Arc::new(KeyRing::generate());
         Self::new_with_keyring(config, coordinator, keyring).await
     }
 
-    pub async fn new_with_coordinator(config: VaultSyncConfig, coordinator: Arc<dyn Coordinator>) -> Result<Self, VaultSyncError> {
+    pub async fn new_with_coordinator(
+        config: VaultSyncConfig,
+        coordinator: Arc<dyn Coordinator>,
+    ) -> Result<Self, VaultSyncError> {
         let keyring = Arc::new(KeyRing::generate());
         Self::new_with_keyring(config, coordinator, keyring).await
     }
@@ -134,9 +144,17 @@ impl VaultSyncClient {
             #[cfg(feature = "storage-sqlite")]
             StorageConfig::Sqlite { path } => Arc::new(SQLiteStorage::new(path)?),
             #[cfg(not(feature = "storage-sqlite"))]
-            StorageConfig::Sqlite { .. } => return Err(VaultSyncError::Config("sqlite storage not available".into())),
+            StorageConfig::Sqlite { .. } => {
+                return Err(VaultSyncError::Config(
+                    "sqlite storage not available".into(),
+                ))
+            }
             StorageConfig::InMemory => Arc::new(InMemoryStorage::new()),
-            StorageConfig::Wasm => return Err(VaultSyncError::Config("WASM storage not available in native build".into())),
+            StorageConfig::Wasm => {
+                return Err(VaultSyncError::Config(
+                    "WASM storage not available in native build".into(),
+                ))
+            }
         };
         Self::new_with_storage(config, coordinator, keyring, storage).await
     }
@@ -147,7 +165,14 @@ impl VaultSyncClient {
         keyring: Arc<KeyRing>,
         storage: Arc<dyn Storage>,
     ) -> Result<Self, VaultSyncError> {
-        Self::new_with_storage_and_migrations(config, coordinator, keyring, storage, crate::schema::migration::get_global_migrations()).await
+        Self::new_with_storage_and_migrations(
+            config,
+            coordinator,
+            keyring,
+            storage,
+            crate::schema::migration::get_global_migrations(),
+        )
+        .await
     }
 
     pub async fn new_with_storage_and_migrations(
@@ -189,7 +214,10 @@ impl VaultSyncClient {
                         if k_rec.key_bytes.len() == 32 {
                             let mut private_key = [0u8; 32];
                             private_key.copy_from_slice(&k_rec.key_bytes);
-                            let public_key = x25519_dalek::x25519(private_key, x25519_dalek::X25519_BASEPOINT_BYTES);
+                            let public_key = x25519_dalek::x25519(
+                                private_key,
+                                x25519_dalek::X25519_BASEPOINT_BYTES,
+                            );
                             loaded_keypairs.push(crate::e2ee::keyring::NamespaceKeypair {
                                 public_key,
                                 private_key,
@@ -209,7 +237,8 @@ impl VaultSyncClient {
                 if key_rec.key_bytes.len() == 32 {
                     let mut private_key = [0u8; 32];
                     private_key.copy_from_slice(&key_rec.key_bytes);
-                    let public_key = x25519_dalek::x25519(private_key, x25519_dalek::X25519_BASEPOINT_BYTES);
+                    let public_key =
+                        x25519_dalek::x25519(private_key, x25519_dalek::X25519_BASEPOINT_BYTES);
                     loaded_keypairs.push(crate::e2ee::keyring::NamespaceKeypair {
                         public_key,
                         private_key,
@@ -237,7 +266,10 @@ impl VaultSyncClient {
         };
 
         let metrics = Arc::new(crate::telemetry::metrics::VaultSyncMetrics::new());
-        let debug_api = Arc::new(crate::telemetry::debug::DebugApi::new(storage.clone(), metrics.clone()));
+        let debug_api = Arc::new(crate::telemetry::debug::DebugApi::new(
+            storage.clone(),
+            metrics.clone(),
+        ));
 
         let upload_queue = Arc::new(UploadQueue::new(
             oplog.clone(),
@@ -269,12 +301,18 @@ impl VaultSyncClient {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Perform crash recovery on startup before starting the sync loop
-        let crash_recovery = crate::ipc::crash_recovery::CrashRecovery::new(storage.clone(), config.namespace.clone());
+        let crash_recovery = crate::ipc::crash_recovery::CrashRecovery::new(
+            storage.clone(),
+            config.namespace.clone(),
+        );
         if let Err(e) = crash_recovery.recover(keyring.clone()).await {
             tracing::error!(error = %e, "Crash recovery failed during startup");
         }
 
-        let leader_election = Arc::new(crate::ipc::leader_election::LeaderElection::new(&config.namespace, &config.storage));
+        let leader_election = Arc::new(crate::ipc::leader_election::LeaderElection::new(
+            &config.namespace,
+            &config.storage,
+        ));
 
         #[cfg(not(target_arch = "wasm32"))]
         let mut p2p_handle = None;
@@ -284,7 +322,9 @@ impl VaultSyncClient {
             let (incoming_tx, mut incoming_rx) = tokio::sync::mpsc::channel(100);
             let listen_addr = config.p2p_listen_addr.clone();
             let ns = config.namespace.clone();
-            match vaultsync_transport_libp2p::LibP2pTransport::new(&ns, listen_addr, incoming_tx).await {
+            match vaultsync_transport_libp2p::LibP2pTransport::new(&ns, listen_addr, incoming_tx)
+                .await
+            {
                 Ok((transport, handle)) => {
                     p2p_handle = Some(handle);
                     crate::time_utils::spawn(async move {
@@ -315,7 +355,12 @@ impl VaultSyncClient {
             }
         }
 
-        let shared_memory = Arc::new(crate::ipc::shared_memory::SharedMemory::create_with_namespace(&config.namespace, 64 * 1024)?);
+        let shared_memory = Arc::new(
+            crate::ipc::shared_memory::SharedMemory::create_with_namespace(
+                &config.namespace,
+                64 * 1024,
+            )?,
+        );
 
         let client = Self {
             config,
@@ -357,12 +402,14 @@ impl VaultSyncClient {
             let ns = namespace_clone.clone();
             let rx = shutdown_rx.clone();
             tokio::spawn(async move {
-                cleanup.run_scheduled(
-                    &ns,
-                    std::time::Duration::from_secs(7 * 24 * 3600), // 7-day retention
-                    std::time::Duration::from_secs(3600),            // run every hour
-                    rx,
-                ).await;
+                cleanup
+                    .run_scheduled(
+                        &ns,
+                        std::time::Duration::from_secs(7 * 24 * 3600), // 7-day retention
+                        std::time::Duration::from_secs(3600),          // run every hour
+                        rx,
+                    )
+                    .await;
             });
         }
 
@@ -401,7 +448,9 @@ impl VaultSyncClient {
                             Ok(status) => status,
                             Err(_) => false,
                         };
-                        if let Ok(Some(mut state)) = storage_clone.read_sync_state(&namespace_clone).await {
+                        if let Ok(Some(mut state)) =
+                            storage_clone.read_sync_state(&namespace_clone).await
+                        {
                             state.leader_status = Some(is_leader);
                             let _ = storage_clone.write_sync_state(&state).await;
                         }
@@ -421,7 +470,9 @@ impl VaultSyncClient {
                         }
                         if sync_cycles >= 1000 {
                             sync_cycles = 0;
-                            let _ = compaction_engine.run_snapshot_compaction(&namespace_clone).await;
+                            let _ = compaction_engine
+                                .run_snapshot_compaction(&namespace_clone)
+                                .await;
                         }
                     }
 
@@ -431,7 +482,10 @@ impl VaultSyncClient {
 
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + sync_interval, sync_interval);
+                let mut interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + sync_interval,
+                    sync_interval,
+                );
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
@@ -510,29 +564,47 @@ impl VaultSyncClient {
 
     pub async fn initialize(&self) -> Result<(), VaultSyncError> {
         tracing::info!(namespace = %self.config.namespace, "VaultSync client initializing");
-        self.coordinator.register(&self.config.namespace, ReplicaInfo {
-            replica_id: self.config.replica_id.clone(),
-            namespace: self.config.namespace.clone(),
-            public_key: self.keyring.active_key().public_key.to_vec(),
-            schema_version: self.schema_version,
-        }).await.map_err(|e| VaultSyncError::Coordinator(format!("register failed: {e:?}")))?;
+        self.coordinator
+            .register(
+                &self.config.namespace,
+                ReplicaInfo {
+                    replica_id: self.config.replica_id.clone(),
+                    namespace: self.config.namespace.clone(),
+                    public_key: self.keyring.active_key().public_key.to_vec(),
+                    schema_version: self.schema_version,
+                },
+            )
+            .await
+            .map_err(|e| VaultSyncError::Coordinator(format!("register failed: {e:?}")))?;
         Ok(())
     }
 
     pub async fn shutdown(&self) -> Result<(), VaultSyncError> {
         tracing::info!("VaultSync client shutting down");
         #[cfg(target_arch = "wasm32")]
-        self.shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(target_arch = "wasm32"))]
         let _ = self.shutdown_tx.send(true);
         Ok(())
     }
 
-    pub async fn insert(&self, doc_id: &str, record_id: &str, fields: HashMap<String, CrdtValue>) -> Result<(), VaultSyncError> {
-        let span = tracing::info_span!("vaultsync.write", doc_id = doc_id, record_id = record_id, namespace = self.config.namespace.as_str());
+    pub async fn insert(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+        fields: HashMap<String, CrdtValue>,
+    ) -> Result<(), VaultSyncError> {
+        let span = tracing::info_span!(
+            "vaultsync.write",
+            doc_id = doc_id,
+            record_id = record_id,
+            namespace = self.config.namespace.as_str()
+        );
         let _enter = span.enter();
 
-        self.metrics.record_mutation_attempt(&self.config.namespace, "attempt");
+        self.metrics
+            .record_mutation_attempt(&self.config.namespace, "attempt");
 
         let mut doc = CRDTDocument::new(doc_id, record_id, 0);
         for (field, value) in &fields {
@@ -540,11 +612,16 @@ impl VaultSyncClient {
         }
         let update_bytes = doc.to_snapshot();
         if update_bytes.len() > self.config.max_document_size {
-            return Err(VaultSyncError::DocumentTooLarge(update_bytes.len(), self.config.max_document_size));
+            return Err(VaultSyncError::DocumentTooLarge(
+                update_bytes.len(),
+                self.config.max_document_size,
+            ));
         }
         let snapshot = update_bytes.clone();
 
-        let encrypted_blob = self.encryptor.encrypt_symmetric(&update_bytes, &self.config.namespace)?;
+        let encrypted_blob = self
+            .encryptor
+            .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
         let epoch = crate::time_utils::system_time_now_ms();
         let entry = OplogEntry {
@@ -562,10 +639,17 @@ impl VaultSyncClient {
             synced_at: None,
             created_at: epoch,
         };
-        
-        let append_span = tracing::info_span!("oplog.append", entry_id = entry.id.as_str(), namespace = self.config.namespace.as_str());
+
+        let append_span = tracing::info_span!(
+            "oplog.append",
+            entry_id = entry.id.as_str(),
+            namespace = self.config.namespace.as_str()
+        );
         let append_guard = append_span.enter();
-        let res = self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await;
+        let res = self
+            .storage
+            .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
+            .await;
         drop(append_guard);
 
         match res {
@@ -573,33 +657,55 @@ impl VaultSyncClient {
                 let _ = self.shared_memory.write_entry(&entry.id, &entry.yrs_update);
                 let key_version = self.keyring.active_key().version;
                 self.broadcast_p2p(&entry, key_version).await;
-                self.metrics.record_mutation_attempt(&self.config.namespace, "success");
+                self.metrics
+                    .record_mutation_attempt(&self.config.namespace, "success");
                 let pending = self.pending_uploads().await.unwrap_or(0);
-                self.metrics.set_mutations_pending(&self.config.namespace, pending as i64);
-                if let Ok(entries) = self.storage.read_pending_oplog(&self.config.namespace, 10000).await {
-                    self.metrics.set_oplog_size(&self.config.namespace, entries.len() as i64);
+                self.metrics
+                    .set_mutations_pending(&self.config.namespace, pending as i64);
+                if let Ok(entries) = self
+                    .storage
+                    .read_pending_oplog(&self.config.namespace, 10000)
+                    .await
+                {
+                    self.metrics
+                        .set_oplog_size(&self.config.namespace, entries.len() as i64);
                 }
-                
+
                 // Fire reactive subscriptions locally
                 let state = doc.to_map();
                 let sub_span = tracing::info_span!("subscription.fire", doc_id = doc_id);
                 let _sub_guard = sub_span.enter();
-                self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
+                self.subscriptions
+                    .lock()
+                    .unwrap()
+                    .fire(doc_id, record_id, &state);
 
                 Ok(())
             }
             Err(e) => {
-                self.metrics.record_mutation_failed(&self.config.namespace, "storage_error");
+                self.metrics
+                    .record_mutation_failed(&self.config.namespace, "storage_error");
                 Err(e)
             }
         }
     }
 
-    pub async fn update(&self, doc_id: &str, record_id: &str, fields: HashMap<String, CrdtValue>) -> Result<(), VaultSyncError> {
-        let span = tracing::info_span!("vaultsync.write", doc_id = doc_id, record_id = record_id, namespace = self.config.namespace.as_str());
+    pub async fn update(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+        fields: HashMap<String, CrdtValue>,
+    ) -> Result<(), VaultSyncError> {
+        let span = tracing::info_span!(
+            "vaultsync.write",
+            doc_id = doc_id,
+            record_id = record_id,
+            namespace = self.config.namespace.as_str()
+        );
         let _enter = span.enter();
 
-        self.metrics.record_mutation_attempt(&self.config.namespace, "attempt");
+        self.metrics
+            .record_mutation_attempt(&self.config.namespace, "attempt");
 
         let existing = self.storage.get_document(doc_id, record_id).await?;
         let mut doc = match existing {
@@ -611,11 +717,16 @@ impl VaultSyncClient {
         }
         let update_bytes = doc.to_snapshot();
         if update_bytes.len() > self.config.max_document_size {
-            return Err(VaultSyncError::DocumentTooLarge(update_bytes.len(), self.config.max_document_size));
+            return Err(VaultSyncError::DocumentTooLarge(
+                update_bytes.len(),
+                self.config.max_document_size,
+            ));
         }
         let snapshot = update_bytes.clone();
 
-        let encrypted_blob = self.encryptor.encrypt_symmetric(&update_bytes, &self.config.namespace)?;
+        let encrypted_blob = self
+            .encryptor
+            .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
         let epoch = crate::time_utils::system_time_now_ms();
         let entry = OplogEntry {
@@ -634,9 +745,16 @@ impl VaultSyncClient {
             created_at: epoch,
         };
 
-        let append_span = tracing::info_span!("oplog.append", entry_id = entry.id.as_str(), namespace = self.config.namespace.as_str());
+        let append_span = tracing::info_span!(
+            "oplog.append",
+            entry_id = entry.id.as_str(),
+            namespace = self.config.namespace.as_str()
+        );
         let append_guard = append_span.enter();
-        let res = self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await;
+        let res = self
+            .storage
+            .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
+            .await;
         drop(append_guard);
 
         match res {
@@ -644,33 +762,50 @@ impl VaultSyncClient {
                 let _ = self.shared_memory.write_entry(&entry.id, &entry.yrs_update);
                 let key_version = self.keyring.active_key().version;
                 self.broadcast_p2p(&entry, key_version).await;
-                self.metrics.record_mutation_attempt(&self.config.namespace, "success");
+                self.metrics
+                    .record_mutation_attempt(&self.config.namespace, "success");
                 let pending = self.pending_uploads().await.unwrap_or(0);
-                self.metrics.set_mutations_pending(&self.config.namespace, pending as i64);
-                if let Ok(entries) = self.storage.read_pending_oplog(&self.config.namespace, 10000).await {
-                    self.metrics.set_oplog_size(&self.config.namespace, entries.len() as i64);
+                self.metrics
+                    .set_mutations_pending(&self.config.namespace, pending as i64);
+                if let Ok(entries) = self
+                    .storage
+                    .read_pending_oplog(&self.config.namespace, 10000)
+                    .await
+                {
+                    self.metrics
+                        .set_oplog_size(&self.config.namespace, entries.len() as i64);
                 }
 
                 // Fire reactive subscriptions locally
                 let state = doc.to_map();
                 let sub_span = tracing::info_span!("subscription.fire", doc_id = doc_id);
                 let _sub_guard = sub_span.enter();
-                self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
+                self.subscriptions
+                    .lock()
+                    .unwrap()
+                    .fire(doc_id, record_id, &state);
 
                 Ok(())
             }
             Err(e) => {
-                self.metrics.record_mutation_failed(&self.config.namespace, "storage_error");
+                self.metrics
+                    .record_mutation_failed(&self.config.namespace, "storage_error");
                 Err(e)
             }
         }
     }
 
     pub async fn delete(&self, doc_id: &str, record_id: &str) -> Result<(), VaultSyncError> {
-        let span = tracing::info_span!("vaultsync.write", doc_id = doc_id, record_id = record_id, namespace = self.config.namespace.as_str());
+        let span = tracing::info_span!(
+            "vaultsync.write",
+            doc_id = doc_id,
+            record_id = record_id,
+            namespace = self.config.namespace.as_str()
+        );
         let _enter = span.enter();
 
-        self.metrics.record_mutation_attempt(&self.config.namespace, "attempt");
+        self.metrics
+            .record_mutation_attempt(&self.config.namespace, "attempt");
 
         let existing = self.storage.get_document(doc_id, record_id).await?;
         if let Some(bytes) = existing {
@@ -679,7 +814,9 @@ impl VaultSyncClient {
             let update_bytes = doc.to_snapshot();
             let snapshot = update_bytes.clone();
 
-            let encrypted_blob = self.encryptor.encrypt_symmetric(&update_bytes, &self.config.namespace)?;
+            let encrypted_blob = self
+                .encryptor
+                .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
             let epoch = crate::time_utils::system_time_now_ms();
             let entry = OplogEntry {
@@ -698,9 +835,16 @@ impl VaultSyncClient {
                 created_at: epoch,
             };
 
-            let append_span = tracing::info_span!("oplog.append", entry_id = entry.id.as_str(), namespace = self.config.namespace.as_str());
+            let append_span = tracing::info_span!(
+                "oplog.append",
+                entry_id = entry.id.as_str(),
+                namespace = self.config.namespace.as_str()
+            );
             let append_guard = append_span.enter();
-            let res = self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await;
+            let res = self
+                .storage
+                .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
+                .await;
             drop(append_guard);
 
             match res {
@@ -708,21 +852,32 @@ impl VaultSyncClient {
                     let _ = self.shared_memory.write_entry(&entry.id, &entry.yrs_update);
                     let key_version = self.keyring.active_key().version;
                     self.broadcast_p2p(&entry, key_version).await;
-                    self.metrics.record_mutation_attempt(&self.config.namespace, "success");
+                    self.metrics
+                        .record_mutation_attempt(&self.config.namespace, "success");
                     let pending = self.pending_uploads().await.unwrap_or(0);
-                    self.metrics.set_mutations_pending(&self.config.namespace, pending as i64);
-                    if let Ok(entries) = self.storage.read_pending_oplog(&self.config.namespace, 10000).await {
-                        self.metrics.set_oplog_size(&self.config.namespace, entries.len() as i64);
+                    self.metrics
+                        .set_mutations_pending(&self.config.namespace, pending as i64);
+                    if let Ok(entries) = self
+                        .storage
+                        .read_pending_oplog(&self.config.namespace, 10000)
+                        .await
+                    {
+                        self.metrics
+                            .set_oplog_size(&self.config.namespace, entries.len() as i64);
                     }
 
                     // Fire reactive subscriptions locally
                     let state = doc.to_map();
                     let sub_span = tracing::info_span!("subscription.fire", doc_id = doc_id);
                     let _sub_guard = sub_span.enter();
-                    self.subscriptions.lock().unwrap().fire(doc_id, record_id, &state);
+                    self.subscriptions
+                        .lock()
+                        .unwrap()
+                        .fire(doc_id, record_id, &state);
                 }
                 Err(e) => {
-                    self.metrics.record_mutation_failed(&self.config.namespace, "storage_error");
+                    self.metrics
+                        .record_mutation_failed(&self.config.namespace, "storage_error");
                     return Err(e);
                 }
             }
@@ -730,7 +885,11 @@ impl VaultSyncClient {
         Ok(())
     }
 
-    pub async fn get(&self, doc_id: &str, record_id: &str) -> Result<Option<HashMap<String, CrdtValue>>, VaultSyncError> {
+    pub async fn get(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<Option<HashMap<String, CrdtValue>>, VaultSyncError> {
         match self.storage.get_document(doc_id, record_id).await? {
             Some(bytes) => {
                 let doc = CRDTDocument::from_snapshot(&bytes)?;
@@ -745,7 +904,11 @@ impl VaultSyncClient {
         }
     }
 
-    pub async fn find(&self, doc_id: &str, filter: Option<&Filter>) -> Result<Vec<HashMap<String, CrdtValue>>, VaultSyncError> {
+    pub async fn find(
+        &self,
+        doc_id: &str,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<HashMap<String, CrdtValue>>, VaultSyncError> {
         let docs = self.storage.list_documents(doc_id).await?;
         let mut results = Vec::new();
         for (_rid, bytes) in docs {
@@ -761,21 +924,42 @@ impl VaultSyncClient {
         Ok(results)
     }
 
-    pub fn subscribe(&self, doc_id: &str, callback: Callback) -> crate::subscription::engine::SubscriptionHandle {
-        self.subscriptions.lock().unwrap().register(doc_id, callback)
+    pub fn subscribe(
+        &self,
+        doc_id: &str,
+        callback: Callback,
+    ) -> crate::subscription::engine::SubscriptionHandle {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .register(doc_id, callback)
     }
 
-    pub fn unsubscribe(&self, handle: crate::subscription::engine::SubscriptionHandle) -> Result<(), VaultSyncError> {
+    pub fn unsubscribe(
+        &self,
+        handle: crate::subscription::engine::SubscriptionHandle,
+    ) -> Result<(), VaultSyncError> {
         self.subscriptions.lock().unwrap().unregister(handle)
     }
 
     #[allow(clippy::type_complexity)]
     pub fn set_change_listener(&self, listener: Arc<dyn Fn(&str, &str) + Send + Sync>) {
-        self.subscriptions.lock().unwrap().set_global_listener(listener);
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .set_global_listener(listener);
     }
 
-    pub fn fire_local_subscription(&self, doc_id: &str, record_id: &str, state: &HashMap<String, CrdtValue>) {
-        self.subscriptions.lock().unwrap().fire_local(doc_id, record_id, state);
+    pub fn fire_local_subscription(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+        state: &HashMap<String, CrdtValue>,
+    ) {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .fire_local(doc_id, record_id, state);
     }
 
     pub async fn force_sync(&self) -> Result<usize, VaultSyncError> {
@@ -809,7 +993,10 @@ impl VaultSyncClient {
     }
 
     pub async fn rotate_keys(&self) -> Result<(), VaultSyncError> {
-        let span = tracing::info_span!("vaultsync.rotate_keys", namespace = self.config.namespace.as_str());
+        let span = tracing::info_span!(
+            "vaultsync.rotate_keys",
+            namespace = self.config.namespace.as_str()
+        );
         let _enter = span.enter();
 
         let old_active_key = self.keyring.active_key();
@@ -820,13 +1007,20 @@ impl VaultSyncClient {
         let old_decryptor = E2eeDecryptor::new(old_keyring);
         let new_encryptor = self.encryptor.clone();
 
-        let pending = self.storage.read_pending_oplog(&self.config.namespace, 10000).await?;
+        let pending = self
+            .storage
+            .read_pending_oplog(&self.config.namespace, 10000)
+            .await?;
         let mut re_encrypted = 0usize;
         for entry in pending {
             if let Some(encrypted_blob) = entry.encrypted_blob {
-                let plaintext = old_decryptor.decrypt_symmetric(&encrypted_blob, &self.config.namespace)?;
-                let new_encrypted_blob = new_encryptor.encrypt_symmetric(&plaintext, &self.config.namespace)?;
-                self.storage.update_oplog_encrypted_blob(&entry.id, &new_encrypted_blob).await?;
+                let plaintext =
+                    old_decryptor.decrypt_symmetric(&encrypted_blob, &self.config.namespace)?;
+                let new_encrypted_blob =
+                    new_encryptor.encrypt_symmetric(&plaintext, &self.config.namespace)?;
+                self.storage
+                    .update_oplog_encrypted_blob(&entry.id, &new_encrypted_blob)
+                    .await?;
                 re_encrypted += 1;
             }
         }
@@ -841,19 +1035,28 @@ impl VaultSyncClient {
         };
         self.storage.write_key(&key_rec).await?;
 
-        self.coordinator.update_replica_key(
-            &self.config.namespace,
-            &self.config.replica_id,
-            new_pair.public_key.to_vec(),
-            new_pair.version,
-        ).await.map_err(|e| VaultSyncError::Coordinator(format!("key update failed: {e:?}")))?;
+        self.coordinator
+            .update_replica_key(
+                &self.config.namespace,
+                &self.config.replica_id,
+                new_pair.public_key.to_vec(),
+                new_pair.version,
+            )
+            .await
+            .map_err(|e| VaultSyncError::Coordinator(format!("key update failed: {e:?}")))?;
 
-        self.coordinator.register(&self.config.namespace, ReplicaInfo {
-            replica_id: self.config.replica_id.clone(),
-            namespace: self.config.namespace.clone(),
-            public_key: new_pair.public_key.to_vec(),
-            schema_version: self.schema_version,
-        }).await.map_err(|e| VaultSyncError::Coordinator(format!("re-register failed: {e:?}")))?;
+        self.coordinator
+            .register(
+                &self.config.namespace,
+                ReplicaInfo {
+                    replica_id: self.config.replica_id.clone(),
+                    namespace: self.config.namespace.clone(),
+                    public_key: new_pair.public_key.to_vec(),
+                    schema_version: self.schema_version,
+                },
+            )
+            .await
+            .map_err(|e| VaultSyncError::Coordinator(format!("re-register failed: {e:?}")))?;
 
         self.metrics.record_key_rotation(&self.config.namespace);
         Ok(())
@@ -875,13 +1078,22 @@ impl VaultSyncClient {
         self.keyring.prune_to_keep(keep_versions);
     }
 
-    pub async fn define_schema(&self, doc_id: &str, schema: DocumentSchema) -> Result<(), VaultSyncError> {
+    pub async fn define_schema(
+        &self,
+        doc_id: &str,
+        schema: DocumentSchema,
+    ) -> Result<(), VaultSyncError> {
         self.schema.lock().unwrap().define(doc_id, schema)
     }
 
-    pub async fn apply_migration(&self, migration: MigrationDefinition) -> Result<(), VaultSyncError> {
+    pub async fn apply_migration(
+        &self,
+        migration: MigrationDefinition,
+    ) -> Result<(), VaultSyncError> {
         if !migration.verify_checksum() {
-            return Err(VaultSyncError::Schema("Migration checksum verification failed".into()));
+            return Err(VaultSyncError::Schema(
+                "Migration checksum verification failed".into(),
+            ));
         }
         let applied = self.storage.read_migrations().await?;
         if let Some(existing) = applied.iter().find(|m| m.version == migration.version) {
@@ -894,7 +1106,7 @@ impl VaultSyncClient {
             tracing::info!(version = %migration.version, "Migration already applied, skipping");
             return Ok(());
         }
-        
+
         if let Err(e) = migration.apply() {
             let _ = migration.rollback();
             return Err(e);
@@ -918,7 +1130,8 @@ impl VaultSyncClient {
         let (incoming_tx, mut incoming_rx) = tokio::sync::mpsc::channel(100);
         let listen_addr = self.config.p2p_listen_addr.clone();
         let ns = self.config.namespace.clone();
-        match vaultsync_transport_libp2p::LibP2pTransport::new(&ns, listen_addr, incoming_tx).await {
+        match vaultsync_transport_libp2p::LibP2pTransport::new(&ns, listen_addr, incoming_tx).await
+        {
             Ok((transport, handle)) => {
                 self.p2p_handle = Some(handle);
                 crate::time_utils::spawn(async move {
@@ -944,13 +1157,18 @@ impl VaultSyncClient {
                 });
                 Ok(())
             }
-            Err(e) => Err(VaultSyncError::Config(format!("Failed to enable P2P: {}", e))),
+            Err(e) => Err(VaultSyncError::Config(format!(
+                "Failed to enable P2P: {}",
+                e
+            ))),
         }
     }
 
     #[cfg(target_arch = "wasm32")]
     pub async fn enable_p2p(&mut self) -> Result<(), VaultSyncError> {
-        Err(VaultSyncError::Config("P2P transport is not supported on WebAssembly".into()))
+        Err(VaultSyncError::Config(
+            "P2P transport is not supported on WebAssembly".into(),
+        ))
     }
 
     #[cfg(not(target_arch = "wasm32"))]

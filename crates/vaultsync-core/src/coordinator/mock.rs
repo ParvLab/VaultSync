@@ -1,9 +1,9 @@
+use super::traits::*;
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
-use std::task::{Context, Poll};
-use super::traits::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 #[derive(Debug)]
 pub struct MockCoordinator {
@@ -34,28 +34,47 @@ impl MockCoordinator {
 
 #[async_trait]
 impl Coordinator for MockCoordinator {
-    async fn push(&self, _namespace: &str, _mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        _namespace: &str,
+        _mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         let i = self.push_index.fetch_add(1, Ordering::SeqCst);
         let results = self.push_results.lock().unwrap();
         results.get(i).cloned().unwrap_or(Ok(vec![]))
     }
 
-    async fn pull(&self, _namespace: &str, _after: SequenceId, _limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        _namespace: &str,
+        _after: SequenceId,
+        _limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         let i = self.pull_index.fetch_add(1, Ordering::SeqCst);
         let results = self.pull_results.lock().unwrap();
         results.get(i).cloned().unwrap_or(Ok(vec![]))
     }
 
-    async fn subscribe(&self, _namespace: &str, _from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn subscribe(
+        &self,
+        _namespace: &str,
+        _from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         let rx = tokio::sync::mpsc::unbounded_channel().1;
         Ok(Box::new(MockSubscription { rx: Some(rx) }))
     }
 
-    async fn register(&self, _namespace: &str, _info: ReplicaInfo) -> Result<(), CoordinatorError> { Ok(()) }
+    async fn register(&self, _namespace: &str, _info: ReplicaInfo) -> Result<(), CoordinatorError> {
+        Ok(())
+    }
 
-    async fn heartbeat(&self, _namespace: &str, _replica_id: &str) -> Result<(), CoordinatorError> { Ok(()) }
+    async fn heartbeat(&self, _namespace: &str, _replica_id: &str) -> Result<(), CoordinatorError> {
+        Ok(())
+    }
 
-    async fn schema_version(&self, _namespace: &str) -> Result<u64, CoordinatorError> { Ok(0) }
+    async fn schema_version(&self, _namespace: &str) -> Result<u64, CoordinatorError> {
+        Ok(0)
+    }
 }
 
 struct MockSubscription {

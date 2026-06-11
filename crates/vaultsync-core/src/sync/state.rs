@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,7 +21,9 @@ pub enum ConnectionStatus {
 }
 
 impl Default for ConnectionStatus {
-    fn default() -> Self { ConnectionStatus::Disconnected }
+    fn default() -> Self {
+        ConnectionStatus::Disconnected
+    }
 }
 
 impl FromStr for ConnectionStatus {

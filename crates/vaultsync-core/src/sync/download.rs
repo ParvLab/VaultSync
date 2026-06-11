@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use crate::error::VaultSyncError;
 use crate::coordinator::traits::{Coordinator, CoordinatorError};
 use crate::e2ee::keyring::E2eeDecryptor;
-use crate::oplog::entry::{OplogEntry, MutationType, SyncStatus};
+use crate::error::VaultSyncError;
+use crate::oplog::entry::{MutationType, OplogEntry, SyncStatus};
 use crate::sync::reconciler::Reconciler;
 use crate::telemetry::metrics::VaultSyncMetrics;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
@@ -12,7 +12,9 @@ pub struct DownloadConfig {
 }
 
 impl Default for DownloadConfig {
-    fn default() -> Self { Self { batch_size: 50 } }
+    fn default() -> Self {
+        Self { batch_size: 50 }
+    }
 }
 
 pub struct DownloadQueue {
@@ -54,10 +56,18 @@ impl DownloadQueue {
 
     pub async fn process_batch(&self) -> Result<usize, VaultSyncError> {
         let after = self.last_sequence.load(std::sync::atomic::Ordering::SeqCst);
-        let span = tracing::info_span!("transport.receive", batch_size = self.config.batch_size, namespace = self.namespace.as_str());
+        let span = tracing::info_span!(
+            "transport.receive",
+            batch_size = self.config.batch_size,
+            namespace = self.namespace.as_str()
+        );
         let _enter = span.enter();
 
-        match self.coordinator.pull(&self.namespace, after, self.config.batch_size).await {
+        match self
+            .coordinator
+            .pull(&self.namespace, after, self.config.batch_size)
+            .await
+        {
             Ok(mutations) => {
                 self.metrics.set_connection_status(&self.namespace, true);
                 let count = mutations.len();
@@ -81,7 +91,8 @@ impl DownloadQueue {
                     }
 
                     if m.encrypted_blob.len() >= 8 {
-                        let header_version = u64::from_le_bytes(m.encrypted_blob[..8].try_into().unwrap());
+                        let header_version =
+                            u64::from_le_bytes(m.encrypted_blob[..8].try_into().unwrap());
                         if header_version != m.key_version {
                             tracing::warn!(
                                 blob_version = header_version,
@@ -90,7 +101,9 @@ impl DownloadQueue {
                             );
                         }
                     }
-                    let decrypted_bytes = self.decryptor.decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
+                    let decrypted_bytes = self
+                        .decryptor
+                        .decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
                     let entry = OplogEntry {
                         id: m.id.clone(),
@@ -111,14 +124,16 @@ impl DownloadQueue {
                 }
 
                 if !entries.is_empty() {
-                    let merge_remote_span = tracing::info_span!("crdt.merge_remote_batch", count = entries.len());
+                    let merge_remote_span =
+                        tracing::info_span!("crdt.merge_remote_batch", count = entries.len());
                     let _merge_guard = merge_remote_span.enter();
                     self.reconciler.apply_batch(&entries).await?;
                 }
 
                 if let Some(last) = mutations.last() {
                     let new_seq = last.sequence;
-                    self.last_sequence.store(new_seq, std::sync::atomic::Ordering::SeqCst);
+                    self.last_sequence
+                        .store(new_seq, std::sync::atomic::Ordering::SeqCst);
 
                     let mut state = match self.storage.read_sync_state(&self.namespace).await? {
                         Some(s) => s,
@@ -131,7 +146,7 @@ impl DownloadQueue {
                             last_connected_at: None,
                             last_sync_at: None,
                             schema_version: 0,
-                        }
+                        },
                     };
                     state.last_synced_sequence = new_seq;
                     let now_ms = crate::time_utils::system_time_now_ms();
@@ -141,7 +156,8 @@ impl DownloadQueue {
                     // Record sync lag using last mutation's timestamp
                     let lag = now_ms.saturating_sub(last.timestamp);
                     self.metrics.record_sync_lag(lag as f64);
-                    self.metrics.record_download_lag(&self.namespace, lag as f64);
+                    self.metrics
+                        .record_download_lag(&self.namespace, lag as f64);
                 }
                 if count > 0 {
                     self.metrics.record_download(count);
@@ -156,7 +172,9 @@ impl DownloadQueue {
             Err(e) => {
                 self.metrics.set_connection_status(&self.namespace, false);
                 self.metrics.record_sync_error();
-                Err(VaultSyncError::Coordinator(format!("download failed: {e:?}")))
+                Err(VaultSyncError::Coordinator(format!(
+                    "download failed: {e:?}"
+                )))
             }
         }
     }
@@ -165,7 +183,10 @@ impl DownloadQueue {
         self.last_sequence.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub async fn process_p2p_mutation(&self, m: crate::coordinator::traits::PendingMutation) -> Result<(), VaultSyncError> {
+    pub async fn process_p2p_mutation(
+        &self,
+        m: crate::coordinator::traits::PendingMutation,
+    ) -> Result<(), VaultSyncError> {
         let local_time = crate::time_utils::system_time_now_ms();
         let skew = if m.timestamp > local_time {
             m.timestamp - local_time
@@ -186,7 +207,9 @@ impl DownloadQueue {
                 );
             }
         }
-        let decrypted_bytes = self.decryptor.decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
+        let decrypted_bytes = self
+            .decryptor
+            .decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
         let entry = OplogEntry {
             id: m.id.clone(),

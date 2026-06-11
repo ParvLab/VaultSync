@@ -1,9 +1,12 @@
-use yrs::{Transact, Update};
-use yrs::updates::decoder::Decode;
 use crate::crdt::document::CRDTDocument;
 use crate::error::VaultSyncError;
+use yrs::updates::decoder::Decode;
+use yrs::{Transact, Update};
 
-pub fn merge_update_into_document(doc: &mut CRDTDocument, update: &[u8]) -> Result<(), VaultSyncError> {
+pub fn merge_update_into_document(
+    doc: &mut CRDTDocument,
+    update: &[u8],
+) -> Result<(), VaultSyncError> {
     doc.apply_update(update)
 }
 
@@ -20,10 +23,16 @@ pub fn merge_batch(doc: &mut CRDTDocument, updates: &[Vec<u8>]) -> Result<(), Va
 pub fn assert_deterministic(a: &CRDTDocument, b: &CRDTDocument) {
     let sv_a = a.state_vector();
     let sv_b = b.state_vector();
-    assert_eq!(sv_a, sv_b, "CRDT state vectors must match for deterministic merge");
+    assert_eq!(
+        sv_a, sv_b,
+        "CRDT state vectors must match for deterministic merge"
+    );
     let map_a = a.to_map();
     let map_b = b.to_map();
-    assert_eq!(map_a, map_b, "CRDT document maps must be identical after convergent merge");
+    assert_eq!(
+        map_a, map_b,
+        "CRDT document maps must be identical after convergent merge"
+    );
 }
 
 #[cfg(test)]
@@ -72,8 +81,14 @@ mod tests {
         replica_b.apply_update(&update_a).unwrap();
 
         assert_deterministic(&replica_a, &replica_b);
-        assert_eq!(replica_a.get_field("field_a"), Some(CrdtValue::String("val_a".to_string())));
-        assert_eq!(replica_a.get_field("field_b"), Some(CrdtValue::Number(100.0)));
+        assert_eq!(
+            replica_a.get_field("field_a"),
+            Some(CrdtValue::String("val_a".to_string()))
+        );
+        assert_eq!(
+            replica_a.get_field("field_b"),
+            Some(CrdtValue::Number(100.0))
+        );
     }
 
     #[test]
@@ -103,8 +118,17 @@ mod tests {
 
         assert_deterministic(&replica_a, &replica_b);
         assert_deterministic(&replica_b, &replica_c);
-        assert_eq!(replica_a.get_field("field_a"), Some(CrdtValue::String("a".to_string())));
-        assert_eq!(replica_a.get_field("field_b"), Some(CrdtValue::String("b".to_string())));
-        assert_eq!(replica_a.get_field("field_c"), Some(CrdtValue::String("c".to_string())));
+        assert_eq!(
+            replica_a.get_field("field_a"),
+            Some(CrdtValue::String("a".to_string()))
+        );
+        assert_eq!(
+            replica_a.get_field("field_b"),
+            Some(CrdtValue::String("b".to_string()))
+        );
+        assert_eq!(
+            replica_a.get_field("field_c"),
+            Some(CrdtValue::String("c".to_string()))
+        );
     }
 }

@@ -1,8 +1,7 @@
-pub mod tracing;
-pub mod metrics;
 pub mod debug;
+pub mod metrics;
+pub mod tracing;
 
-pub use tracing::VaultSyncTelemetry;
-pub use metrics::{VaultSyncMetrics, MetricsSnapshot};
 pub use debug::DebugApi;
-
+pub use metrics::{MetricsSnapshot, VaultSyncMetrics};
+pub use tracing::VaultSyncTelemetry;

@@ -1,6 +1,6 @@
 use crate::error::VaultSyncError;
 use crate::storage::traits::Storage;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct MigrationDefinition {
@@ -11,7 +11,10 @@ pub struct MigrationDefinition {
 }
 
 impl MigrationDefinition {
-    pub fn new(version: &str, apply_fn: Box<dyn Fn() -> Result<(), VaultSyncError> + Send + Sync>) -> Self {
+    pub fn new(
+        version: &str,
+        apply_fn: Box<dyn Fn() -> Result<(), VaultSyncError> + Send + Sync>,
+    ) -> Self {
         let checksum = compute_checksum(version);
         Self {
             version: version.to_string(),
@@ -21,7 +24,10 @@ impl MigrationDefinition {
         }
     }
 
-    pub fn with_rollback(mut self, rollback_fn: Box<dyn Fn() -> Result<(), VaultSyncError> + Send + Sync>) -> Self {
+    pub fn with_rollback(
+        mut self,
+        rollback_fn: Box<dyn Fn() -> Result<(), VaultSyncError> + Send + Sync>,
+    ) -> Self {
         self.rollback_fn = Some(rollback_fn);
         self
     }
@@ -64,7 +70,9 @@ pub struct MigrationRegistry {
 
 impl MigrationRegistry {
     pub fn new() -> Self {
-        Self { migrations: Vec::new() }
+        Self {
+            migrations: Vec::new(),
+        }
     }
 
     pub fn register(&mut self, migration: MigrationDefinition) {
@@ -92,13 +100,16 @@ pub struct MigrationRunner {
 
 impl MigrationRunner {
     pub fn new(storage: Arc<dyn Storage>, migrations: Vec<Arc<MigrationDefinition>>) -> Self {
-        Self { storage, migrations }
+        Self {
+            storage,
+            migrations,
+        }
     }
 
     /// Run all pending migrations in version order.
     pub async fn run_pending(&self) -> Result<(), VaultSyncError> {
         let applied = self.storage.read_migrations().await?;
-        
+
         for migration in &self.migrations {
             let already_applied = applied.iter().any(|m| m.version == migration.version);
             if !already_applied {
@@ -107,7 +118,7 @@ impl MigrationRunner {
                     let _ = migration.rollback();
                     return Err(e);
                 }
-                
+
                 let epoch = crate::time_utils::system_time_now_secs();
                 let record = crate::storage::traits::MigrationRecord {
                     version: migration.version.clone(),
@@ -123,7 +134,7 @@ impl MigrationRunner {
     /// Validate checksums of already-applied migrations.
     pub async fn validate_applied(&self) -> Result<(), VaultSyncError> {
         let applied = self.storage.read_migrations().await?;
-        
+
         for record in applied {
             if let Some(registered) = self.migrations.iter().find(|m| m.version == record.version) {
                 if record.checksum != registered.checksum {
@@ -139,9 +150,12 @@ impl MigrationRunner {
 
     pub async fn current_version(&self) -> u64 {
         if let Ok(applied) = self.storage.read_migrations().await {
-            applied.iter()
+            applied
+                .iter()
                 .filter_map(|m| {
-                    let digits: String = m.version.chars()
+                    let digits: String = m
+                        .version
+                        .chars()
                         .skip_while(|c| !c.is_ascii_digit())
                         .take_while(|c| c.is_ascii_digit())
                         .collect();

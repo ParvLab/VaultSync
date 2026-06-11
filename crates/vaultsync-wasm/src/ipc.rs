@@ -1,7 +1,7 @@
+use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{BroadcastChannel, MessageEvent};
-use std::sync::{Arc, Mutex};
 
 #[wasm_bindgen]
 pub struct WasmIPC {
@@ -54,7 +54,8 @@ impl WasmIPC {
             }
             let _ = callback.call1(&JsValue::NULL, &data);
         }) as Box<dyn FnMut(MessageEvent)>);
-        self.channel.set_onmessage(Some(closure.as_ref().unchecked_ref()));
+        self.channel
+            .set_onmessage(Some(closure.as_ref().unchecked_ref()));
         closure.forget();
     }
 }

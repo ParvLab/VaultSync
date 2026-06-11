@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use crate::coordinator::traits::{Coordinator, CoordinatorError, EncryptedMutation};
 use crate::error::VaultSyncError;
 use crate::oplog::log::OpLog;
-use crate::coordinator::traits::{Coordinator, EncryptedMutation, CoordinatorError};
+use std::sync::Arc;
 
 use crate::telemetry::metrics::VaultSyncMetrics;
 
@@ -11,7 +11,9 @@ pub struct UploadConfig {
 }
 
 impl Default for UploadConfig {
-    fn default() -> Self { Self { batch_size: 50 } }
+    fn default() -> Self {
+        Self { batch_size: 50 }
+    }
 }
 
 pub struct UploadQueue {
@@ -58,35 +60,47 @@ impl UploadQueue {
             return Ok(0);
         }
 
-        let mutations: Vec<EncryptedMutation> = entries.iter().map(|e| {
-            let key_version = if let Some(ref blob) = e.encrypted_blob {
-                if blob.len() >= 8 {
-                    u64::from_le_bytes(blob[..8].try_into().unwrap())
+        let mutations: Vec<EncryptedMutation> = entries
+            .iter()
+            .map(|e| {
+                let key_version = if let Some(ref blob) = e.encrypted_blob {
+                    if blob.len() >= 8 {
+                        u64::from_le_bytes(blob[..8].try_into().unwrap())
+                    } else {
+                        1
+                    }
                 } else {
                     1
+                };
+                EncryptedMutation {
+                    id: e.id.clone(),
+                    namespace: e.namespace.clone(),
+                    replica_id: e.replica_id.clone(),
+                    doc_id: e.doc_id.clone(),
+                    record_id: e.record_id.clone(),
+                    encrypted_blob: e.encrypted_blob.clone().unwrap_or_default(),
+                    timestamp: e.timestamp,
+                    schema_version: 0,
+                    key_version,
                 }
-            } else {
-                1
-            };
-            EncryptedMutation {
-                id: e.id.clone(),
-                namespace: e.namespace.clone(),
-                replica_id: e.replica_id.clone(),
-                doc_id: e.doc_id.clone(),
-                record_id: e.record_id.clone(),
-                encrypted_blob: e.encrypted_blob.clone().unwrap_or_default(),
-                timestamp: e.timestamp,
-                schema_version: 0,
-                key_version,
-            }
-        }).collect();
+            })
+            .collect();
 
-        let span = tracing::info_span!("transport.send", batch_size = mutations.len(), namespace = self.oplog.namespace());
+        let span = tracing::info_span!(
+            "transport.send",
+            batch_size = mutations.len(),
+            namespace = self.oplog.namespace()
+        );
         let _enter = span.enter();
 
-        match self.coordinator.push(&self.oplog.namespace(), mutations).await {
+        match self
+            .coordinator
+            .push(&self.oplog.namespace(), mutations)
+            .await
+        {
             Ok(sequences) => {
-                self.metrics.set_connection_status(&self.oplog.namespace(), true);
+                self.metrics
+                    .set_connection_status(&self.oplog.namespace(), true);
                 for (entry, seq) in entries.iter().zip(sequences.iter()) {
                     self.oplog.mark_synced(&entry.id, *seq).await?;
                 }
@@ -100,7 +114,8 @@ impl UploadQueue {
                 Ok(entries.len())
             }
             Err(CoordinatorError::NotAvailable) => {
-                self.metrics.set_connection_status(&self.oplog.namespace(), false);
+                self.metrics
+                    .set_connection_status(&self.oplog.namespace(), false);
                 self.metrics.record_sync_error();
                 let failed_ids: Vec<String> = {
                     let mut engine = self.retry_engine.lock().unwrap();
@@ -113,12 +128,15 @@ impl UploadQueue {
                     exhausted
                 };
                 for id in failed_ids {
-                    self.oplog.mark_failed(&id, "Coordinator not available: retry limit reached").await?;
+                    self.oplog
+                        .mark_failed(&id, "Coordinator not available: retry limit reached")
+                        .await?;
                 }
                 Ok(0)
             }
             Err(e) => {
-                self.metrics.set_connection_status(&self.oplog.namespace(), false);
+                self.metrics
+                    .set_connection_status(&self.oplog.namespace(), false);
                 self.metrics.record_sync_error();
                 let err_msg = format!("upload failed: {e:?}");
                 let failed_ids: Vec<String> = {

@@ -1,13 +1,12 @@
-pub mod traits;
-pub mod ws_proto;
+pub mod failover;
+#[cfg(feature = "coordinator-http")]
+pub mod http;
 #[cfg(feature = "async-runtime")]
 pub mod memory;
+pub mod migration;
 #[cfg(feature = "async-runtime")]
 pub mod mock;
 #[cfg(feature = "coordinator-http")]
-pub mod http;
-#[cfg(feature = "coordinator-http")]
 pub mod mux_coordinator;
-pub mod failover;
-pub mod migration;
-
+pub mod traits;
+pub mod ws_proto;

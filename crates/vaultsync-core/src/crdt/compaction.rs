@@ -1,7 +1,7 @@
-use std::time::Duration;
 use crate::crdt::document::CRDTDocument;
 use crate::crdt::types::CrdtValue;
 use crate::error::VaultSyncError;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
@@ -20,10 +20,13 @@ impl Default for CompactionConfig {
     }
 }
 
-pub fn gc_tombstones(doc: &mut CRDTDocument, config: &CompactionConfig) -> Result<Vec<u8>, VaultSyncError> {
+pub fn gc_tombstones(
+    doc: &mut CRDTDocument,
+    config: &CompactionConfig,
+) -> Result<Vec<u8>, VaultSyncError> {
     let now = crate::time_utils::system_time_now_ms();
     let ttl_ms = config.tombstone_ttl.as_millis() as u64;
-    
+
     // Find all fields in the root map that are tombstones to clean up
     let fields = doc.to_map();
     let mut keys_to_delete = Vec::new();
@@ -38,13 +41,13 @@ pub fn gc_tombstones(doc: &mut CRDTDocument, config: &CompactionConfig) -> Resul
             }
         }
     }
-    
+
     let mut combined_update = Vec::new();
     for key in keys_to_delete {
         let update = doc.delete_field(&key);
         combined_update.extend(update);
     }
-    
+
     Ok(combined_update)
 }
 
@@ -52,7 +55,11 @@ pub fn should_compact(oplog_len: usize, config: &CompactionConfig) -> bool {
     oplog_len >= config.snapshot_interval
 }
 
-pub fn compact(doc: &mut CRDTDocument, oplog_len: &mut usize, _config: &CompactionConfig) -> Result<Vec<u8>, VaultSyncError> {
+pub fn compact(
+    doc: &mut CRDTDocument,
+    oplog_len: &mut usize,
+    _config: &CompactionConfig,
+) -> Result<Vec<u8>, VaultSyncError> {
     let snapshot = crate::crdt::snapshot::Snapshot::from_document(doc, 0);
     let bytes = snapshot.encode()?;
     *oplog_len = 0;
@@ -67,13 +74,16 @@ mod tests {
     #[test]
     fn test_gc_tombstones_removes_expired() {
         let mut doc = CRDTDocument::new("doc_1", "rec_1", 1);
-        
+
         let mut expired_tombstone = HashMap::new();
         expired_tombstone.insert("_deleted".to_string(), CrdtValue::Boolean(true));
         // Expired (100 seconds ago)
         let now = crate::time_utils::system_time_now_ms();
-        expired_tombstone.insert("_deleted_at".to_string(), CrdtValue::Number((now - 100000) as f64));
-        
+        expired_tombstone.insert(
+            "_deleted_at".to_string(),
+            CrdtValue::Number((now - 100000) as f64),
+        );
+
         let mut active_tombstone = HashMap::new();
         active_tombstone.insert("_deleted".to_string(), CrdtValue::Boolean(true));
         // Active (deleted just now)

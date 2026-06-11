@@ -1,4 +1,4 @@
-pub mod keyring;
-pub mod encrypt;
 pub mod decrypt;
+pub mod encrypt;
 pub mod kat;
+pub mod keyring;

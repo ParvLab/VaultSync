@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use crate::coordinator::traits::{Coordinator, CoordinatorError, EncryptedMutation};
+use std::sync::Arc;
 
 pub struct CoordinatorMigrationManager;
 
@@ -20,8 +20,10 @@ impl CoordinatorMigrationManager {
         let replicas = from.list_replicas(namespace).await?;
         for r in &replicas {
             to.register(namespace, r.clone()).await?;
-            if let Some((pub_key, key_ver)) = from.get_replica_key(namespace, &r.replica_id).await? {
-                to.update_replica_key(namespace, &r.replica_id, pub_key, key_ver).await?;
+            if let Some((pub_key, key_ver)) = from.get_replica_key(namespace, &r.replica_id).await?
+            {
+                to.update_replica_key(namespace, &r.replica_id, pub_key, key_ver)
+                    .await?;
             }
         }
 
@@ -86,12 +88,17 @@ mod tests {
         let ns = "migrate-test";
 
         // Register replica on from
-        from.register(ns, ReplicaInfo {
-            replica_id: "replica-1".to_string(),
-            namespace: ns.to_string(),
-            public_key: vec![1, 2, 3],
-            schema_version: 3,
-        }).await.unwrap();
+        from.register(
+            ns,
+            ReplicaInfo {
+                replica_id: "replica-1".to_string(),
+                namespace: ns.to_string(),
+                public_key: vec![1, 2, 3],
+                schema_version: 3,
+            },
+        )
+        .await
+        .unwrap();
 
         // Push some mutations to from
         let mutations = vec![
@@ -130,8 +137,10 @@ mod tests {
             1, // chunk size of 1 to test pagination
             move |count| {
                 counter_clone.store(count, std::sync::atomic::Ordering::SeqCst);
-            }
-        ).await.unwrap();
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(migrated, 2);
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);

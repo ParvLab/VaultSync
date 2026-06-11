@@ -1,6 +1,6 @@
-use std::collections::{HashSet, HashMap};
-use crate::crdt::types::CrdtValue;
 use crate::crdt::document::CRDTDocument;
+use crate::crdt::types::CrdtValue;
+use std::collections::{HashMap, HashSet};
 
 pub struct CrdtObserver {
     watched: HashSet<(String, String)>,
@@ -16,12 +16,15 @@ impl CrdtObserver {
     }
 
     pub fn watch(&mut self, doc_id: &str, record_id: &str) {
-        self.watched.insert((doc_id.to_string(), record_id.to_string()));
+        self.watched
+            .insert((doc_id.to_string(), record_id.to_string()));
     }
 
     pub fn unwatch(&mut self, doc_id: &str, record_id: &str) {
-        self.watched.remove(&(doc_id.to_string(), record_id.to_string()));
-        self.last_states.remove(&(doc_id.to_string(), record_id.to_string()));
+        self.watched
+            .remove(&(doc_id.to_string(), record_id.to_string()));
+        self.last_states
+            .remove(&(doc_id.to_string(), record_id.to_string()));
     }
 
     pub fn detect_changes(&mut self, doc_id: &str, doc: &CRDTDocument) -> Vec<String> {

@@ -1,10 +1,10 @@
+use crate::migrations;
 use async_trait::async_trait;
-use vaultsync_core::coordinator::traits::*;
+use futures::Stream;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use futures::Stream;
-use crate::migrations;
 use tokio_postgres::NoTls;
+use vaultsync_core::coordinator::traits::*;
 
 #[derive(Debug, Clone)]
 pub struct PostgresCoordinator {
@@ -15,12 +15,13 @@ pub struct PostgresCoordinator {
 impl PostgresCoordinator {
     pub async fn new(connection_string: &str) -> Result<Self, CoordinatorError> {
         tracing::info!("Connecting to Postgres: {}", connection_string);
-        let (client, mut connection) = tokio_postgres::connect(connection_string, NoTls).await
+        let (client, mut connection) = tokio_postgres::connect(connection_string, NoTls)
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        
+
         let (tx, _) = broadcast::channel(1024);
         let tx_clone = tx.clone();
-        
+
         tokio::spawn(async move {
             let mut stream = futures::stream::poll_fn(move |cx| connection.poll_message(cx));
             use futures::StreamExt;
@@ -38,12 +39,14 @@ impl PostgresCoordinator {
                 }
             }
         });
-        
+
         migrations::initialize(&client).await?;
-        
-        client.execute("LISTEN vaultsync_mutations", &[]).await
+
+        client
+            .execute("LISTEN vaultsync_mutations", &[])
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        
+
         Ok(Self {
             client: Arc::new(tokio::sync::Mutex::new(client)),
             tx,
@@ -53,14 +56,20 @@ impl PostgresCoordinator {
 
 #[async_trait]
 impl Coordinator for PostgresCoordinator {
-    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         let mut seqs = Vec::new();
         let mut client_guard = self.client.lock().await;
         let namespace_str = namespace.to_string();
-        
-        let tx = client_guard.transaction().await
+
+        let tx = client_guard
+            .transaction()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        
+
         for m in mutations {
             let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
                 &m.id,
@@ -72,37 +81,43 @@ impl Coordinator for PostgresCoordinator {
                 &(m.timestamp as i64),
                 &(m.key_version as i64),
             ];
-            
+
             let row = tx.query_one(
                 "INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  RETURNING sequence",
                 params,
             ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            
+
             let seq: i64 = row.get(0);
             seqs.push(seq as u64);
         }
-        
-        tx.commit().await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        
-        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&namespace_str];
-        client_guard.execute("SELECT pg_notify('vaultsync_mutations', $1)", params).await
+
+        tx.commit()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            
+
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&namespace_str];
+        client_guard
+            .execute("SELECT pg_notify('vaultsync_mutations', $1)", params)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
         Ok(seqs)
     }
 
-    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         let client_guard = self.client.lock().await;
         let after_i64 = after as i64;
         let limit_i64 = limit as i64;
-        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-            &namespace,
-            &after_i64,
-            &limit_i64,
-        ];
-        
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+            &[&namespace, &after_i64, &limit_i64];
+
         let rows = client_guard.query(
             "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
              FROM mutations
@@ -111,7 +126,7 @@ impl Coordinator for PostgresCoordinator {
              LIMIT $3",
             params,
         ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        
+
         let mut res = Vec::new();
         for row in rows {
             let seq: i64 = row.get(2);
@@ -131,26 +146,27 @@ impl Coordinator for PostgresCoordinator {
         Ok(res)
     }
 
-    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn subscribe(
+        &self,
+        namespace: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         let (tx_mpsc, rx_mpsc) = tokio::sync::mpsc::channel(1024);
         let mut rx_broadcast = self.tx.subscribe();
         let client = self.client.clone();
         let namespace_str = namespace.to_string();
-        
+
         tokio::spawn(async move {
             let mut last_sent = from_sequence;
             let pull_limit = 1000;
-            
+
             // 1. Fetch initial historical data
             loop {
                 let client_guard = client.lock().await;
                 let last_sent_i64 = last_sent as i64;
                 let pull_limit_i64 = pull_limit as i64;
-                let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-                    &namespace_str,
-                    &last_sent_i64,
-                    &pull_limit_i64,
-                ];
+                let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+                    &[&namespace_str, &last_sent_i64, &pull_limit_i64];
                 let rows_res = client_guard.query(
                     "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
                      FROM mutations
@@ -159,9 +175,9 @@ impl Coordinator for PostgresCoordinator {
                      LIMIT $3",
                     params,
                 ).await;
-                
+
                 drop(client_guard);
-                
+
                 match rows_res {
                     Ok(rows) => {
                         if rows.is_empty() {
@@ -193,7 +209,7 @@ impl Coordinator for PostgresCoordinator {
                     Err(_) => break,
                 }
             }
-            
+
             // 2. Poll/listen for new notifications
             while let Ok(notif_ns) = rx_broadcast.recv().await {
                 if notif_ns == namespace_str {
@@ -201,11 +217,8 @@ impl Coordinator for PostgresCoordinator {
                         let client_guard = client.lock().await;
                         let last_sent_i64 = last_sent as i64;
                         let pull_limit_i64 = pull_limit as i64;
-                        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-                            &namespace_str,
-                            &last_sent_i64,
-                            &pull_limit_i64,
-                        ];
+                        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+                            &[&namespace_str, &last_sent_i64, &pull_limit_i64];
                         let rows_res = client_guard.query(
                             "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
                              FROM mutations
@@ -214,9 +227,9 @@ impl Coordinator for PostgresCoordinator {
                              LIMIT $3",
                             params,
                         ).await;
-                        
+
                         drop(client_guard);
-                        
+
                         match rows_res {
                             Ok(rows) => {
                                 if rows.is_empty() {
@@ -251,7 +264,7 @@ impl Coordinator for PostgresCoordinator {
                 }
             }
         });
-        
+
         Ok(Box::new(PostgresSubscription { rx: rx_mpsc }))
     }
 
@@ -262,10 +275,12 @@ impl Coordinator for PostgresCoordinator {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        
-        let tx = client_guard.transaction().await
+
+        let tx = client_guard
+            .transaction()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        
+
         let schema_version_i64 = info.schema_version as i64;
         let params1: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
             &info.replica_id,
@@ -283,21 +298,25 @@ impl Coordinator for PostgresCoordinator {
                  schema_version = EXCLUDED.schema_version,
                  last_seen = EXCLUDED.last_seen",
             params1,
-        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        
-        let params2: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-            &namespace_str,
-            &schema_version_i64,
-        ];
+        )
+        .await
+        .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        let params2: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+            &[&namespace_str, &schema_version_i64];
         tx.execute(
             "INSERT INTO schema_versions (namespace, version)
              VALUES ($1, $2)
              ON CONFLICT (namespace) DO UPDATE
              SET version = GREATEST(schema_versions.version, EXCLUDED.version)",
             params2,
-        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        
-        tx.commit().await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        )
+        .await
+        .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -306,30 +325,31 @@ impl Coordinator for PostgresCoordinator {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        
+
         let client_guard = self.client.lock().await;
-        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-            &now,
-            &namespace,
-            &replica_id,
-        ];
-        client_guard.execute(
-            "UPDATE replicas SET last_seen = $1 WHERE namespace = $2 AND replica_id = $3",
-            params,
-        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+            &[&now, &namespace, &replica_id];
+        client_guard
+            .execute(
+                "UPDATE replicas SET last_seen = $1 WHERE namespace = $2 AND replica_id = $3",
+                params,
+            )
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(())
     }
 
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError> {
         let client_guard = self.client.lock().await;
-        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-            &namespace,
-        ];
-        let row_opt = client_guard.query_opt(
-            "SELECT version FROM schema_versions WHERE namespace = $1",
-            params,
-        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&namespace];
+        let row_opt = client_guard
+            .query_opt(
+                "SELECT version FROM schema_versions WHERE namespace = $1",
+                params,
+            )
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
         if let Some(row) = row_opt {
             let v: i64 = row.get(0);
             Ok(v as u64)
@@ -346,12 +366,8 @@ impl Coordinator for PostgresCoordinator {
         key_version: u64,
     ) -> Result<(), CoordinatorError> {
         let client_guard = self.client.lock().await;
-        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-            &public_key,
-            &(key_version as i64),
-            &namespace,
-            &replica_id,
-        ];
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+            &[&public_key, &(key_version as i64), &namespace, &replica_id];
         client_guard.execute(
             "UPDATE replicas SET public_key = $1, key_version = $2 WHERE namespace = $3 AND replica_id = $4",
             params,
@@ -365,15 +381,12 @@ impl Coordinator for PostgresCoordinator {
         replica_id: &str,
     ) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
         let client_guard = self.client.lock().await;
-        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-            &namespace,
-            &replica_id,
-        ];
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&namespace, &replica_id];
         let row_opt = client_guard.query_opt(
             "SELECT public_key, key_version FROM replicas WHERE namespace = $1 AND replica_id = $2",
             params,
         ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        
+
         if let Some(row) = row_opt {
             let pk: Vec<u8> = row.get(0);
             let kv: i64 = row.get(1);
@@ -390,7 +403,10 @@ struct PostgresSubscription {
 
 impl Stream for PostgresSubscription {
     type Item = PendingMutation;
-    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
     }
 }

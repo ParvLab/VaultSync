@@ -1,6 +1,6 @@
+pub mod bench;
 pub mod inspect;
 pub mod replay;
-pub mod bench;
 
 use clap::{Parser, Subcommand};
 

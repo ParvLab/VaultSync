@@ -1,7 +1,7 @@
-use std::sync::Arc;
 use crate::error::VaultSyncError;
 use crate::oplog::entry::OplogEntry;
 use crate::storage::traits::Storage;
+use std::sync::Arc;
 
 pub struct OpLog {
     storage: Arc<dyn Storage>,
@@ -10,7 +10,10 @@ pub struct OpLog {
 
 impl OpLog {
     pub fn new(storage: Arc<dyn Storage>, namespace: &str) -> Self {
-        Self { storage, namespace: namespace.to_string() }
+        Self {
+            storage,
+            namespace: namespace.to_string(),
+        }
     }
 
     pub async fn append(&self, entry: OplogEntry) -> Result<(), VaultSyncError> {
@@ -18,10 +21,15 @@ impl OpLog {
     }
 
     pub async fn read_pending(&self, limit: usize) -> Result<Vec<OplogEntry>, VaultSyncError> {
-        self.storage.read_pending_oplog(&self.namespace, limit).await
+        self.storage
+            .read_pending_oplog(&self.namespace, limit)
+            .await
     }
 
-    pub async fn pending_entries(&self, namespace: &str) -> Result<Vec<OplogEntry>, VaultSyncError> {
+    pub async fn pending_entries(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<OplogEntry>, VaultSyncError> {
         self.storage.read_pending_oplog(namespace, 50000).await
     }
 
@@ -29,8 +37,15 @@ impl OpLog {
         self.storage.update_oplog_encrypted_blob(id, new_blob).await
     }
 
-    pub async fn read_after_sequence(&self, seq: u64, limit: usize) -> Result<Vec<OplogEntry>, VaultSyncError> {
-        let entries = self.storage.read_oplog_after_sequence(&self.namespace, seq).await?;
+    pub async fn read_after_sequence(
+        &self,
+        seq: u64,
+        limit: usize,
+    ) -> Result<Vec<OplogEntry>, VaultSyncError> {
+        let entries = self
+            .storage
+            .read_oplog_after_sequence(&self.namespace, seq)
+            .await?;
         Ok(entries.into_iter().take(limit).collect())
     }
 
@@ -43,7 +58,11 @@ impl OpLog {
     }
 
     pub async fn count_pending(&self) -> Result<usize, VaultSyncError> {
-        Ok(self.storage.read_pending_oplog(&self.namespace, 50000).await?.len())
+        Ok(self
+            .storage
+            .read_pending_oplog(&self.namespace, 50000)
+            .await?
+            .len())
     }
 
     pub async fn delete_compacted(&self, _before_sequence: u64) -> Result<usize, VaultSyncError> {

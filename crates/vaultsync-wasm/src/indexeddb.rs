@@ -1,18 +1,18 @@
+use async_trait::async_trait;
+use js_sys::{Promise, Uint8Array};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
-use std::pin::Pin;
-use std::future::Future;
-use async_trait::async_trait;
-use serde::{Serialize, Deserialize};
-use wasm_bindgen::{JsCast, JsValue, prelude::*};
+use vaultsync_core::oplog::entry::OplogEntry;
+use vaultsync_core::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
+use vaultsync_core::sync::state::SyncState;
+use vaultsync_core::VaultSyncError;
+use wasm_bindgen::{prelude::*, JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::*;
-use js_sys::{Promise, Uint8Array};
-use vaultsync_core::VaultSyncError;
-use vaultsync_core::oplog::entry::OplogEntry;
-use vaultsync_core::sync::state::SyncState;
-use vaultsync_core::storage::traits::{Storage, SchemaMeta, MigrationRecord, KeyRecord};
 
 struct SendJsFuture<T = JsValue>(JsFuture<T>);
 
@@ -75,7 +75,12 @@ fn request_to_future(req: &IdbRequest) -> SendJsFuture {
         }) as Box<dyn FnMut(Event)>);
 
         let onerror = Closure::wrap(Box::new(move |_event: Event| {
-            reject.call1(&JsValue::UNDEFINED, &JsValue::from_str("IndexedDB request failed")).unwrap();
+            reject
+                .call1(
+                    &JsValue::UNDEFINED,
+                    &JsValue::from_str("IndexedDB request failed"),
+                )
+                .unwrap();
         }) as Box<dyn FnMut(Event)>);
 
         req.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
@@ -90,11 +95,13 @@ fn request_to_future(req: &IdbRequest) -> SendJsFuture {
 impl IndexedDbStorage {
     pub async fn new(db_name: &str) -> Result<Self, VaultSyncError> {
         let window = window().ok_or_else(|| VaultSyncError::Storage("no window".into()))?;
-        let idb_factory = window.indexed_db()
+        let idb_factory = window
+            .indexed_db()
             .map_err(|e| VaultSyncError::Storage(format!("indexedDB not available: {:?}", e)))?
             .ok_or_else(|| VaultSyncError::Storage("indexedDB is None".into()))?;
 
-        let req = idb_factory.open_with_u32(db_name, 1)
+        let req = idb_factory
+            .open_with_u32(db_name, 1)
             .map_err(|e| VaultSyncError::Storage(format!("open db request failed: {:?}", e)))?;
 
         let promise = Promise::new(&mut |resolve, reject| {
@@ -102,7 +109,7 @@ impl IndexedDbStorage {
                 let target = event.target().unwrap();
                 let req = target.dyn_into::<IdbOpenDbRequest>().unwrap();
                 let db: IdbDatabase = req.result().unwrap().into();
-                
+
                 db.create_object_store("documents").unwrap();
                 db.create_object_store("system").unwrap();
             }) as Box<dyn FnMut(Event)>);
@@ -115,7 +122,12 @@ impl IndexedDbStorage {
             }) as Box<dyn FnMut(Event)>);
 
             let onerror = Closure::wrap(Box::new(move |_event: Event| {
-                reject.call1(&JsValue::UNDEFINED, &JsValue::from_str("IndexedDB open failed")).unwrap();
+                reject
+                    .call1(
+                        &JsValue::UNDEFINED,
+                        &JsValue::from_str("IndexedDB open failed"),
+                    )
+                    .unwrap();
             }) as Box<dyn FnMut(Event)>);
 
             req.set_onupgradeneeded(Some(onupgradeneeded.as_ref().unchecked_ref()));
@@ -127,7 +139,8 @@ impl IndexedDbStorage {
             onerror.forget();
         });
 
-        let db_val = SendJsFuture::from(promise).await
+        let db_val = SendJsFuture::from(promise)
+            .await
             .map_err(|e| VaultSyncError::Storage(format!("open_db promise failed: {:?}", e)))?;
         let db: IdbDatabase = db_val.into();
 
@@ -141,14 +154,18 @@ impl IndexedDbStorage {
     }
 
     async fn load_index_from_db(db: &IdbDatabase) -> Result<Option<IdbIndex>, VaultSyncError> {
-        let tx = db.transaction_with_str_and_mode("system", IdbTransactionMode::Readonly)
+        let tx = db
+            .transaction_with_str_and_mode("system", IdbTransactionMode::Readonly)
             .map_err(|e| VaultSyncError::Storage(format!("tx failed: {:?}", e)))?;
-        let store = tx.object_store("system")
+        let store = tx
+            .object_store("system")
             .map_err(|e| VaultSyncError::Storage(format!("store failed: {:?}", e)))?;
-        let req = store.get(&JsValue::from_str("index"))
+        let req = store
+            .get(&JsValue::from_str("index"))
             .map_err(|e| VaultSyncError::Storage(format!("get failed: {:?}", e)))?;
 
-        let val = request_to_future(&req).await
+        let val = request_to_future(&req)
+            .await
             .map_err(|e| VaultSyncError::Storage(format!("request failed: {:?}", e)))?;
 
         if val.is_null() || val.is_undefined() {
@@ -167,40 +184,57 @@ impl IndexedDbStorage {
     async fn flush_index(&self, index: &IdbIndex) -> Result<(), VaultSyncError> {
         let bytes = serde_json::to_vec(index)
             .map_err(|e| VaultSyncError::Storage(format!("serialize failed: {:?}", e)))?;
-        let tx = self.db.transaction_with_str_and_mode("system", IdbTransactionMode::Readwrite)
+        let tx = self
+            .db
+            .transaction_with_str_and_mode("system", IdbTransactionMode::Readwrite)
             .map_err(|e| VaultSyncError::Storage(format!("tx failed: {:?}", e)))?;
-        let store = tx.object_store("system")
+        let store = tx
+            .object_store("system")
             .map_err(|e| VaultSyncError::Storage(format!("store failed: {:?}", e)))?;
 
         let uint8 = Uint8Array::from(bytes.as_slice());
-        let req = store.put_with_key(&uint8, &JsValue::from_str("index"))
+        let req = store
+            .put_with_key(&uint8, &JsValue::from_str("index"))
             .map_err(|e| VaultSyncError::Storage(format!("put failed: {:?}", e)))?;
 
-        request_to_future(&req).await
+        request_to_future(&req)
+            .await
             .map_err(|e| VaultSyncError::Storage(format!("flush failed: {:?}", e)))?;
         Ok(())
-     }
+    }
 
     async fn get_fresh_index(&self) -> Result<IdbIndex, VaultSyncError> {
-        let index = Self::load_index_from_db(&self.db).await?.unwrap_or_default();
+        let index = Self::load_index_from_db(&self.db)
+            .await?
+            .unwrap_or_default();
         Ok(index)
     }
 }
 
 #[async_trait]
 impl Storage for IndexedDbStorage {
-    async fn insert_document(&self, doc_id: &str, record_id: &str, bytes: &[u8]) -> Result<(), VaultSyncError> {
-        let tx = self.db.transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
+    async fn insert_document(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+        bytes: &[u8],
+    ) -> Result<(), VaultSyncError> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
             .map_err(|e| VaultSyncError::Storage(format!("tx failed: {:?}", e)))?;
-        let store = tx.object_store("documents")
+        let store = tx
+            .object_store("documents")
             .map_err(|e| VaultSyncError::Storage(format!("store failed: {:?}", e)))?;
 
         let uint8 = Uint8Array::from(bytes);
         let key = format!("{}/{}", doc_id, record_id);
-        let req = store.put_with_key(&uint8, &JsValue::from_str(&key))
+        let req = store
+            .put_with_key(&uint8, &JsValue::from_str(&key))
             .map_err(|e| VaultSyncError::Storage(format!("put failed: {:?}", e)))?;
 
-        request_to_future(&req).await
+        request_to_future(&req)
+            .await
             .map_err(|e| VaultSyncError::Storage(format!("insert doc failed: {:?}", e)))?;
 
         // Update doc listing index
@@ -215,17 +249,26 @@ impl Storage for IndexedDbStorage {
         Ok(())
     }
 
-    async fn get_document(&self, doc_id: &str, record_id: &str) -> Result<Option<Vec<u8>>, VaultSyncError> {
-        let tx = self.db.transaction_with_str_and_mode("documents", IdbTransactionMode::Readonly)
+    async fn get_document(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<Option<Vec<u8>>, VaultSyncError> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode("documents", IdbTransactionMode::Readonly)
             .map_err(|e| VaultSyncError::Storage(format!("tx failed: {:?}", e)))?;
-        let store = tx.object_store("documents")
+        let store = tx
+            .object_store("documents")
             .map_err(|e| VaultSyncError::Storage(format!("store failed: {:?}", e)))?;
 
         let key = format!("{}/{}", doc_id, record_id);
-        let req = store.get(&JsValue::from_str(&key))
+        let req = store
+            .get(&JsValue::from_str(&key))
             .map_err(|e| VaultSyncError::Storage(format!("get failed: {:?}", e)))?;
 
-        let val = request_to_future(&req).await
+        let val = request_to_future(&req)
+            .await
             .map_err(|e| VaultSyncError::Storage(format!("get doc failed: {:?}", e)))?;
 
         if val.is_null() || val.is_undefined() {
@@ -239,16 +282,21 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn delete_document(&self, doc_id: &str, record_id: &str) -> Result<(), VaultSyncError> {
-        let tx = self.db.transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
+        let tx = self
+            .db
+            .transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
             .map_err(|e| VaultSyncError::Storage(format!("tx failed: {:?}", e)))?;
-        let store = tx.object_store("documents")
+        let store = tx
+            .object_store("documents")
             .map_err(|e| VaultSyncError::Storage(format!("store failed: {:?}", e)))?;
 
         let key = format!("{}/{}", doc_id, record_id);
-        let req = store.delete(&JsValue::from_str(&key))
+        let req = store
+            .delete(&JsValue::from_str(&key))
             .map_err(|e| VaultSyncError::Storage(format!("delete failed: {:?}", e)))?;
 
-        request_to_future(&req).await
+        request_to_future(&req)
+            .await
             .map_err(|e| VaultSyncError::Storage(format!("delete doc failed: {:?}", e)))?;
 
         // Update doc listing index
@@ -275,18 +323,29 @@ impl Storage for IndexedDbStorage {
         Ok(results)
     }
 
-    async fn write_document_and_oplog(&self, doc_id: &str, record_id: &str, bytes: &[u8], entry: &OplogEntry) -> Result<(), VaultSyncError> {
-        let tx = self.db.transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
+    async fn write_document_and_oplog(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+        bytes: &[u8],
+        entry: &OplogEntry,
+    ) -> Result<(), VaultSyncError> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
             .map_err(|e| VaultSyncError::Storage(format!("tx failed: {:?}", e)))?;
-        let store = tx.object_store("documents")
+        let store = tx
+            .object_store("documents")
             .map_err(|e| VaultSyncError::Storage(format!("store failed: {:?}", e)))?;
 
         let uint8 = Uint8Array::from(bytes);
         let key = format!("{}/{}", doc_id, record_id);
-        let req = store.put_with_key(&uint8, &JsValue::from_str(&key))
+        let req = store
+            .put_with_key(&uint8, &JsValue::from_str(&key))
             .map_err(|e| VaultSyncError::Storage(format!("put failed: {:?}", e)))?;
 
-        request_to_future(&req).await
+        request_to_future(&req)
+            .await
             .map_err(|e| VaultSyncError::Storage(format!("write doc failed: {:?}", e)))?;
 
         // Update doc listing index and oplog
@@ -302,17 +361,27 @@ impl Storage for IndexedDbStorage {
         Ok(())
     }
 
-    async fn delete_document_and_oplog(&self, doc_id: &str, record_id: &str, entry: &OplogEntry) -> Result<(), VaultSyncError> {
-        let tx = self.db.transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
+    async fn delete_document_and_oplog(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+        entry: &OplogEntry,
+    ) -> Result<(), VaultSyncError> {
+        let tx = self
+            .db
+            .transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
             .map_err(|e| VaultSyncError::Storage(format!("tx failed: {:?}", e)))?;
-        let store = tx.object_store("documents")
+        let store = tx
+            .object_store("documents")
             .map_err(|e| VaultSyncError::Storage(format!("store failed: {:?}", e)))?;
 
         let key = format!("{}/{}", doc_id, record_id);
-        let req = store.delete(&JsValue::from_str(&key))
+        let req = store
+            .delete(&JsValue::from_str(&key))
             .map_err(|e| VaultSyncError::Storage(format!("delete failed: {:?}", e)))?;
 
-        request_to_future(&req).await
+        request_to_future(&req)
+            .await
             .map_err(|e| VaultSyncError::Storage(format!("delete doc failed: {:?}", e)))?;
 
         // Update doc listing index and oplog
@@ -335,10 +404,22 @@ impl Storage for IndexedDbStorage {
         Ok(())
     }
 
-    async fn read_pending_oplog(&self, namespace: &str, limit: usize) -> Result<Vec<OplogEntry>, VaultSyncError> {
+    async fn read_pending_oplog(
+        &self,
+        namespace: &str,
+        limit: usize,
+    ) -> Result<Vec<OplogEntry>, VaultSyncError> {
         let index = self.get_fresh_index().await?;
-        let pending: Vec<OplogEntry> = index.oplog.iter()
-            .filter(|e| e.namespace == namespace && matches!(e.sync_status, vaultsync_core::oplog::entry::SyncStatus::Pending))
+        let pending: Vec<OplogEntry> = index
+            .oplog
+            .iter()
+            .filter(|e| {
+                e.namespace == namespace
+                    && matches!(
+                        e.sync_status,
+                        vaultsync_core::oplog::entry::SyncStatus::Pending
+                    )
+            })
             .take(limit)
             .cloned()
             .collect();
@@ -366,9 +447,15 @@ impl Storage for IndexedDbStorage {
         Ok(())
     }
 
-    async fn read_oplog_after_sequence(&self, namespace: &str, seq: u64) -> Result<Vec<OplogEntry>, VaultSyncError> {
+    async fn read_oplog_after_sequence(
+        &self,
+        namespace: &str,
+        seq: u64,
+    ) -> Result<Vec<OplogEntry>, VaultSyncError> {
         let index = self.get_fresh_index().await?;
-        let entries: Vec<OplogEntry> = index.oplog.iter()
+        let entries: Vec<OplogEntry> = index
+            .oplog
+            .iter()
             .filter(|e| e.namespace == namespace && e.sequence.unwrap_or(0) > seq)
             .cloned()
             .collect();
@@ -382,7 +469,9 @@ impl Storage for IndexedDbStorage {
 
     async fn write_sync_state(&self, state: &SyncState) -> Result<(), VaultSyncError> {
         let mut index = self.get_fresh_index().await?;
-        index.sync_states.insert(state.namespace.clone(), state.clone());
+        index
+            .sync_states
+            .insert(state.namespace.clone(), state.clone());
         self.flush_index(&index).await?;
         *self.index.lock().unwrap() = index;
         Ok(())
@@ -408,7 +497,10 @@ impl Storage for IndexedDbStorage {
 
     async fn write_migration(&self, record: &MigrationRecord) -> Result<(), VaultSyncError> {
         let mut index = self.get_fresh_index().await?;
-        let pos = index.migrations.iter().position(|m| m.version == record.version);
+        let pos = index
+            .migrations
+            .iter()
+            .position(|m| m.version == record.version);
         if let Some(i) = pos {
             index.migrations[i] = record.clone();
         } else {
@@ -421,7 +513,9 @@ impl Storage for IndexedDbStorage {
 
     async fn read_keys(&self, namespace: &str) -> Result<Vec<KeyRecord>, VaultSyncError> {
         let index = self.get_fresh_index().await?;
-        let results: Vec<KeyRecord> = index.keys.iter()
+        let results: Vec<KeyRecord> = index
+            .keys
+            .iter()
             .filter(|k| k.namespace == namespace)
             .cloned()
             .collect();
@@ -430,7 +524,10 @@ impl Storage for IndexedDbStorage {
 
     async fn write_key(&self, key: &KeyRecord) -> Result<(), VaultSyncError> {
         let mut index = self.get_fresh_index().await?;
-        let pos = index.keys.iter().position(|k| k.namespace == key.namespace && k.version == key.version);
+        let pos = index
+            .keys
+            .iter()
+            .position(|k| k.namespace == key.namespace && k.version == key.version);
         if let Some(i) = pos {
             index.keys[i] = key.clone();
         } else {
@@ -441,31 +538,61 @@ impl Storage for IndexedDbStorage {
         Ok(())
     }
 
-    async fn reset_stale_pending(&self, _namespace: &str, _older_than_ms: u64) -> Result<usize, VaultSyncError> {
+    async fn reset_stale_pending(
+        &self,
+        _namespace: &str,
+        _older_than_ms: u64,
+    ) -> Result<usize, VaultSyncError> {
         Ok(0)
     }
 
-    async fn delete_synced_oplog_older_than(&self, _namespace: &str, _older_than_secs: u64) -> Result<usize, VaultSyncError> {
+    async fn delete_synced_oplog_older_than(
+        &self,
+        _namespace: &str,
+        _older_than_secs: u64,
+    ) -> Result<usize, VaultSyncError> {
         Ok(0)
     }
 
-    async fn list_tombstoned_documents(&self, _namespace: &str, _older_than_secs: u64) -> Result<Vec<(String, String)>, VaultSyncError> {
+    async fn list_tombstoned_documents(
+        &self,
+        _namespace: &str,
+        _older_than_secs: u64,
+    ) -> Result<Vec<(String, String)>, VaultSyncError> {
         Ok(Vec::new())
     }
 
-    async fn update_oplog_encrypted_blob(&self, _id: &str, _new_blob: &[u8]) -> Result<(), VaultSyncError> {
+    async fn update_oplog_encrypted_blob(
+        &self,
+        _id: &str,
+        _new_blob: &[u8],
+    ) -> Result<(), VaultSyncError> {
         Ok(())
     }
 
-    async fn list_active_documents(&self, _namespace: &str) -> Result<Vec<(String, String)>, VaultSyncError> {
+    async fn list_active_documents(
+        &self,
+        _namespace: &str,
+    ) -> Result<Vec<(String, String)>, VaultSyncError> {
         Ok(Vec::new())
     }
 
-    async fn read_synced_oplog_for_document(&self, _namespace: &str, _doc_id: &str, _record_id: &str) -> Result<Vec<OplogEntry>, VaultSyncError> {
+    async fn read_synced_oplog_for_document(
+        &self,
+        _namespace: &str,
+        _doc_id: &str,
+        _record_id: &str,
+    ) -> Result<Vec<OplogEntry>, VaultSyncError> {
         Ok(Vec::new())
     }
 
-    async fn delete_synced_oplog_before_timestamp(&self, _namespace: &str, _doc_id: &str, _record_id: &str, _timestamp: u64) -> Result<usize, VaultSyncError> {
+    async fn delete_synced_oplog_before_timestamp(
+        &self,
+        _namespace: &str,
+        _doc_id: &str,
+        _record_id: &str,
+        _timestamp: u64,
+    ) -> Result<usize, VaultSyncError> {
         Ok(0)
     }
 

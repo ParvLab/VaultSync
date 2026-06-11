@@ -1,6 +1,6 @@
-use std::sync::{Arc, RwLock};
 use crate::error::VaultSyncError;
 use crate::sync::state::SyncState;
+use std::sync::{Arc, RwLock};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -56,7 +56,11 @@ pub struct SharedMemory {
 }
 
 impl SharedMemory {
-    pub fn create_in_path(namespace: &str, path: std::path::PathBuf, size: usize) -> Result<Self, VaultSyncError> {
+    pub fn create_in_path(
+        namespace: &str,
+        path: std::path::PathBuf,
+        size: usize,
+    ) -> Result<Self, VaultSyncError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let file = std::fs::OpenOptions::new()
@@ -65,9 +69,10 @@ impl SharedMemory {
                 .create(true)
                 .open(&path)
                 .map_err(|e| VaultSyncError::Storage(format!("failed to open mmap file: {e}")))?;
-            
-            file.set_len(size as u64)
-                .map_err(|e| VaultSyncError::Storage(format!("failed to set mmap file len: {e}")))?;
+
+            file.set_len(size as u64).map_err(|e| {
+                VaultSyncError::Storage(format!("failed to set mmap file len: {e}"))
+            })?;
 
             let mmap = unsafe { MmapMut::map_mut(&file) }
                 .map_err(|e| VaultSyncError::Storage(format!("failed to mmap file: {e}")))?;
@@ -154,10 +159,13 @@ impl SharedMemory {
                 .read(true)
                 .write(true)
                 .open(&path)
-                .map_err(|e| VaultSyncError::Storage(format!("failed to open existing mmap file: {e}")))?;
-            
-            let metadata = file.metadata()
-                .map_err(|e| VaultSyncError::Storage(format!("failed to read file metadata: {e}")))?;
+                .map_err(|e| {
+                    VaultSyncError::Storage(format!("failed to open existing mmap file: {e}"))
+                })?;
+
+            let metadata = file.metadata().map_err(|e| {
+                VaultSyncError::Storage(format!("failed to read file metadata: {e}"))
+            })?;
             let size = metadata.len() as usize;
 
             let mmap = unsafe { MmapMut::map_mut(&file) }
@@ -182,13 +190,18 @@ impl SharedMemory {
     }
 
     pub fn write_entry(&self, id: &str, yrs_update: &[u8]) -> Result<(), VaultSyncError> {
-        let mut inner = self.inner.write().map_err(|e| VaultSyncError::Storage(e.to_string()))?;
-        
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|e| VaultSyncError::Storage(e.to_string()))?;
+
         let entry_header_size = std::mem::size_of::<RingBufferEntryHeader>();
         let needed_size = entry_header_size + yrs_update.len();
-        
+
         if needed_size > inner.capacity {
-            return Err(VaultSyncError::Storage("mutation too large for ring buffer".to_string()));
+            return Err(VaultSyncError::Storage(
+                "mutation too large for ring buffer".to_string(),
+            ));
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -197,7 +210,7 @@ impl SharedMemory {
         let slice = &mut inner.buffer[..];
 
         let mut header = read_header(slice);
-        
+
         let mut head = header.ring_buffer_head as usize;
         let mut tail = header.ring_buffer_tail as usize;
         let capacity = header.ring_buffer_capacity as usize;
@@ -224,7 +237,7 @@ impl SharedMemory {
 
         // Free space by advancing head if it is overlapped by our new write
         let new_tail = tail + needed_size;
-        
+
         // Loop to advance head until it is no longer within the [tail, new_tail) range
         // Note: we also check if head is at the end (wrapped)
         while head_is_between(head, tail, new_tail, capacity) {
@@ -233,7 +246,7 @@ impl SharedMemory {
                 head = 0;
                 continue;
             }
-            
+
             let mut entry_h = RingBufferEntryHeader {
                 id: [0; 64],
                 yrs_update_size: 0,
@@ -246,7 +259,7 @@ impl SharedMemory {
                     entry_header_size,
                 );
             }
-            
+
             if entry_h.yrs_update_size == 0xFFFFFFFF {
                 head = 0;
             } else {
@@ -286,7 +299,10 @@ impl SharedMemory {
     }
 
     pub fn read_uncommitted(&self) -> Result<Vec<RingBufferEntry>, VaultSyncError> {
-        let inner = self.inner.read().map_err(|e| VaultSyncError::Storage(e.to_string()))?;
+        let inner = self
+            .inner
+            .read()
+            .map_err(|e| VaultSyncError::Storage(e.to_string()))?;
 
         #[cfg(not(target_arch = "wasm32"))]
         let slice = &inner.mmap[..];
@@ -308,7 +324,9 @@ impl SharedMemory {
         while head != tail {
             if head + entry_header_size > capacity {
                 head = 0;
-                if head == tail { break; }
+                if head == tail {
+                    break;
+                }
             }
 
             let mut entry_h = RingBufferEntryHeader {
@@ -339,7 +357,8 @@ impl SharedMemory {
                 .trim_end_matches('\0')
                 .to_string();
 
-            let yrs_update = slice[HEADER_SIZE + head + entry_header_size..HEADER_SIZE + next_head].to_vec();
+            let yrs_update =
+                slice[HEADER_SIZE + head + entry_header_size..HEADER_SIZE + next_head].to_vec();
 
             entries.push(RingBufferEntry {
                 id: id_str,
@@ -355,7 +374,10 @@ impl SharedMemory {
 
     // Raw read/write for legacy tests
     pub fn write(&self, data: &[u8]) -> Result<(), VaultSyncError> {
-        let mut inner = self.inner.write().map_err(|e| VaultSyncError::Storage(e.to_string()))?;
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|e| VaultSyncError::Storage(e.to_string()))?;
         #[cfg(not(target_arch = "wasm32"))]
         {
             let len = data.len().min(inner.mmap.len());
@@ -376,7 +398,10 @@ impl SharedMemory {
     }
 
     pub fn read(&self) -> Result<Vec<u8>, VaultSyncError> {
-        let inner = self.inner.read().map_err(|e| VaultSyncError::Storage(e.to_string()))?;
+        let inner = self
+            .inner
+            .read()
+            .map_err(|e| VaultSyncError::Storage(e.to_string()))?;
         #[cfg(not(target_arch = "wasm32"))]
         {
             Ok(inner.mmap.to_vec())
@@ -428,7 +453,8 @@ fn write_header(mmap: &mut [u8], header: &SharedMemoryHeader) {
 }
 
 pub fn encode_sync_state(state: &SyncState) -> Result<Vec<u8>, VaultSyncError> {
-    bincode::serialize(state).map_err(|e| VaultSyncError::Storage(format!("serialization failed: {e}")))
+    bincode::serialize(state)
+        .map_err(|e| VaultSyncError::Storage(format!("serialization failed: {e}")))
 }
 
 pub fn decode_sync_state(bytes: &[u8]) -> Option<SyncState> {
