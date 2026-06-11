@@ -1,28 +1,36 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use vaultsync_core::VaultSyncClient;
-use vaultsync_core::VaultSyncConfig;
+use vaultsync_core::coordinator::memory::InMemoryCoordinator;
 use vaultsync_core::crdt::types::CrdtValue;
 use vaultsync_core::storage::traits::StorageConfig;
-use vaultsync_core::coordinator::memory::InMemoryCoordinator;
+use vaultsync_core::VaultSyncClient;
+use vaultsync_core::VaultSyncConfig;
 
 #[tokio::test]
 async fn test_end_to_end_client_sync_pipeline() {
-    use vaultsync_core::test_utils::VaultSyncFixture;
     use vaultsync_core::storage::memory::InMemoryStorage;
+    use vaultsync_core::test_utils::VaultSyncFixture;
 
     let coordinator = Arc::new(InMemoryCoordinator::new());
-    let alice = VaultSyncFixture::new(Arc::new(InMemoryStorage::new()), coordinator.clone()).with_replica_id("alice");
-    let bob = VaultSyncFixture::new(Arc::new(InMemoryStorage::new()), coordinator.clone()).with_replica_id("bob");
+    let alice = VaultSyncFixture::new(Arc::new(InMemoryStorage::new()), coordinator.clone())
+        .with_replica_id("alice");
+    let bob = VaultSyncFixture::new(Arc::new(InMemoryStorage::new()), coordinator.clone())
+        .with_replica_id("bob");
 
     let mut fields = HashMap::new();
-    fields.insert("title".to_string(), CrdtValue::String("Local First".to_string()));
+    fields.insert(
+        "title".to_string(),
+        CrdtValue::String("Local First".to_string()),
+    );
     fields.insert("version".to_string(), CrdtValue::Number(1.0));
     alice.write("doc-1", "record-1", fields).await.unwrap();
 
     // Verify local
     let doc = alice.get_document("doc-1", "record-1").await.unwrap();
-    assert_eq!(doc.get_field("title").unwrap(), CrdtValue::String("Local First".to_string()));
+    assert_eq!(
+        doc.get_field("title").unwrap(),
+        CrdtValue::String("Local First".to_string())
+    );
 
     // Sync
     alice.sync().await.unwrap();
@@ -35,8 +43,16 @@ async fn test_end_to_end_client_sync_pipeline() {
 #[tokio::test]
 async fn test_background_sync_loop_automatic() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let alice_db_path = temp_dir.path().join("alice_bg.db").to_string_lossy().to_string();
-    let bob_db_path = temp_dir.path().join("bob_bg.db").to_string_lossy().to_string();
+    let alice_db_path = temp_dir
+        .path()
+        .join("alice_bg.db")
+        .to_string_lossy()
+        .to_string();
+    let bob_db_path = temp_dir
+        .path()
+        .join("bob_bg.db")
+        .to_string_lossy()
+        .to_string();
 
     let coordinator = Arc::new(InMemoryCoordinator::new());
     let keyring = Arc::new(vaultsync_core::e2ee::keyring::KeyRing::generate());
@@ -44,25 +60,35 @@ async fn test_background_sync_loop_automatic() {
     let mut config_alice = VaultSyncConfig::default();
     config_alice.namespace = "bg-sync-test-ns".to_string();
     config_alice.replica_id = "replica-alice".to_string();
-    config_alice.storage = StorageConfig::Sqlite { path: alice_db_path };
+    config_alice.storage = StorageConfig::Sqlite {
+        path: alice_db_path,
+    };
     config_alice.sync_interval = std::time::Duration::from_millis(50);
-    let client_alice = VaultSyncClient::new_with_keyring(config_alice, coordinator.clone(), keyring.clone())
-        .await
-        .unwrap();
+    let client_alice =
+        VaultSyncClient::new_with_keyring(config_alice, coordinator.clone(), keyring.clone())
+            .await
+            .unwrap();
 
     let mut config_bob = VaultSyncConfig::default();
     config_bob.namespace = "bg-sync-test-ns".to_string();
     config_bob.replica_id = "replica-bob".to_string();
     config_bob.storage = StorageConfig::Sqlite { path: bob_db_path };
     config_bob.sync_interval = std::time::Duration::from_millis(50);
-    let client_bob = VaultSyncClient::new_with_keyring(config_bob, coordinator.clone(), keyring.clone())
-        .await
-        .unwrap();
+    let client_bob =
+        VaultSyncClient::new_with_keyring(config_bob, coordinator.clone(), keyring.clone())
+            .await
+            .unwrap();
 
     // Alice inserts a document
     let mut fields = HashMap::new();
-    fields.insert("title".to_string(), CrdtValue::String("Background First".to_string()));
-    client_alice.insert("doc-2", "record-2", fields).await.unwrap();
+    fields.insert(
+        "title".to_string(),
+        CrdtValue::String("Background First".to_string()),
+    );
+    client_alice
+        .insert("doc-2", "record-2", fields)
+        .await
+        .unwrap();
 
     // Wait for background tasks to sync the change
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -71,7 +97,10 @@ async fn test_background_sync_loop_automatic() {
     let bob_doc = client_bob.get("doc-2", "record-2").await.unwrap();
     assert!(bob_doc.is_some());
     let doc = bob_doc.unwrap();
-    assert_eq!(doc.get("title").unwrap(), &CrdtValue::String("Background First".to_string()));
+    assert_eq!(
+        doc.get("title").unwrap(),
+        &CrdtValue::String("Background First".to_string())
+    );
 
     // Clean up
     client_alice.shutdown().await.unwrap();
@@ -81,7 +110,11 @@ async fn test_background_sync_loop_automatic() {
 #[tokio::test]
 async fn test_schema_migration_runner() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let db_path = temp_dir.path().join("migration.db").to_string_lossy().to_string();
+    let db_path = temp_dir
+        .path()
+        .join("migration.db")
+        .to_string_lossy()
+        .to_string();
 
     let mut config = VaultSyncConfig::default();
     config.storage = StorageConfig::Sqlite { path: db_path };
@@ -119,15 +152,29 @@ async fn test_schema_migration_runner() {
 #[tokio::test]
 async fn test_retry_backoff_and_failed_status() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let db_path = temp_dir.path().join("retry.db").to_string_lossy().to_string();
+    let db_path = temp_dir
+        .path()
+        .join("retry.db")
+        .to_string_lossy()
+        .to_string();
 
     // Use a mock/failing coordinator
     let coordinator = Arc::new(vaultsync_core::coordinator::mock::MockCoordinator::new());
-    coordinator.expect_push(Err(vaultsync_core::coordinator::traits::CoordinatorError::NotAvailable));
-    coordinator.expect_push(Err(vaultsync_core::coordinator::traits::CoordinatorError::NotAvailable));
-    coordinator.expect_push(Err(vaultsync_core::coordinator::traits::CoordinatorError::NotAvailable));
-    coordinator.expect_push(Err(vaultsync_core::coordinator::traits::CoordinatorError::NotAvailable));
-    coordinator.expect_push(Err(vaultsync_core::coordinator::traits::CoordinatorError::NotAvailable));
+    coordinator.expect_push(Err(
+        vaultsync_core::coordinator::traits::CoordinatorError::NotAvailable,
+    ));
+    coordinator.expect_push(Err(
+        vaultsync_core::coordinator::traits::CoordinatorError::NotAvailable,
+    ));
+    coordinator.expect_push(Err(
+        vaultsync_core::coordinator::traits::CoordinatorError::NotAvailable,
+    ));
+    coordinator.expect_push(Err(
+        vaultsync_core::coordinator::traits::CoordinatorError::NotAvailable,
+    ));
+    coordinator.expect_push(Err(
+        vaultsync_core::coordinator::traits::CoordinatorError::NotAvailable,
+    ));
 
     let mut config = VaultSyncConfig::default();
     config.storage = StorageConfig::Sqlite { path: db_path };
@@ -138,7 +185,9 @@ async fn test_retry_backoff_and_failed_status() {
     // Disable background loop to manually trace upload attempts
     config.sync_interval = std::time::Duration::from_secs(3600);
 
-    let client = VaultSyncClient::new_with_coordinator(config, coordinator.clone()).await.unwrap();
+    let client = VaultSyncClient::new_with_coordinator(config, coordinator.clone())
+        .await
+        .unwrap();
 
     // Insert a document
     let mut fields = HashMap::new();
@@ -165,11 +214,19 @@ async fn test_retry_backoff_and_failed_status() {
 #[tokio::test]
 async fn test_two_replicas_independent_keyrings_sync() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let alice_db_path = temp_dir.path().join("alice_ind.db").to_string_lossy().to_string();
-    let bob_db_path = temp_dir.path().join("bob_ind.db").to_string_lossy().to_string();
+    let alice_db_path = temp_dir
+        .path()
+        .join("alice_ind.db")
+        .to_string_lossy()
+        .to_string();
+    let bob_db_path = temp_dir
+        .path()
+        .join("bob_ind.db")
+        .to_string_lossy()
+        .to_string();
 
     let coordinator = Arc::new(InMemoryCoordinator::new());
-    
+
     // Generate Alice's keyring
     let kr_alice = vaultsync_core::e2ee::keyring::KeyRing::generate();
     let alice_key = kr_alice.active_key().clone();
@@ -180,25 +237,35 @@ async fn test_two_replicas_independent_keyrings_sync() {
     let mut config_alice = VaultSyncConfig::default();
     config_alice.namespace = "ind-sync-ns".to_string();
     config_alice.replica_id = "replica-alice".to_string();
-    config_alice.storage = StorageConfig::Sqlite { path: alice_db_path };
+    config_alice.storage = StorageConfig::Sqlite {
+        path: alice_db_path,
+    };
     config_alice.sync_interval = std::time::Duration::from_secs(3600);
-    let client_alice = VaultSyncClient::new_with_keyring(config_alice, coordinator.clone(), Arc::new(kr_alice))
-        .await
-        .unwrap();
+    let client_alice =
+        VaultSyncClient::new_with_keyring(config_alice, coordinator.clone(), Arc::new(kr_alice))
+            .await
+            .unwrap();
 
     let mut config_bob = VaultSyncConfig::default();
     config_bob.namespace = "ind-sync-ns".to_string();
     config_bob.replica_id = "replica-bob".to_string();
     config_bob.storage = StorageConfig::Sqlite { path: bob_db_path };
     config_bob.sync_interval = std::time::Duration::from_secs(3600);
-    let client_bob = VaultSyncClient::new_with_keyring(config_bob, coordinator.clone(), Arc::new(kr_bob))
-        .await
-        .unwrap();
+    let client_bob =
+        VaultSyncClient::new_with_keyring(config_bob, coordinator.clone(), Arc::new(kr_bob))
+            .await
+            .unwrap();
 
     // Alice inserts a document
     let mut fields = HashMap::new();
-    fields.insert("value".to_string(), CrdtValue::String("independent keys work".to_string()));
-    client_alice.insert("doc-4", "record-4", fields).await.unwrap();
+    fields.insert(
+        "value".to_string(),
+        CrdtValue::String("independent keys work".to_string()),
+    );
+    client_alice
+        .insert("doc-4", "record-4", fields)
+        .await
+        .unwrap();
 
     // Alice forces sync (uploads)
     client_alice.force_sync().await.unwrap();
@@ -208,6 +275,8 @@ async fn test_two_replicas_independent_keyrings_sync() {
 
     // Verify Bob successfully decrypted and read the document
     let bob_doc = client_bob.get("doc-4", "record-4").await.unwrap().unwrap();
-    assert_eq!(bob_doc.get("value").unwrap(), &CrdtValue::String("independent keys work".to_string()));
+    assert_eq!(
+        bob_doc.get("value").unwrap(),
+        &CrdtValue::String("independent keys work".to_string())
+    );
 }
-

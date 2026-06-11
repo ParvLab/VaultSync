@@ -1,8 +1,10 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
+use super::traits::{
+    Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId,
+};
 use async_trait::async_trait;
 use futures::Stream;
-use super::traits::{Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct FailoverCoordinator {
@@ -14,7 +16,10 @@ pub struct FailoverCoordinator {
 
 impl FailoverCoordinator {
     pub fn new(candidates: Vec<Arc<dyn Coordinator>>) -> Self {
-        assert!(!candidates.is_empty(), "FailoverCoordinator requires at least one candidate");
+        assert!(
+            !candidates.is_empty(),
+            "FailoverCoordinator requires at least one candidate"
+        );
         Self {
             candidates,
             current: AtomicUsize::new(0),
@@ -32,8 +37,6 @@ impl FailoverCoordinator {
         self.current.load(Ordering::SeqCst)
     }
 
-
-
     fn record_failure(&self, idx: usize) -> bool {
         let current_idx = self.current.load(Ordering::SeqCst);
         if idx != current_idx {
@@ -46,7 +49,11 @@ impl FailoverCoordinator {
             if next_idx != current_idx {
                 self.current.store(next_idx, Ordering::SeqCst);
                 self.failure_count.store(0, Ordering::SeqCst);
-                tracing::warn!("Failover triggered! Switching coordinator from index {} to {}", current_idx, next_idx);
+                tracing::warn!(
+                    "Failover triggered! Switching coordinator from index {} to {}",
+                    current_idx,
+                    next_idx
+                );
                 return true;
             }
         }
@@ -94,15 +101,28 @@ macro_rules! try_coord {
 
 #[async_trait]
 impl Coordinator for FailoverCoordinator {
-    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         try_coord!(self, push(namespace, mutations.clone()))
     }
 
-    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         try_coord!(self, pull(namespace, after, limit))
     }
 
-    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn subscribe(
+        &self,
+        namespace: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         try_coord!(self, subscribe(namespace, from_sequence))
     }
 
@@ -125,10 +145,17 @@ impl Coordinator for FailoverCoordinator {
         public_key: Vec<u8>,
         key_version: u64,
     ) -> Result<(), CoordinatorError> {
-        try_coord!(self, update_replica_key(namespace, replica_id, public_key.clone(), key_version))
+        try_coord!(
+            self,
+            update_replica_key(namespace, replica_id, public_key.clone(), key_version)
+        )
     }
 
-    async fn get_replica_key(&self, namespace: &str, replica_id: &str) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
+    async fn get_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
         try_coord!(self, get_replica_key(namespace, replica_id))
     }
 
@@ -136,22 +163,34 @@ impl Coordinator for FailoverCoordinator {
         try_coord!(self, list_replicas(namespace))
     }
 
-    async fn get_snapshot(&self, namespace: &str, doc_id: &str, record_id: &str)
-        -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+    async fn get_snapshot(
+        &self,
+        namespace: &str,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
         try_coord!(self, get_snapshot(namespace, doc_id, record_id))
     }
 
-    async fn store_snapshot(&self, namespace: &str, snapshot: &crate::crdt::snapshot::Snapshot)
-        -> Result<(), CoordinatorError> {
+    async fn store_snapshot(
+        &self,
+        namespace: &str,
+        snapshot: &crate::crdt::snapshot::Snapshot,
+    ) -> Result<(), CoordinatorError> {
         try_coord!(self, store_snapshot(namespace, snapshot))
     }
 
-    async fn compact_oplog(&self, namespace: &str) -> Result<crate::sync::compaction::CompactionStats, CoordinatorError> {
+    async fn compact_oplog(
+        &self,
+        namespace: &str,
+    ) -> Result<crate::sync::compaction::CompactionStats, CoordinatorError> {
         try_coord!(self, compact_oplog(namespace))
     }
 
-    async fn list_snapshots(&self, namespace: &str)
-        -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+    async fn list_snapshots(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
         try_coord!(self, list_snapshots(namespace))
     }
 }

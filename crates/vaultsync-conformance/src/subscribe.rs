@@ -1,6 +1,6 @@
+use futures::StreamExt;
 use std::sync::Arc;
 use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation};
-use futures::StreamExt;
 
 pub async fn run_subscribe_tests(coord: Arc<dyn Coordinator>, ns: &str, other_ns: &str) {
     // 1. subscribe_receives_push
@@ -17,8 +17,11 @@ pub async fn run_subscribe_tests(coord: Arc<dyn Coordinator>, ns: &str, other_ns
         schema_version: 0,
         key_version: 1,
     };
-    
-    let seqs = coord.push(ns, vec![mut1.clone()]).await.expect("push mutation");
+
+    let seqs = coord
+        .push(ns, vec![mut1.clone()])
+        .await
+        .expect("push mutation");
     let seq = seqs[0];
 
     // Read from stream
@@ -30,8 +33,9 @@ pub async fn run_subscribe_tests(coord: Arc<dyn Coordinator>, ns: &str, other_ns
     assert_eq!(item.sequence, seq);
 
     // 2. subscribe_from_sequence_skips_old
-    let mut stream_skip = Box::into_pin(coord.subscribe(ns, seq).await.expect("subscribe after seq"));
-    
+    let mut stream_skip =
+        Box::into_pin(coord.subscribe(ns, seq).await.expect("subscribe after seq"));
+
     let mut2 = EncryptedMutation {
         id: format!("{}-sub-2", ns),
         namespace: ns.to_string(),
@@ -43,7 +47,10 @@ pub async fn run_subscribe_tests(coord: Arc<dyn Coordinator>, ns: &str, other_ns
         schema_version: 0,
         key_version: 1,
     };
-    let seqs2 = coord.push(ns, vec![mut2.clone()]).await.expect("push second mutation");
+    let seqs2 = coord
+        .push(ns, vec![mut2.clone()])
+        .await
+        .expect("push second mutation");
     let seq2 = seqs2[0];
 
     let item2 = tokio::time::timeout(std::time::Duration::from_secs(3), stream_skip.next())
@@ -68,7 +75,10 @@ pub async fn run_subscribe_tests(coord: Arc<dyn Coordinator>, ns: &str, other_ns
         schema_version: 0,
         key_version: 1,
     };
-    coord.push(ns, vec![mut3.clone()]).await.expect("push third mutation");
+    coord
+        .push(ns, vec![mut3.clone()])
+        .await
+        .expect("push third mutation");
 
     let item_a = tokio::time::timeout(std::time::Duration::from_secs(3), stream_a.next())
         .await
@@ -82,7 +92,8 @@ pub async fn run_subscribe_tests(coord: Arc<dyn Coordinator>, ns: &str, other_ns
     assert_eq!(item_b.id, mut3.id);
 
     // 4. subscribe_namespace_isolation
-    let mut stream_other = Box::into_pin(coord.subscribe(other_ns, 0).await.expect("subscribe other"));
+    let mut stream_other =
+        Box::into_pin(coord.subscribe(other_ns, 0).await.expect("subscribe other"));
     let mut4 = EncryptedMutation {
         id: format!("{}-sub-4", ns),
         namespace: ns.to_string(),
@@ -94,12 +105,19 @@ pub async fn run_subscribe_tests(coord: Arc<dyn Coordinator>, ns: &str, other_ns
         schema_version: 0,
         key_version: 1,
     };
-    coord.push(ns, vec![mut4]).await.expect("push fourth mutation");
+    coord
+        .push(ns, vec![mut4])
+        .await
+        .expect("push fourth mutation");
 
     // Wait a short amount of time to ensure stream_other doesn't receive anything
-    let opt = tokio::time::timeout(std::time::Duration::from_millis(500), stream_other.next()).await;
+    let opt =
+        tokio::time::timeout(std::time::Duration::from_millis(500), stream_other.next()).await;
     if let Ok(ref res) = opt {
         println!("DEBUG: stream_other received item: {:?}", res);
     }
-    assert!(opt.is_err(), "expected no item on stream_other due to isolation");
+    assert!(
+        opt.is_err(),
+        "expected no item on stream_other due to isolation"
+    );
 }

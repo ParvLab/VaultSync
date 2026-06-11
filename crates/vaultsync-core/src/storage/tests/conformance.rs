@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use crate::storage::traits::{Storage, SchemaMeta, MigrationRecord, KeyRecord};
-use crate::oplog::entry::{OplogEntry, SyncStatus, MutationType};
+use crate::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+use crate::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use crate::sync::state::SyncState;
+use std::sync::Arc;
 
 pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
     // 1. Document CRUD Roundtrips
@@ -16,12 +16,24 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
         assert!(storage.get_document(doc_id, rec_1).await.unwrap().is_none());
 
         // Insert
-        storage.insert_document(doc_id, rec_1, &bytes_1).await.unwrap();
-        storage.insert_document(doc_id, rec_2, &bytes_2).await.unwrap();
+        storage
+            .insert_document(doc_id, rec_1, &bytes_1)
+            .await
+            .unwrap();
+        storage
+            .insert_document(doc_id, rec_2, &bytes_2)
+            .await
+            .unwrap();
 
         // Get
-        assert_eq!(storage.get_document(doc_id, rec_1).await.unwrap().unwrap(), bytes_1);
-        assert_eq!(storage.get_document(doc_id, rec_2).await.unwrap().unwrap(), bytes_2);
+        assert_eq!(
+            storage.get_document(doc_id, rec_1).await.unwrap().unwrap(),
+            bytes_1
+        );
+        assert_eq!(
+            storage.get_document(doc_id, rec_2).await.unwrap().unwrap(),
+            bytes_2
+        );
 
         // List
         let docs = storage.list_documents(doc_id).await.unwrap();
@@ -33,8 +45,11 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
         // Delete
         storage.delete_document(doc_id, rec_1).await.unwrap();
         assert!(storage.get_document(doc_id, rec_1).await.unwrap().is_none());
-        assert_eq!(storage.get_document(doc_id, rec_2).await.unwrap().unwrap(), bytes_2);
-        
+        assert_eq!(
+            storage.get_document(doc_id, rec_2).await.unwrap().unwrap(),
+            bytes_2
+        );
+
         // Clean up rec_2
         storage.delete_document(doc_id, rec_2).await.unwrap();
     }
@@ -61,10 +76,16 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             created_at: 1000,
         };
 
-        storage.write_document_and_oplog(doc_id, rec_id, &bytes, &entry).await.unwrap();
+        storage
+            .write_document_and_oplog(doc_id, rec_id, &bytes, &entry)
+            .await
+            .unwrap();
 
         // Verify doc and oplog inserted
-        assert_eq!(storage.get_document(doc_id, rec_id).await.unwrap().unwrap(), bytes);
+        assert_eq!(
+            storage.get_document(doc_id, rec_id).await.unwrap().unwrap(),
+            bytes
+        );
         let pending = storage.read_pending_oplog(ns_atomic, 10).await.unwrap();
         assert!(pending.iter().any(|e| e.id == "atomic-entry"));
 
@@ -84,10 +105,17 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             synced_at: None,
             created_at: 1001,
         };
-        storage.delete_document_and_oplog(doc_id, rec_id, &del_entry).await.unwrap();
+        storage
+            .delete_document_and_oplog(doc_id, rec_id, &del_entry)
+            .await
+            .unwrap();
 
         // Verify doc is deleted
-        assert!(storage.get_document(doc_id, rec_id).await.unwrap().is_none());
+        assert!(storage
+            .get_document(doc_id, rec_id)
+            .await
+            .unwrap()
+            .is_none());
         // Verify delete oplog entry is added
         let pending_after = storage.read_pending_oplog(ns_atomic, 10).await.unwrap();
         assert!(pending_after.iter().any(|e| e.id == "atomic-del-entry"));
@@ -148,7 +176,10 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
         assert_eq!(pending.len(), 0);
 
         // Read oplog after sequence
-        let after = storage.read_oplog_after_sequence(ns_oplog, 5).await.unwrap();
+        let after = storage
+            .read_oplog_after_sequence(ns_oplog, 5)
+            .await
+            .unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, "e-1");
         assert_eq!(after[0].sequence, Some(10));
@@ -232,7 +263,7 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
     // 8. reset_stale_pending, delete_synced_oplog_older_than, list_tombstoned_documents, update_oplog_encrypted_blob
     {
         let ns_advanced = "ns-advanced";
-        
+
         // Setup stale failed entry
         let stale_failed = OplogEntry {
             id: "stale-failed-1".to_string(),
@@ -252,11 +283,17 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
         storage.append_oplog(&stale_failed).await.unwrap();
 
         // 8a. update_oplog_encrypted_blob
-        storage.update_oplog_encrypted_blob("stale-failed-1", &[99, 88]).await.unwrap();
+        storage
+            .update_oplog_encrypted_blob("stale-failed-1", &[99, 88])
+            .await
+            .unwrap();
 
         // 8b. reset_stale_pending
         // should reset "stale-failed-1" back to Pending
-        let reset_count = storage.reset_stale_pending(ns_advanced, 1000).await.unwrap();
+        let reset_count = storage
+            .reset_stale_pending(ns_advanced, 1000)
+            .await
+            .unwrap();
         assert_eq!(reset_count, 1);
 
         let pending = storage.read_pending_oplog(ns_advanced, 10).await.unwrap();
@@ -269,12 +306,15 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
         // Mark as synced first
         // Mark as synced first
         storage.mark_synced("stale-failed-1", 500).await.unwrap();
-        
+
         // Wait 1.05 seconds so the system clock second advances, guaranteeing synced_at is strictly older than threshold
         tokio::time::sleep(std::time::Duration::from_millis(1050)).await;
 
         // If we delete synced oplog older than 0 seconds, it will target it.
-        let removed = storage.delete_synced_oplog_older_than(ns_advanced, 0).await.unwrap();
+        let removed = storage
+            .delete_synced_oplog_older_than(ns_advanced, 0)
+            .await
+            .unwrap();
         assert_eq!(removed, 1);
 
         // 8d. list_tombstoned_documents
@@ -292,11 +332,14 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sequence: Some(600),
             sync_status: SyncStatus::Synced,
             synced_at: Some(10), // 10 seconds epoch
-            created_at: 100, // 100ms epoch
+            created_at: 100,     // 100ms epoch
         };
         storage.append_oplog(&tombstone_entry).await.unwrap();
 
-        let tombstones = storage.list_tombstoned_documents(ns_advanced, 3600).await.unwrap();
+        let tombstones = storage
+            .list_tombstoned_documents(ns_advanced, 3600)
+            .await
+            .unwrap();
         assert_eq!(tombstones.len(), 1);
         assert_eq!(tombstones[0], ("d-tomb".to_string(), "r-tomb".to_string()));
     }

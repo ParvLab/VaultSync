@@ -13,9 +13,7 @@ pub struct MetricsSnapshot {
 }
 
 #[cfg(feature = "telemetry")]
-use prometheus::{
-    Registry, IntCounterVec, IntGaugeVec, HistogramVec, Opts, HistogramOpts
-};
+use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry};
 
 #[cfg(feature = "telemetry")]
 pub struct VaultSyncMetrics {
@@ -38,63 +36,100 @@ pub struct VaultSyncMetrics {
 impl VaultSyncMetrics {
     pub fn new() -> Self {
         let registry = get_registry();
-        
+
         let mutations_total = IntCounterVec::new(
-            Opts::new("vaultsync_mutations_total", "Total number of mutations attempted"),
-            &["status", "namespace"]
-        ).unwrap();
+            Opts::new(
+                "vaultsync_mutations_total",
+                "Total number of mutations attempted",
+            ),
+            &["status", "namespace"],
+        )
+        .unwrap();
         let mutations_failed = IntCounterVec::new(
-            Opts::new("vaultsync_mutations_failed", "Total number of failed mutations"),
-            &["namespace", "reason"]
-        ).unwrap();
+            Opts::new(
+                "vaultsync_mutations_failed",
+                "Total number of failed mutations",
+            ),
+            &["namespace", "reason"],
+        )
+        .unwrap();
         let conflicts_total = IntCounterVec::new(
-            Opts::new("vaultsync_conflicts_total", "Total number of sync conflicts encountered"),
-            &[]
-        ).unwrap();
+            Opts::new(
+                "vaultsync_conflicts_total",
+                "Total number of sync conflicts encountered",
+            ),
+            &[],
+        )
+        .unwrap();
         let mutations_pending = IntGaugeVec::new(
-            Opts::new("vaultsync_mutations_pending", "Number of mutations pending sync"),
-            &["namespace"]
-        ).unwrap();
+            Opts::new(
+                "vaultsync_mutations_pending",
+                "Number of mutations pending sync",
+            ),
+            &["namespace"],
+        )
+        .unwrap();
         let connection_status = IntGaugeVec::new(
-            Opts::new("vaultsync_connection_status", "Connection status (1=connected, 0=disconnected)"),
-            &["namespace"]
-        ).unwrap();
+            Opts::new(
+                "vaultsync_connection_status",
+                "Connection status (1=connected, 0=disconnected)",
+            ),
+            &["namespace"],
+        )
+        .unwrap();
         let leader_status = IntGaugeVec::new(
-            Opts::new("vaultsync_leader_status", "Leader status (1=leader, 0=reader)"),
-            &[]
-        ).unwrap();
+            Opts::new(
+                "vaultsync_leader_status",
+                "Leader status (1=leader, 0=reader)",
+            ),
+            &[],
+        )
+        .unwrap();
         let oplog_size = IntGaugeVec::new(
             Opts::new("vaultsync_oplog_size", "Size of the oplog in entries"),
-            &["namespace"]
-        ).unwrap();
+            &["namespace"],
+        )
+        .unwrap();
         let replica_count = IntGaugeVec::new(
             Opts::new("vaultsync_replica_count", "Number of known replicas"),
-            &["namespace"]
-        ).unwrap();
+            &["namespace"],
+        )
+        .unwrap();
         let doc_count = IntGaugeVec::new(
             Opts::new("vaultsync_doc_count", "Number of documents"),
-            &["doc_id"]
-        ).unwrap();
+            &["doc_id"],
+        )
+        .unwrap();
         let sync_lag_ms = HistogramVec::new(
             HistogramOpts::new("vaultsync_sync_lag_ms", "Sync lag in milliseconds")
                 .buckets(vec![10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0]),
-            &["namespace"]
-        ).unwrap();
+            &["namespace"],
+        )
+        .unwrap();
         let download_lag_ms = HistogramVec::new(
             HistogramOpts::new("vaultsync_download_lag_ms", "Download lag in milliseconds")
                 .buckets(vec![10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0]),
-            &["namespace"]
-        ).unwrap();
+            &["namespace"],
+        )
+        .unwrap();
         let encryption_time_us = HistogramVec::new(
-            HistogramOpts::new("vaultsync_encryption_time_us", "Encryption/decryption time in microseconds")
-                .buckets(vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]),
-            &["operation"]
-        ).unwrap();
+            HistogramOpts::new(
+                "vaultsync_encryption_time_us",
+                "Encryption/decryption time in microseconds",
+            )
+            .buckets(vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]),
+            &["operation"],
+        )
+        .unwrap();
         let crdt_merge_time_us = HistogramVec::new(
-            HistogramOpts::new("vaultsync_crdt_merge_time_us", "CRDT merge time in microseconds")
-                .buckets(vec![5.0, 25.0, 100.0, 500.0, 1000.0, 5000.0]),
-            &["doc_id"]
-        ).unwrap();
+            HistogramOpts::new(
+                "vaultsync_crdt_merge_time_us",
+                "CRDT merge time in microseconds",
+            )
+            .buckets(vec![5.0, 25.0, 100.0, 500.0, 1000.0, 5000.0]),
+            &["doc_id"],
+        )
+        .unwrap();
 
         let _ = registry.register(Box::new(mutations_total.clone()));
         let _ = registry.register(Box::new(mutations_failed.clone()));
@@ -128,11 +163,15 @@ impl VaultSyncMetrics {
     }
 
     pub fn record_upload(&self, count: usize) {
-        self.mutations_total.with_label_values(&["success", "default"]).inc_by(count as u64);
+        self.mutations_total
+            .with_label_values(&["success", "default"])
+            .inc_by(count as u64);
     }
 
     pub fn record_download(&self, count: usize) {
-        self.mutations_total.with_label_values(&["success", "default"]).inc_by(count as u64);
+        self.mutations_total
+            .with_label_values(&["success", "default"])
+            .inc_by(count as u64);
     }
 
     pub fn record_sync_lag(&self, ms: f64) {
@@ -140,15 +179,21 @@ impl VaultSyncMetrics {
     }
 
     pub fn record_sync_error(&self) {
-        self.mutations_failed.with_label_values(&["default", "sync_error"]).inc();
+        self.mutations_failed
+            .with_label_values(&["default", "sync_error"])
+            .inc();
     }
 
     pub fn record_mutation_attempt(&self, namespace: &str, status: &str) {
-        self.mutations_total.with_label_values(&[status, namespace]).inc();
+        self.mutations_total
+            .with_label_values(&[status, namespace])
+            .inc();
     }
 
     pub fn record_mutation_failed(&self, namespace: &str, reason: &str) {
-        self.mutations_failed.with_label_values(&[namespace, reason]).inc();
+        self.mutations_failed
+            .with_label_values(&[namespace, reason])
+            .inc();
     }
 
     pub fn record_conflict(&self) {
@@ -156,15 +201,21 @@ impl VaultSyncMetrics {
     }
 
     pub fn set_mutations_pending(&self, namespace: &str, count: i64) {
-        self.mutations_pending.with_label_values(&[namespace]).set(count);
+        self.mutations_pending
+            .with_label_values(&[namespace])
+            .set(count);
     }
 
     pub fn set_connection_status(&self, namespace: &str, connected: bool) {
-        self.connection_status.with_label_values(&[namespace]).set(if connected { 1 } else { 0 });
+        self.connection_status
+            .with_label_values(&[namespace])
+            .set(if connected { 1 } else { 0 });
     }
 
     pub fn set_leader_status(&self, leader: bool) {
-        self.leader_status.with_label_values(&[]).set(if leader { 1 } else { 0 });
+        self.leader_status
+            .with_label_values(&[])
+            .set(if leader { 1 } else { 0 });
     }
 
     pub fn set_oplog_size(&self, namespace: &str, size: i64) {
@@ -172,7 +223,9 @@ impl VaultSyncMetrics {
     }
 
     pub fn set_replica_count(&self, namespace: &str, count: i64) {
-        self.replica_count.with_label_values(&[namespace]).set(count);
+        self.replica_count
+            .with_label_values(&[namespace])
+            .set(count);
     }
 
     pub fn set_doc_count(&self, doc_id: &str, count: i64) {
@@ -180,15 +233,21 @@ impl VaultSyncMetrics {
     }
 
     pub fn record_download_lag(&self, namespace: &str, ms: f64) {
-        self.download_lag_ms.with_label_values(&[namespace]).observe(ms);
+        self.download_lag_ms
+            .with_label_values(&[namespace])
+            .observe(ms);
     }
 
     pub fn record_encryption_time(&self, operation: &str, us: f64) {
-        self.encryption_time_us.with_label_values(&[operation]).observe(us);
+        self.encryption_time_us
+            .with_label_values(&[operation])
+            .observe(us);
     }
 
     pub fn record_crdt_merge_time(&self, doc_id: &str, us: f64) {
-        self.crdt_merge_time_us.with_label_values(&[doc_id]).observe(us);
+        self.crdt_merge_time_us
+            .with_label_values(&[doc_id])
+            .observe(us);
     }
 
     pub fn record_key_rotation(&self, _namespace: &str) {
@@ -197,10 +256,22 @@ impl VaultSyncMetrics {
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
-            mutations_uploaded: self.mutations_total.with_label_values(&["success", "default"]).get(),
-            mutations_downloaded: self.mutations_total.with_label_values(&["success", "default"]).get(),
-            sync_errors: self.mutations_failed.with_label_values(&["default", "sync_error"]).get(),
-            last_sync_lag_ms: self.sync_lag_ms.with_label_values(&["default"]).get_sample_sum() as u64,
+            mutations_uploaded: self
+                .mutations_total
+                .with_label_values(&["success", "default"])
+                .get(),
+            mutations_downloaded: self
+                .mutations_total
+                .with_label_values(&["success", "default"])
+                .get(),
+            sync_errors: self
+                .mutations_failed
+                .with_label_values(&["default", "sync_error"])
+                .get(),
+            last_sync_lag_ms: self
+                .sync_lag_ms
+                .with_label_values(&["default"])
+                .get_sample_sum() as u64,
             pending_mutations: self.mutations_pending.with_label_values(&["default"]).get() as u64,
             replica_count: self.replica_count.with_label_values(&["default"]).get() as u64,
             doc_count: 0,
@@ -248,11 +319,13 @@ impl VaultSyncMetrics {
     }
 
     pub fn record_upload(&self, count: usize) {
-        self.mutations_uploaded.fetch_add(count as u64, Ordering::Relaxed);
+        self.mutations_uploaded
+            .fetch_add(count as u64, Ordering::Relaxed);
     }
 
     pub fn record_download(&self, count: usize) {
-        self.mutations_downloaded.fetch_add(count as u64, Ordering::Relaxed);
+        self.mutations_downloaded
+            .fetch_add(count as u64, Ordering::Relaxed);
     }
 
     pub fn record_sync_lag(&self, ms: f64) {

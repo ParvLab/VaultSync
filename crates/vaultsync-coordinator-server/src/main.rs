@@ -3,33 +3,51 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use vaultsync_coordinator_server::{
+    build_router,
     config::ServerConfig,
     state::AppState,
-    token_store::{MemoryTokenStore, SqliteTokenStore, RedisTokenStore, TokenStore},
-    build_router,
+    token_store::{MemoryTokenStore, RedisTokenStore, SqliteTokenStore, TokenStore},
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize structured logging
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     // Parse config arguments
     let config = ServerConfig::parse_args();
-    tracing::info!("Starting VaultSync Coordinator Server with config: {:?}", config);
+    tracing::info!(
+        "Starting VaultSync Coordinator Server with config: {:?}",
+        config
+    );
 
     // Initialize the pluggable coordinator backend
-    let coordinator: Arc<dyn vaultsync_core::coordinator::traits::Coordinator> = match config.backend.as_str() {
+    let coordinator: Arc<dyn vaultsync_core::coordinator::traits::Coordinator> = match config
+        .backend
+        .as_str()
+    {
         "sqlite" => {
-            tracing::info!("Initializing SQLite coordinator backend at path: {}", config.db_path);
-            Arc::new(vaultsync_coordinator_sqlite::coordinator::SQLiteCoordinator::new(&config.db_path))
+            tracing::info!(
+                "Initializing SQLite coordinator backend at path: {}",
+                config.db_path
+            );
+            Arc::new(
+                vaultsync_coordinator_sqlite::coordinator::SQLiteCoordinator::new(&config.db_path),
+            )
         }
         "redis" => {
-            tracing::info!("Initializing Redis coordinator backend at URL: {}", config.db_url);
-            let redis_coord = vaultsync_coordinator_redis::coordinator::RedisCoordinator::new(&config.db_url).await
-                .map_err(|e| format!("Redis initialization error: {:?}", e))?;
+            tracing::info!(
+                "Initializing Redis coordinator backend at URL: {}",
+                config.db_url
+            );
+            let redis_coord =
+                vaultsync_coordinator_redis::coordinator::RedisCoordinator::new(&config.db_url)
+                    .await
+                    .map_err(|e| format!("Redis initialization error: {:?}", e))?;
             Arc::new(redis_coord)
         }
         "memory" | _ => {
@@ -42,7 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token_store: Option<Arc<dyn TokenStore>> = if config.admin_token.is_some() {
         let store: Arc<dyn TokenStore> = match config.backend.as_str() {
             "sqlite" => {
-                tracing::info!("Initializing SQLite token store at path: {}", config.db_path);
+                tracing::info!(
+                    "Initializing SQLite token store at path: {}",
+                    config.db_path
+                );
                 Arc::new(SqliteTokenStore::new(&config.db_path)?)
             }
             "redis" => {

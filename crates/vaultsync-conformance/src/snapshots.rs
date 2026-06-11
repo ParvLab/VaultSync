@@ -7,7 +7,10 @@ pub async fn run_snapshots_tests(coord: Arc<dyn Coordinator>, ns: &str) {
     let record_id = "rec-snap-1";
 
     // 1. get_missing_snapshot_returns_none
-    let missing = coord.get_snapshot(ns, doc_id, record_id).await.expect("get missing snapshot");
+    let missing = coord
+        .get_snapshot(ns, doc_id, record_id)
+        .await
+        .expect("get missing snapshot");
     assert!(missing.is_none(), "expected missing snapshot to be None");
 
     // 2. store_and_get_snapshot & store_snapshot_checksum_survives
@@ -21,9 +24,15 @@ pub async fn run_snapshots_tests(coord: Arc<dyn Coordinator>, ns: &str) {
         checksum: 12345, // Arbitrary checksum for test
     };
 
-    coord.store_snapshot(ns, &snap).await.expect("store snapshot");
+    coord
+        .store_snapshot(ns, &snap)
+        .await
+        .expect("store snapshot");
 
-    let retrieved = coord.get_snapshot(ns, doc_id, record_id).await.expect("get stored snapshot")
+    let retrieved = coord
+        .get_snapshot(ns, doc_id, record_id)
+        .await
+        .expect("get stored snapshot")
         .expect("expected snapshot to exist");
 
     assert_eq!(retrieved.doc_id, snap.doc_id);
@@ -45,9 +54,15 @@ pub async fn run_snapshots_tests(coord: Arc<dyn Coordinator>, ns: &str) {
         checksum: 54321,
     };
 
-    coord.store_snapshot(ns, &snap_new).await.expect("store updated snapshot");
+    coord
+        .store_snapshot(ns, &snap_new)
+        .await
+        .expect("store updated snapshot");
 
-    let retrieved_new = coord.get_snapshot(ns, doc_id, record_id).await.expect("get updated snapshot")
+    let retrieved_new = coord
+        .get_snapshot(ns, doc_id, record_id)
+        .await
+        .expect("get updated snapshot")
         .expect("expected snapshot to exist");
     assert_eq!(retrieved_new.sequence, 20);
     assert_eq!(retrieved_new.bytes, vec![6, 7, 8, 9, 10]);
@@ -83,7 +98,10 @@ pub async fn run_snapshots_tests(coord: Arc<dyn Coordinator>, ns: &str) {
         schema_version: 0,
         key_version: 1,
     };
-    let seqs = coord.push(ns, vec![mut1]).await.expect("push compaction mutation");
+    let seqs = coord
+        .push(ns, vec![mut1])
+        .await
+        .expect("push compaction mutation");
     let seq = seqs[0];
 
     // Store snapshot with sequence >= the mutation's sequence
@@ -96,7 +114,10 @@ pub async fn run_snapshots_tests(coord: Arc<dyn Coordinator>, ns: &str) {
         bytes: vec![9, 9],
         checksum: 123,
     };
-    coord.store_snapshot(ns, &snap_c).await.expect("store snapshot for compact");
+    coord
+        .store_snapshot(ns, &snap_c)
+        .await
+        .expect("store snapshot for compact");
 
     // Perform compaction
     let stats = coord.compact_oplog(ns).await.expect("compact oplog");

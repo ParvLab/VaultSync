@@ -1,8 +1,8 @@
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::error::VaultSyncError;
 use aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use crate::error::VaultSyncError;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static NONCE_PREFIX: OnceLock<[u8; 4]> = OnceLock::new();
@@ -37,13 +37,14 @@ pub fn encrypt_with_shared_secret(
     shared_secret: &[u8; 32],
 ) -> Result<Vec<u8>, VaultSyncError> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(shared_secret));
-    
+
     let nonce_bytes = get_unique_nonce();
     let nonce = Nonce::from_slice(&nonce_bytes);
-    
-    let ciphertext = cipher.encrypt(nonce, plaintext)
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
         .map_err(|e| VaultSyncError::Encryption(format!("encrypt failed: {e}")))?;
-        
+
     let mut payload = Vec::with_capacity(12 + ciphertext.len());
     payload.extend_from_slice(&nonce_bytes);
     payload.extend_from_slice(&ciphertext);

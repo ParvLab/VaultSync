@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use crate::error::VaultSyncError;
-use crate::storage::traits::Storage;
-use crate::oplog::entry::{OplogEntry, SyncStatus, MutationType};
 use crate::crdt::document::CRDTDocument;
+use crate::error::VaultSyncError;
+use crate::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+use crate::storage::traits::Storage;
+use std::sync::Arc;
 
 pub struct CrashRecovery {
     storage: Arc<dyn Storage>,
@@ -14,9 +14,15 @@ impl CrashRecovery {
         Self { storage, namespace }
     }
 
-    pub async fn recover(&self, keyring: Arc<crate::e2ee::keyring::KeyRing>) -> Result<usize, VaultSyncError> {
+    pub async fn recover(
+        &self,
+        keyring: Arc<crate::e2ee::keyring::KeyRing>,
+    ) -> Result<usize, VaultSyncError> {
         // 1. Reset any stale non-synced entries older than 60 seconds back to Pending.
-        let mut recovered_count = self.storage.reset_stale_pending(&self.namespace, 60_000).await?;
+        let mut recovered_count = self
+            .storage
+            .reset_stale_pending(&self.namespace, 60_000)
+            .await?;
 
         // 2. Open shared memory ring buffer and read uncommitted entries
         if let Ok(shm) = crate::ipc::shared_memory::SharedMemory::open(&self.namespace) {
@@ -26,8 +32,9 @@ impl CrashRecovery {
                     if let Ok(doc) = CRDTDocument::from_snapshot(&entry.yrs_update) {
                         let doc_id = doc.doc_id.clone();
                         let record_id = doc.record_id.clone();
-                        
-                        let encrypted_blob = encryptor.encrypt_symmetric(&entry.yrs_update, &self.namespace)?;
+
+                        let encrypted_blob =
+                            encryptor.encrypt_symmetric(&entry.yrs_update, &self.namespace)?;
                         let epoch = entry.timestamp;
                         let oplog_entry = OplogEntry {
                             id: entry.id.clone(),
@@ -45,7 +52,16 @@ impl CrashRecovery {
                             created_at: epoch,
                         };
 
-                        match self.storage.write_document_and_oplog(&doc_id, &record_id, &entry.yrs_update, &oplog_entry).await {
+                        match self
+                            .storage
+                            .write_document_and_oplog(
+                                &doc_id,
+                                &record_id,
+                                &entry.yrs_update,
+                                &oplog_entry,
+                            )
+                            .await
+                        {
                             Ok(_) => {
                                 recovered_count += 1;
                             }

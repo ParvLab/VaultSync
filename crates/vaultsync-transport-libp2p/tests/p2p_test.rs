@@ -4,20 +4,21 @@ use vaultsync_transport_libp2p::{LibP2pTransport, PendingMutation};
 
 #[tokio::test]
 async fn test_mutation_gossip_roundtrip() {
-
     let ns = "test-gossip-ns";
     let (incoming_tx1, _incoming_rx1) = mpsc::channel(10);
     let (incoming_tx2, mut incoming_rx2) = mpsc::channel(10);
 
     // Node 1 listens on TCP ephemeral port
-    let (node1, handle1) = LibP2pTransport::new(ns, Some("/ip4/127.0.0.1/tcp/0".to_string()), incoming_tx1)
-        .await
-        .unwrap();
+    let (node1, handle1) =
+        LibP2pTransport::new(ns, Some("/ip4/127.0.0.1/tcp/0".to_string()), incoming_tx1)
+            .await
+            .unwrap();
 
     // Node 2 listens on TCP ephemeral port
-    let (node2, handle2) = LibP2pTransport::new(ns, Some("/ip4/127.0.0.1/tcp/0".to_string()), incoming_tx2)
-        .await
-        .unwrap();
+    let (node2, handle2) =
+        LibP2pTransport::new(ns, Some("/ip4/127.0.0.1/tcp/0".to_string()), incoming_tx2)
+            .await
+            .unwrap();
 
     tokio::spawn(node1.run());
     tokio::spawn(node2.run());
@@ -26,7 +27,10 @@ async fn test_mutation_gossip_roundtrip() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let addresses1 = handle1.listen_addresses();
-    assert!(!addresses1.is_empty(), "Node 1 should be listening on at least one address");
+    assert!(
+        !addresses1.is_empty(),
+        "Node 1 should be listening on at least one address"
+    );
     let target_addr = addresses1[0].clone();
 
     // Explicitly dial Node 1 from Node 2 to bypass mDNS discovery unreliability on loopback
@@ -67,14 +71,22 @@ async fn test_namespace_isolation() {
     let (incoming_tx2, mut incoming_rx2) = mpsc::channel(10);
 
     // Node 1 is on ns-1
-    let (node1, handle1) = LibP2pTransport::new("ns-1", Some("/ip4/127.0.0.1/tcp/0".to_string()), incoming_tx1)
-        .await
-        .unwrap();
+    let (node1, handle1) = LibP2pTransport::new(
+        "ns-1",
+        Some("/ip4/127.0.0.1/tcp/0".to_string()),
+        incoming_tx1,
+    )
+    .await
+    .unwrap();
 
     // Node 2 is on ns-2
-    let (node2, handle2) = LibP2pTransport::new("ns-2", Some("/ip4/127.0.0.1/tcp/0".to_string()), incoming_tx2)
-        .await
-        .unwrap();
+    let (node2, handle2) = LibP2pTransport::new(
+        "ns-2",
+        Some("/ip4/127.0.0.1/tcp/0".to_string()),
+        incoming_tx2,
+    )
+    .await
+    .unwrap();
 
     tokio::spawn(node1.run());
     tokio::spawn(node2.run());
@@ -108,14 +120,17 @@ async fn test_namespace_isolation() {
 
     // Node 2 (ns-2) should not receive it since they are on different topics/namespaces
     let receive_attempt = tokio::time::timeout(Duration::from_secs(2), incoming_rx2.recv()).await;
-    assert!(receive_attempt.is_err(), "Node on ns-2 received a message from ns-1");
+    assert!(
+        receive_attempt.is_err(),
+        "Node on ns-2 received a message from ns-1"
+    );
 }
 
 #[tokio::test]
 async fn test_hybrid_p2p_and_coordinator_convergence() {
+    use std::sync::Arc;
     use vaultsync_coordinator_memory::coordinator::InMemoryCoordinator;
     use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation};
-    use std::sync::Arc;
 
     let coordinator = Arc::new(InMemoryCoordinator::new());
     let namespace = "hybrid-test-ns";
@@ -128,13 +143,17 @@ async fn test_hybrid_p2p_and_coordinator_convergence() {
         namespace,
         Some("/ip4/127.0.0.1/tcp/0".to_string()),
         incoming_tx_a,
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     let (node_b, handle_b) = LibP2pTransport::new(
         namespace,
         Some("/ip4/127.0.0.1/tcp/0".to_string()),
         incoming_tx_b,
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     tokio::spawn(node_a.run());
     tokio::spawn(node_b.run());
@@ -176,15 +195,26 @@ async fn test_hybrid_p2p_and_coordinator_convergence() {
         .await
         .expect("B did not receive mutation via P2P within 5s")
         .unwrap();
-    assert_eq!(received_by_b.id, "hybrid-mut-1", "B got wrong mutation via P2P");
+    assert_eq!(
+        received_by_b.id, "hybrid-mut-1",
+        "B got wrong mutation via P2P"
+    );
 
     // --- Path 2: Push to coordinator (e.g. replica C pulls it) ---
-    coordinator.push(namespace, vec![mutation.clone()]).await.unwrap();
+    coordinator
+        .push(namespace, vec![mutation.clone()])
+        .await
+        .unwrap();
     let pulled = coordinator.pull(namespace, 0, 10).await.unwrap();
     assert_eq!(pulled.len(), 1, "Coordinator should have 1 mutation");
-    assert_eq!(pulled[0].id, "hybrid-mut-1", "C got wrong mutation via coordinator");
+    assert_eq!(
+        pulled[0].id, "hybrid-mut-1",
+        "C got wrong mutation via coordinator"
+    );
 
     // --- Convergence check ---
-    assert_eq!(received_by_b.encrypted_blob, pulled[0].encrypted_blob,
-        "P2P blob and coordinator blob must be identical");
+    assert_eq!(
+        received_by_b.encrypted_blob, pulled[0].encrypted_blob,
+        "P2P blob and coordinator blob must be identical"
+    );
 }

@@ -1,8 +1,8 @@
 //! CRDT property-based tests. (vaultsync-testing-spec.md §6)
 //! Tests 4 CRDT properties using randomly generated mutations.
 
-use vaultsync_core::crdt::{document::CRDTDocument, types::CrdtValue};
 use proptest::prelude::*;
+use vaultsync_core::crdt::{document::CRDTDocument, types::CrdtValue};
 
 fn new_doc() -> CRDTDocument {
     CRDTDocument::new("test", "r:1", 0)
@@ -11,7 +11,9 @@ fn new_doc() -> CRDTDocument {
 fn arb_value() -> impl Strategy<Value = CrdtValue> {
     prop_oneof![
         "[a-z]{0,20}".prop_map(CrdtValue::String),
-        any::<f64>().prop_filter("finite", |f| f.is_finite()).prop_map(CrdtValue::Number),
+        any::<f64>()
+            .prop_filter("finite", |f| f.is_finite())
+            .prop_map(CrdtValue::Number),
         any::<bool>().prop_map(CrdtValue::Boolean),
         Just(CrdtValue::Null),
     ]
@@ -26,14 +28,18 @@ fn arb_mutations() -> impl Strategy<Value = Vec<(String, CrdtValue)>> {
 }
 
 fn apply_all(doc: &mut CRDTDocument, ms: &[(String, CrdtValue)]) -> Vec<Vec<u8>> {
-    ms.iter().map(|(k, v)| doc.set_field(k, v.clone())).collect()
+    ms.iter()
+        .map(|(k, v)| doc.set_field(k, v.clone()))
+        .collect()
 }
 
 fn permuted<T: Clone>(items: &[T], seed: u64) -> Vec<T> {
     let mut v = items.to_vec();
     let mut s = seed;
     for i in (1..v.len()).rev() {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (s >> 33) as usize % (i + 1);
         v.swap(i, j);
     }

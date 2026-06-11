@@ -1,7 +1,11 @@
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
-pub fn encrypt(plaintext: &[u8], sender_sk: &[u8], recipient_pk: &[u8]) -> Result<Vec<u8>, JsValue> {
+pub fn encrypt(
+    plaintext: &[u8],
+    sender_sk: &[u8],
+    recipient_pk: &[u8],
+) -> Result<Vec<u8>, JsValue> {
     if sender_sk.len() != 32 || recipient_pk.len() != 32 {
         return Err(JsValue::from_str("Invalid key lengths"));
     }
@@ -15,7 +19,11 @@ pub fn encrypt(plaintext: &[u8], sender_sk: &[u8], recipient_pk: &[u8]) -> Resul
 }
 
 #[wasm_bindgen]
-pub fn decrypt(ciphertext: &[u8], recipient_sk: &[u8], sender_pk: &[u8]) -> Result<Vec<u8>, JsValue> {
+pub fn decrypt(
+    ciphertext: &[u8],
+    recipient_sk: &[u8],
+    sender_pk: &[u8],
+) -> Result<Vec<u8>, JsValue> {
     if recipient_sk.len() != 32 || sender_pk.len() != 32 {
         return Err(JsValue::from_str("Invalid key lengths"));
     }

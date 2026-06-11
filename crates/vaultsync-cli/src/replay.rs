@@ -1,17 +1,19 @@
+use async_trait::async_trait;
 use clap::Args;
-use serde::{Serialize, Deserialize};
+use futures::Stream;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::path::Path;
-use async_trait::async_trait;
-use futures::Stream;
-use vaultsync_core::VaultSyncClient;
-use vaultsync_core::VaultSyncConfig;
+use std::sync::Arc;
+use vaultsync_core::coordinator::memory::InMemoryCoordinator;
+use vaultsync_core::coordinator::traits::{
+    Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId,
+};
 use vaultsync_core::crdt::types::CrdtValue;
 use vaultsync_core::storage::traits::StorageConfig;
-use vaultsync_core::coordinator::memory::InMemoryCoordinator;
-use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId, CoordinatorError};
+use vaultsync_core::VaultSyncClient;
+use vaultsync_core::VaultSyncConfig;
 
 #[derive(Args)]
 pub struct ReplayArgs {
@@ -32,9 +34,15 @@ pub enum TraceEvent {
         record_id: String,
         fields: HashMap<String, CrdtValue>,
     },
-    Disconnect { replica_id: String },
-    Reconnect { replica_id: String },
-    Crash { replica_id: String },
+    Disconnect {
+        replica_id: String,
+    },
+    Reconnect {
+        replica_id: String,
+    },
+    Crash {
+        replica_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -68,7 +76,11 @@ impl SimulatedNetworkCoordinator {
 
 #[async_trait]
 impl Coordinator for SimulatedNetworkCoordinator {
-    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         if let Some(first) = mutations.first() {
             if self.is_offline(&first.replica_id) {
                 return Err(CoordinatorError::NotAvailable);
@@ -77,11 +89,20 @@ impl Coordinator for SimulatedNetworkCoordinator {
         self.inner.push(namespace, mutations).await
     }
 
-    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         self.inner.pull(namespace, after, limit).await
     }
 
-    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn subscribe(
+        &self,
+        namespace: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         self.inner.subscribe(namespace, from_sequence).await
     }
 
@@ -118,10 +139,21 @@ pub async fn run(args: ReplayArgs) {
         for span in spans {
             if span.get("name").and_then(|v| v.as_str()) == Some("vaultsync.write") {
                 if let Some(fields) = span.get("fields") {
-                    let doc_id = fields.get("doc_id").and_then(|v| v.as_str()).unwrap_or("doc-1").to_string();
-                    let record_id = fields.get("record_id").and_then(|v| v.as_str()).unwrap_or("rec-1").to_string();
+                    let doc_id = fields
+                        .get("doc_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("doc-1")
+                        .to_string();
+                    let record_id = fields
+                        .get("record_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("rec-1")
+                        .to_string();
                     let mut write_fields = HashMap::new();
-                    write_fields.insert("title".to_string(), CrdtValue::String("Simulated edit".to_string()));
+                    write_fields.insert(
+                        "title".to_string(),
+                        CrdtValue::String("Simulated edit".to_string()),
+                    );
                     evs.push(TraceEvent::Write {
                         replica_id: "replica-1".to_string(),
                         doc_id,
@@ -145,19 +177,33 @@ pub async fn run(args: ReplayArgs) {
 
     for event in events {
         match event {
-            TraceEvent::Write { replica_id, doc_id, record_id, fields } => {
+            TraceEvent::Write {
+                replica_id,
+                doc_id,
+                record_id,
+                fields,
+            } => {
                 if !replicas.contains_key(&replica_id) {
                     let mut config = VaultSyncConfig::default();
                     config.namespace = ns.to_string();
                     config.replica_id = replica_id.clone();
                     config.storage = StorageConfig::InMemory;
                     config.sync_interval = std::time::Duration::from_secs(3600);
-                    let client = VaultSyncClient::new_with_keyring(config, simulated_coordinator.clone(), keyring.clone()).await.unwrap();
+                    let client = VaultSyncClient::new_with_keyring(
+                        config,
+                        simulated_coordinator.clone(),
+                        keyring.clone(),
+                    )
+                    .await
+                    .unwrap();
                     replicas.insert(replica_id.clone(), client);
                 }
 
                 let client = replicas.get(&replica_id).unwrap();
-                println!("Replaying: Replica {} writes to {}/{}", replica_id, doc_id, record_id);
+                println!(
+                    "Replaying: Replica {} writes to {}/{}",
+                    replica_id, doc_id, record_id
+                );
                 if let Err(e) = client.insert(&doc_id, &record_id, fields).await {
                     eprintln!("Write failed: {:?}", e);
                     return;

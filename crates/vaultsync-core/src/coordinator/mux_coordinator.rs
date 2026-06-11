@@ -1,7 +1,7 @@
-use async_trait::async_trait;
+use crate::coordinator::http::HttpCoordinatorConfig;
 use crate::coordinator::traits::*;
 use crate::coordinator::ws_proto::*;
-use crate::coordinator::http::HttpCoordinatorConfig;
+use async_trait::async_trait;
 use futures::Stream;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -14,11 +14,29 @@ use futures::SinkExt;
 #[derive(Debug, Clone)]
 struct MuxWsHandle {
     tx: tokio::sync::mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
-    pending_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
-    pending_registers: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<NamespaceAckPayload>>>>,
-    pending_schema_syncs: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<SchemaMigrationPayload>>>>,
-    namespace_txs: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<PendingMutation>>>>,
-    snapshots: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<crate::crdt::snapshot::Snapshot>>>>,
+    pending_requests: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>,
+        >,
+    >,
+    pending_registers: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<NamespaceAckPayload>>,
+        >,
+    >,
+    pending_schema_syncs: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<SchemaMigrationPayload>>,
+        >,
+    >,
+    namespace_txs: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::mpsc::Sender<PendingMutation>>,
+        >,
+    >,
+    snapshots: Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, Vec<crate::crdt::snapshot::Snapshot>>>,
+    >,
 }
 
 #[derive(Clone, Debug)]
@@ -33,11 +51,12 @@ struct ActiveNamespaceConfig {
 pub struct MuxCoordinator {
     client: reqwest::Client,
     config: HttpCoordinatorConfig,
-    
+
     #[cfg(not(target_arch = "wasm32"))]
     ws_client: Arc<tokio::sync::Mutex<Option<MuxWsHandle>>>,
-    
-    active_namespaces: Arc<tokio::sync::Mutex<std::collections::HashMap<String, ActiveNamespaceConfig>>>,
+
+    active_namespaces:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, ActiveNamespaceConfig>>>,
 }
 
 impl MuxCoordinator {
@@ -52,7 +71,11 @@ impl MuxCoordinator {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn ensure_connected(self_arc: Arc<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<MuxWsHandle, CoordinatorError>> + Send>> {
+    fn ensure_connected(
+        self_arc: Arc<Self>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<MuxWsHandle, CoordinatorError>> + Send>,
+    > {
         Box::pin(async move {
             {
                 let ws_client_lock = self_arc.ws_client.lock().await;
@@ -62,11 +85,13 @@ impl MuxCoordinator {
             }
 
             let ws_url = get_ws_mux_url(&self_arc.config.url);
-            let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await
+            let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
+                .await
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
             let (mut ws_sink, mut ws_stream) = ws_stream.split();
-            let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<tokio_tungstenite::tungstenite::Message>(128);
+            let (write_tx, mut write_rx) =
+                tokio::sync::mpsc::channel::<tokio_tungstenite::tungstenite::Message>(128);
 
             // Writer task
             crate::time_utils::spawn(async move {
@@ -77,9 +102,12 @@ impl MuxCoordinator {
                 }
             });
 
-            let pending_requests = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-            let pending_registers = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-            let pending_schema_syncs = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+            let pending_requests =
+                Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+            let pending_registers =
+                Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+            let pending_schema_syncs =
+                Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
             let namespace_txs = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
             let snapshots = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -100,7 +128,10 @@ impl MuxCoordinator {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     let namespaces = {
                         let guard = active_namespaces_hb.lock().await;
-                        guard.iter().map(|(ns, cfg)| (ns.clone(), cfg.replica_id.clone())).collect::<Vec<_>>()
+                        guard
+                            .iter()
+                            .map(|(ns, cfg)| (ns.clone(), cfg.replica_id.clone()))
+                            .collect::<Vec<_>>()
                     };
 
                     if namespaces.is_empty() {
@@ -109,7 +140,11 @@ impl MuxCoordinator {
                             namespace: "".to_string(),
                         };
                         if let Ok(frame) = encode_frame(MSG_HEARTBEAT, &hb) {
-                            if write_tx_heartbeat.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_err() {
+                            if write_tx_heartbeat
+                                .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -120,7 +155,11 @@ impl MuxCoordinator {
                                 namespace: ns,
                             };
                             if let Ok(frame) = encode_frame(MSG_HEARTBEAT, &hb) {
-                                if write_tx_heartbeat.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_err() {
+                                if write_tx_heartbeat
+                                    .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -137,7 +176,7 @@ impl MuxCoordinator {
             let pending_schema_syncs_clone = pending_schema_syncs.clone();
             let namespace_txs_clone = namespace_txs.clone();
             let snapshots_clone = snapshots.clone();
-            
+
             let self_weak = Arc::downgrade(&self_arc);
 
             crate::time_utils::spawn(async move {
@@ -152,11 +191,17 @@ impl MuxCoordinator {
                         if let Ok((msg_type, payload)) = decode_frame(&bin) {
                             match msg_type {
                                 MSG_MUTATION_PUSH => {
-                                    if let Ok(mutat) = serde_json::from_slice::<PendingMutation>(payload) {
+                                    if let Ok(mutat) =
+                                        serde_json::from_slice::<PendingMutation>(payload)
+                                    {
                                         {
-                                            let mut active_guard = active_namespaces_clone.lock().await;
-                                            if let Some(cfg) = active_guard.get_mut(&mutat.namespace) {
-                                                cfg.last_sequence = cfg.last_sequence.max(mutat.sequence);
+                                            let mut active_guard =
+                                                active_namespaces_clone.lock().await;
+                                            if let Some(cfg) =
+                                                active_guard.get_mut(&mutat.namespace)
+                                            {
+                                                cfg.last_sequence =
+                                                    cfg.last_sequence.max(mutat.sequence);
                                             }
                                         }
                                         let tx_opt = {
@@ -169,7 +214,9 @@ impl MuxCoordinator {
                                     }
                                 }
                                 MSG_SNAPSHOT => {
-                                    if let Ok(snap_payload) = serde_json::from_slice::<SnapshotPayload>(payload) {
+                                    if let Ok(snap_payload) =
+                                        serde_json::from_slice::<SnapshotPayload>(payload)
+                                    {
                                         let snap = crate::crdt::snapshot::Snapshot {
                                             doc_id: snap_payload.doc_id,
                                             record_id: snap_payload.record_id,
@@ -181,8 +228,13 @@ impl MuxCoordinator {
                                         };
                                         if snap.verify_checksum() {
                                             let mut snaps_guard = snapshots_clone.lock().await;
-                                            let ns_snaps = snaps_guard.entry(snap_payload.namespace.clone()).or_default();
-                                            if let Some(existing) = ns_snaps.iter_mut().find(|s| s.doc_id == snap.doc_id && s.record_id == snap.record_id) {
+                                            let ns_snaps = snaps_guard
+                                                .entry(snap_payload.namespace.clone())
+                                                .or_default();
+                                            if let Some(existing) = ns_snaps.iter_mut().find(|s| {
+                                                s.doc_id == snap.doc_id
+                                                    && s.record_id == snap.record_id
+                                            }) {
                                                 if snap.sequence > existing.sequence {
                                                     *existing = snap;
                                                 }
@@ -193,7 +245,9 @@ impl MuxCoordinator {
                                     }
                                 }
                                 MSG_NAMESPACE_ACK => {
-                                    if let Ok(ack) = serde_json::from_slice::<NamespaceAckPayload>(payload) {
+                                    if let Ok(ack) =
+                                        serde_json::from_slice::<NamespaceAckPayload>(payload)
+                                    {
                                         let mut reqs = pending_registers_clone.lock().await;
                                         if let Some(tx) = reqs.remove(&ack.namespace) {
                                             let _ = tx.send(ack);
@@ -201,7 +255,9 @@ impl MuxCoordinator {
                                     }
                                 }
                                 MSG_SCHEMA_MIGRATION => {
-                                    if let Ok(mig) = serde_json::from_slice::<SchemaMigrationPayload>(payload) {
+                                    if let Ok(mig) =
+                                        serde_json::from_slice::<SchemaMigrationPayload>(payload)
+                                    {
                                         let mut reqs = pending_schema_syncs_clone.lock().await;
                                         if let Some(tx) = reqs.remove(&mig.namespace) {
                                             let _ = tx.send(mig);
@@ -209,8 +265,12 @@ impl MuxCoordinator {
                                     }
                                 }
                                 _ => {
-                                    if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(payload) {
-                                        if let Some(req_id) = json_val.get("request_id").and_then(|v| v.as_str()) {
+                                    if let Ok(json_val) =
+                                        serde_json::from_slice::<serde_json::Value>(payload)
+                                    {
+                                        if let Some(req_id) =
+                                            json_val.get("request_id").and_then(|v| v.as_str())
+                                        {
                                             let mut reqs = pending_requests_clone.lock().await;
                                             if let Some(tx) = reqs.remove(req_id) {
                                                 let _ = tx.send(bin);
@@ -291,7 +351,14 @@ impl MuxCoordinator {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn add_namespace(self_arc: Arc<Self>, namespace: &str, replica_id: &str, public_key: Vec<u8>, schema_version: u64, last_sequence: u64) -> Result<(), CoordinatorError> {
+    pub async fn add_namespace(
+        self_arc: Arc<Self>,
+        namespace: &str,
+        replica_id: &str,
+        public_key: Vec<u8>,
+        schema_version: u64,
+        last_sequence: u64,
+    ) -> Result<(), CoordinatorError> {
         let handle = Self::ensure_connected(self_arc.clone()).await?;
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<NamespaceAckPayload>();
@@ -312,10 +379,14 @@ impl MuxCoordinator {
         let add_frame = encode_frame(MSG_NAMESPACE_ADD, &add_payload)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
-        handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(add_frame)).await
+        handle
+            .tx
+            .send(tokio_tungstenite::tungstenite::Message::Binary(add_frame))
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
-        let ack = tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx)
+            .await
             .map_err(|_| CoordinatorError::Timeout)?
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
@@ -337,10 +408,14 @@ impl MuxCoordinator {
         let sync_frame = encode_frame(MSG_SCHEMA_SYNC, &sync)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
-        handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(sync_frame)).await
+        handle
+            .tx
+            .send(tokio_tungstenite::tungstenite::Message::Binary(sync_frame))
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
-        let mig = tokio::time::timeout(std::time::Duration::from_secs(10), mig_rx).await
+        let mig = tokio::time::timeout(std::time::Duration::from_secs(10), mig_rx)
+            .await
             .map_err(|_| CoordinatorError::Timeout)?
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
@@ -349,12 +424,15 @@ impl MuxCoordinator {
         }
 
         let mut active = self_arc.active_namespaces.lock().await;
-        active.insert(namespace.to_string(), ActiveNamespaceConfig {
-            replica_id: replica_id.to_string(),
-            public_key,
-            schema_version,
-            last_sequence,
-        });
+        active.insert(
+            namespace.to_string(),
+            ActiveNamespaceConfig {
+                replica_id: replica_id.to_string(),
+                public_key,
+                schema_version,
+                last_sequence,
+            },
+        );
 
         Ok(())
     }
@@ -367,7 +445,11 @@ impl MuxCoordinator {
         })
     }
 
-    pub async fn drop_namespace(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError> {
+    pub async fn drop_namespace(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+    ) -> Result<(), CoordinatorError> {
         {
             let mut active = self.active_namespaces.lock().await;
             active.remove(namespace);
@@ -388,14 +470,21 @@ impl MuxCoordinator {
                 };
 
                 if let Ok(frame) = encode_frame(MSG_NAMESPACE_DROP, &drop_payload) {
-                    let _ = handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await;
+                    let _ = handle
+                        .tx
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                        .await;
                 }
             }
         }
         Ok(())
     }
 
-    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle_opt = self.ws_client.lock().await.clone();
@@ -413,11 +502,18 @@ impl MuxCoordinator {
                 };
 
                 if let Ok(frame) = encode_frame(MSG_PUSH, &push) {
-                    if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                    if handle
+                        .tx
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                        .await
+                        .is_ok()
+                    {
                         if let Ok(resp_bin) = rx.await {
                             if let Ok((msg_type, payload)) = decode_frame(&resp_bin) {
                                 if msg_type == MSG_PUSH_ACK {
-                                    if let Ok(ack) = serde_json::from_slice::<PushAckPayload>(payload) {
+                                    if let Ok(ack) =
+                                        serde_json::from_slice::<PushAckPayload>(payload)
+                                    {
                                         if let Some(err) = ack.error {
                                             return Err(CoordinatorError::Internal(err));
                                         }
@@ -431,22 +527,38 @@ impl MuxCoordinator {
             }
         }
 
-        let url = format!("{}/namespace/{}/push", self.config.url.trim_end_matches('/'), namespace);
+        let url = format!(
+            "{}/namespace/{}/push",
+            self.config.url.trim_end_matches('/'),
+            namespace
+        );
         let mut builder = self.client.post(&url).json(&mutations);
         if let Some(ref token) = self.config.auth_token {
             builder = builder.bearer_auth(token);
         }
-        let resp = builder.send().await
+        let resp = builder
+            .send()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+            return Err(CoordinatorError::Internal(format!(
+                "HTTP error status: {}",
+                resp.status()
+            )));
         }
-        let seq_ids = resp.json::<Vec<SequenceId>>().await
+        let seq_ids = resp
+            .json::<Vec<SequenceId>>()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(seq_ids)
     }
 
-    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle_opt = self.ws_client.lock().await.clone();
@@ -466,11 +578,18 @@ impl MuxCoordinator {
                 };
 
                 if let Ok(frame) = encode_frame(MSG_PULL, &pull) {
-                    if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                    if handle
+                        .tx
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                        .await
+                        .is_ok()
+                    {
                         if let Ok(resp_bin) = rx.await {
                             if let Ok((msg_type, payload)) = decode_frame(&resp_bin) {
                                 if msg_type == MSG_PULL_RESPONSE {
-                                    if let Ok(resp) = serde_json::from_slice::<PullResponsePayload>(payload) {
+                                    if let Ok(resp) =
+                                        serde_json::from_slice::<PullResponsePayload>(payload)
+                                    {
                                         return Ok(resp.mutations);
                                     }
                                 }
@@ -492,20 +611,41 @@ impl MuxCoordinator {
         if let Some(ref token) = self.config.auth_token {
             builder = builder.bearer_auth(token);
         }
-        let resp = builder.send().await
+        let resp = builder
+            .send()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+            return Err(CoordinatorError::Internal(format!(
+                "HTTP error status: {}",
+                resp.status()
+            )));
         }
-        let mutations = resp.json::<Vec<PendingMutation>>().await
+        let mutations = resp
+            .json::<Vec<PendingMutation>>()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(mutations)
     }
 
-    async fn subscribe(self_arc: Arc<Self>, namespace: &str, replica_id: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn subscribe(
+        self_arc: Arc<Self>,
+        namespace: &str,
+        replica_id: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            match Self::add_namespace(self_arc.clone(), namespace, replica_id, vec![], 0, from_sequence).await {
+            match Self::add_namespace(
+                self_arc.clone(),
+                namespace,
+                replica_id,
+                vec![],
+                0,
+                from_sequence,
+            )
+            .await
+            {
                 Ok(_) => {
                     let (mut_tx, mut_rx) = tokio::sync::mpsc::channel::<PendingMutation>(1024);
                     let handle = Self::ensure_connected(self_arc.clone()).await?;
@@ -520,13 +660,19 @@ impl MuxCoordinator {
                         after: from_sequence,
                     };
                     if let Ok(frame) = encode_frame(MSG_SUBSCRIBE, &sub) {
-                        let _ = handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await;
+                        let _ = handle
+                            .tx
+                            .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                            .await;
                     }
 
                     return Ok(Box::new(MuxSubscription { rx: mut_rx }));
                 }
                 Err(e) => {
-                    warn!("Multiplexed WebSocket subscription failed, falling back to SSE: {:?}", e);
+                    warn!(
+                        "Multiplexed WebSocket subscription failed, falling back to SSE: {:?}",
+                        e
+                    );
                 }
             }
         }
@@ -535,11 +681,11 @@ impl MuxCoordinator {
         let client = self_arc.client.clone();
         let config = self_arc.config.clone();
         let ns = namespace.to_string();
-        
+
         crate::time_utils::spawn(async move {
             let mut after = from_sequence;
             let url_base = config.url.clone();
-            
+
             loop {
                 let url = format!(
                     "{}/namespace/{}/events?after={}",
@@ -547,12 +693,12 @@ impl MuxCoordinator {
                     ns,
                     after
                 );
-                
+
                 let mut builder = client.get(&url).header("Accept", "text/event-stream");
                 if let Some(ref token) = config.auth_token {
                     builder = builder.bearer_auth(token);
                 }
-                
+
                 let resp = match builder.send().await {
                     Ok(r) if r.status().is_success() => r,
                     _ => {
@@ -560,28 +706,29 @@ impl MuxCoordinator {
                         continue;
                     }
                 };
-                
+
                 let mut stream = resp.bytes_stream();
                 let mut buffer = Vec::new();
-                
+
                 while let Some(chunk_res) = stream.next().await {
                     let chunk = match chunk_res {
                         Ok(bytes) => bytes,
                         Err(_) => break,
                     };
-                    
+
                     buffer.extend_from_slice(&chunk);
-                    
+
                     while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                         let line_bytes = buffer.drain(..=pos).collect::<Vec<u8>>();
                         let line = match std::str::from_utf8(&line_bytes) {
                             Ok(s) => s.trim(),
                             Err(_) => continue,
                         };
-                        
+
                         if line.starts_with("data:") {
                             let data_json = line["data:".len()..].trim();
-                            if let Ok(mutation) = serde_json::from_str::<PendingMutation>(data_json) {
+                            if let Ok(mutation) = serde_json::from_str::<PendingMutation>(data_json)
+                            {
                                 after = after.max(mutation.sequence);
                                 if tx.send(mutation).await.is_err() {
                                     return;
@@ -590,7 +737,7 @@ impl MuxCoordinator {
                         }
                     }
                 }
-                
+
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
@@ -608,14 +755,23 @@ impl MuxCoordinator {
                     namespace: namespace.to_string(),
                 };
                 if let Ok(frame) = encode_frame(MSG_HEARTBEAT, &hb) {
-                    if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                    if handle
+                        .tx
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                        .await
+                        .is_ok()
+                    {
                         return Ok(());
                     }
                 }
             }
         }
 
-        let url = format!("{}/namespace/{}/heartbeat", self.config.url.trim_end_matches('/'), namespace);
+        let url = format!(
+            "{}/namespace/{}/heartbeat",
+            self.config.url.trim_end_matches('/'),
+            namespace
+        );
         let mut builder = self.client.post(&url).json(&replica_id);
         if let Some(ref token) = self.config.auth_token {
             builder = builder.bearer_auth(token);
@@ -625,29 +781,46 @@ impl MuxCoordinator {
     }
 
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError> {
-        let url = format!("{}/namespace/{}/schema_version", self.config.url.trim_end_matches('/'), namespace);
+        let url = format!(
+            "{}/namespace/{}/schema_version",
+            self.config.url.trim_end_matches('/'),
+            namespace
+        );
         let mut builder = self.client.get(&url);
         if let Some(ref token) = self.config.auth_token {
             builder = builder.bearer_auth(token);
         }
-        let resp = builder.send().await
+        let resp = builder
+            .send()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+            return Err(CoordinatorError::Internal(format!(
+                "HTTP error status: {}",
+                resp.status()
+            )));
         }
-        let version = resp.json::<u64>().await
+        let version = resp
+            .json::<u64>()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(version)
     }
 
-    async fn get_snapshot(&self, namespace: &str, doc_id: &str, record_id: &str) -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+    async fn get_snapshot(
+        &self,
+        namespace: &str,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle_opt = self.ws_client.lock().await.clone();
             if let Some(handle) = handle_opt {
                 let snaps_guard = handle.snapshots.lock().await;
                 if let Some(ns_snaps) = snaps_guard.get(namespace) {
-                    let found = ns_snaps.iter()
+                    let found = ns_snaps
+                        .iter()
                         .find(|s| s.doc_id == doc_id && s.record_id == record_id)
                         .cloned();
                     return Ok(found);
@@ -657,7 +830,11 @@ impl MuxCoordinator {
         Ok(None)
     }
 
-    async fn store_snapshot(&self, namespace: &str, snapshot: &crate::crdt::snapshot::Snapshot) -> Result<(), CoordinatorError> {
+    async fn store_snapshot(
+        &self,
+        namespace: &str,
+        snapshot: &crate::crdt::snapshot::Snapshot,
+    ) -> Result<(), CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle_opt = self.ws_client.lock().await.clone();
@@ -672,7 +849,12 @@ impl MuxCoordinator {
                 };
                 let frame = encode_frame(MSG_SNAPSHOT, &snap_payload)
                     .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-                if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                if handle
+                    .tx
+                    .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                    .await
+                    .is_ok()
+                {
                     return Ok(());
                 }
             }
@@ -680,7 +862,10 @@ impl MuxCoordinator {
         Ok(())
     }
 
-    async fn list_snapshots(&self, namespace: &str) -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+    async fn list_snapshots(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle_opt = self.ws_client.lock().await.clone();
@@ -704,28 +889,57 @@ pub struct NamespacedCoordinator {
 
 impl NamespacedCoordinator {
     pub async fn leave(&self) -> Result<(), CoordinatorError> {
-        self.mux.drop_namespace(&self.namespace, &self.replica_id).await
+        self.mux
+            .drop_namespace(&self.namespace, &self.replica_id)
+            .await
     }
 }
 
 #[async_trait]
 impl Coordinator for NamespacedCoordinator {
-    async fn push(&self, _namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        _namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         self.mux.push(&self.namespace, mutations).await
     }
 
-    async fn pull(&self, _namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        _namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         self.mux.pull(&self.namespace, after, limit).await
     }
 
-    async fn subscribe(&self, _namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
-        MuxCoordinator::subscribe(self.mux.clone(), &self.namespace, &self.replica_id, from_sequence).await
+    async fn subscribe(
+        &self,
+        _namespace: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+        MuxCoordinator::subscribe(
+            self.mux.clone(),
+            &self.namespace,
+            &self.replica_id,
+            from_sequence,
+        )
+        .await
     }
 
     async fn register(&self, _namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            MuxCoordinator::add_namespace(self.mux.clone(), &self.namespace, &info.replica_id, info.public_key, info.schema_version, 0).await
+            MuxCoordinator::add_namespace(
+                self.mux.clone(),
+                &self.namespace,
+                &info.replica_id,
+                info.public_key,
+                info.schema_version,
+                0,
+            )
+            .await
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -741,15 +955,29 @@ impl Coordinator for NamespacedCoordinator {
         self.mux.schema_version(&self.namespace).await
     }
 
-    async fn get_snapshot(&self, _namespace: &str, doc_id: &str, record_id: &str) -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
-        self.mux.get_snapshot(&self.namespace, doc_id, record_id).await
+    async fn get_snapshot(
+        &self,
+        _namespace: &str,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<Option<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+        self.mux
+            .get_snapshot(&self.namespace, doc_id, record_id)
+            .await
     }
 
-    async fn store_snapshot(&self, _namespace: &str, snapshot: &crate::crdt::snapshot::Snapshot) -> Result<(), CoordinatorError> {
+    async fn store_snapshot(
+        &self,
+        _namespace: &str,
+        snapshot: &crate::crdt::snapshot::Snapshot,
+    ) -> Result<(), CoordinatorError> {
         self.mux.store_snapshot(&self.namespace, snapshot).await
     }
 
-    async fn list_snapshots(&self, _namespace: &str) -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
+    async fn list_snapshots(
+        &self,
+        _namespace: &str,
+    ) -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
         self.mux.list_snapshots(&self.namespace).await
     }
 }
@@ -760,7 +988,10 @@ struct MuxSubscription {
 
 impl Stream for MuxSubscription {
     type Item = PendingMutation;
-    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
     }
 }

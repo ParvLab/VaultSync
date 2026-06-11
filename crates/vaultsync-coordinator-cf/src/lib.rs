@@ -1,6 +1,6 @@
-use worker::*;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use worker::*;
 
 #[derive(Serialize, Deserialize)]
 struct WebSocketAttachment {
@@ -34,7 +34,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
     let url = req.url()?;
     let path = url.path();
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    
+
     let ns = if segments.len() >= 2 && segments[0] == "namespace" {
         segments[1]
     } else if segments.len() == 1 && segments[0] == "ws" {
@@ -46,7 +46,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
     let ns_do = env.durable_object("NAMESPACE_DO")?;
     let id = ns_do.id_from_name(ns)?;
     let stub = id.get_stub()?;
-    
+
     stub.fetch_with_request(req).await
 }
 
@@ -65,7 +65,7 @@ impl DurableObject for NamespaceDurableObject {
         let url = req.url()?;
         let path = url.path();
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        
+
         if segments.len() == 1 && segments[0] == "ws" {
             let pairs = WebSocketPair::new()?;
             let client = pairs.client;
@@ -78,7 +78,7 @@ impl DurableObject for NamespaceDurableObject {
         if segments.len() < 3 {
             return Response::error("Not Found", 404);
         }
-        
+
         let ns = segments[1];
         let method = segments[2];
 
@@ -93,14 +93,15 @@ impl DurableObject for NamespaceDurableObject {
         }
 
         let db = self.env.d1("DB")?;
-        
+
         match method {
             "push" => {
                 if req.method() != Method::Post {
                     return Response::error("Method Not Allowed", 405);
                 }
-                let mutations: Vec<vaultsync_core::coordinator::traits::EncryptedMutation> = req.json().await?;
-                
+                let mutations: Vec<vaultsync_core::coordinator::traits::EncryptedMutation> =
+                    req.json().await?;
+
                 let mut sequences = Vec::new();
                 for m in mutations {
                     let stmt = db.prepare("INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)");
@@ -114,22 +115,26 @@ impl DurableObject for NamespaceDurableObject {
                         blob_js.into(),
                         (m.timestamp as i64).into(),
                         (m.key_version as i64).into(),
-                    ])?.run().await?;
-                    
-                    let last_row: serde_json::Value = db.prepare("SELECT last_insert_rowid() as seq")
-                        .first(None).await?
+                    ])?
+                    .run()
+                    .await?;
+
+                    let last_row: serde_json::Value = db
+                        .prepare("SELECT last_insert_rowid() as seq")
+                        .first(None)
+                        .await?
                         .ok_or_else(|| worker::Error::from("Failed to get row ID"))?;
                     let seq = last_row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
                     sequences.push(seq);
                 }
-                
+
                 Response::from_json(&sequences)
             }
             "pull" => {
                 let query = url.query_pairs().collect::<HashMap<_, _>>();
                 let after_str = query.get("after").map(|s| s.as_ref()).unwrap_or("0");
                 let limit_str = query.get("limit").map(|s| s.as_ref()).unwrap_or("100");
-                
+
                 let after: i64 = after_str.parse().unwrap_or(0);
                 let limit: i64 = limit_str.parse().unwrap_or(100);
 
@@ -140,13 +145,16 @@ impl DurableObject for NamespaceDurableObject {
                      ORDER BY sequence ASC
                      LIMIT ?3"
                 );
-                
-                let rows: Vec<D1MutationRow> = stmt.bind(&[ns.into(), after.into(), limit.into()])?
-                    .all().await?
+
+                let rows: Vec<D1MutationRow> = stmt
+                    .bind(&[ns.into(), after.into(), limit.into()])?
+                    .all()
+                    .await?
                     .results()?;
-                
-                let pending: Vec<vaultsync_core::coordinator::traits::PendingMutation> = rows.into_iter().map(|r| {
-                    vaultsync_core::coordinator::traits::PendingMutation {
+
+                let pending: Vec<vaultsync_core::coordinator::traits::PendingMutation> = rows
+                    .into_iter()
+                    .map(|r| vaultsync_core::coordinator::traits::PendingMutation {
                         id: r.id,
                         namespace: r.namespace,
                         sequence: r.sequence as u64,
@@ -155,9 +163,9 @@ impl DurableObject for NamespaceDurableObject {
                         encrypted_blob: r.encrypted_blob,
                         timestamp: r.timestamp as u64,
                         key_version: r.key_version as u64,
-                    }
-                }).collect();
-                
+                    })
+                    .collect();
+
                 Response::from_json(&pending)
             }
             "register" => {
@@ -165,7 +173,7 @@ impl DurableObject for NamespaceDurableObject {
                     return Response::error("Method Not Allowed", 405);
                 }
                 let info: vaultsync_core::coordinator::traits::ReplicaInfo = req.json().await?;
-                
+
                 let stmt = db.prepare(
                     "INSERT OR REPLACE INTO replicas (replica_id, namespace, public_key, schema_version, last_seen)
                      VALUES (?1, ?2, ?3, ?4, ?5)"
@@ -178,15 +186,20 @@ impl DurableObject for NamespaceDurableObject {
                     pub_key_js.into(),
                     (info.schema_version as i64).into(),
                     now.into(),
-                ])?.run().await?;
-                
+                ])?
+                .run()
+                .await?;
+
                 let schema_stmt = db.prepare(
                     "INSERT INTO schema_versions (namespace, version)
                      VALUES (?1, ?2)
-                     ON CONFLICT(namespace) DO UPDATE SET version = MAX(version, excluded.version)"
+                     ON CONFLICT(namespace) DO UPDATE SET version = MAX(version, excluded.version)",
                 );
-                schema_stmt.bind(&[ns.into(), (info.schema_version as i64).into()])?.run().await?;
-                
+                schema_stmt
+                    .bind(&[ns.into(), (info.schema_version as i64).into()])?
+                    .run()
+                    .await?;
+
                 Response::ok("")
             }
             "heartbeat" => {
@@ -195,18 +208,22 @@ impl DurableObject for NamespaceDurableObject {
                 }
                 let query = url.query_pairs().collect::<HashMap<_, _>>();
                 let replica_id = query.get("replica_id").map(|s| s.as_ref()).unwrap_or("");
-                
+
                 let now = Date::now().as_millis() as i64;
-                let stmt = db.prepare("UPDATE replicas SET last_seen = ?1 WHERE namespace = ?2 AND replica_id = ?3");
-                stmt.bind(&[now.into(), ns.into(), replica_id.into()])?.run().await?;
-                
+                let stmt = db.prepare(
+                    "UPDATE replicas SET last_seen = ?1 WHERE namespace = ?2 AND replica_id = ?3",
+                );
+                stmt.bind(&[now.into(), ns.into(), replica_id.into()])?
+                    .run()
+                    .await?;
+
                 Response::ok("")
             }
             "schema_version" => {
                 let stmt = db.prepare("SELECT version FROM schema_versions WHERE namespace = ?1");
                 let row: Option<D1SchemaVersionRow> = stmt.bind(&[ns.into()])?.first(None).await?;
                 let version = row.map(|r| r.version).unwrap_or(0);
-                
+
                 Response::from_json(&version.to_string())
             }
             "snapshot" => {
@@ -251,7 +268,7 @@ impl DurableObject for NamespaceDurableObject {
                 }
 
                 let snap_stmt = db.prepare(
-                    "SELECT doc_id, record_id, sequence FROM snapshots WHERE namespace = ?1"
+                    "SELECT doc_id, record_id, sequence FROM snapshots WHERE namespace = ?1",
                 );
                 let snaps: Vec<D1SnapRow> = snap_stmt.bind(&[ns.into()])?.all().await?.results()?;
 
@@ -263,12 +280,15 @@ impl DurableObject for NamespaceDurableObject {
                         "DELETE FROM mutations \
                          WHERE namespace = ?1 AND doc_id = ?2 AND record_id = ?3 AND sequence <= ?4"
                     );
-                    let _result = del_stmt.bind(&[
-                        ns.into(),
-                        snap.doc_id.into(),
-                        snap.record_id.into(),
-                        snap.sequence.into(),
-                    ])?.run().await?;
+                    let _result = del_stmt
+                        .bind(&[
+                            ns.into(),
+                            snap.doc_id.into(),
+                            snap.record_id.into(),
+                            snap.sequence.into(),
+                        ])?
+                        .run()
+                        .await?;
 
                     oplog_removed += 1;
                     snapshots_collapsed += 1;
@@ -300,14 +320,15 @@ impl DurableObject for NamespaceDurableObject {
                 );
                 let rows: Vec<D1ReplicaRow> = stmt.bind(&[ns.into()])?.all().await?.results()?;
 
-                let replicas: Vec<vaultsync_core::coordinator::traits::ReplicaInfo> = rows.into_iter().map(|r| {
-                    vaultsync_core::coordinator::traits::ReplicaInfo {
+                let replicas: Vec<vaultsync_core::coordinator::traits::ReplicaInfo> = rows
+                    .into_iter()
+                    .map(|r| vaultsync_core::coordinator::traits::ReplicaInfo {
                         replica_id: r.replica_id,
                         namespace: r.namespace,
                         public_key: r.public_key,
                         schema_version: r.schema_version as u64,
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 Response::from_json(&replicas)
             }
@@ -315,7 +336,13 @@ impl DurableObject for NamespaceDurableObject {
         }
     }
 
-    async fn websocket_close(&self, _ws: WebSocket, _code: usize, _reason: String, _was_clean: bool) -> Result<()> {
+    async fn websocket_close(
+        &self,
+        _ws: WebSocket,
+        _code: usize,
+        _reason: String,
+        _was_clean: bool,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -323,7 +350,11 @@ impl DurableObject for NamespaceDurableObject {
         Ok(())
     }
 
-    async fn websocket_message(&self, ws: WebSocket, message: worker::durable::WebSocketIncomingMessage) -> Result<()> {
+    async fn websocket_message(
+        &self,
+        ws: WebSocket,
+        message: worker::durable::WebSocketIncomingMessage,
+    ) -> Result<()> {
         let bin = match message {
             worker::durable::WebSocketIncomingMessage::Binary(b) => b,
             _ => return Ok(()),
@@ -338,13 +369,17 @@ impl DurableObject for NamespaceDurableObject {
 
         match msg_type {
             vaultsync_core::coordinator::ws_proto::MSG_AUTH => {
-                let auth_payload: vaultsync_core::coordinator::ws_proto::AuthPayload = match serde_json::from_slice(payload) {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()),
-                };
-                
+                let auth_payload: vaultsync_core::coordinator::ws_proto::AuthPayload =
+                    match serde_json::from_slice(payload) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
+
                 let mut namespaces = HashMap::new();
-                namespaces.insert(auth_payload.namespace.clone(), auth_payload.replica_id.clone());
+                namespaces.insert(
+                    auth_payload.namespace.clone(),
+                    auth_payload.replica_id.clone(),
+                );
                 let attachment = WebSocketAttachment {
                     replica_id: auth_payload.replica_id.clone(),
                     namespace: auth_payload.namespace.clone(),
@@ -360,15 +395,17 @@ impl DurableObject for NamespaceDurableObject {
                 };
                 let ack_frame = vaultsync_core::coordinator::ws_proto::encode_frame(
                     vaultsync_core::coordinator::ws_proto::MSG_AUTH_ACK,
-                    &ack
-                ).map_err(|e| worker::Error::from(e.to_string()))?;
+                    &ack,
+                )
+                .map_err(|e| worker::Error::from(e.to_string()))?;
                 ws.send_with_bytes(&ack_frame)?;
             }
             vaultsync_core::coordinator::ws_proto::MSG_NAMESPACE_ADD => {
-                let add_payload: vaultsync_core::coordinator::ws_proto::NamespaceAddPayload = match serde_json::from_slice(payload) {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()),
-                };
+                let add_payload: vaultsync_core::coordinator::ws_proto::NamespaceAddPayload =
+                    match serde_json::from_slice(payload) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
 
                 let mut attachment = match ws.deserialize_attachment::<WebSocketAttachment>()? {
                     Some(a) => a,
@@ -379,7 +416,10 @@ impl DurableObject for NamespaceDurableObject {
                         namespaces: HashMap::new(),
                     },
                 };
-                attachment.namespaces.insert(add_payload.namespace.clone(), add_payload.replica_id.clone());
+                attachment.namespaces.insert(
+                    add_payload.namespace.clone(),
+                    add_payload.replica_id.clone(),
+                );
                 ws.serialize_attachment(&attachment)?;
 
                 let stmt = db.prepare(
@@ -394,14 +434,22 @@ impl DurableObject for NamespaceDurableObject {
                     pub_key_js.into(),
                     (add_payload.schema_version as i64).into(),
                     now.into(),
-                ])?.run().await?;
+                ])?
+                .run()
+                .await?;
 
                 let schema_stmt = db.prepare(
                     "INSERT INTO schema_versions (namespace, version)
                      VALUES (?1, ?2)
-                     ON CONFLICT(namespace) DO UPDATE SET version = MAX(version, excluded.version)"
+                     ON CONFLICT(namespace) DO UPDATE SET version = MAX(version, excluded.version)",
                 );
-                schema_stmt.bind(&[add_payload.namespace.clone().into(), (add_payload.schema_version as i64).into()])?.run().await?;
+                schema_stmt
+                    .bind(&[
+                        add_payload.namespace.clone().into(),
+                        (add_payload.schema_version as i64).into(),
+                    ])?
+                    .run()
+                    .await?;
 
                 let mut ack = vaultsync_core::coordinator::ws_proto::NamespaceAckPayload {
                     namespace: add_payload.namespace.clone(),
@@ -411,24 +459,33 @@ impl DurableObject for NamespaceDurableObject {
                     snapshot_sequence: 0,
                     error: None,
                 };
-                if let Ok(Some(row)) = db.prepare("SELECT version FROM schema_versions WHERE namespace = ?1")
-                    .bind(&[add_payload.namespace.clone().into()])?.first::<D1SchemaVersionRow>(None).await
+                if let Ok(Some(row)) = db
+                    .prepare("SELECT version FROM schema_versions WHERE namespace = ?1")
+                    .bind(&[add_payload.namespace.clone().into()])?
+                    .first::<D1SchemaVersionRow>(None)
+                    .await
                 {
                     ack.coordinator_sequence = row.version as u64;
                 }
 
                 let mut available_snapshots = Vec::new();
                 let snap_stmt = db.prepare("SELECT bytes FROM snapshots WHERE namespace = ?1");
-                
+
                 #[derive(Deserialize)]
                 struct D1SnapshotRow {
                     bytes: Vec<u8>,
                 }
-                
-                if let Ok(rows) = snap_stmt.bind(&[add_payload.namespace.clone().into()])?.all().await {
+
+                if let Ok(rows) = snap_stmt
+                    .bind(&[add_payload.namespace.clone().into()])?
+                    .all()
+                    .await
+                {
                     if let Ok(row_results) = rows.results::<D1SnapshotRow>() {
                         for row in row_results {
-                            if let Ok(snap) = vaultsync_core::crdt::snapshot::Snapshot::decode(&row.bytes) {
+                            if let Ok(snap) =
+                                vaultsync_core::crdt::snapshot::Snapshot::decode(&row.bytes)
+                            {
                                 if snap.sequence > add_payload.last_sequence {
                                     available_snapshots.push(snap);
                                 }
@@ -436,16 +493,21 @@ impl DurableObject for NamespaceDurableObject {
                         }
                     }
                 }
-                
+
                 if !available_snapshots.is_empty() {
                     ack.snapshot_available = true;
-                    ack.snapshot_sequence = available_snapshots.iter().map(|s| s.sequence).max().unwrap_or(0);
+                    ack.snapshot_sequence = available_snapshots
+                        .iter()
+                        .map(|s| s.sequence)
+                        .max()
+                        .unwrap_or(0);
                 }
 
                 let ack_frame = vaultsync_core::coordinator::ws_proto::encode_frame(
                     vaultsync_core::coordinator::ws_proto::MSG_NAMESPACE_ACK,
-                    &ack
-                ).map_err(|e| worker::Error::from(e.to_string()))?;
+                    &ack,
+                )
+                .map_err(|e| worker::Error::from(e.to_string()))?;
                 ws.send_with_bytes(&ack_frame)?;
 
                 for snap in available_snapshots {
@@ -459,31 +521,34 @@ impl DurableObject for NamespaceDurableObject {
                     };
                     if let Ok(snap_frame) = vaultsync_core::coordinator::ws_proto::encode_frame(
                         vaultsync_core::coordinator::ws_proto::MSG_SNAPSHOT,
-                        &snap_payload
+                        &snap_payload,
                     ) {
                         let _ = ws.send_with_bytes(&snap_frame);
                     }
                 }
             }
             vaultsync_core::coordinator::ws_proto::MSG_NAMESPACE_DROP => {
-                let drop_payload: vaultsync_core::coordinator::ws_proto::NamespaceDropPayload = match serde_json::from_slice(payload) {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()),
-                };
+                let drop_payload: vaultsync_core::coordinator::ws_proto::NamespaceDropPayload =
+                    match serde_json::from_slice(payload) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
                 if let Some(mut attachment) = ws.deserialize_attachment::<WebSocketAttachment>()? {
                     attachment.namespaces.remove(&drop_payload.namespace);
                     ws.serialize_attachment(&attachment)?;
                 }
             }
             vaultsync_core::coordinator::ws_proto::MSG_REGISTER => {
-                let attachment: WebSocketAttachment = match ws.deserialize_attachment::<WebSocketAttachment>()? {
-                    Some(a) if a.authenticated => a,
-                    _ => return Ok(()),
-                };
-                let reg_payload: vaultsync_core::coordinator::ws_proto::RegisterPayload = match serde_json::from_slice(payload) {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()),
-                };
+                let attachment: WebSocketAttachment =
+                    match ws.deserialize_attachment::<WebSocketAttachment>()? {
+                        Some(a) if a.authenticated => a,
+                        _ => return Ok(()),
+                    };
+                let reg_payload: vaultsync_core::coordinator::ws_proto::RegisterPayload =
+                    match serde_json::from_slice(payload) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
 
                 let stmt = db.prepare(
                     "INSERT OR REPLACE INTO replicas (replica_id, namespace, public_key, schema_version, last_seen)
@@ -497,14 +562,22 @@ impl DurableObject for NamespaceDurableObject {
                     pub_key_js.into(),
                     (reg_payload.schema_version as i64).into(),
                     now.into(),
-                ])?.run().await?;
+                ])?
+                .run()
+                .await?;
 
                 let schema_stmt = db.prepare(
                     "INSERT INTO schema_versions (namespace, version)
                      VALUES (?1, ?2)
-                     ON CONFLICT(namespace) DO UPDATE SET version = MAX(version, excluded.version)"
+                     ON CONFLICT(namespace) DO UPDATE SET version = MAX(version, excluded.version)",
                 );
-                schema_stmt.bind(&[attachment.namespace.clone().into(), (reg_payload.schema_version as i64).into()])?.run().await?;
+                schema_stmt
+                    .bind(&[
+                        attachment.namespace.clone().into(),
+                        (reg_payload.schema_version as i64).into(),
+                    ])?
+                    .run()
+                    .await?;
 
                 let mut reg_ack = vaultsync_core::coordinator::ws_proto::RegisterAckPayload {
                     status: "ok".to_string(),
@@ -514,24 +587,33 @@ impl DurableObject for NamespaceDurableObject {
                     snapshot_url: None,
                     error: None,
                 };
-                if let Ok(Some(row)) = db.prepare("SELECT version FROM schema_versions WHERE namespace = ?1")
-                    .bind(&[attachment.namespace.clone().into()])?.first::<D1SchemaVersionRow>(None).await
+                if let Ok(Some(row)) = db
+                    .prepare("SELECT version FROM schema_versions WHERE namespace = ?1")
+                    .bind(&[attachment.namespace.clone().into()])?
+                    .first::<D1SchemaVersionRow>(None)
+                    .await
                 {
                     reg_ack.coordinator_sequence = row.version as u64;
                 }
 
                 let mut available_snapshots = Vec::new();
                 let snap_stmt = db.prepare("SELECT bytes FROM snapshots WHERE namespace = ?1");
-                
+
                 #[derive(Deserialize)]
                 struct D1SnapshotRow {
                     bytes: Vec<u8>,
                 }
-                
-                if let Ok(rows) = snap_stmt.bind(&[attachment.namespace.clone().into()])?.all().await {
+
+                if let Ok(rows) = snap_stmt
+                    .bind(&[attachment.namespace.clone().into()])?
+                    .all()
+                    .await
+                {
                     if let Ok(row_results) = rows.results::<D1SnapshotRow>() {
                         for row in row_results {
-                            if let Ok(snap) = vaultsync_core::crdt::snapshot::Snapshot::decode(&row.bytes) {
+                            if let Ok(snap) =
+                                vaultsync_core::crdt::snapshot::Snapshot::decode(&row.bytes)
+                            {
                                 if snap.sequence > reg_payload.last_sequence {
                                     available_snapshots.push(snap);
                                 }
@@ -539,16 +621,21 @@ impl DurableObject for NamespaceDurableObject {
                         }
                     }
                 }
-                
+
                 if !available_snapshots.is_empty() {
                     reg_ack.snapshot_available = true;
-                    reg_ack.snapshot_sequence = available_snapshots.iter().map(|s| s.sequence).max().unwrap_or(0);
+                    reg_ack.snapshot_sequence = available_snapshots
+                        .iter()
+                        .map(|s| s.sequence)
+                        .max()
+                        .unwrap_or(0);
                 }
 
                 let ack_frame = vaultsync_core::coordinator::ws_proto::encode_frame(
                     vaultsync_core::coordinator::ws_proto::MSG_REGISTER_ACK,
-                    &reg_ack
-                ).map_err(|e| worker::Error::from(e.to_string()))?;
+                    &reg_ack,
+                )
+                .map_err(|e| worker::Error::from(e.to_string()))?;
                 ws.send_with_bytes(&ack_frame)?;
 
                 for snap in available_snapshots {
@@ -562,21 +649,23 @@ impl DurableObject for NamespaceDurableObject {
                     };
                     if let Ok(snap_frame) = vaultsync_core::coordinator::ws_proto::encode_frame(
                         vaultsync_core::coordinator::ws_proto::MSG_SNAPSHOT,
-                        &snap_payload
+                        &snap_payload,
                     ) {
                         let _ = ws.send_with_bytes(&snap_frame);
                     }
                 }
             }
             vaultsync_core::coordinator::ws_proto::MSG_PUSH => {
-                let attachment: WebSocketAttachment = match ws.deserialize_attachment::<WebSocketAttachment>()? {
-                    Some(a) if a.authenticated => a,
-                    _ => return Ok(()),
-                };
-                let push: vaultsync_core::coordinator::ws_proto::PushPayload = match serde_json::from_slice(payload) {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()),
-                };
+                let attachment: WebSocketAttachment =
+                    match ws.deserialize_attachment::<WebSocketAttachment>()? {
+                        Some(a) if a.authenticated => a,
+                        _ => return Ok(()),
+                    };
+                let push: vaultsync_core::coordinator::ws_proto::PushPayload =
+                    match serde_json::from_slice(payload) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
 
                 let ns = match push.mutations.first() {
                     Some(m) => m.namespace.clone(),
@@ -598,24 +687,30 @@ impl DurableObject for NamespaceDurableObject {
                         blob_js.into(),
                         (m.timestamp as i64).into(),
                         (m.key_version as i64).into(),
-                    ])?.run().await?;
+                    ])?
+                    .run()
+                    .await?;
 
-                    let last_row: serde_json::Value = db.prepare("SELECT last_insert_rowid() as seq")
-                        .first(None).await?
+                    let last_row: serde_json::Value = db
+                        .prepare("SELECT last_insert_rowid() as seq")
+                        .first(None)
+                        .await?
                         .ok_or_else(|| worker::Error::from("Failed to get row ID"))?;
                     let seq = last_row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
                     sequences.push(seq);
 
-                    pending_to_broadcast.push(vaultsync_core::coordinator::traits::PendingMutation {
-                        id: m.id,
-                        namespace: ns.clone(),
-                        sequence: seq,
-                        doc_id: m.doc_id,
-                        record_id: m.record_id,
-                        encrypted_blob: m.encrypted_blob,
-                        timestamp: m.timestamp,
-                        key_version: m.key_version,
-                    });
+                    pending_to_broadcast.push(
+                        vaultsync_core::coordinator::traits::PendingMutation {
+                            id: m.id,
+                            namespace: ns.clone(),
+                            sequence: seq,
+                            doc_id: m.doc_id,
+                            record_id: m.record_id,
+                            encrypted_blob: m.encrypted_blob,
+                            timestamp: m.timestamp,
+                            key_version: m.key_version,
+                        },
+                    );
                 }
 
                 let ack = vaultsync_core::coordinator::ws_proto::PushAckPayload {
@@ -625,15 +720,21 @@ impl DurableObject for NamespaceDurableObject {
                 };
                 let ack_frame = vaultsync_core::coordinator::ws_proto::encode_frame(
                     vaultsync_core::coordinator::ws_proto::MSG_PUSH_ACK,
-                    &ack
-                ).map_err(|e| worker::Error::from(e.to_string()))?;
+                    &ack,
+                )
+                .map_err(|e| worker::Error::from(e.to_string()))?;
                 ws.send_with_bytes(&ack_frame)?;
 
                 let all_ws = self.state.get_websockets();
                 for socket in all_ws {
                     if socket != ws {
-                        if let Ok(Some(sock_attachment)) = socket.deserialize_attachment::<WebSocketAttachment>() {
-                            if sock_attachment.authenticated && (sock_attachment.namespace == ns || sock_attachment.namespaces.contains_key(&ns)) {
+                        if let Ok(Some(sock_attachment)) =
+                            socket.deserialize_attachment::<WebSocketAttachment>()
+                        {
+                            if sock_attachment.authenticated
+                                && (sock_attachment.namespace == ns
+                                    || sock_attachment.namespaces.contains_key(&ns))
+                            {
                                 for pm in &pending_to_broadcast {
                                     if let Ok(frame) = vaultsync_core::coordinator::ws_proto::encode_frame(
                                         vaultsync_core::coordinator::ws_proto::MSG_MUTATION_PUSH,
@@ -648,16 +749,22 @@ impl DurableObject for NamespaceDurableObject {
                 }
             }
             vaultsync_core::coordinator::ws_proto::MSG_PULL => {
-                let attachment: WebSocketAttachment = match ws.deserialize_attachment::<WebSocketAttachment>()? {
-                    Some(a) if a.authenticated => a,
-                    _ => return Ok(()),
-                };
-                let pull: vaultsync_core::coordinator::ws_proto::PullPayload = match serde_json::from_slice(payload) {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()),
-                };
+                let attachment: WebSocketAttachment =
+                    match ws.deserialize_attachment::<WebSocketAttachment>()? {
+                        Some(a) if a.authenticated => a,
+                        _ => return Ok(()),
+                    };
+                let pull: vaultsync_core::coordinator::ws_proto::PullPayload =
+                    match serde_json::from_slice(payload) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
 
-                let ns = if !pull.namespace.is_empty() { pull.namespace.clone() } else { attachment.namespace.clone() };
+                let ns = if !pull.namespace.is_empty() {
+                    pull.namespace.clone()
+                } else {
+                    attachment.namespace.clone()
+                };
 
                 let stmt = db.prepare(
                     "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence, key_version
@@ -666,14 +773,19 @@ impl DurableObject for NamespaceDurableObject {
                      ORDER BY sequence ASC
                      LIMIT ?3"
                 );
-                let rows: Vec<D1MutationRow> = stmt.bind(&[
-                    ns.into(),
-                    (pull.after as i64).into(),
-                    (pull.limit as i64).into()
-                ])?.all().await?.results()?;
+                let rows: Vec<D1MutationRow> = stmt
+                    .bind(&[
+                        ns.into(),
+                        (pull.after as i64).into(),
+                        (pull.limit as i64).into(),
+                    ])?
+                    .all()
+                    .await?
+                    .results()?;
 
-                let mutations: Vec<vaultsync_core::coordinator::traits::PendingMutation> = rows.into_iter().map(|r| {
-                    vaultsync_core::coordinator::traits::PendingMutation {
+                let mutations: Vec<vaultsync_core::coordinator::traits::PendingMutation> = rows
+                    .into_iter()
+                    .map(|r| vaultsync_core::coordinator::traits::PendingMutation {
                         id: r.id,
                         namespace: r.namespace,
                         sequence: r.sequence as u64,
@@ -682,8 +794,8 @@ impl DurableObject for NamespaceDurableObject {
                         encrypted_blob: r.encrypted_blob,
                         timestamp: r.timestamp as u64,
                         key_version: r.key_version as u64,
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 let resp = vaultsync_core::coordinator::ws_proto::PullResponsePayload {
                     request_id: pull.request_id,
@@ -692,21 +804,28 @@ impl DurableObject for NamespaceDurableObject {
                 };
                 let resp_frame = vaultsync_core::coordinator::ws_proto::encode_frame(
                     vaultsync_core::coordinator::ws_proto::MSG_PULL_RESPONSE,
-                    &resp
-                ).map_err(|e| worker::Error::from(e.to_string()))?;
+                    &resp,
+                )
+                .map_err(|e| worker::Error::from(e.to_string()))?;
                 ws.send_with_bytes(&resp_frame)?;
             }
             vaultsync_core::coordinator::ws_proto::MSG_SUBSCRIBE => {
-                let attachment: WebSocketAttachment = match ws.deserialize_attachment::<WebSocketAttachment>()? {
-                    Some(a) if a.authenticated => a,
-                    _ => return Ok(()),
-                };
-                let sub: vaultsync_core::coordinator::ws_proto::SubscribePayload = match serde_json::from_slice(payload) {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()),
-                };
+                let attachment: WebSocketAttachment =
+                    match ws.deserialize_attachment::<WebSocketAttachment>()? {
+                        Some(a) if a.authenticated => a,
+                        _ => return Ok(()),
+                    };
+                let sub: vaultsync_core::coordinator::ws_proto::SubscribePayload =
+                    match serde_json::from_slice(payload) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
 
-                let ns = if !sub.namespace.is_empty() { sub.namespace.clone() } else { attachment.namespace.clone() };
+                let ns = if !sub.namespace.is_empty() {
+                    sub.namespace.clone()
+                } else {
+                    attachment.namespace.clone()
+                };
 
                 let stmt = db.prepare(
                     "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence, key_version
@@ -714,10 +833,11 @@ impl DurableObject for NamespaceDurableObject {
                      WHERE namespace = ?1 AND sequence > ?2
                      ORDER BY sequence ASC"
                 );
-                let rows: Vec<D1MutationRow> = stmt.bind(&[
-                    ns.into(),
-                    (sub.after as i64).into()
-                ])?.all().await?.results()?;
+                let rows: Vec<D1MutationRow> = stmt
+                    .bind(&[ns.into(), (sub.after as i64).into()])?
+                    .all()
+                    .await?
+                    .results()?;
 
                 for r in rows {
                     let pm = vaultsync_core::coordinator::traits::PendingMutation {
@@ -732,66 +852,88 @@ impl DurableObject for NamespaceDurableObject {
                     };
                     if let Ok(frame) = vaultsync_core::coordinator::ws_proto::encode_frame(
                         vaultsync_core::coordinator::ws_proto::MSG_MUTATION_PUSH,
-                        &pm
+                        &pm,
                     ) {
                         let _ = ws.send_with_bytes(&frame);
                     }
                 }
             }
             vaultsync_core::coordinator::ws_proto::MSG_HEARTBEAT => {
-                let attachment: WebSocketAttachment = match ws.deserialize_attachment::<WebSocketAttachment>()? {
-                    Some(a) if a.authenticated => a,
-                    _ => return Ok(()),
-                };
-                let hb: vaultsync_core::coordinator::ws_proto::HeartbeatPayload = match serde_json::from_slice(payload) {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()),
-                };
+                let attachment: WebSocketAttachment =
+                    match ws.deserialize_attachment::<WebSocketAttachment>()? {
+                        Some(a) if a.authenticated => a,
+                        _ => return Ok(()),
+                    };
+                let hb: vaultsync_core::coordinator::ws_proto::HeartbeatPayload =
+                    match serde_json::from_slice(payload) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
 
                 let now = Date::now().as_millis() as i64;
-                
+
                 if !hb.namespace.is_empty() {
                     let stmt = db.prepare("UPDATE replicas SET last_seen = ?1 WHERE namespace = ?2 AND replica_id = ?3");
-                    stmt.bind(&[now.into(), hb.namespace.clone().into(), hb.replica_id.into()])?.run().await?;
+                    stmt.bind(&[
+                        now.into(),
+                        hb.namespace.clone().into(),
+                        hb.replica_id.into(),
+                    ])?
+                    .run()
+                    .await?;
                 } else {
                     let mut namespaces_to_hb = vec![attachment.namespace.clone()];
                     namespaces_to_hb.extend(attachment.namespaces.keys().cloned());
                     for ns in namespaces_to_hb {
                         let stmt = db.prepare("UPDATE replicas SET last_seen = ?1 WHERE namespace = ?2 AND replica_id = ?3");
-                        stmt.bind(&[now.into(), ns.into(), hb.replica_id.clone().into()])?.run().await?;
+                        stmt.bind(&[now.into(), ns.into(), hb.replica_id.clone().into()])?
+                            .run()
+                            .await?;
                     }
                 }
 
                 let ack = vaultsync_core::coordinator::ws_proto::HeartbeatAckPayload {};
                 let ack_frame = vaultsync_core::coordinator::ws_proto::encode_frame(
                     vaultsync_core::coordinator::ws_proto::MSG_HEARTBEAT_ACK,
-                    &ack
-                ).map_err(|e| worker::Error::from(e.to_string()))?;
+                    &ack,
+                )
+                .map_err(|e| worker::Error::from(e.to_string()))?;
                 ws.send_with_bytes(&ack_frame)?;
             }
             vaultsync_core::coordinator::ws_proto::MSG_SNAPSHOT => {
-                let attachment: WebSocketAttachment = match ws.deserialize_attachment::<WebSocketAttachment>()? {
-                    Some(a) if a.authenticated => a,
-                    _ => return Ok(()),
-                };
-                
-                let (ns, snap) = if let Ok(snap_payload) = serde_json::from_slice::<vaultsync_core::coordinator::ws_proto::SnapshotPayload>(payload) {
-                    (snap_payload.namespace.clone(), vaultsync_core::crdt::snapshot::Snapshot {
-                        doc_id: snap_payload.doc_id,
-                        record_id: snap_payload.record_id,
-                        schema_version: 0,
-                        sequence: snap_payload.sequence,
-                        created_at: 0,
-                        bytes: snap_payload.bytes,
-                        checksum: snap_payload.checksum,
-                    })
-                } else if let Ok(snap) = serde_json::from_slice::<vaultsync_core::crdt::snapshot::Snapshot>(payload) {
+                let attachment: WebSocketAttachment =
+                    match ws.deserialize_attachment::<WebSocketAttachment>()? {
+                        Some(a) if a.authenticated => a,
+                        _ => return Ok(()),
+                    };
+
+                let (ns, snap) = if let Ok(snap_payload) = serde_json::from_slice::<
+                    vaultsync_core::coordinator::ws_proto::SnapshotPayload,
+                >(payload)
+                {
+                    (
+                        snap_payload.namespace.clone(),
+                        vaultsync_core::crdt::snapshot::Snapshot {
+                            doc_id: snap_payload.doc_id,
+                            record_id: snap_payload.record_id,
+                            schema_version: 0,
+                            sequence: snap_payload.sequence,
+                            created_at: 0,
+                            bytes: snap_payload.bytes,
+                            checksum: snap_payload.checksum,
+                        },
+                    )
+                } else if let Ok(snap) =
+                    serde_json::from_slice::<vaultsync_core::crdt::snapshot::Snapshot>(payload)
+                {
                     (attachment.namespace.clone(), snap)
                 } else {
                     return Ok(());
                 };
 
-                let snap_bytes = snap.encode().map_err(|e| worker::Error::from(e.to_string()))?;
+                let snap_bytes = snap
+                    .encode()
+                    .map_err(|e| worker::Error::from(e.to_string()))?;
                 let stmt = db.prepare(
                     "INSERT OR REPLACE INTO snapshots (namespace, doc_id, record_id, sequence, created_at, bytes, checksum)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
@@ -805,24 +947,38 @@ impl DurableObject for NamespaceDurableObject {
                     (snap.created_at as i64).into(),
                     snap_bytes_js.into(),
                     (snap.checksum as i64).into(),
-                ])?.run().await?;
+                ])?
+                .run()
+                .await?;
             }
             vaultsync_core::coordinator::ws_proto::MSG_P2P_SIGNAL => {
-                let attachment: WebSocketAttachment = match ws.deserialize_attachment::<WebSocketAttachment>()? {
-                    Some(a) if a.authenticated => a,
-                    _ => return Ok(()),
-                };
-                let sig: vaultsync_core::coordinator::ws_proto::P2PSignalPayload = match serde_json::from_slice(payload) {
-                    Ok(p) => p,
-                    Err(_) => return Ok(()),
-                };
+                let attachment: WebSocketAttachment =
+                    match ws.deserialize_attachment::<WebSocketAttachment>()? {
+                        Some(a) if a.authenticated => a,
+                        _ => return Ok(()),
+                    };
+                let sig: vaultsync_core::coordinator::ws_proto::P2PSignalPayload =
+                    match serde_json::from_slice(payload) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
 
                 let all_ws = self.state.get_websockets();
                 for socket in all_ws {
-                    if let Ok(Some(sock_attachment)) = socket.deserialize_attachment::<WebSocketAttachment>() {
-                        if sock_attachment.authenticated 
-                           && (sock_attachment.namespace == attachment.namespace || sock_attachment.namespaces.keys().any(|k| attachment.namespaces.contains_key(k)))
-                           && (sock_attachment.replica_id == sig.target_replica_id || sock_attachment.namespaces.values().any(|v| v == &sig.target_replica_id))
+                    if let Ok(Some(sock_attachment)) =
+                        socket.deserialize_attachment::<WebSocketAttachment>()
+                    {
+                        if sock_attachment.authenticated
+                            && (sock_attachment.namespace == attachment.namespace
+                                || sock_attachment
+                                    .namespaces
+                                    .keys()
+                                    .any(|k| attachment.namespaces.contains_key(k)))
+                            && (sock_attachment.replica_id == sig.target_replica_id
+                                || sock_attachment
+                                    .namespaces
+                                    .values()
+                                    .any(|v| v == &sig.target_replica_id))
                         {
                             let ack = vaultsync_core::coordinator::ws_proto::P2PSignalAckPayload {
                                 sender_replica_id: attachment.replica_id.clone(),
@@ -831,7 +987,7 @@ impl DurableObject for NamespaceDurableObject {
                             };
                             if let Ok(frame) = vaultsync_core::coordinator::ws_proto::encode_frame(
                                 vaultsync_core::coordinator::ws_proto::MSG_P2P_SIGNAL_ACK,
-                                &ack
+                                &ack,
                             ) {
                                 let _ = socket.send_with_bytes(&frame);
                             }

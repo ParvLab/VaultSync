@@ -13,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(ops) = bincode::deserialize::<Vec<FuzzOp>>(data) {
         let base = CRDTDocument::new("doc-1", "rec-1", 0);
         let base_snapshot = base.to_snapshot();
-        
+
         let mut replica_a = CRDTDocument::from_snapshot(&base_snapshot).unwrap();
         let mut replica_b = CRDTDocument::from_snapshot(&base_snapshot).unwrap();
 

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use vaultsync_core::coordinator::traits::*;
 use futures::Stream;
+use vaultsync_core::coordinator::traits::*;
 
 #[derive(Debug, Clone)]
 pub struct RedisCoordinator {
@@ -10,9 +10,11 @@ pub struct RedisCoordinator {
 impl RedisCoordinator {
     pub async fn new(url: &str) -> Result<Self, CoordinatorError> {
         tracing::info!("Connecting to Redis: {}", url);
-        let client = redis::Client::open(url)
-            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        let conn = client.get_multiplexed_tokio_connection().await
+        let client =
+            redis::Client::open(url).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        let conn = client
+            .get_multiplexed_tokio_connection()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(Self { conn })
     }
@@ -36,25 +38,25 @@ fn parse_stream_entry(entry_val: &redis::Value, namespace: &str) -> Option<Pendi
         redis::Value::Bulk(b) if b.len() == 2 => b,
         _ => return None,
     };
-    
+
     let id_str = match &bulk[0] {
         redis::Value::Data(d) => std::str::from_utf8(d).ok()?,
         _ => return None,
     };
     let sequence = stream_id_to_seq(id_str);
-    
+
     let fields = match &bulk[1] {
         redis::Value::Bulk(f) => f,
         _ => return None,
     };
-    
+
     let mut id = None;
     let mut doc_id = None;
     let mut record_id = None;
     let mut encrypted_blob = None;
     let mut timestamp = None;
     let mut key_version = None;
-    
+
     for chunk in fields.chunks_exact(2) {
         let key = match &chunk[0] {
             redis::Value::Data(d) => std::str::from_utf8(d).ok()?,
@@ -100,7 +102,7 @@ fn parse_stream_entry(entry_val: &redis::Value, namespace: &str) -> Option<Pendi
             _ => {}
         }
     }
-    
+
     Some(PendingMutation {
         id: id?,
         namespace: namespace.to_string(),
@@ -115,7 +117,11 @@ fn parse_stream_entry(entry_val: &redis::Value, namespace: &str) -> Option<Pendi
 
 #[async_trait]
 impl Coordinator for RedisCoordinator {
-    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         let mut conn = self.conn.clone();
         let stream_key = format!("vaultsync:{}:mutations", namespace);
         let mut seqs = Vec::with_capacity(mutations.len());
@@ -124,37 +130,51 @@ impl Coordinator for RedisCoordinator {
             let res: String = redis::cmd("XADD")
                 .arg(&stream_key)
                 .arg("*")
-                .arg("id").arg(&mutation.id)
-                .arg("replica_id").arg(&mutation.replica_id)
-                .arg("doc_id").arg(&mutation.doc_id)
-                .arg("record_id").arg(&mutation.record_id)
-                .arg("blob").arg(&mutation.encrypted_blob)
-                .arg("ts").arg(mutation.timestamp.to_string())
-                .arg("schema_version").arg(mutation.schema_version.to_string())
-                .arg("key_version").arg(mutation.key_version.to_string())
+                .arg("id")
+                .arg(&mutation.id)
+                .arg("replica_id")
+                .arg(&mutation.replica_id)
+                .arg("doc_id")
+                .arg(&mutation.doc_id)
+                .arg("record_id")
+                .arg(&mutation.record_id)
+                .arg("blob")
+                .arg(&mutation.encrypted_blob)
+                .arg("ts")
+                .arg(mutation.timestamp.to_string())
+                .arg("schema_version")
+                .arg(mutation.schema_version.to_string())
+                .arg("key_version")
+                .arg(mutation.key_version.to_string())
                 .query_async(&mut conn)
                 .await
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            
+
             seqs.push(stream_id_to_seq(&res));
         }
         Ok(seqs)
     }
 
-    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         let mut conn = self.conn.clone();
         let stream_key = format!("vaultsync:{}:mutations", namespace);
         let start_id = seq_to_stream_id(after.saturating_add(1));
-        
+
         let res: redis::Value = redis::cmd("XRANGE")
             .arg(&stream_key)
             .arg(&start_id)
             .arg("+")
-            .arg("COUNT").arg(limit)
+            .arg("COUNT")
+            .arg(limit)
             .query_async(&mut conn)
             .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            
+
         let mut mutations = Vec::new();
         if let redis::Value::Bulk(entries) = res {
             for entry in entries {
@@ -163,7 +183,7 @@ impl Coordinator for RedisCoordinator {
                 }
             }
         }
-        
+
         Ok(mutations)
     }
 
@@ -171,10 +191,10 @@ impl Coordinator for RedisCoordinator {
         let mut conn = self.conn.clone();
         let replicas_key = format!("vaultsync:{}:replicas", namespace);
         let schema_key = format!("vaultsync:{}:schema_version", namespace);
-        
-        let info_str = serde_json::to_string(&info)
-            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            
+
+        let info_str =
+            serde_json::to_string(&info).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
         redis::cmd("HSET")
             .arg(&replicas_key)
             .arg(&info.replica_id)
@@ -182,18 +202,18 @@ impl Coordinator for RedisCoordinator {
             .query_async::<_, ()>(&mut conn)
             .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            
+
         let current_version: Option<String> = redis::cmd("GET")
             .arg(&schema_key)
             .query_async(&mut conn)
             .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            
+
         let current_v = match current_version {
             Some(s) => s.parse::<u64>().unwrap_or(0),
             None => 0,
         };
-        
+
         if info.schema_version > current_v {
             redis::cmd("SET")
                 .arg(&schema_key)
@@ -202,7 +222,7 @@ impl Coordinator for RedisCoordinator {
                 .await
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         }
-        
+
         Ok(())
     }
 
@@ -213,7 +233,7 @@ impl Coordinator for RedisCoordinator {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-            
+
         redis::cmd("HSET")
             .arg(&heartbeats_key)
             .arg(replica_id)
@@ -221,28 +241,36 @@ impl Coordinator for RedisCoordinator {
             .query_async::<_, ()>(&mut conn)
             .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            
+
         Ok(())
     }
 
-    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn subscribe(
+        &self,
+        namespace: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         let (tx_mpsc, rx_mpsc) = tokio::sync::mpsc::channel(1024);
         let mut conn = self.conn.clone();
         let stream_key = format!("vaultsync:{}:mutations", namespace);
         let namespace = namespace.to_string();
-        
+
         tokio::spawn(async move {
             let mut last_id_str = if from_sequence == 0 {
                 "0-0".to_string()
             } else {
                 seq_to_stream_id(from_sequence)
             };
-            
+
             loop {
                 let res: redis::Value = match redis::cmd("XREAD")
-                    .arg("BLOCK").arg(500)
-                    .arg("COUNT").arg(100)
-                    .arg("STREAMS").arg(&stream_key).arg(&last_id_str)
+                    .arg("BLOCK")
+                    .arg(500)
+                    .arg("COUNT")
+                    .arg(100)
+                    .arg("STREAMS")
+                    .arg(&stream_key)
+                    .arg(&last_id_str)
                     .query_async(&mut conn)
                     .await
                 {
@@ -253,7 +281,7 @@ impl Coordinator for RedisCoordinator {
                         continue;
                     }
                 };
-                
+
                 let mut entries = Vec::new();
                 if let redis::Value::Bulk(streams) = res {
                     for stream in streams {
@@ -266,16 +294,18 @@ impl Coordinator for RedisCoordinator {
                         }
                     }
                 }
-                
+
                 for entry in entries {
                     let entry_id = match &entry {
                         redis::Value::Bulk(b) if b.len() == 2 => match &b[0] {
-                            redis::Value::Data(d) => std::str::from_utf8(d).ok().map(|s| s.to_string()),
+                            redis::Value::Data(d) => {
+                                std::str::from_utf8(d).ok().map(|s| s.to_string())
+                            }
                             _ => None,
                         },
                         _ => None,
                     };
-                    
+
                     if let Some(id_str) = entry_id {
                         if let Some(m) = parse_stream_entry(&entry, &namespace) {
                             last_id_str = id_str;
@@ -287,20 +317,20 @@ impl Coordinator for RedisCoordinator {
                 }
             }
         });
-        
+
         Ok(Box::new(RedisSubscription { rx: rx_mpsc }))
     }
 
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError> {
         let mut conn = self.conn.clone();
         let schema_key = format!("vaultsync:{}:schema_version", namespace);
-        
+
         let res: Option<String> = redis::cmd("GET")
             .arg(&schema_key)
             .query_async(&mut conn)
             .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            
+
         match res {
             Some(s) => Ok(s.parse::<u64>().unwrap_or(0)),
             None => Ok(0),
@@ -310,13 +340,13 @@ impl Coordinator for RedisCoordinator {
     async fn list_replicas(&self, namespace: &str) -> Result<Vec<ReplicaInfo>, CoordinatorError> {
         let mut conn = self.conn.clone();
         let replicas_key = format!("vaultsync:{}:replicas", namespace);
-        
+
         let res: Vec<String> = redis::cmd("HVALS")
             .arg(&replicas_key)
             .query_async(&mut conn)
             .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            
+
         let mut replicas = Vec::new();
         for s in res {
             if let Ok(info) = serde_json::from_str(&s) {
@@ -361,8 +391,8 @@ impl Coordinator for RedisCoordinator {
             .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         if let Some(s) = res {
-            let parsed: (Vec<u8>, u64) = serde_json::from_str(&s)
-                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            let parsed: (Vec<u8>, u64) =
+                serde_json::from_str(&s).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
             Ok(Some(parsed))
         } else {
             Ok(None)
@@ -376,7 +406,10 @@ struct RedisSubscription {
 
 impl Stream for RedisSubscription {
     type Item = PendingMutation;
-    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
     }
 }

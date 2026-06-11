@@ -1,5 +1,5 @@
-use std::time::Duration;
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -52,7 +52,10 @@ impl RetryEngine {
             let jitter = rand::random::<f64>() * 0.5 + 0.75;
             delay = Duration::from_secs_f64(delay.as_secs_f64() * jitter);
         }
-        self.next_retry.insert(id.to_string(), crate::time_utils::PlatformInstant::now() + delay);
+        self.next_retry.insert(
+            id.to_string(),
+            crate::time_utils::PlatformInstant::now() + delay,
+        );
         Some(delay)
     }
 

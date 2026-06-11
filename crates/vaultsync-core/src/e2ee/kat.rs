@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use crate::e2ee::encrypt::encrypt;
     use crate::e2ee::decrypt::decrypt;
+    use crate::e2ee::encrypt::encrypt;
     use crate::e2ee::keyring::{KeyRing, NamespaceKeypair};
 
     #[test]
@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn e2ee_roundtrip_via_encryptor_decryptor() {
-        use crate::e2ee::keyring::{E2eeEncryptor, E2eeDecryptor};
+        use crate::e2ee::keyring::{E2eeDecryptor, E2eeEncryptor};
 
         let kr_alice = KeyRing::generate();
         let kr_bob = KeyRing::generate();
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn e2ee_symmetric_roundtrip() {
-        use crate::e2ee::keyring::{E2eeEncryptor, E2eeDecryptor};
+        use crate::e2ee::keyring::{E2eeDecryptor, E2eeEncryptor};
 
         let kr_alice = KeyRing::generate();
         let alice_key = kr_alice.active_key().clone();
@@ -99,7 +99,7 @@ mod tests {
 
         let msg = b"symmetric encrypted message";
         let namespace = "test-namespace";
-        
+
         let ciphertext = encryptor.encrypt_symmetric(msg, namespace).unwrap();
         let plaintext = decryptor.decrypt_symmetric(&ciphertext, namespace).unwrap();
 
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn test_versioned_blob_roundtrip() {
-        use crate::e2ee::keyring::{E2eeEncryptor, E2eeDecryptor};
+        use crate::e2ee::keyring::{E2eeDecryptor, E2eeEncryptor};
         let keyring = std::sync::Arc::new(KeyRing::generate());
         let encryptor = E2eeEncryptor::new(keyring.clone());
         let decryptor = E2eeDecryptor::new(keyring.clone());
@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn test_rotation_new_version_decryptable() {
-        use crate::e2ee::keyring::{E2eeEncryptor, E2eeDecryptor};
+        use crate::e2ee::keyring::{E2eeDecryptor, E2eeEncryptor};
         let keyring_alice = std::sync::Arc::new(KeyRing::generate());
         let alice_key_v1 = keyring_alice.active_key();
 

@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::coordinator::traits::*;
 use crate::coordinator::ws_proto::*;
+use async_trait::async_trait;
 use futures::Stream;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -19,7 +19,11 @@ pub struct HttpCoordinatorConfig {
 #[derive(Debug, Clone)]
 struct WsClientHandle {
     tx: tokio::sync::mpsc::Sender<tokio_tungstenite::tungstenite::Message>,
-    pending_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
+    pending_requests: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>,
+        >,
+    >,
     /// Snapshots received during the REGISTER handshake, keyed by (doc_id, record_id)
     received_snapshots: Arc<tokio::sync::Mutex<Vec<crate::crdt::snapshot::Snapshot>>>,
 }
@@ -45,11 +49,16 @@ impl HttpCoordinator {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    async fn try_connect_ws(&self, namespace: &str, after: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn try_connect_ws(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         use tokio_tungstenite::tungstenite::Message;
 
         let ws_url = get_ws_url(&self.config.url, namespace);
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         let (mut ws_sink, mut ws_stream) = ws_stream.split();
@@ -63,25 +72,35 @@ impl HttpCoordinator {
             namespace: namespace.to_string(),
         };
 
-        let auth_frame = encode_frame(MSG_AUTH, &auth)
-            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        ws_sink.send(Message::Binary(auth_frame)).await
+        let auth_frame =
+            encode_frame(MSG_AUTH, &auth).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        ws_sink
+            .send(Message::Binary(auth_frame))
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
-        let resp = ws_stream.next().await
+        let resp = ws_stream
+            .next()
+            .await
             .ok_or_else(|| CoordinatorError::Internal("Connection closed".to_string()))?
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         let bin = match resp {
             Message::Binary(b) => b,
-            _ => return Err(CoordinatorError::Internal("Expected binary frame during AUTH".to_string())),
+            _ => {
+                return Err(CoordinatorError::Internal(
+                    "Expected binary frame during AUTH".to_string(),
+                ))
+            }
         };
 
-        let (msg_type, payload) = decode_frame(&bin)
-            .map_err(|e| CoordinatorError::Internal(e))?;
+        let (msg_type, payload) = decode_frame(&bin).map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type != MSG_AUTH_ACK {
-            return Err(CoordinatorError::Internal(format!("Expected MSG_AUTH_ACK, got {:02X}", msg_type)));
+            return Err(CoordinatorError::Internal(format!(
+                "Expected MSG_AUTH_ACK, got {:02X}",
+                msg_type
+            )));
         }
 
         let auth_ack: AuthAckPayload = serde_json::from_slice(payload)
@@ -92,7 +111,9 @@ impl HttpCoordinator {
         }
 
         // 2. REGISTER handshake
-        let current_version = self.schema_version.load(std::sync::atomic::Ordering::Relaxed);
+        let current_version = self
+            .schema_version
+            .load(std::sync::atomic::Ordering::Relaxed);
         let reg = RegisterPayload {
             replica_id: auth.replica_id.clone(),
             namespace: namespace.to_string(),
@@ -104,23 +125,35 @@ impl HttpCoordinator {
 
         let reg_frame = encode_frame(MSG_REGISTER, &reg)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        ws_sink.send(Message::Binary(reg_frame)).await
+        ws_sink
+            .send(Message::Binary(reg_frame))
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
-        let resp = ws_stream.next().await
-            .ok_or_else(|| CoordinatorError::Internal("Connection closed during REGISTER".to_string()))?
+        let resp = ws_stream
+            .next()
+            .await
+            .ok_or_else(|| {
+                CoordinatorError::Internal("Connection closed during REGISTER".to_string())
+            })?
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         let bin = match resp {
             Message::Binary(b) => b,
-            _ => return Err(CoordinatorError::Internal("Expected binary frame during REGISTER".to_string())),
+            _ => {
+                return Err(CoordinatorError::Internal(
+                    "Expected binary frame during REGISTER".to_string(),
+                ))
+            }
         };
 
-        let (msg_type, _payload) = decode_frame(&bin)
-            .map_err(|e| CoordinatorError::Internal(e))?;
+        let (msg_type, _payload) = decode_frame(&bin).map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type != MSG_REGISTER_ACK {
-            return Err(CoordinatorError::Internal(format!("Expected MSG_REGISTER_ACK, got {:02X}", msg_type)));
+            return Err(CoordinatorError::Internal(format!(
+                "Expected MSG_REGISTER_ACK, got {:02X}",
+                msg_type
+            )));
         }
 
         // 2.5 Drain any MSG_SNAPSHOT frames the server pushes immediately after REGISTER_ACK.
@@ -130,15 +163,15 @@ impl HttpCoordinator {
         loop {
             // Peek the next frame with a short timeout; if nothing arrives quickly
             // the server has finished sending snapshots.
-            let next = tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                ws_stream.next(),
-            ).await;
+            let next =
+                tokio::time::timeout(std::time::Duration::from_millis(200), ws_stream.next()).await;
             match next {
                 Ok(Some(Ok(Message::Binary(peeked)))) => {
                     if let Ok((peeked_type, peeked_payload)) = decode_frame(&peeked) {
                         if peeked_type == MSG_SNAPSHOT {
-                            if let Ok(snap_payload) = serde_json::from_slice::<SnapshotPayload>(peeked_payload) {
+                            if let Ok(snap_payload) =
+                                serde_json::from_slice::<SnapshotPayload>(peeked_payload)
+                            {
                                 let snap = crate::crdt::snapshot::Snapshot {
                                     doc_id: snap_payload.doc_id,
                                     record_id: snap_payload.record_id,
@@ -172,23 +205,35 @@ impl HttpCoordinator {
         };
         let sync_frame = encode_frame(MSG_SCHEMA_SYNC, &sync)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        ws_sink.send(Message::Binary(sync_frame)).await
+        ws_sink
+            .send(Message::Binary(sync_frame))
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
-        let resp = ws_stream.next().await
-            .ok_or_else(|| CoordinatorError::Internal("Connection closed during SCHEMA_SYNC".to_string()))?
+        let resp = ws_stream
+            .next()
+            .await
+            .ok_or_else(|| {
+                CoordinatorError::Internal("Connection closed during SCHEMA_SYNC".to_string())
+            })?
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         let bin = match resp {
             Message::Binary(b) => b,
-            _ => return Err(CoordinatorError::Internal("Expected binary frame during SCHEMA_SYNC".to_string())),
+            _ => {
+                return Err(CoordinatorError::Internal(
+                    "Expected binary frame during SCHEMA_SYNC".to_string(),
+                ))
+            }
         };
 
-        let (msg_type, payload) = decode_frame(&bin)
-            .map_err(|e| CoordinatorError::Internal(e))?;
+        let (msg_type, payload) = decode_frame(&bin).map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type != MSG_SCHEMA_MIGRATION {
-            return Err(CoordinatorError::Internal(format!("Expected MSG_SCHEMA_MIGRATION, got {:02X}", msg_type)));
+            return Err(CoordinatorError::Internal(format!(
+                "Expected MSG_SCHEMA_MIGRATION, got {:02X}",
+                msg_type
+            )));
         }
 
         let migration_payload: SchemaMigrationPayload = serde_json::from_slice(payload)
@@ -207,7 +252,9 @@ impl HttpCoordinator {
 
         let sub_frame = encode_frame(MSG_SUBSCRIBE, &sub)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        ws_sink.send(Message::Binary(sub_frame)).await
+        ws_sink
+            .send(Message::Binary(sub_frame))
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         // Setup writer/reader tasks
@@ -235,7 +282,11 @@ impl HttpCoordinator {
                     namespace: "".to_string(),
                 };
                 if let Ok(frame) = encode_frame(MSG_HEARTBEAT, &hb) {
-                    if write_tx_heartbeat.send(Message::Binary(frame)).await.is_err() {
+                    if write_tx_heartbeat
+                        .send(Message::Binary(frame))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -275,7 +326,9 @@ impl HttpCoordinator {
                         } else if msg_type == MSG_SNAPSHOT {
                             // Server occasionally pushes a fresh snapshot (e.g. after compaction).
                             // Store it in the cache; the sync engine will apply it via get_snapshot.
-                            if let Ok(snap_payload) = serde_json::from_slice::<SnapshotPayload>(payload) {
+                            if let Ok(snap_payload) =
+                                serde_json::from_slice::<SnapshotPayload>(payload)
+                            {
                                 if snap_payload.checksum != 0 {
                                     let snap = crate::crdt::snapshot::Snapshot {
                                         doc_id: snap_payload.doc_id,
@@ -289,7 +342,9 @@ impl HttpCoordinator {
                                     if snap.verify_checksum() {
                                         let mut snaps = received_snapshots_arc.lock().await;
                                         // Update or insert keyed by (doc_id, record_id)
-                                        if let Some(existing) = snaps.iter_mut().find(|s| s.doc_id == snap.doc_id && s.record_id == snap.record_id) {
+                                        if let Some(existing) = snaps.iter_mut().find(|s| {
+                                            s.doc_id == snap.doc_id && s.record_id == snap.record_id
+                                        }) {
                                             if snap.sequence > existing.sequence {
                                                 *existing = snap;
                                             }
@@ -300,8 +355,12 @@ impl HttpCoordinator {
                                 }
                             }
                         } else {
-                            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(payload) {
-                                if let Some(req_id) = json_val.get("request_id").and_then(|v| v.as_str()) {
+                            if let Ok(json_val) =
+                                serde_json::from_slice::<serde_json::Value>(payload)
+                            {
+                                if let Some(req_id) =
+                                    json_val.get("request_id").and_then(|v| v.as_str())
+                                {
                                     let mut reqs = pending_requests.lock().await;
                                     if let Some(tx) = reqs.remove(req_id) {
                                         let _ = tx.send(bin);
@@ -337,7 +396,11 @@ fn get_ws_url(http_url: &str, namespace: &str) -> String {
 
 #[async_trait]
 impl Coordinator for HttpCoordinator {
-    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle_opt = self.ws_client.lock().await.clone();
@@ -355,11 +418,18 @@ impl Coordinator for HttpCoordinator {
                 };
 
                 if let Ok(frame) = encode_frame(MSG_PUSH, &push) {
-                    if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                    if handle
+                        .tx
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                        .await
+                        .is_ok()
+                    {
                         if let Ok(resp_bin) = rx.await {
                             if let Ok((msg_type, payload)) = decode_frame(&resp_bin) {
                                 if msg_type == MSG_PUSH_ACK {
-                                    if let Ok(ack) = serde_json::from_slice::<PushAckPayload>(payload) {
+                                    if let Ok(ack) =
+                                        serde_json::from_slice::<PushAckPayload>(payload)
+                                    {
                                         if let Some(err) = ack.error {
                                             return Err(CoordinatorError::Internal(err));
                                         }
@@ -374,22 +444,38 @@ impl Coordinator for HttpCoordinator {
         }
 
         // Fallback to HTTP POST
-        let url = format!("{}/namespace/{}/push", self.config.url.trim_end_matches('/'), namespace);
+        let url = format!(
+            "{}/namespace/{}/push",
+            self.config.url.trim_end_matches('/'),
+            namespace
+        );
         let mut builder = self.client.post(&url).json(&mutations);
         if let Some(ref token) = self.config.auth_token {
             builder = builder.bearer_auth(token);
         }
-        let resp = builder.send().await
+        let resp = builder
+            .send()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+            return Err(CoordinatorError::Internal(format!(
+                "HTTP error status: {}",
+                resp.status()
+            )));
         }
-        let seq_ids = resp.json::<Vec<SequenceId>>().await
+        let seq_ids = resp
+            .json::<Vec<SequenceId>>()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(seq_ids)
     }
 
-    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle_opt = self.ws_client.lock().await.clone();
@@ -409,11 +495,18 @@ impl Coordinator for HttpCoordinator {
                 };
 
                 if let Ok(frame) = encode_frame(MSG_PULL, &pull) {
-                    if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                    if handle
+                        .tx
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                        .await
+                        .is_ok()
+                    {
                         if let Ok(resp_bin) = rx.await {
                             if let Ok((msg_type, payload)) = decode_frame(&resp_bin) {
                                 if msg_type == MSG_PULL_RESPONSE {
-                                    if let Ok(resp) = serde_json::from_slice::<PullResponsePayload>(payload) {
+                                    if let Ok(resp) =
+                                        serde_json::from_slice::<PullResponsePayload>(payload)
+                                    {
                                         return Ok(resp.mutations);
                                     }
                                 }
@@ -436,25 +529,39 @@ impl Coordinator for HttpCoordinator {
         if let Some(ref token) = self.config.auth_token {
             builder = builder.bearer_auth(token);
         }
-        let resp = builder.send().await
+        let resp = builder
+            .send()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+            return Err(CoordinatorError::Internal(format!(
+                "HTTP error status: {}",
+                resp.status()
+            )));
         }
-        let mutations = resp.json::<Vec<PendingMutation>>().await
+        let mutations = resp
+            .json::<Vec<PendingMutation>>()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(mutations)
     }
 
-    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn subscribe(
+        &self,
+        namespace: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             match self.try_connect_ws(namespace, from_sequence).await {
                 Ok(stream) => return Ok(stream),
                 Err(CoordinatorError::AuthFailed) => return Err(CoordinatorError::AuthFailed),
                 Err(e) => {
-                    warn!("WebSocket subscription failed, falling back to SSE: {:?}", e);
-                }   
+                    warn!(
+                        "WebSocket subscription failed, falling back to SSE: {:?}",
+                        e
+                    );
+                }
             }
         }
 
@@ -463,11 +570,11 @@ impl Coordinator for HttpCoordinator {
         let client = self.client.clone();
         let config = self.config.clone();
         let ns = namespace.to_string();
-        
+
         crate::time_utils::spawn(async move {
             let mut after = from_sequence;
             let url_base = config.url.clone();
-            
+
             loop {
                 let url = format!(
                     "{}/namespace/{}/events?after={}",
@@ -475,12 +582,12 @@ impl Coordinator for HttpCoordinator {
                     ns,
                     after
                 );
-                
+
                 let mut builder = client.get(&url).header("Accept", "text/event-stream");
                 if let Some(ref token) = config.auth_token {
                     builder = builder.bearer_auth(token);
                 }
-                
+
                 let resp = match builder.send().await {
                     Ok(r) if r.status().is_success() => r,
                     _ => {
@@ -488,28 +595,29 @@ impl Coordinator for HttpCoordinator {
                         continue;
                     }
                 };
-                
+
                 let mut stream = resp.bytes_stream();
                 let mut buffer = Vec::new();
-                
+
                 while let Some(chunk_res) = stream.next().await {
                     let chunk = match chunk_res {
                         Ok(bytes) => bytes,
                         Err(_) => break,
                     };
-                    
+
                     buffer.extend_from_slice(&chunk);
-                    
+
                     while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                         let line_bytes = buffer.drain(..=pos).collect::<Vec<u8>>();
                         let line = match std::str::from_utf8(&line_bytes) {
                             Ok(s) => s.trim(),
                             Err(_) => continue,
                         };
-                        
+
                         if line.starts_with("data:") {
                             let data_json = line["data:".len()..].trim();
-                            if let Ok(mutation) = serde_json::from_str::<PendingMutation>(data_json) {
+                            if let Ok(mutation) = serde_json::from_str::<PendingMutation>(data_json)
+                            {
                                 after = after.max(mutation.sequence);
                                 if tx.send(mutation).await.is_err() {
                                     return;
@@ -518,16 +626,17 @@ impl Coordinator for HttpCoordinator {
                         }
                     }
                 }
-                
+
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
-        
+
         Ok(Box::new(HttpSubscription { rx }))
     }
 
     async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
-        self.schema_version.store(info.schema_version, std::sync::atomic::Ordering::Relaxed);
+        self.schema_version
+            .store(info.schema_version, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle_opt = self.ws_client.lock().await.clone();
@@ -541,7 +650,12 @@ impl Coordinator for HttpCoordinator {
                     key_version: 1,
                 };
                 if let Ok(frame) = encode_frame(MSG_REGISTER, &reg) {
-                    if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                    if handle
+                        .tx
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                        .await
+                        .is_ok()
+                    {
                         return Ok(());
                     }
                 }
@@ -549,15 +663,24 @@ impl Coordinator for HttpCoordinator {
         }
 
         // Fallback to HTTP POST
-        let url = format!("{}/namespace/{}/register", self.config.url.trim_end_matches('/'), namespace);
+        let url = format!(
+            "{}/namespace/{}/register",
+            self.config.url.trim_end_matches('/'),
+            namespace
+        );
         let mut builder = self.client.post(&url).json(&info);
         if let Some(ref token) = self.config.auth_token {
             builder = builder.bearer_auth(token);
         }
-        let resp = builder.send().await
+        let resp = builder
+            .send()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+            return Err(CoordinatorError::Internal(format!(
+                "HTTP error status: {}",
+                resp.status()
+            )));
         }
         Ok(())
     }
@@ -569,7 +692,12 @@ impl Coordinator for HttpCoordinator {
         public_key: Vec<u8>,
         key_version: u64,
     ) -> Result<(), CoordinatorError> {
-        let url = format!("{}/namespace/{}/replicas/{}/key", self.config.url.trim_end_matches('/'), namespace, replica_id);
+        let url = format!(
+            "{}/namespace/{}/replicas/{}/key",
+            self.config.url.trim_end_matches('/'),
+            namespace,
+            replica_id
+        );
         let payload = crate::coordinator::ws_proto::UpdateReplicaKeyPayload {
             public_key,
             key_version,
@@ -578,10 +706,15 @@ impl Coordinator for HttpCoordinator {
         if let Some(ref token) = self.config.auth_token {
             builder = builder.bearer_auth(token);
         }
-        let resp = builder.send().await
+        let resp = builder
+            .send()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+            return Err(CoordinatorError::Internal(format!(
+                "HTTP error status: {}",
+                resp.status()
+            )));
         }
         Ok(())
     }
@@ -591,20 +724,32 @@ impl Coordinator for HttpCoordinator {
         namespace: &str,
         replica_id: &str,
     ) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
-        let url = format!("{}/namespace/{}/replicas/{}/key", self.config.url.trim_end_matches('/'), namespace, replica_id);
+        let url = format!(
+            "{}/namespace/{}/replicas/{}/key",
+            self.config.url.trim_end_matches('/'),
+            namespace,
+            replica_id
+        );
         let mut builder = self.client.get(&url);
         if let Some(ref token) = self.config.auth_token {
             builder = builder.bearer_auth(token);
         }
-        let resp = builder.send().await
+        let resp = builder
+            .send()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+            return Err(CoordinatorError::Internal(format!(
+                "HTTP error status: {}",
+                resp.status()
+            )));
         }
-        let payload: Option<crate::coordinator::ws_proto::UpdateReplicaKeyPayload> = resp.json().await
+        let payload: Option<crate::coordinator::ws_proto::UpdateReplicaKeyPayload> = resp
+            .json()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(payload.map(|p| (p.public_key, p.key_version)))
     }
@@ -619,7 +764,12 @@ impl Coordinator for HttpCoordinator {
                     namespace: namespace.to_string(),
                 };
                 if let Ok(frame) = encode_frame(MSG_HEARTBEAT, &hb) {
-                    if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                    if handle
+                        .tx
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                        .await
+                        .is_ok()
+                    {
                         return Ok(());
                     }
                 }
@@ -637,38 +787,63 @@ impl Coordinator for HttpCoordinator {
         if let Some(ref token) = self.config.auth_token {
             builder = builder.bearer_auth(token);
         }
-        let resp = builder.send().await
+        let resp = builder
+            .send()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+            return Err(CoordinatorError::Internal(format!(
+                "HTTP error status: {}",
+                resp.status()
+            )));
         }
         Ok(())
     }
 
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError> {
-        let url = format!("{}/namespace/{}/schema_version", self.config.url.trim_end_matches('/'), namespace);
+        let url = format!(
+            "{}/namespace/{}/schema_version",
+            self.config.url.trim_end_matches('/'),
+            namespace
+        );
         let mut builder = self.client.get(&url);
         if let Some(ref token) = self.config.auth_token {
             builder = builder.bearer_auth(token);
         }
-        let resp = builder.send().await
+        let resp = builder
+            .send()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordinatorError::Internal(format!("HTTP error status: {}", resp.status())));
+            return Err(CoordinatorError::Internal(format!(
+                "HTTP error status: {}",
+                resp.status()
+            )));
         }
-        let version = resp.json::<u64>().await
+        let version = resp
+            .json::<u64>()
+            .await
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         Ok(version)
     }
 
-    async fn store_snapshot(&self, _namespace: &str, snapshot: &crate::crdt::snapshot::Snapshot) -> Result<(), CoordinatorError> {
+    async fn store_snapshot(
+        &self,
+        _namespace: &str,
+        snapshot: &crate::crdt::snapshot::Snapshot,
+    ) -> Result<(), CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let handle_opt = self.ws_client.lock().await.clone();
             if let Some(handle) = handle_opt {
                 let frame = encode_frame(MSG_SNAPSHOT, snapshot)
                     .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-                if handle.tx.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_ok() {
+                if handle
+                    .tx
+                    .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                    .await
+                    .is_ok()
+                {
                     return Ok(());
                 }
             }
@@ -719,7 +894,10 @@ struct HttpSubscription {
 
 impl Stream for HttpSubscription {
     type Item = PendingMutation;
-    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
     }
 }

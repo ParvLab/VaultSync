@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use serde_json::Value;
+use crate::error::VaultSyncError;
 use crate::storage::traits::Storage;
 use crate::telemetry::metrics::VaultSyncMetrics;
-use crate::error::VaultSyncError;
+use serde_json::Value;
+use std::sync::Arc;
 
 #[cfg(feature = "telemetry")]
 use std::sync::Mutex;
@@ -82,19 +82,26 @@ impl DebugApi {
                 http::StatusCode,
                 response::{IntoResponse, Response},
                 routing::{get, post},
-                Json, Router, Extension,
+                Extension, Json, Router,
             };
-            use std::net::SocketAddr;
             use serde_json::json;
+            use std::net::SocketAddr;
 
             async fn handle_state(Extension(api): Extension<Arc<DebugApi>>) -> Response {
                 let namespace = {
                     let state = api.server_state.lock().unwrap();
-                    state.as_ref().map(|s| s.namespace.clone()).unwrap_or_else(|| "default".to_string())
+                    state
+                        .as_ref()
+                        .map(|s| s.namespace.clone())
+                        .unwrap_or_else(|| "default".to_string())
                 };
                 match api.get_state(&namespace).await {
                     Ok(val) => Json(val).into_response(),
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                        .into_response(),
                 }
             }
 
@@ -103,7 +110,11 @@ impl DebugApi {
                     let state = api.server_state.lock().unwrap();
                     match state.as_ref() {
                         Some(s) => Ok(s.namespace.clone()),
-                        None => Err((StatusCode::BAD_REQUEST, Json(json!({"error": "server not started"}))).into_response()),
+                        None => Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "server not started"})),
+                        )
+                            .into_response()),
                     }
                 };
                 let namespace = match namespace_res {
@@ -122,10 +133,18 @@ impl DebugApi {
                                 }
                                 Json(pending).into_response()
                             }
-                            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+                            Err(e) => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": e.to_string()})),
+                            )
+                                .into_response(),
                         }
                     }
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                        .into_response(),
                 }
             }
 
@@ -134,7 +153,11 @@ impl DebugApi {
                     let state = api.server_state.lock().unwrap();
                     match state.as_ref() {
                         Some(s) => Ok(s.namespace.clone()),
-                        None => Err((StatusCode::BAD_REQUEST, Json(json!({"error": "server not started"}))).into_response()),
+                        None => Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "server not started"})),
+                        )
+                            .into_response()),
                     }
                 };
                 let namespace = match namespace_res {
@@ -149,7 +172,13 @@ impl DebugApi {
                             doc_ids.insert(entry.doc_id);
                         }
                     }
-                    Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": e.to_string()})),
+                        )
+                            .into_response()
+                    }
                 }
                 match api.storage.read_oplog_after_sequence(&namespace, 0).await {
                     Ok(synced) => {
@@ -157,7 +186,13 @@ impl DebugApi {
                             doc_ids.insert(entry.doc_id);
                         }
                     }
-                    Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": e.to_string()})),
+                        )
+                            .into_response()
+                    }
                 }
 
                 let mut docs_meta = Vec::new();
@@ -171,7 +206,13 @@ impl DebugApi {
                                 "total_size_bytes": size,
                             }));
                         }
-                        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+                        Err(e) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": e.to_string()})),
+                            )
+                                .into_response()
+                        }
                     }
                 }
 
@@ -183,7 +224,11 @@ impl DebugApi {
                     let state = api.server_state.lock().unwrap();
                     match state.as_ref() {
                         Some(s) => Ok(s.namespace.clone()),
-                        None => Err((StatusCode::BAD_REQUEST, Json(json!({"error": "server not started"}))).into_response()),
+                        None => Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "server not started"})),
+                        )
+                            .into_response()),
                     }
                 };
                 let namespace = match namespace_res {
@@ -193,14 +238,23 @@ impl DebugApi {
 
                 match api.storage.read_keys(&namespace).await {
                     Ok(keys) => {
-                        let meta: Vec<Value> = keys.iter().map(|k| json!({
-                            "namespace": k.namespace,
-                            "version": k.version,
-                            "key_len": k.key_bytes.len(),
-                        })).collect();
+                        let meta: Vec<Value> = keys
+                            .iter()
+                            .map(|k| {
+                                json!({
+                                    "namespace": k.namespace,
+                                    "version": k.version,
+                                    "key_len": k.key_bytes.len(),
+                                })
+                            })
+                            .collect();
                         Json(meta).into_response()
                     }
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                        .into_response(),
                 }
             }
 
@@ -209,7 +263,11 @@ impl DebugApi {
                     let state = api.server_state.lock().unwrap();
                     match state.as_ref() {
                         Some(s) => Ok((s.namespace.clone(), s.coordinator.clone())),
-                        None => Err((StatusCode::BAD_REQUEST, Json(json!({"error": "server not started"}))).into_response()),
+                        None => Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "server not started"})),
+                        )
+                            .into_response()),
                     }
                 };
                 let (namespace, coordinator) = match res {
@@ -219,7 +277,11 @@ impl DebugApi {
 
                 match coordinator.list_replicas(&namespace).await {
                     Ok(replicas) => Json(replicas).into_response(),
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{:?}", e)}))).into_response(),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("{:?}", e)})),
+                    )
+                        .into_response(),
                 }
             }
 
@@ -230,17 +292,23 @@ impl DebugApi {
                 let mut buffer = Vec::new();
                 if encoder.encode(&metric_families, &mut buffer).is_ok() {
                     match String::from_utf8(buffer) {
-                        Ok(text) => {
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header("Content-Type", "text/plain; version=0.0.4")
-                                .body(axum::body::boxed(axum::body::Full::from(text)))
-                                .unwrap()
-                        }
-                        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "invalid UTF-8 in metrics").into_response(),
+                        Ok(text) => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", "text/plain; version=0.0.4")
+                            .body(axum::body::boxed(axum::body::Full::from(text)))
+                            .unwrap(),
+                        Err(_) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "invalid UTF-8 in metrics",
+                        )
+                            .into_response(),
                     }
                 } else {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "failed to encode metrics").into_response()
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to encode metrics",
+                    )
+                        .into_response()
                 }
             }
 
@@ -254,7 +322,11 @@ impl DebugApi {
                     let state = api.server_state.lock().unwrap();
                     match state.as_ref() {
                         Some(s) => Ok((s.replica_id.clone(), s.leader_election.clone())),
-                        None => Err((StatusCode::BAD_REQUEST, Json(json!({"error": "server not started"}))).into_response()),
+                        None => Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "server not started"})),
+                        )
+                            .into_response()),
                     }
                 };
                 let (replica_id, leader_election) = match res {
@@ -266,7 +338,8 @@ impl DebugApi {
                 Json(json!({
                     "leader": is_leader,
                     "replica_id": replica_id,
-                })).into_response()
+                }))
+                .into_response()
             }
 
             async fn handle_force_sync(Extension(api): Extension<Arc<DebugApi>>) -> Response {
@@ -274,7 +347,11 @@ impl DebugApi {
                     let state = api.server_state.lock().unwrap();
                     match state.as_ref() {
                         Some(s) => Ok((s.upload_queue.clone(), s.download_queue.clone())),
-                        None => Err((StatusCode::BAD_REQUEST, Json(json!({"error": "server not started"}))).into_response()),
+                        None => Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "server not started"})),
+                        )
+                            .into_response()),
                     }
                 };
                 let (upload_queue, download_queue) = match res {
@@ -283,17 +360,24 @@ impl DebugApi {
                 };
 
                 match upload_queue.process_batch().await {
-                    Ok(up) => {
-                        match download_queue.process_batch().await {
-                            Ok(down) => Json(json!({
-                                "status": "success",
-                                "uploaded_mutations": up,
-                                "downloaded_mutations": down,
-                            })).into_response(),
-                            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("download failed: {e}")}))).into_response(),
-                        }
-                    }
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("upload failed: {e}")}))).into_response(),
+                    Ok(up) => match download_queue.process_batch().await {
+                        Ok(down) => Json(json!({
+                            "status": "success",
+                            "uploaded_mutations": up,
+                            "downloaded_mutations": down,
+                        }))
+                        .into_response(),
+                        Err(e) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": format!("download failed: {e}")})),
+                        )
+                            .into_response(),
+                    },
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("upload failed: {e}")})),
+                    )
+                        .into_response(),
                 }
             }
 
@@ -302,7 +386,11 @@ impl DebugApi {
                     let state = api.server_state.lock().unwrap();
                     match state.as_ref() {
                         Some(s) => Ok(s.leader_election.clone()),
-                        None => Err((StatusCode::BAD_REQUEST, Json(json!({"error": "server not started"}))).into_response()),
+                        None => Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "server not started"})),
+                        )
+                            .into_response()),
                     }
                 };
                 let leader_election = match leader_election_res {
@@ -316,8 +404,13 @@ impl DebugApi {
                         "status": "success",
                         "action": "released and re-tried lock",
                         "acquired": acquired,
-                    })).into_response(),
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+                    }))
+                    .into_response(),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                        .into_response(),
                 }
             }
 
@@ -331,7 +424,10 @@ impl DebugApi {
                 .route("/debug/vaultsync/traces", get(handle_traces))
                 .route("/debug/vaultsync/leader", get(handle_leader))
                 .route("/debug/vaultsync/force-sync", post(handle_force_sync))
-                .route("/debug/vaultsync/force-election", post(handle_force_election))
+                .route(
+                    "/debug/vaultsync/force-election",
+                    post(handle_force_election),
+                )
                 .layer(Extension(api_clone));
 
             let addr = SocketAddr::from(([127, 0, 0, 1], port));

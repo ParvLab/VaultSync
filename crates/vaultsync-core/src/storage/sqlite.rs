@@ -1,10 +1,10 @@
-use std::sync::{Arc, Mutex};
-use async_trait::async_trait;
-use rusqlite::params;
+use super::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use crate::error::VaultSyncError;
 use crate::oplog::entry::OplogEntry;
 use crate::sync::state::SyncState;
-use super::traits::{Storage, SchemaMeta, MigrationRecord, KeyRecord};
+use async_trait::async_trait;
+use rusqlite::params;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct SQLiteStorage {
@@ -14,21 +14,26 @@ pub struct SQLiteStorage {
 impl SQLiteStorage {
     pub fn new(path: &str) -> Result<Self, VaultSyncError> {
         let conn = rusqlite::Connection::open(path)?;
-        let storage = Self { conn: Arc::new(Mutex::new(conn)) };
+        let storage = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
         storage.init_tables()?;
         Ok(storage)
     }
 
     pub fn in_memory() -> Result<Self, VaultSyncError> {
         let conn = rusqlite::Connection::open_in_memory()?;
-        let storage = Self { conn: Arc::new(Mutex::new(conn)) };
+        let storage = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
         storage.init_tables()?;
         Ok(storage)
     }
 
     fn init_tables(&self) -> Result<(), VaultSyncError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS documents (
                 doc_id TEXT NOT NULL,
@@ -77,14 +82,20 @@ impl SQLiteStorage {
                 version INTEGER NOT NULL,
                 PRIMARY KEY (namespace, version)
             );
-        ")?;
+        ",
+        )?;
         Ok(())
     }
 }
 
 #[async_trait]
 impl Storage for SQLiteStorage {
-    async fn insert_document(&self, doc_id: &str, record_id: &str, bytes: &[u8]) -> Result<(), VaultSyncError> {
+    async fn insert_document(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+        bytes: &[u8],
+    ) -> Result<(), VaultSyncError> {
         let doc_id = doc_id.to_string();
         let record_id = record_id.to_string();
         let bytes = bytes.to_vec();
@@ -101,13 +112,18 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn get_document(&self, doc_id: &str, record_id: &str) -> Result<Option<Vec<u8>>, VaultSyncError> {
+    async fn get_document(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<Option<Vec<u8>>, VaultSyncError> {
         let doc_id = doc_id.to_string();
         let record_id = record_id.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT bytes FROM documents WHERE doc_id = ?1 AND record_id = ?2")?;
+            let mut stmt =
+                conn.prepare("SELECT bytes FROM documents WHERE doc_id = ?1 AND record_id = ?2")?;
             let mut rows = stmt.query(params![doc_id, record_id])?;
             match rows.next()? {
                 Some(row) => Ok(Some(row.get(0)?)),
@@ -139,7 +155,8 @@ impl Storage for SQLiteStorage {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT record_id, bytes FROM documents WHERE doc_id = ?1")?;
+            let mut stmt =
+                conn.prepare("SELECT record_id, bytes FROM documents WHERE doc_id = ?1")?;
             let rows = stmt.query_map(params![doc_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
             })?;
@@ -153,7 +170,13 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn write_document_and_oplog(&self, doc_id: &str, record_id: &str, bytes: &[u8], entry: &OplogEntry) -> Result<(), VaultSyncError> {
+    async fn write_document_and_oplog(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+        bytes: &[u8],
+        entry: &OplogEntry,
+    ) -> Result<(), VaultSyncError> {
         let doc_id = doc_id.to_string();
         let record_id = record_id.to_string();
         let bytes = bytes.to_vec();
@@ -162,7 +185,7 @@ impl Storage for SQLiteStorage {
         tokio::task::spawn_blocking(move || {
             let mut conn = conn.lock().unwrap();
             let tx = conn.transaction()?;
-            
+
             tx.execute(
                 "INSERT OR REPLACE INTO documents (doc_id, record_id, bytes) VALUES (?1, ?2, ?3)",
                 params![doc_id, record_id, bytes],
@@ -187,7 +210,12 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn delete_document_and_oplog(&self, doc_id: &str, record_id: &str, entry: &OplogEntry) -> Result<(), VaultSyncError> {
+    async fn delete_document_and_oplog(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+        entry: &OplogEntry,
+    ) -> Result<(), VaultSyncError> {
         let doc_id = doc_id.to_string();
         let record_id = record_id.to_string();
         let entry = entry.clone();
@@ -242,7 +270,11 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn read_pending_oplog(&self, namespace: &str, limit: usize) -> Result<Vec<OplogEntry>, VaultSyncError> {
+    async fn read_pending_oplog(
+        &self,
+        namespace: &str,
+        limit: usize,
+    ) -> Result<Vec<OplogEntry>, VaultSyncError> {
         let namespace = namespace.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -292,7 +324,11 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn read_oplog_after_sequence(&self, namespace: &str, seq: u64) -> Result<Vec<OplogEntry>, VaultSyncError> {
+    async fn read_oplog_after_sequence(
+        &self,
+        namespace: &str,
+        seq: u64,
+    ) -> Result<Vec<OplogEntry>, VaultSyncError> {
         let namespace = namespace.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -369,7 +405,8 @@ impl Storage for SQLiteStorage {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT doc_id, version, schema_bytes FROM schemas WHERE doc_id = ?1")?;
+            let mut stmt = conn
+                .prepare("SELECT doc_id, version, schema_bytes FROM schemas WHERE doc_id = ?1")?;
             let mut rows = stmt.query(params![doc_id])?;
             match rows.next()? {
                 Some(row) => Ok(Some(SchemaMeta {
@@ -403,7 +440,9 @@ impl Storage for SQLiteStorage {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let mut stmt = conn.prepare("SELECT version, applied_at, checksum FROM migrations ORDER BY applied_at ASC")?;
+            let mut stmt = conn.prepare(
+                "SELECT version, applied_at, checksum FROM migrations ORDER BY applied_at ASC",
+            )?;
             let rows = stmt.query_map([], |row| {
                 Ok(MigrationRecord {
                     version: row.get(0)?,
@@ -474,7 +513,11 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn reset_stale_pending(&self, namespace: &str, older_than_ms: u64) -> Result<usize, VaultSyncError> {
+    async fn reset_stale_pending(
+        &self,
+        namespace: &str,
+        older_than_ms: u64,
+    ) -> Result<usize, VaultSyncError> {
         let namespace = namespace.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -492,7 +535,11 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn delete_synced_oplog_older_than(&self, namespace: &str, older_than_secs: u64) -> Result<usize, VaultSyncError> {
+    async fn delete_synced_oplog_older_than(
+        &self,
+        namespace: &str,
+        older_than_secs: u64,
+    ) -> Result<usize, VaultSyncError> {
         let namespace = namespace.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -509,7 +556,11 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn list_tombstoned_documents(&self, namespace: &str, older_than_secs: u64) -> Result<Vec<(String, String)>, VaultSyncError> {
+    async fn list_tombstoned_documents(
+        &self,
+        namespace: &str,
+        older_than_secs: u64,
+    ) -> Result<Vec<(String, String)>, VaultSyncError> {
         let namespace = namespace.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -533,7 +584,11 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn update_oplog_encrypted_blob(&self, id: &str, new_blob: &[u8]) -> Result<(), VaultSyncError> {
+    async fn update_oplog_encrypted_blob(
+        &self,
+        id: &str,
+        new_blob: &[u8],
+    ) -> Result<(), VaultSyncError> {
         let id = id.to_string();
         let new_blob = new_blob.to_vec();
         let conn = self.conn.clone();
@@ -549,14 +604,16 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn list_active_documents(&self, namespace: &str) -> Result<Vec<(String, String)>, VaultSyncError> {
+    async fn list_active_documents(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<(String, String)>, VaultSyncError> {
         let namespace = namespace.to_string();
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT doc_id, record_id FROM oplog WHERE namespace = ?1"
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT DISTINCT doc_id, record_id FROM oplog WHERE namespace = ?1")?;
             let rows = stmt.query_map(params![namespace], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -570,7 +627,12 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn read_synced_oplog_for_document(&self, namespace: &str, doc_id: &str, record_id: &str) -> Result<Vec<OplogEntry>, VaultSyncError> {
+    async fn read_synced_oplog_for_document(
+        &self,
+        namespace: &str,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<Vec<OplogEntry>, VaultSyncError> {
         let namespace = namespace.to_string();
         let doc_id = doc_id.to_string();
         let record_id = record_id.to_string();
@@ -592,7 +654,13 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
-    async fn delete_synced_oplog_before_timestamp(&self, namespace: &str, doc_id: &str, record_id: &str, timestamp: u64) -> Result<usize, VaultSyncError> {
+    async fn delete_synced_oplog_before_timestamp(
+        &self,
+        namespace: &str,
+        doc_id: &str,
+        record_id: &str,
+        timestamp: u64,
+    ) -> Result<usize, VaultSyncError> {
         let namespace = namespace.to_string();
         let doc_id = doc_id.to_string();
         let record_id = record_id.to_string();
@@ -654,7 +722,7 @@ impl Storage for SQLiteStorage {
 
 impl SQLiteStorage {
     fn map_oplog_entry(row: &rusqlite::Row) -> rusqlite::Result<OplogEntry> {
-        use crate::oplog::entry::{SyncStatus, MutationType};
+        use crate::oplog::entry::{MutationType, SyncStatus};
         let sync_status_str: String = row.get(10)?;
         let sync_status = match sync_status_str.as_str() {
             "Synced" => SyncStatus::Synced,

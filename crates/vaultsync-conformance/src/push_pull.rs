@@ -18,7 +18,10 @@ pub async fn run_push_pull_tests(coord: Arc<dyn Coordinator>, ns: &str) {
         schema_version: 0,
         key_version: 1,
     };
-    let seqs = coord.push(ns, vec![mut1.clone()]).await.expect("push single");
+    let seqs = coord
+        .push(ns, vec![mut1.clone()])
+        .await
+        .expect("push single");
     assert_eq!(seqs.len(), 1, "expected 1 sequence ID returned");
     let seq1 = seqs[0];
 
@@ -88,7 +91,13 @@ pub async fn run_push_pull_tests(coord: Arc<dyn Coordinator>, ns: &str) {
     // Some coordinators return the existing sequence IDs or succeed. We check that we don't have duplicate records in pull.
     if res.is_ok() {
         let pulled_all = coord.pull(ns, 0, 10).await.expect("pull all");
-        let occurrences = pulled_all.iter().filter(|m| m.id == format!("{}-m-1", ns)).count();
-        assert_eq!(occurrences, 1, "mutation ID must be unique (idempotent / deduplicated)");
+        let occurrences = pulled_all
+            .iter()
+            .filter(|m| m.id == format!("{}-m-1", ns))
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "mutation ID must be unique (idempotent / deduplicated)"
+        );
     }
 }

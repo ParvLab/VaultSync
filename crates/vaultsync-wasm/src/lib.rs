@@ -33,11 +33,14 @@ impl tracing::Subscriber for ConsoleSubscriber {
                     if !self.message.is_empty() {
                         self.message.push_str(", ");
                     }
-                    self.message.push_str(&format!("{}={:?}", field.name(), value));
+                    self.message
+                        .push_str(&format!("{}={:?}", field.name(), value));
                 }
             }
         }
-        let mut visitor = Visitor { message: String::new() };
+        let mut visitor = Visitor {
+            message: String::new(),
+        };
         event.record(&mut visitor);
         console_log_str(&format!("[Rust] {}", visitor.message));
     }
@@ -54,9 +57,9 @@ pub fn init() {
 }
 
 pub mod client;
-pub mod storage;
+pub mod e2ee;
 pub mod indexeddb;
 pub mod ipc;
-pub mod e2ee;
+pub mod storage;
 pub mod transport;
 pub mod ws_coordinator;

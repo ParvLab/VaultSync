@@ -3,7 +3,7 @@ use rusqlite::Connection;
 pub fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
-        
+
         CREATE TABLE IF NOT EXISTS mutations (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
             id TEXT UNIQUE NOT NULL,
@@ -39,7 +39,7 @@ pub fn initialize(conn: &Connection) -> Result<(), rusqlite::Error> {
             bytes BLOB NOT NULL,
             checksum INTEGER NOT NULL,
             PRIMARY KEY (namespace, doc_id, record_id)
-        );"
+        );",
     )?;
     Ok(())
 }

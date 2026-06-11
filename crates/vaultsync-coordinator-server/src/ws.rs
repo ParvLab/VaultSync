@@ -9,9 +9,9 @@ use futures::{SinkExt, StreamExt};
 use std::borrow::Cow;
 use tracing::{error, info, warn};
 
+use crate::state::AppState;
 use vaultsync_core::coordinator::traits::ReplicaInfo;
 use vaultsync_core::coordinator::ws_proto::*;
-use crate::state::AppState;
 
 async fn validate_token(state: &AppState, namespace: &str, token: &str) -> bool {
     // 1. Check global static token if configured
@@ -42,10 +42,10 @@ pub async fn ws_handler(
 
 async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
-    
+
     // Dedicated channel for outgoing messages
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(128);
-    
+
     // Spawn writer task
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -57,36 +57,43 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
     });
 
     // 1. AUTH handshake
-    let auth_msg = match tokio::time::timeout(std::time::Duration::from_secs(5), ws_receiver.next()).await {
-        Ok(Some(Ok(Message::Binary(bin)))) => bin,
-        _ => {
-            warn!("WS connection closed or timed out before AUTH frame received");
-            let _ = tx.send(Message::Close(Some(CloseFrame {
-                code: 4001,
-                reason: Cow::Borrowed("Auth timeout"),
-            }))).await;
-            return;
-        }
-    };
+    let auth_msg =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), ws_receiver.next()).await {
+            Ok(Some(Ok(Message::Binary(bin)))) => bin,
+            _ => {
+                warn!("WS connection closed or timed out before AUTH frame received");
+                let _ = tx
+                    .send(Message::Close(Some(CloseFrame {
+                        code: 4001,
+                        reason: Cow::Borrowed("Auth timeout"),
+                    })))
+                    .await;
+                return;
+            }
+        };
 
     let (msg_type, payload) = match decode_frame(&auth_msg) {
         Ok(res) => res,
         Err(e) => {
             warn!("Failed to decode AUTH frame: {}", e);
-            let _ = tx.send(Message::Close(Some(CloseFrame {
-                code: 4001,
-                reason: Cow::Borrowed("Invalid frame header"),
-            }))).await;
+            let _ = tx
+                .send(Message::Close(Some(CloseFrame {
+                    code: 4001,
+                    reason: Cow::Borrowed("Invalid frame header"),
+                })))
+                .await;
             return;
         }
     };
 
     if msg_type != MSG_AUTH {
         warn!("Expected MSG_AUTH (0x01), got 0x{:02X}", msg_type);
-        let _ = tx.send(Message::Close(Some(CloseFrame {
-            code: 4001,
-            reason: Cow::Borrowed("Expected AUTH frame first"),
-        }))).await;
+        let _ = tx
+            .send(Message::Close(Some(CloseFrame {
+                code: 4001,
+                reason: Cow::Borrowed("Expected AUTH frame first"),
+            })))
+            .await;
         return;
     }
 
@@ -94,16 +101,21 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         Ok(p) => p,
         Err(e) => {
             warn!("Failed to parse AuthPayload JSON: {}", e);
-            let _ = tx.send(Message::Close(Some(CloseFrame {
-                code: 4001,
-                reason: Cow::Borrowed("Invalid AUTH payload"),
-            }))).await;
+            let _ = tx
+                .send(Message::Close(Some(CloseFrame {
+                    code: 4001,
+                    reason: Cow::Borrowed("Invalid AUTH payload"),
+                })))
+                .await;
             return;
         }
     };
 
     if auth_payload.namespace != ns {
-        warn!("AUTH namespace mismatch: expected '{}', got '{}'", ns, auth_payload.namespace);
+        warn!(
+            "AUTH namespace mismatch: expected '{}', got '{}'",
+            ns, auth_payload.namespace
+        );
         let ack = AuthAckPayload {
             status: "error".to_string(),
             error: Some("NAMESPACE_MISMATCH".to_string()),
@@ -112,10 +124,12 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         if let Ok(ack_frame) = encode_frame(MSG_AUTH_ACK, &ack) {
             let _ = tx.send(Message::Binary(ack_frame)).await;
         }
-        let _ = tx.send(Message::Close(Some(CloseFrame {
-            code: 4001,
-            reason: Cow::Borrowed("Namespace mismatch"),
-        }))).await;
+        let _ = tx
+            .send(Message::Close(Some(CloseFrame {
+                code: 4001,
+                reason: Cow::Borrowed("Namespace mismatch"),
+            })))
+            .await;
         return;
     }
 
@@ -129,10 +143,12 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         if let Ok(ack_frame) = encode_frame(MSG_AUTH_ACK, &ack) {
             let _ = tx.send(Message::Binary(ack_frame)).await;
         }
-        let _ = tx.send(Message::Close(Some(CloseFrame {
-            code: 4001,
-            reason: Cow::Borrowed("Invalid token"),
-        }))).await;
+        let _ = tx
+            .send(Message::Close(Some(CloseFrame {
+                code: 4001,
+                reason: Cow::Borrowed("Invalid token"),
+            })))
+            .await;
         return;
     }
 
@@ -149,36 +165,43 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
     }
 
     // 2. REGISTER handshake
-    let register_msg = match tokio::time::timeout(std::time::Duration::from_secs(5), ws_receiver.next()).await {
-        Ok(Some(Ok(Message::Binary(bin)))) => bin,
-        _ => {
-            warn!("WS connection closed or timed out before REGISTER frame received");
-            let _ = tx.send(Message::Close(Some(CloseFrame {
-                code: 4002,
-                reason: Cow::Borrowed("Register timeout"),
-            }))).await;
-            return;
-        }
-    };
+    let register_msg =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), ws_receiver.next()).await {
+            Ok(Some(Ok(Message::Binary(bin)))) => bin,
+            _ => {
+                warn!("WS connection closed or timed out before REGISTER frame received");
+                let _ = tx
+                    .send(Message::Close(Some(CloseFrame {
+                        code: 4002,
+                        reason: Cow::Borrowed("Register timeout"),
+                    })))
+                    .await;
+                return;
+            }
+        };
 
     let (msg_type, payload) = match decode_frame(&register_msg) {
         Ok(res) => res,
         Err(e) => {
             warn!("Failed to decode REGISTER frame: {}", e);
-            let _ = tx.send(Message::Close(Some(CloseFrame {
-                code: 4002,
-                reason: Cow::Borrowed("Invalid register frame"),
-            }))).await;
+            let _ = tx
+                .send(Message::Close(Some(CloseFrame {
+                    code: 4002,
+                    reason: Cow::Borrowed("Invalid register frame"),
+                })))
+                .await;
             return;
         }
     };
 
     if msg_type != MSG_REGISTER {
         warn!("Expected MSG_REGISTER (0x03), got 0x{:02X}", msg_type);
-        let _ = tx.send(Message::Close(Some(CloseFrame {
-            code: 4002,
-            reason: Cow::Borrowed("Expected REGISTER frame"),
-        }))).await;
+        let _ = tx
+            .send(Message::Close(Some(CloseFrame {
+                code: 4002,
+                reason: Cow::Borrowed("Expected REGISTER frame"),
+            })))
+            .await;
         return;
     }
 
@@ -186,10 +209,12 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         Ok(p) => p,
         Err(e) => {
             warn!("Failed to parse RegisterPayload JSON: {}", e);
-            let _ = tx.send(Message::Close(Some(CloseFrame {
-                code: 4002,
-                reason: Cow::Borrowed("Invalid REGISTER payload"),
-            }))).await;
+            let _ = tx
+                .send(Message::Close(Some(CloseFrame {
+                    code: 4002,
+                    reason: Cow::Borrowed("Invalid REGISTER payload"),
+                })))
+                .await;
             return;
         }
     };
@@ -222,17 +247,23 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
             reg_ack.coordinator_sequence = seq;
         }
         if let Ok(snaps) = state.coordinator.list_snapshots(&ns).await {
-            available_snapshots = snaps.into_iter()
+            available_snapshots = snaps
+                .into_iter()
                 .filter(|s| s.sequence > reg_payload.last_sequence)
                 .collect::<Vec<_>>();
             if !available_snapshots.is_empty() {
                 reg_ack.snapshot_available = true;
-                reg_ack.snapshot_sequence = available_snapshots.iter().map(|s| s.sequence).max().unwrap_or(0);
+                reg_ack.snapshot_sequence = available_snapshots
+                    .iter()
+                    .map(|s| s.sequence)
+                    .max()
+                    .unwrap_or(0);
             }
         }
     }
 
-    let ack_frame = encode_frame(MSG_REGISTER_ACK, &reg_ack).expect("Failed to encode MSG_REGISTER_ACK");
+    let ack_frame =
+        encode_frame(MSG_REGISTER_ACK, &reg_ack).expect("Failed to encode MSG_REGISTER_ACK");
     if tx.send(Message::Binary(ack_frame)).await.is_err() {
         return;
     }
@@ -255,17 +286,20 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
 
     // Register session
     let replica_id = reg_payload.replica_id.clone();
-    state.sessions.sessions.write().await.insert((ns.clone(), replica_id.clone()), tx.clone());
+    state
+        .sessions
+        .sessions
+        .write()
+        .await
+        .insert((ns.clone(), replica_id.clone()), tx.clone());
 
     // Keep track of active subscription cancellation token
     let mut active_sub_tx: Option<tokio::sync::oneshot::Sender<()>> = None;
 
     // 3. Message processing loop with 90s heartbeat timeout
     loop {
-        let next_msg = tokio::time::timeout(
-            std::time::Duration::from_secs(90),
-            ws_receiver.next()
-        ).await;
+        let next_msg =
+            tokio::time::timeout(std::time::Duration::from_secs(90), ws_receiver.next()).await;
 
         let msg = match next_msg {
             Ok(Some(Ok(m))) => m,
@@ -279,10 +313,12 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
             }
             Err(_) => {
                 warn!("WS connection timed out (no heartbeat for 90s)");
-                let _ = tx.send(Message::Close(Some(CloseFrame {
-                    code: 4000,
-                    reason: Cow::Borrowed("Heartbeat timeout"),
-                }))).await;
+                let _ = tx
+                    .send(Message::Close(Some(CloseFrame {
+                        code: 4000,
+                        reason: Cow::Borrowed("Heartbeat timeout"),
+                    })))
+                    .await;
                 break;
             }
         };
@@ -350,7 +386,8 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                     }
                     MSG_SCHEMA_SYNC => {
                         if let Ok(sync) = serde_json::from_slice::<SchemaSyncPayload>(payload) {
-                            let current_v = state.coordinator.schema_version(&ns).await.unwrap_or(0);
+                            let current_v =
+                                state.coordinator.schema_version(&ns).await.unwrap_or(0);
                             let status = if sync.version == current_v {
                                 "ok".to_string()
                             } else {
@@ -427,14 +464,19 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                         }
                     }
                     MSG_SNAPSHOT => {
-                        if let Ok(snap) = serde_json::from_slice::<vaultsync_core::crdt::snapshot::Snapshot>(payload) {
+                        if let Ok(snap) = serde_json::from_slice::<
+                            vaultsync_core::crdt::snapshot::Snapshot,
+                        >(payload)
+                        {
                             let _ = state.coordinator.store_snapshot(&ns, &snap).await;
                         }
                     }
                     MSG_P2P_SIGNAL => {
                         if let Ok(sig) = serde_json::from_slice::<P2PSignalPayload>(payload) {
                             let sessions_guard = state.sessions.sessions.read().await;
-                            if let Some(target_tx) = sessions_guard.get(&(ns.clone(), sig.target_replica_id.clone())) {
+                            if let Some(target_tx) =
+                                sessions_guard.get(&(ns.clone(), sig.target_replica_id.clone()))
+                            {
                                 let ack = P2PSignalAckPayload {
                                     sender_replica_id: replica_id.clone(),
                                     signal_type: sig.signal_type,
@@ -444,12 +486,18 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                                     let _ = target_tx.send(Message::Binary(ack_frame)).await;
                                 }
                             } else {
-                                warn!("WebRTC signaling target replica not found: {}", sig.target_replica_id);
+                                warn!(
+                                    "WebRTC signaling target replica not found: {}",
+                                    sig.target_replica_id
+                                );
                             }
                         }
                     }
                     _ => {
-                        warn!("Received unexpected message type over WS: 0x{:02X}", msg_type);
+                        warn!(
+                            "Received unexpected message type over WS: 0x{:02X}",
+                            msg_type
+                        );
                     }
                 }
             }
@@ -467,6 +515,11 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
     if let Some(cancel) = active_sub_tx.take() {
         let _ = cancel.send(());
     }
-    state.sessions.sessions.write().await.remove(&(ns.clone(), replica_id.clone()));
+    state
+        .sessions
+        .sessions
+        .write()
+        .await
+        .remove(&(ns.clone(), replica_id.clone()));
     writer_task.abort();
 }

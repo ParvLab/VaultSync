@@ -12,9 +12,7 @@ pub enum Filter {
 impl Filter {
     pub fn matches(&self, doc: &std::collections::HashMap<String, CrdtValue>) -> bool {
         match self {
-            Filter::FieldEquals { field, value } => {
-                doc.get(field).map_or(false, |v| v == value)
-            }
+            Filter::FieldEquals { field, value } => doc.get(field).map_or(false, |v| v == value),
             Filter::FieldContains { field, value } => {
                 doc.get(field).map_or(false, |v| match (v, value) {
                     (CrdtValue::String(hay), CrdtValue::String(needle)) => hay.contains(needle),

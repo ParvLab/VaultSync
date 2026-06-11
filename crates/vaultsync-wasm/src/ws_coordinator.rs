@@ -1,11 +1,13 @@
 use async_trait::async_trait;
-use vaultsync_core::coordinator::traits::{Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId};
-use vaultsync_core::coordinator::ws_proto::*;
+use futures::channel::{mpsc, oneshot};
 use futures::FutureExt;
 use futures::{Stream, StreamExt};
-use futures::channel::{oneshot, mpsc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use vaultsync_core::coordinator::traits::{
+    Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId,
+};
+use vaultsync_core::coordinator::ws_proto::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{BinaryType, WebSocket};
@@ -46,7 +48,7 @@ impl WasmWsCoordinator {
     pub fn new(url: &str, auth_token: Option<String>) -> Self {
         let ice_servers = vec!["stun:stun.l.google.com:19302".to_string()];
         let peer_coord = vaultsync_transport_webrtc::PeerCoordinator::new(
-            vaultsync_transport_webrtc::WebRtcConfig { ice_servers }
+            vaultsync_transport_webrtc::WebRtcConfig { ice_servers },
         );
         Self {
             inner: Arc::new(WasmWsCoordinatorInner {
@@ -60,12 +62,21 @@ impl WasmWsCoordinator {
         }
     }
 
-    async fn connect_and_handshake(&self, namespace: &str, after: SequenceId, info: Option<&ReplicaInfo>) -> Result<(), CoordinatorError> {
-        console_log!("[WasmWs] connect_and_handshake starting for namespace={}", namespace);
+    async fn connect_and_handshake(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        info: Option<&ReplicaInfo>,
+    ) -> Result<(), CoordinatorError> {
+        console_log!(
+            "[WasmWs] connect_and_handshake starting for namespace={}",
+            namespace
+        );
         let ws_url = get_ws_url(&self.inner.url, namespace);
         console_log!("[WasmWs] connecting to url={}", ws_url);
-        let ws = WebSocket::new(&ws_url)
-            .map_err(|e| CoordinatorError::Internal(format!("Failed to create WebSocket: {:?}", e)))?;
+        let ws = WebSocket::new(&ws_url).map_err(|e| {
+            CoordinatorError::Internal(format!("Failed to create WebSocket: {:?}", e))
+        })?;
         ws.set_binary_type(BinaryType::Arraybuffer);
 
         // 1. Wait for connection to open
@@ -115,7 +126,8 @@ impl WasmWsCoordinator {
                     let vec = array.to_vec();
                     let _ = msg_tx.try_send(vec);
                 }
-            }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+            })
+                as Box<dyn FnMut(web_sys::MessageEvent)>);
             ws.set_onmessage(Some(msg_callback.as_ref().unchecked_ref()));
             msg_callback.forget();
 
@@ -125,29 +137,38 @@ impl WasmWsCoordinator {
         // 2. Perform AUTH
         console_log!("[WasmWs] sending auth...");
         let token = self.inner.auth_token.clone().unwrap_or_default();
-        let replica_id = info.map(|i| i.replica_id.clone()).unwrap_or_else(|| format!("client-wasm-{}", uuid::Uuid::new_v4()));
+        let replica_id = info
+            .map(|i| i.replica_id.clone())
+            .unwrap_or_else(|| format!("client-wasm-{}", uuid::Uuid::new_v4()));
         let auth = AuthPayload {
             token,
             protocol_version: 1,
             replica_id: replica_id.clone(),
             namespace: namespace.to_string(),
         };
-        let auth_frame = encode_frame(MSG_AUTH, &auth)
-            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        let auth_frame =
+            encode_frame(MSG_AUTH, &auth).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         ws.send_with_u8_array(&auth_frame)
             .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
 
         // Wait for AUTH_ACK
         console_log!("[WasmWs] waiting for auth ack...");
-        let auth_resp = msg_rx.next().await
-            .ok_or_else(|| CoordinatorError::Internal("Connection closed during AUTH".to_string()))?;
+        let auth_resp = msg_rx.next().await.ok_or_else(|| {
+            CoordinatorError::Internal("Connection closed during AUTH".to_string())
+        })?;
 
-        let (msg_type, payload) = decode_frame(&auth_resp)
-            .map_err(|e| CoordinatorError::Internal(e))?;
+        let (msg_type, payload) =
+            decode_frame(&auth_resp).map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type != MSG_AUTH_ACK {
-            console_log!("[WasmWs] auth failed: expected MSG_AUTH_ACK, got {:02X}", msg_type);
-            return Err(CoordinatorError::Internal(format!("Expected MSG_AUTH_ACK, got {:02X}", msg_type)));
+            console_log!(
+                "[WasmWs] auth failed: expected MSG_AUTH_ACK, got {:02X}",
+                msg_type
+            );
+            return Err(CoordinatorError::Internal(format!(
+                "Expected MSG_AUTH_ACK, got {:02X}",
+                msg_type
+            )));
         }
 
         let auth_ack: AuthAckPayload = serde_json::from_slice(payload)
@@ -176,15 +197,21 @@ impl WasmWsCoordinator {
 
         // Wait for REGISTER_ACK
         console_log!("[WasmWs] waiting for register ack...");
-        let reg_resp = msg_rx.next().await
-            .ok_or_else(|| CoordinatorError::Internal("Connection closed during REGISTER".to_string()))?;
+        let reg_resp = msg_rx.next().await.ok_or_else(|| {
+            CoordinatorError::Internal("Connection closed during REGISTER".to_string())
+        })?;
 
-        let (msg_type, _) = decode_frame(&reg_resp)
-            .map_err(|e| CoordinatorError::Internal(e))?;
+        let (msg_type, _) = decode_frame(&reg_resp).map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type != MSG_REGISTER_ACK {
-            console_log!("[WasmWs] register failed: expected MSG_REGISTER_ACK, got {:02X}", msg_type);
-            return Err(CoordinatorError::Internal(format!("Expected MSG_REGISTER_ACK, got {:02X}", msg_type)));
+            console_log!(
+                "[WasmWs] register failed: expected MSG_REGISTER_ACK, got {:02X}",
+                msg_type
+            );
+            return Err(CoordinatorError::Internal(format!(
+                "Expected MSG_REGISTER_ACK, got {:02X}",
+                msg_type
+            )));
         }
         console_log!("[WasmWs] register successful!");
 
@@ -209,25 +236,30 @@ impl WasmWsCoordinator {
                 if let Ok((msg_type, payload)) = decode_frame(&bin) {
                     if msg_type == MSG_MUTATION_PUSH {
                         if let Ok(mutat) = serde_json::from_slice::<PendingMutation>(payload) {
-                            console_log!("[WasmWs] received MSG_MUTATION_PUSH: seq={}", mutat.sequence);
+                            console_log!(
+                                "[WasmWs] received MSG_MUTATION_PUSH: seq={}",
+                                mutat.sequence
+                            );
                             let mut subs = inner_clone.subscribers.lock().unwrap();
-                            subs.retain_mut(|sub| {
-                                sub.try_send(mutat.clone()).is_ok()
-                            });
+                            subs.retain_mut(|sub| sub.try_send(mutat.clone()).is_ok());
                         }
                     } else if msg_type == MSG_P2P_SIGNAL_ACK {
                         if let Ok(ack) = serde_json::from_slice::<P2PSignalAckPayload>(payload) {
                             if let Some(ref peer_coord) = *inner_clone.peer_coord.lock().unwrap() {
-                                let _ = peer_coord.handle_signaling_message(
-                                    &ack.sender_replica_id,
-                                    &ack.signal_type,
-                                    &ack.data
-                                ).await;
+                                let _ = peer_coord
+                                    .handle_signaling_message(
+                                        &ack.sender_replica_id,
+                                        &ack.signal_type,
+                                        &ack.data,
+                                    )
+                                    .await;
                             }
                         }
                     } else {
                         if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(payload) {
-                            if let Some(req_id) = json_val.get("request_id").and_then(|v| v.as_str()) {
+                            if let Some(req_id) =
+                                json_val.get("request_id").and_then(|v| v.as_str())
+                            {
                                 let mut reqs = inner_clone.pending_requests.lock().unwrap();
                                 if let Some(tx) = reqs.remove(req_id) {
                                     let _ = tx.send(bin);
@@ -263,22 +295,24 @@ impl WasmWsCoordinator {
             let peer_coord_clone = peer_coord.clone();
             let ns_str = namespace.to_string();
             let my_replica_id = auth.replica_id.clone();
-            
+
             // Set signaling handler
             wasm_bindgen_futures::spawn_local(async move {
-                peer_coord_clone.set_signal_handler(move |target_id, signal_type, data| {
-                    let ws_send = ws_sender.clone();
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let sig = P2PSignalPayload {
-                            target_replica_id: target_id,
-                            signal_type,
-                            data,
-                        };
-                        if let Ok(frame) = encode_frame(MSG_P2P_SIGNAL, &sig) {
-                            let _ = ws_send.send_with_u8_array(&frame);
-                        }
-                    });
-                }).await;
+                peer_coord_clone
+                    .set_signal_handler(move |target_id, signal_type, data| {
+                        let ws_send = ws_sender.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let sig = P2PSignalPayload {
+                                target_replica_id: target_id,
+                                signal_type,
+                                data,
+                            };
+                            if let Ok(frame) = encode_frame(MSG_P2P_SIGNAL, &sig) {
+                                let _ = ws_send.send_with_u8_array(&frame);
+                            }
+                        });
+                    })
+                    .await;
             });
 
             // Register with PeerCoordinator
@@ -288,7 +322,7 @@ impl WasmWsCoordinator {
                 public_key: info.map(|i| i.public_key.clone()).unwrap_or_default(),
                 schema_version: info.map(|i| i.schema_version).unwrap_or(0),
             };
-            
+
             let peer_coord_clone = peer_coord.clone();
             let ns_str_clone = ns_str.clone();
             wasm_bindgen_futures::spawn_local(async move {
@@ -304,7 +338,8 @@ impl WasmWsCoordinator {
                     if let Ok(active_replicas) = fetch_replicas(&http_url, &ns_str).await {
                         for peer in active_replicas {
                             if peer.replica_id > my_replica_id {
-                                let _ = peer_coord_clone.initiate_connection(&peer.replica_id).await;
+                                let _ =
+                                    peer_coord_clone.initiate_connection(&peer.replica_id).await;
                             }
                         }
                     }
@@ -316,7 +351,12 @@ impl WasmWsCoordinator {
         Ok(())
     }
 
-    async fn send_request<T: serde::Serialize>(&self, msg_type: u8, request_id: &str, payload: &T) -> Result<Vec<u8>, CoordinatorError> {
+    async fn send_request<T: serde::Serialize>(
+        &self,
+        msg_type: u8,
+        request_id: &str,
+        payload: &T,
+    ) -> Result<Vec<u8>, CoordinatorError> {
         let (tx, rx) = oneshot::channel::<Vec<u8>>();
         {
             let mut reqs = self.inner.pending_requests.lock().unwrap();
@@ -336,7 +376,8 @@ impl WasmWsCoordinator {
             }
         }
 
-        let resp = rx.await
+        let resp = rx
+            .await
             .map_err(|_| CoordinatorError::Internal("Request cancelled".to_string()))?;
         Ok(resp)
     }
@@ -356,8 +397,16 @@ fn get_ws_url(http_url: &str, namespace: &str) -> String {
 
 #[async_trait]
 impl Coordinator for WasmWsCoordinator {
-    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
-        console_log!("[WasmWs] push called for namespace={}, mutations count={}", namespace, mutations.len());
+    async fn push(
+        &self,
+        namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
+        console_log!(
+            "[WasmWs] push called for namespace={}, mutations count={}",
+            namespace,
+            mutations.len()
+        );
         let req_id = uuid::Uuid::new_v4().to_string();
         let payload = PushPayload {
             request_id: req_id.clone(),
@@ -365,8 +414,8 @@ impl Coordinator for WasmWsCoordinator {
         };
 
         let resp_bin = self.send_request(MSG_PUSH, &req_id, &payload).await?;
-        let (msg_type, payload) = decode_frame(&resp_bin)
-            .map_err(|e| CoordinatorError::Internal(e))?;
+        let (msg_type, payload) =
+            decode_frame(&resp_bin).map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type == MSG_PUSH_ACK {
             let ack: PushAckPayload = serde_json::from_slice(payload)
@@ -375,16 +424,31 @@ impl Coordinator for WasmWsCoordinator {
                 console_log!("[WasmWs] push failed with error: {}", err);
                 return Err(CoordinatorError::Internal(err));
             }
-            console_log!("[WasmWs] push ack success, returned sequences={:?}", ack.sequences);
+            console_log!(
+                "[WasmWs] push ack success, returned sequences={:?}",
+                ack.sequences
+            );
             Ok(ack.sequences)
         } else {
             console_log!("[WasmWs] push got invalid response type: {:02X}", msg_type);
-            Err(CoordinatorError::Internal("Invalid response type".to_string()))
+            Err(CoordinatorError::Internal(
+                "Invalid response type".to_string(),
+            ))
         }
     }
 
-    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
-        console_log!("[WasmWs] pull called for namespace={}, after={}, limit={}", namespace, after, limit);
+    async fn pull(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
+        console_log!(
+            "[WasmWs] pull called for namespace={}, after={}, limit={}",
+            namespace,
+            after,
+            limit
+        );
         let req_id = uuid::Uuid::new_v4().to_string();
         let payload = PullPayload {
             request_id: req_id.clone(),
@@ -394,28 +458,39 @@ impl Coordinator for WasmWsCoordinator {
         };
 
         let resp_bin = self.send_request(MSG_PULL, &req_id, &payload).await?;
-        let (msg_type, payload) = decode_frame(&resp_bin)
-            .map_err(|e| CoordinatorError::Internal(e))?;
+        let (msg_type, payload) =
+            decode_frame(&resp_bin).map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type == MSG_PULL_RESPONSE {
             let resp: PullResponsePayload = serde_json::from_slice(payload)
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            console_log!("[WasmWs] pull returned {} mutations, has_more={}", resp.mutations.len(), resp.has_more);
+            console_log!(
+                "[WasmWs] pull returned {} mutations, has_more={}",
+                resp.mutations.len(),
+                resp.has_more
+            );
             Ok(resp.mutations)
         } else {
             console_log!("[WasmWs] pull got invalid response type: {:02X}", msg_type);
-            Err(CoordinatorError::Internal("Invalid response type".to_string()))
+            Err(CoordinatorError::Internal(
+                "Invalid response type".to_string(),
+            ))
         }
     }
 
-    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn subscribe(
+        &self,
+        namespace: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         let is_connected = {
             let ws_lock = self.inner.ws.lock().unwrap();
             ws_lock.is_some()
         };
 
         if !is_connected {
-            self.connect_and_handshake(namespace, from_sequence, None).await?;
+            self.connect_and_handshake(namespace, from_sequence, None)
+                .await?;
         } else {
             let sub = SubscribePayload {
                 request_id: uuid::Uuid::new_v4().to_string(),
@@ -430,7 +505,7 @@ impl Coordinator for WasmWsCoordinator {
                     .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
             }
         }
-        
+
         let (tx, rx) = mpsc::channel::<PendingMutation>(100);
         {
             let mut subs = self.inner.subscribers.lock().unwrap();
@@ -447,7 +522,8 @@ impl Coordinator for WasmWsCoordinator {
         };
 
         if !is_connected {
-            self.connect_and_handshake(namespace, 0, Some(&info)).await?;
+            self.connect_and_handshake(namespace, 0, Some(&info))
+                .await?;
         } else {
             let reg = RegisterPayload {
                 replica_id: info.replica_id.clone(),
@@ -494,30 +570,37 @@ impl Coordinator for WasmWsCoordinator {
 async fn fetch_replicas(url: &str, namespace: &str) -> Result<Vec<ReplicaInfo>, String> {
     use wasm_bindgen_futures::JsFuture;
     let window = web_sys::window().ok_or("No window object found".to_string())?;
-    let req_url = format!("{}/namespace/{}/replicas", url.trim_end_matches('/'), namespace);
-    
+    let req_url = format!(
+        "{}/namespace/{}/replicas",
+        url.trim_end_matches('/'),
+        namespace
+    );
+
     let opts = web_sys::RequestInit::new();
     opts.set_method("GET");
-    
+
     let request = web_sys::Request::new_with_str_and_init(&req_url, &opts)
         .map_err(|e| format!("Failed to create request: {:?}", e))?;
-        
-    let resp_value = JsFuture::from(window.fetch_with_request(&request)).await
+
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
         .map_err(|e| format!("Fetch failed: {:?}", e))?;
-        
-    let resp = resp_value.dyn_into::<web_sys::Response>()
+
+    let resp = resp_value
+        .dyn_into::<web_sys::Response>()
         .map_err(|_| "Failed to cast to Response".to_string())?;
-        
+
     if !resp.ok() {
         return Err(format!("HTTP error: {}", resp.status()));
     }
-    
-    let text_value = JsFuture::from(resp.text().map_err(|e| format!("{:?}", e))?).await
+
+    let text_value = JsFuture::from(resp.text().map_err(|e| format!("{:?}", e))?)
+        .await
         .map_err(|e| format!("Failed to read text: {:?}", e))?;
-        
+
     let text_str: String = text_value.as_string().unwrap_or_default();
-    let replicas: Vec<ReplicaInfo> = serde_json::from_str(&text_str)
-        .map_err(|e| format!("Failed to parse JSON: {:?}", e))?;
-        
+    let replicas: Vec<ReplicaInfo> =
+        serde_json::from_str(&text_str).map_err(|e| format!("Failed to parse JSON: {:?}", e))?;
+
     Ok(replicas)
 }

@@ -1,16 +1,19 @@
+use futures::StreamExt;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use futures::StreamExt;
-use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation, ReplicaInfo};
-use vaultsync_core::coordinator::http::{HttpCoordinator, HttpCoordinatorConfig};
 use vaultsync_coordinator_server::{
     build_router,
     config::ServerConfig,
     state::AppState,
     token_store::{MemoryTokenStore, TokenStore},
 };
+use vaultsync_core::coordinator::http::{HttpCoordinator, HttpCoordinatorConfig};
+use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation, ReplicaInfo};
 
-async fn spawn_test_server(auth_token: Option<String>, admin_token: Option<String>) -> (String, tokio::task::JoinHandle<()>) {
+async fn spawn_test_server(
+    auth_token: Option<String>,
+    admin_token: Option<String>,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://127.0.0.1:{}", addr.port());
@@ -25,7 +28,8 @@ async fn spawn_test_server(auth_token: Option<String>, admin_token: Option<Strin
         admin_token,
     };
 
-    let coordinator = Arc::new(vaultsync_coordinator_memory::coordinator::InMemoryCoordinator::new());
+    let coordinator =
+        Arc::new(vaultsync_coordinator_memory::coordinator::InMemoryCoordinator::new());
     let token_store: Option<Arc<dyn TokenStore>> = if config.admin_token.is_some() {
         let store: Arc<dyn TokenStore> = Arc::new(MemoryTokenStore::new());
         store.initialize().await.unwrap();
@@ -74,12 +78,18 @@ async fn test_push_pull_flow() {
     let ns = "test-ns";
 
     // Register a replica
-    coord.register(ns, ReplicaInfo {
-        replica_id: "replica-1".to_string(),
-        namespace: ns.to_string(),
-        public_key: vec![1, 2, 3],
-        schema_version: 42,
-    }).await.unwrap();
+    coord
+        .register(
+            ns,
+            ReplicaInfo {
+                replica_id: "replica-1".to_string(),
+                namespace: ns.to_string(),
+                public_key: vec![1, 2, 3],
+                schema_version: 42,
+            },
+        )
+        .await
+        .unwrap();
 
     // Verify schema version is 42
     let schema_ver = coord.schema_version(ns).await.unwrap();
@@ -143,14 +153,20 @@ async fn test_admin_and_namespace_auth() {
     let ns = "ns-erp";
 
     // 1. Register namespace ns-erp via admin API without token should fail (401)
-    let resp = client.post(&format!("{}/admin/namespace/{}", url, ns))
-        .send().await.unwrap();
+    let resp = client
+        .post(&format!("{}/admin/namespace/{}", url, ns))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     // 2. Register namespace ns-erp via admin API with correct token should succeed and return namespace token
-    let resp = client.post(&format!("{}/admin/namespace/{}", url, ns))
+    let resp = client
+        .post(&format!("{}/admin/namespace/{}", url, ns))
         .bearer_auth(&admin_token)
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert!(resp.status().is_success());
     let reg_res: serde_json::Value = resp.json().await.unwrap();
     let ns_token = reg_res["token"].as_str().unwrap().to_string();
@@ -196,17 +212,23 @@ async fn test_sse_events() {
     let mut stream = std::pin::Pin::from(stream);
 
     // Push a mutation
-    coord.push(ns, vec![EncryptedMutation {
-        id: "m-sse-1".to_string(),
-        namespace: ns.to_string(),
-        replica_id: "replica-sse".to_string(),
-        doc_id: "doc-sse".to_string(),
-        record_id: "rec-sse".to_string(),
-        encrypted_blob: vec![7, 7, 7],
-        timestamp: 12345,
-        schema_version: 1,
-        key_version: 1,
-    }]).await.unwrap();
+    coord
+        .push(
+            ns,
+            vec![EncryptedMutation {
+                id: "m-sse-1".to_string(),
+                namespace: ns.to_string(),
+                replica_id: "replica-sse".to_string(),
+                doc_id: "doc-sse".to_string(),
+                record_id: "rec-sse".to_string(),
+                encrypted_blob: vec![7, 7, 7],
+                timestamp: 12345,
+                schema_version: 1,
+                key_version: 1,
+            }],
+        )
+        .await
+        .unwrap();
 
     // Read from the subscription stream
     let mutation = stream.next().await;

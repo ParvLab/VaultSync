@@ -1,12 +1,12 @@
-use wasm_bindgen::prelude::*;
+use crate::storage::BrowserStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
+use vaultsync_core::coordinator::memory::InMemoryCoordinator;
+use vaultsync_core::crdt::types::CrdtValue;
+use vaultsync_core::e2ee::keyring::KeyRing;
 use vaultsync_core::VaultSyncClient;
 use vaultsync_core::VaultSyncConfig;
-use vaultsync_core::crdt::types::CrdtValue;
-use crate::storage::BrowserStorage;
-use vaultsync_core::coordinator::memory::InMemoryCoordinator;
-use vaultsync_core::e2ee::keyring::KeyRing;
+use wasm_bindgen::prelude::*;
 
 use wasm_bindgen::JsCast;
 
@@ -23,48 +23,51 @@ impl WasmVaultSyncClient {
         config.replica_id = replica_id.to_string();
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
-        
+
         let db_name = format!("{}_db", namespace);
-        let storage = Arc::new(BrowserStorage::new(&db_name).await
-            .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?);
+        let storage = Arc::new(
+            BrowserStorage::new(&db_name)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?,
+        );
 
         let coordinator = Arc::new(InMemoryCoordinator::new());
         let keyring = Arc::new(KeyRing::generate());
 
-        let client = Arc::new(VaultSyncClient::new_with_storage(
-            config,
-            coordinator,
-            keyring,
-            storage,
-        )
-        .await
-        .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?);
+        let client = Arc::new(
+            VaultSyncClient::new_with_storage(config, coordinator, keyring, storage)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
+        );
 
         // Setup BroadcastChannel for cross-tab sync
         let channel_name = format!("vaultsync-ipc-{}", namespace);
-        let channel = web_sys::BroadcastChannel::new(&channel_name)
-            .map_err(|e| JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e)))?;
+        let channel = web_sys::BroadcastChannel::new(&channel_name).map_err(|e| {
+            JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e))
+        })?;
 
         let client_clone = client.clone();
-        let onmessage = wasm_bindgen::closure::Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
-            if let Some(msg_str) = e.data().as_string() {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg_str) {
-                    if let (Some(doc_id), Some(record_id)) = (
-                        val.get("doc_id").and_then(|v| v.as_str()),
-                        val.get("record_id").and_then(|v| v.as_str())
-                    ) {
-                        let doc_id = doc_id.to_string();
-                        let record_id = record_id.to_string();
-                        let client = client_clone.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            if let Ok(Some(state)) = client.get(&doc_id, &record_id).await {
-                                client.fire_local_subscription(&doc_id, &record_id, &state);
-                            }
-                        });
+        let onmessage =
+            wasm_bindgen::closure::Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
+                if let Some(msg_str) = e.data().as_string() {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg_str) {
+                        if let (Some(doc_id), Some(record_id)) = (
+                            val.get("doc_id").and_then(|v| v.as_str()),
+                            val.get("record_id").and_then(|v| v.as_str()),
+                        ) {
+                            let doc_id = doc_id.to_string();
+                            let record_id = record_id.to_string();
+                            let client = client_clone.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if let Ok(Some(state)) = client.get(&doc_id, &record_id).await {
+                                    client.fire_local_subscription(&doc_id, &record_id, &state);
+                                }
+                            });
+                        }
                     }
                 }
-            }
-        }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+            })
+                as Box<dyn FnMut(web_sys::MessageEvent)>);
 
         channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
@@ -74,7 +77,8 @@ impl WasmVaultSyncClient {
             let msg = serde_json::json!({
                 "doc_id": doc_id,
                 "record_id": record_id,
-            }).to_string();
+            })
+            .to_string();
             let _ = channel_send.post_message(&JsValue::from_str(&msg));
         }));
 
@@ -92,10 +96,13 @@ impl WasmVaultSyncClient {
         config.replica_id = replica_id.to_string();
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
-        
+
         let db_name = format!("{}_db", namespace);
-        let storage = Arc::new(BrowserStorage::new(&db_name).await
-            .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?);
+        let storage = Arc::new(
+            BrowserStorage::new(&db_name)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?,
+        );
 
         let coordinator = Arc::new(crate::ws_coordinator::WasmWsCoordinator::new(
             coordinator_url,
@@ -103,40 +110,40 @@ impl WasmVaultSyncClient {
         ));
         let keyring = Arc::new(KeyRing::generate());
 
-        let client = Arc::new(VaultSyncClient::new_with_storage(
-            config,
-            coordinator,
-            keyring,
-            storage,
-        )
-        .await
-        .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?);
+        let client = Arc::new(
+            VaultSyncClient::new_with_storage(config, coordinator, keyring, storage)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
+        );
 
         // Setup BroadcastChannel for cross-tab sync
         let channel_name = format!("vaultsync-ipc-{}", namespace);
-        let channel = web_sys::BroadcastChannel::new(&channel_name)
-            .map_err(|e| JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e)))?;
+        let channel = web_sys::BroadcastChannel::new(&channel_name).map_err(|e| {
+            JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e))
+        })?;
 
         let client_clone = client.clone();
-        let onmessage = wasm_bindgen::closure::Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
-            if let Some(msg_str) = e.data().as_string() {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg_str) {
-                    if let (Some(doc_id), Some(record_id)) = (
-                        val.get("doc_id").and_then(|v| v.as_str()),
-                        val.get("record_id").and_then(|v| v.as_str())
-                    ) {
-                        let doc_id = doc_id.to_string();
-                        let record_id = record_id.to_string();
-                        let client = client_clone.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            if let Ok(Some(state)) = client.get(&doc_id, &record_id).await {
-                                client.fire_local_subscription(&doc_id, &record_id, &state);
-                            }
-                        });
+        let onmessage =
+            wasm_bindgen::closure::Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
+                if let Some(msg_str) = e.data().as_string() {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg_str) {
+                        if let (Some(doc_id), Some(record_id)) = (
+                            val.get("doc_id").and_then(|v| v.as_str()),
+                            val.get("record_id").and_then(|v| v.as_str()),
+                        ) {
+                            let doc_id = doc_id.to_string();
+                            let record_id = record_id.to_string();
+                            let client = client_clone.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if let Ok(Some(state)) = client.get(&doc_id, &record_id).await {
+                                    client.fire_local_subscription(&doc_id, &record_id, &state);
+                                }
+                            });
+                        }
                     }
                 }
-            }
-        }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+            })
+                as Box<dyn FnMut(web_sys::MessageEvent)>);
 
         channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
@@ -146,7 +153,8 @@ impl WasmVaultSyncClient {
             let msg = serde_json::json!({
                 "doc_id": doc_id,
                 "record_id": record_id,
-            }).to_string();
+            })
+            .to_string();
             let _ = channel_send.post_message(&JsValue::from_str(&msg));
         }));
 
@@ -155,35 +163,47 @@ impl WasmVaultSyncClient {
 
     pub async fn insert(&self, doc_id: &str, record_id: &str, json: &str) -> Result<(), JsValue> {
         let fields = json_to_fields(json)?;
-        self.client.insert(doc_id, record_id, fields).await
+        self.client
+            .insert(doc_id, record_id, fields)
+            .await
             .map_err(|e| JsValue::from_str(&format!("Insert failed: {:?}", e)))?;
         Ok(())
     }
 
     pub async fn update(&self, doc_id: &str, record_id: &str, json: &str) -> Result<(), JsValue> {
         let fields = json_to_fields(json)?;
-        self.client.update(doc_id, record_id, fields).await
+        self.client
+            .update(doc_id, record_id, fields)
+            .await
             .map_err(|e| JsValue::from_str(&format!("Update failed: {:?}", e)))?;
         Ok(())
     }
 
     pub async fn delete(&self, doc_id: &str, record_id: &str) -> Result<(), JsValue> {
-        self.client.delete(doc_id, record_id).await
+        self.client
+            .delete(doc_id, record_id)
+            .await
             .map_err(|e| JsValue::from_str(&format!("Delete failed: {:?}", e)))?;
         Ok(())
     }
 
     pub async fn get(&self, doc_id: &str, record_id: &str) -> Result<JsValue, JsValue> {
-        let doc_opt = self.client.get(doc_id, record_id).await
+        let doc_opt = self
+            .client
+            .get(doc_id, record_id)
+            .await
             .map_err(|e| JsValue::from_str(&format!("Get failed: {:?}", e)))?;
-        
+
         match doc_opt {
             Some(fields) => {
                 let mut map = serde_json::Map::new();
                 for (k, v) in fields {
                     let json_val = match v {
                         CrdtValue::String(s) => serde_json::Value::String(s),
-                        CrdtValue::Number(n) => serde_json::Value::Number(serde_json::Number::from_f64(n).unwrap_or_else(|| serde_json::Number::from(0))),
+                        CrdtValue::Number(n) => serde_json::Value::Number(
+                            serde_json::Number::from_f64(n)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
                         CrdtValue::Boolean(b) => serde_json::Value::Bool(b),
                         CrdtValue::Null => serde_json::Value::Null,
                         _ => serde_json::Value::Null,
@@ -199,22 +219,30 @@ impl WasmVaultSyncClient {
     }
 
     pub async fn shutdown(&self) -> Result<(), JsValue> {
-        self.client.shutdown().await
+        self.client
+            .shutdown()
+            .await
             .map_err(|e| JsValue::from_str(&format!("Shutdown failed: {:?}", e)))?;
         Ok(())
     }
 
     pub async fn find(&self, doc_id: &str) -> Result<js_sys::Array, JsValue> {
-        let records = self.client.find(doc_id, None).await
+        let records = self
+            .client
+            .find(doc_id, None)
+            .await
             .map_err(|e| JsValue::from_str(&format!("Find failed: {:?}", e)))?;
-        
+
         let arr = js_sys::Array::new();
         for fields in records {
             let mut map = serde_json::Map::new();
             for (k, v) in fields {
                 let json_val = match v {
                     CrdtValue::String(s) => serde_json::Value::String(s),
-                    CrdtValue::Number(n) => serde_json::Value::Number(serde_json::Number::from_f64(n).unwrap_or_else(|| serde_json::Number::from(0))),
+                    CrdtValue::Number(n) => serde_json::Value::Number(
+                        serde_json::Number::from_f64(n)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    ),
                     CrdtValue::Boolean(b) => serde_json::Value::Bool(b),
                     CrdtValue::Null => serde_json::Value::Null,
                     _ => serde_json::Value::Null,
@@ -229,17 +257,30 @@ impl WasmVaultSyncClient {
     }
 
     pub async fn sync_status(&self) -> Result<JsValue, JsValue> {
-        let state = self.client.sync_status().await
+        let state = self
+            .client
+            .sync_status()
+            .await
             .map_err(|e| JsValue::from_str(&format!("Sync status failed: {:?}", e)))?;
-        let pending = self.client.pending_uploads().await
+        let pending = self
+            .client
+            .pending_uploads()
+            .await
             .map_err(|e| JsValue::from_str(&format!("Pending uploads failed: {:?}", e)))?;
 
-        let connected = state.connection_status != vaultsync_core::sync::state::ConnectionStatus::Disconnected;
+        let connected =
+            state.connection_status != vaultsync_core::sync::state::ConnectionStatus::Disconnected;
 
         let mut map = serde_json::Map::new();
         map.insert("connected".to_string(), serde_json::Value::Bool(connected));
-        map.insert("pendingMutations".to_string(), serde_json::Value::Number(serde_json::Number::from(pending)));
-        map.insert("lastSyncedSequence".to_string(), serde_json::Value::Number(serde_json::Number::from(state.last_synced_sequence)));
+        map.insert(
+            "pendingMutations".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(pending)),
+        );
+        map.insert(
+            "lastSyncedSequence".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(state.last_synced_sequence)),
+        );
 
         let json_str = serde_json::to_string(&serde_json::Value::Object(map))
             .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))?;
@@ -248,26 +289,34 @@ impl WasmVaultSyncClient {
 
     pub fn subscribe(&self, doc_id: &str, callback: js_sys::Function) -> WasmSubscriptionHandle {
         let send_cb = SendFunction(callback);
-        let handle = self.client.subscribe(doc_id, Box::new(move |_doc_id, record_id, fields| {
-            let mut map = serde_json::Map::new();
-            for (k, v) in fields {
-                let json_val = match v {
-                    CrdtValue::String(s) => serde_json::Value::String(s.clone()),
-                    CrdtValue::Number(n) => serde_json::Value::Number(serde_json::Number::from_f64(*n).unwrap_or_else(|| serde_json::Number::from(0))),
-                    CrdtValue::Boolean(b) => serde_json::Value::Bool(*b),
-                    CrdtValue::Null => serde_json::Value::Null,
-                    _ => serde_json::Value::Null,
-                };
-                map.insert(k.clone(), json_val);
-            }
-            if let Ok(json_str) = serde_json::to_string(&serde_json::Value::Object(map)) {
-                let record_id_js = JsValue::from_str(record_id);
-                let json_js = JsValue::from_str(&json_str);
-                let _ = send_cb.0.call2(&JsValue::NULL, &record_id_js, &json_js);
-            }
-        }));
+        let handle = self.client.subscribe(
+            doc_id,
+            Box::new(move |_doc_id, record_id, fields| {
+                let mut map = serde_json::Map::new();
+                for (k, v) in fields {
+                    let json_val = match v {
+                        CrdtValue::String(s) => serde_json::Value::String(s.clone()),
+                        CrdtValue::Number(n) => serde_json::Value::Number(
+                            serde_json::Number::from_f64(*n)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
+                        CrdtValue::Boolean(b) => serde_json::Value::Bool(*b),
+                        CrdtValue::Null => serde_json::Value::Null,
+                        _ => serde_json::Value::Null,
+                    };
+                    map.insert(k.clone(), json_val);
+                }
+                if let Ok(json_str) = serde_json::to_string(&serde_json::Value::Object(map)) {
+                    let record_id_js = JsValue::from_str(record_id);
+                    let json_js = JsValue::from_str(&json_str);
+                    let _ = send_cb.0.call2(&JsValue::NULL, &record_id_js, &json_js);
+                }
+            }),
+        );
 
-        WasmSubscriptionHandle { handle: Some(handle) }
+        WasmSubscriptionHandle {
+            handle: Some(handle),
+        }
     }
 
     pub fn unsubscribe(&self, handle: &mut WasmSubscriptionHandle) -> Result<(), JsValue> {
@@ -275,7 +324,9 @@ impl WasmVaultSyncClient {
     }
 
     pub async fn rotate_keys(&self) -> Result<JsValue, JsValue> {
-        self.client.rotate_keys().await
+        self.client
+            .rotate_keys()
+            .await
             .map_err(|e| JsValue::from_str(&format!("Rotate keys failed: {:?}", e)))?;
         let active = self.client.active_key_version();
         Ok(JsValue::from_f64(active as f64))
@@ -307,9 +358,12 @@ impl WasmVaultSyncClient {
     }
 
     pub async fn define_schema(&self, doc_id: &str, schema_json: &str) -> Result<(), JsValue> {
-        let schema: vaultsync_core::schema::registry::DocumentSchema = serde_json::from_str(schema_json)
-            .map_err(|e| JsValue::from_str(&format!("Invalid schema JSON: {:?}", e)))?;
-        self.client.define_schema(doc_id, schema).await
+        let schema: vaultsync_core::schema::registry::DocumentSchema =
+            serde_json::from_str(schema_json)
+                .map_err(|e| JsValue::from_str(&format!("Invalid schema JSON: {:?}", e)))?;
+        self.client
+            .define_schema(doc_id, schema)
+            .await
             .map_err(|e| JsValue::from_str(&format!("Define schema failed: {:?}", e)))?;
         Ok(())
     }
@@ -328,7 +382,9 @@ pub struct WasmSubscriptionHandle {
 impl WasmSubscriptionHandle {
     pub fn cancel(&mut self, client: &WasmVaultSyncClient) -> Result<(), JsValue> {
         if let Some(h) = self.handle.take() {
-            client.client.unsubscribe(h)
+            client
+                .client
+                .unsubscribe(h)
                 .map_err(|e| JsValue::from_str(&format!("Unsubscribe failed: {:?}", e)))?;
         }
         Ok(())
@@ -340,11 +396,10 @@ struct SendFunction(js_sys::Function);
 unsafe impl Send for SendFunction {}
 unsafe impl Sync for SendFunction {}
 
-
 fn json_to_fields(json: &str) -> Result<HashMap<String, CrdtValue>, JsValue> {
     let val: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| JsValue::from_str(&format!("invalid json: {e:?}")))?;
-    
+
     let map = match val {
         serde_json::Value::Object(obj) => obj,
         _ => return Err(JsValue::from_str("expected json object")),

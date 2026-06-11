@@ -1,16 +1,18 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use async_trait::async_trait;
 use futures::Stream;
-use vaultsync_core::VaultSyncClient;
-use vaultsync_core::VaultSyncConfig;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use vaultsync_core::coordinator::memory::InMemoryCoordinator;
+use vaultsync_core::coordinator::traits::{
+    Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId,
+};
 use vaultsync_core::crdt::types::CrdtValue;
 use vaultsync_core::storage::traits::StorageConfig;
-use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId, CoordinatorError};
-use vaultsync_core::coordinator::memory::InMemoryCoordinator;
 use vaultsync_core::sync::retry::RetryConfig;
+use vaultsync_core::VaultSyncClient;
+use vaultsync_core::VaultSyncConfig;
 
 #[derive(Debug)]
 struct ChaosCoordinator {
@@ -33,21 +35,34 @@ impl ChaosCoordinator {
 
 #[async_trait]
 impl Coordinator for ChaosCoordinator {
-    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         if self.partitioned.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
         self.inner.push(namespace, mutations).await
     }
 
-    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         if self.partitioned.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
         self.inner.pull(namespace, after, limit).await
     }
 
-    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn subscribe(
+        &self,
+        namespace: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         if self.partitioned.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
@@ -88,8 +103,8 @@ fn test_retry_config() -> RetryConfig {
 
 #[tokio::test]
 async fn test_chaos_network_partition() {
-    use vaultsync_core::test_utils::{SimulatedNetwork, NetworkPartitionFault};
     use vaultsync_core::storage::memory::InMemoryStorage;
+    use vaultsync_core::test_utils::{NetworkPartitionFault, SimulatedNetwork};
 
     let coord = Arc::new(InMemoryCoordinator::new());
     let mut net = SimulatedNetwork::new(coord);
@@ -97,17 +112,31 @@ async fn test_chaos_network_partition() {
     net.add_replica("bob", Arc::new(InMemoryStorage::new()));
 
     // Partition the network for alice
-    let fault = NetworkPartitionFault { target_id: "alice".to_string() };
+    let fault = NetworkPartitionFault {
+        target_id: "alice".to_string(),
+    };
     net.inject_fault(&fault);
 
     // Write concurrently during partition
     let mut fields_a = HashMap::new();
-    fields_a.insert("title".to_string(), CrdtValue::String("Alice's partition task".to_string()));
-    net.replicas[0].write("doc-1", "rec-1", fields_a).await.unwrap();
+    fields_a.insert(
+        "title".to_string(),
+        CrdtValue::String("Alice's partition task".to_string()),
+    );
+    net.replicas[0]
+        .write("doc-1", "rec-1", fields_a)
+        .await
+        .unwrap();
 
     let mut fields_b = HashMap::new();
-    fields_b.insert("description".to_string(), CrdtValue::String("Bob's partition description".to_string()));
-    net.replicas[1].write("doc-1", "rec-1", fields_b).await.unwrap();
+    fields_b.insert(
+        "description".to_string(),
+        CrdtValue::String("Bob's partition description".to_string()),
+    );
+    net.replicas[1]
+        .write("doc-1", "rec-1", fields_b)
+        .await
+        .unwrap();
 
     // Verify sync does not converge alice (who is partitioned)
     net.sync_all().await;
@@ -125,27 +154,41 @@ async fn test_chaos_network_partition() {
 #[tokio::test]
 async fn test_chaos_leader_crash() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let db_path = temp_dir.path().join("chaos_leader.db").to_string_lossy().to_string();
+    let db_path = temp_dir
+        .path()
+        .join("chaos_leader.db")
+        .to_string_lossy()
+        .to_string();
 
     // Leader client (Client 1)
     let mut config1 = VaultSyncConfig::default();
     config1.namespace = "chaos-leader-ns".to_string();
     config1.replica_id = "replica-1".to_string();
-    config1.storage = StorageConfig::Sqlite { path: db_path.clone() };
+    config1.storage = StorageConfig::Sqlite {
+        path: db_path.clone(),
+    };
     config1.sync_interval = Duration::from_millis(40);
     let client1 = VaultSyncClient::new(config1).await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
-    assert_eq!(client1.sync_status().await.unwrap().leader_status, Some(true));
+    assert_eq!(
+        client1.sync_status().await.unwrap().leader_status,
+        Some(true)
+    );
 
     // Reader client (Client 2)
     let mut config2 = VaultSyncConfig::default();
     config2.namespace = "chaos-leader-ns".to_string();
     config2.replica_id = "replica-2".to_string();
-    config2.storage = StorageConfig::Sqlite { path: db_path.clone() };
+    config2.storage = StorageConfig::Sqlite {
+        path: db_path.clone(),
+    };
     config2.sync_interval = Duration::from_millis(40);
     let client2 = VaultSyncClient::new(config2).await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
-    assert_eq!(client2.sync_status().await.unwrap().leader_status, Some(false));
+    assert_eq!(
+        client2.sync_status().await.unwrap().leader_status,
+        Some(false)
+    );
 
     // Simulate leader crash by dropping/shutting down Client 1
     client1.shutdown().await.unwrap();
@@ -155,7 +198,11 @@ async fn test_chaos_leader_crash() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let status2 = client2.sync_status().await.unwrap();
-    assert_eq!(status2.leader_status, Some(true), "Client 2 should promote to leader after Client 1 crashes");
+    assert_eq!(
+        status2.leader_status,
+        Some(true),
+        "Client 2 should promote to leader after Client 1 crashes"
+    );
 
     client2.shutdown().await.unwrap();
 }
@@ -163,18 +210,27 @@ async fn test_chaos_leader_crash() {
 #[tokio::test]
 async fn test_chaos_simultaneous_crash() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let db_path = temp_dir.path().join("chaos_crash.db").to_string_lossy().to_string();
+    let db_path = temp_dir
+        .path()
+        .join("chaos_crash.db")
+        .to_string_lossy()
+        .to_string();
 
     let mut config = VaultSyncConfig::default();
     config.namespace = "chaos-crash-ns".to_string();
     config.replica_id = "replica-1".to_string();
-    config.storage = StorageConfig::Sqlite { path: db_path.clone() };
+    config.storage = StorageConfig::Sqlite {
+        path: db_path.clone(),
+    };
     config.sync_interval = Duration::from_secs(3600);
 
     let client = VaultSyncClient::new(config.clone()).await.unwrap();
 
     let mut fields = HashMap::new();
-    fields.insert("key1".to_string(), CrdtValue::String("value before crash".to_string()));
+    fields.insert(
+        "key1".to_string(),
+        CrdtValue::String("value before crash".to_string()),
+    );
     client.insert("doc-1", "rec-1", fields).await.unwrap();
 
     // Verify it is written locally
@@ -189,7 +245,10 @@ async fn test_chaos_simultaneous_crash() {
 
     // Verify data was restored from the persistent SQLite storage
     let restored = client_reborn.get("doc-1", "rec-1").await.unwrap().unwrap();
-    assert_eq!(restored.get("key1").unwrap(), &CrdtValue::String("value before crash".to_string()));
+    assert_eq!(
+        restored.get("key1").unwrap(),
+        &CrdtValue::String("value before crash".to_string())
+    );
     assert_eq!(client_reborn.pending_uploads().await.unwrap(), 1);
 
     client_reborn.shutdown().await.unwrap();
@@ -198,18 +257,27 @@ async fn test_chaos_simultaneous_crash() {
 #[tokio::test]
 async fn test_chaos_corrupt_oplog_entry() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let db_path = temp_dir.path().join("chaos_corrupt.db").to_string_lossy().to_string();
+    let db_path = temp_dir
+        .path()
+        .join("chaos_corrupt.db")
+        .to_string_lossy()
+        .to_string();
 
     let mut config = VaultSyncConfig::default();
     config.namespace = "chaos-corrupt-ns".to_string();
     config.replica_id = "replica-1".to_string();
-    config.storage = StorageConfig::Sqlite { path: db_path.clone() };
+    config.storage = StorageConfig::Sqlite {
+        path: db_path.clone(),
+    };
     config.sync_interval = Duration::from_secs(3600);
 
     let client = VaultSyncClient::new(config.clone()).await.unwrap();
 
     let mut fields = HashMap::new();
-    fields.insert("key1".to_string(), CrdtValue::String("safe data".to_string()));
+    fields.insert(
+        "key1".to_string(),
+        CrdtValue::String("safe data".to_string()),
+    );
     client.insert("doc-1", "rec-1", fields).await.unwrap();
     client.shutdown().await.unwrap();
     drop(client);
@@ -218,7 +286,11 @@ async fn test_chaos_corrupt_oplog_entry() {
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         // Set yrs_update to garbage bytes that are not valid Yrs encoded updates
-        conn.execute("UPDATE oplog SET yrs_update = ?1", [vec![255, 255, 255, 255]]).unwrap();
+        conn.execute(
+            "UPDATE oplog SET yrs_update = ?1",
+            [vec![255, 255, 255, 255]],
+        )
+        .unwrap();
     }
 
     // Starting client should succeed (it handles corruption gracefully in recovery/startup without panicking)
@@ -244,18 +316,26 @@ async fn test_chaos_clock_skew() {
     config_alice.replica_id = "alice".to_string();
     config_alice.storage = StorageConfig::InMemory;
     config_alice.sync_interval = Duration::from_secs(3600);
-    let client_alice = VaultSyncClient::new_with_keyring(config_alice, shared.clone(), keyring.clone()).await.unwrap();
+    let client_alice =
+        VaultSyncClient::new_with_keyring(config_alice, shared.clone(), keyring.clone())
+            .await
+            .unwrap();
 
     let mut config_bob = VaultSyncConfig::default();
     config_bob.namespace = ns.to_string();
     config_bob.replica_id = "bob".to_string();
     config_bob.storage = StorageConfig::InMemory;
     config_bob.sync_interval = Duration::from_secs(3600);
-    let client_bob = VaultSyncClient::new_with_keyring(config_bob, shared.clone(), keyring.clone()).await.unwrap();
+    let client_bob = VaultSyncClient::new_with_keyring(config_bob, shared.clone(), keyring.clone())
+        .await
+        .unwrap();
 
     let mut fields_a = HashMap::new();
     fields_a.insert("k1".to_string(), CrdtValue::String("val-a".to_string()));
-    client_alice.insert("doc-1", "rec-1", fields_a).await.unwrap();
+    client_alice
+        .insert("doc-1", "rec-1", fields_a)
+        .await
+        .unwrap();
 
     let mut fields_b = HashMap::new();
     fields_b.insert("k2".to_string(), CrdtValue::String("val-b".to_string()));
@@ -275,12 +355,18 @@ async fn test_chaos_clock_skew() {
 #[tokio::test]
 async fn test_chaos_massive_oplog() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let db_path = temp_dir.path().join("massive.db").to_string_lossy().to_string();
+    let db_path = temp_dir
+        .path()
+        .join("massive.db")
+        .to_string_lossy()
+        .to_string();
     let namespace = format!("massive-ns-{}", uuid::Uuid::new_v4());
 
     let mut config = VaultSyncConfig::default();
     config.namespace = namespace.clone();
-    config.storage = StorageConfig::Sqlite { path: db_path.clone() };
+    config.storage = StorageConfig::Sqlite {
+        path: db_path.clone(),
+    };
     config.sync_interval = Duration::from_secs(3600);
 
     let client = VaultSyncClient::new(config).await.unwrap();
@@ -324,7 +410,11 @@ async fn test_chaos_key_rotation_mid_sync() {
     config.storage = StorageConfig::InMemory;
     config.sync_interval = Duration::from_secs(3600);
 
-    let client = Arc::new(VaultSyncClient::new_with_keyring(config, shared.clone(), keyring.clone()).await.unwrap());
+    let client = Arc::new(
+        VaultSyncClient::new_with_keyring(config, shared.clone(), keyring.clone())
+            .await
+            .unwrap(),
+    );
 
     let client_c = client.clone();
     let update_handle = tokio::spawn(async move {
@@ -374,19 +464,32 @@ impl PanickingCoordinator {
 
 #[async_trait]
 impl Coordinator for PanickingCoordinator {
-    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         if self.should_fail.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
         self.inner.push(namespace, mutations).await
     }
-    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         if self.should_fail.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
         self.inner.pull(namespace, after, limit).await
     }
-    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn subscribe(
+        &self,
+        namespace: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         if self.should_fail.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
@@ -420,10 +523,13 @@ async fn test_chaos_failover_during_push() {
     let primary = Arc::new(PanickingCoordinator::new(primary_inner));
     let fallback = Arc::new(PanickingCoordinator::new(fallback_inner));
 
-    let failover = Arc::new(vaultsync_core::coordinator::failover::FailoverCoordinator::new(vec![
-        primary.clone(),
-        fallback.clone(),
-    ]).with_max_failures(1));
+    let failover = Arc::new(
+        vaultsync_core::coordinator::failover::FailoverCoordinator::new(vec![
+            primary.clone(),
+            fallback.clone(),
+        ])
+        .with_max_failures(1),
+    );
 
     let ns = "chaos-failover-push-ns";
     let keyring = Arc::new(vaultsync_core::e2ee::keyring::KeyRing::generate());
@@ -434,7 +540,9 @@ async fn test_chaos_failover_during_push() {
     config.storage = StorageConfig::InMemory;
     config.sync_interval = Duration::from_secs(3600);
 
-    let client = VaultSyncClient::new_with_keyring(config, failover.clone(), keyring.clone()).await.unwrap();
+    let client = VaultSyncClient::new_with_keyring(config, failover.clone(), keyring.clone())
+        .await
+        .unwrap();
 
     let mut fields = HashMap::new();
     fields.insert("k".to_string(), CrdtValue::String("v".to_string()));
@@ -452,8 +560,10 @@ async fn test_chaos_failover_during_push() {
 #[tokio::test]
 async fn test_unicode_text_field_convergence() {
     let base = vaultsync_core::crdt::document::CRDTDocument::new("doc-unicode", "rec-unicode", 1);
-    let mut replica_a = vaultsync_core::crdt::document::CRDTDocument::from_snapshot(&base.to_snapshot()).unwrap();
-    let mut replica_b = vaultsync_core::crdt::document::CRDTDocument::from_snapshot(&base.to_snapshot()).unwrap();
+    let mut replica_a =
+        vaultsync_core::crdt::document::CRDTDocument::from_snapshot(&base.to_snapshot()).unwrap();
+    let mut replica_b =
+        vaultsync_core::crdt::document::CRDTDocument::from_snapshot(&base.to_snapshot()).unwrap();
 
     let text_a = "Hello, 🦀! Greetings from Munich 🇩🇪 and Tokyo 🇯🇵.";
     let text_b = "Hello, 🦀! Greetings from Munich 🇩🇪 and Cairo 🇪🇬.";
@@ -466,4 +576,3 @@ async fn test_unicode_text_field_convergence() {
 
     assert_eq!(replica_a.to_map(), replica_b.to_map());
 }
-

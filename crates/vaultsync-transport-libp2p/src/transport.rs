@@ -1,15 +1,11 @@
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use futures::StreamExt;
 use libp2p::{
-    gossipsub,
-    mdns,
-    identify,
-    swarm::{SwarmEvent, NetworkBehaviour},
-    Swarm,
-    SwarmBuilder,
-    Multiaddr,
+    gossipsub, identify, mdns,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    Multiaddr, Swarm, SwarmBuilder,
 };
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -46,11 +42,17 @@ pub struct LibP2pTransportHandle {
 
 impl LibP2pTransportHandle {
     pub async fn broadcast_mutation(&self, mutation: PendingMutation) -> Result<(), String> {
-        self.outgoing_tx.send(Command::Broadcast(mutation)).await.map_err(|e| e.to_string())
+        self.outgoing_tx
+            .send(Command::Broadcast(mutation))
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub async fn dial(&self, addr: Multiaddr) -> Result<(), String> {
-        self.outgoing_tx.send(Command::Dial(addr)).await.map_err(|e| e.to_string())
+        self.outgoing_tx
+            .send(Command::Dial(addr))
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub fn listen_addresses(&self) -> Vec<Multiaddr> {
@@ -99,17 +101,20 @@ impl LibP2pTransport {
                 )
                 .map_err(|e| format!("Failed to create Gossipsub behaviour: {:?}", e))?;
 
-                let mdns = mdns::tokio::Behaviour::new(
-                    mdns::Config::default(),
-                    key.public().to_peer_id(),
-                )
-                .map_err(|e| format!("Failed to create mDNS behaviour: {:?}", e))?;
+                let mdns =
+                    mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())
+                        .map_err(|e| format!("Failed to create mDNS behaviour: {:?}", e))?;
 
-                let identify = identify::Behaviour::new(
-                    identify::Config::new("/vaultsync/1.0.0".to_string(), key.public()),
-                );
+                let identify = identify::Behaviour::new(identify::Config::new(
+                    "/vaultsync/1.0.0".to_string(),
+                    key.public(),
+                ));
 
-                Ok(VaultSyncBehaviour { gossipsub, mdns, identify })
+                Ok(VaultSyncBehaviour {
+                    gossipsub,
+                    mdns,
+                    identify,
+                })
             })
             .map_err(|e| format!("Failed to build behavior: {:?}", e))?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
