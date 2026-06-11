@@ -157,7 +157,7 @@ jobs:
           tool: cargo
           output-file-path: bench_output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
+          auto-push: false
           alert-threshold: "110%"
           fail-on-alert: true
           comment-on-alert: true
