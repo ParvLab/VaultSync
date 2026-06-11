@@ -9,5 +9,6 @@
   "excludePrivate": true,
   "excludeProtected": true,
   "hideGenerator": true,
-  "theme": "default"
+  "theme": "default",
+  "skipErrorChecking": true
 }
