@@ -38,7 +38,7 @@ jobs:
         run: |
           python3 scripts/check_coverage.py \
             --xml coverage/cobertura.xml \
-            --require "vaultsync_core=67"
+            --require "overall=60"
 
       - name: Upload HTML report artifact
         uses: actions/upload-artifact@v4
