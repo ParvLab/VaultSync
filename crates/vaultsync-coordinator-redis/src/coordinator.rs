@@ -422,7 +422,7 @@ impl Coordinator for RedisCoordinator {
     ) -> Result<Option<vaultsync_core::crdt::snapshot::Snapshot>, CoordinatorError> {
         let mut conn = self.conn.clone();
         let key = format!("vaultsync:{}:snapshot:{}:{}", namespace, doc_id, record_id);
-        
+
         let res: Option<Vec<u8>> = redis::cmd("GET")
             .arg(&key)
             .query_async(&mut conn)
@@ -444,9 +444,14 @@ impl Coordinator for RedisCoordinator {
         snapshot: &vaultsync_core::crdt::snapshot::Snapshot,
     ) -> Result<(), CoordinatorError> {
         let mut conn = self.conn.clone();
-        let key = format!("vaultsync:{}:snapshot:{}:{}", namespace, snapshot.doc_id, snapshot.record_id);
+        let key = format!(
+            "vaultsync:{}:snapshot:{}:{}",
+            namespace, snapshot.doc_id, snapshot.record_id
+        );
         let set_key = format!("vaultsync:{}:snapshot_keys", namespace);
-        let bytes = snapshot.encode().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        let bytes = snapshot
+            .encode()
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         // Store bytes in GET/SET key
         redis::cmd("SET")
@@ -518,7 +523,7 @@ impl Coordinator for RedisCoordinator {
         for snap in snaps {
             let start_id = "0-0".to_string();
             let end_id = seq_to_stream_id(snap.sequence);
-            
+
             let res: redis::Value = redis::cmd("XRANGE")
                 .arg(&stream_key)
                 .arg(&start_id)

@@ -399,12 +399,15 @@ impl Coordinator for PostgresCoordinator {
     async fn list_replicas(&self, namespace: &str) -> Result<Vec<ReplicaInfo>, CoordinatorError> {
         let client_guard = self.client.lock().await;
         let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&namespace];
-        let rows = client_guard.query(
-            "SELECT replica_id, namespace, public_key, schema_version
+        let rows = client_guard
+            .query(
+                "SELECT replica_id, namespace, public_key, schema_version
              FROM replicas
              WHERE namespace = $1",
-            params,
-        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                params,
+            )
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         let mut replicas = Vec::new();
         for row in rows {
@@ -426,7 +429,8 @@ impl Coordinator for PostgresCoordinator {
         record_id: &str,
     ) -> Result<Option<vaultsync_core::crdt::snapshot::Snapshot>, CoordinatorError> {
         let client_guard = self.client.lock().await;
-        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&namespace, &doc_id, &record_id];
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+            &[&namespace, &doc_id, &record_id];
         let row_opt = client_guard.query_opt(
             "SELECT bytes FROM snapshots WHERE namespace = $1 AND doc_id = $2 AND record_id = $3",
             params,
@@ -448,7 +452,9 @@ impl Coordinator for PostgresCoordinator {
         snapshot: &vaultsync_core::crdt::snapshot::Snapshot,
     ) -> Result<(), CoordinatorError> {
         let client_guard = self.client.lock().await;
-        let bytes = snapshot.encode().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        let bytes = snapshot
+            .encode()
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         let seq_i64 = snapshot.sequence as i64;
         let created_at_i64 = snapshot.created_at as i64;
         let checksum_i64 = snapshot.checksum as i64;
@@ -483,10 +489,10 @@ impl Coordinator for PostgresCoordinator {
     ) -> Result<Vec<vaultsync_core::crdt::snapshot::Snapshot>, CoordinatorError> {
         let client_guard = self.client.lock().await;
         let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&namespace];
-        let rows = client_guard.query(
-            "SELECT bytes FROM snapshots WHERE namespace = $1",
-            params,
-        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        let rows = client_guard
+            .query("SELECT bytes FROM snapshots WHERE namespace = $1", params)
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         let mut snaps = Vec::new();
         for row in rows {
@@ -511,19 +517,18 @@ impl Coordinator for PostgresCoordinator {
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         // 1. Get all snapshots for the namespace
-        let rows = tx.query(
-            "SELECT doc_id, record_id, sequence FROM snapshots WHERE namespace = $1",
-            &[&namespace_str],
-        ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        let rows = tx
+            .query(
+                "SELECT doc_id, record_id, sequence FROM snapshots WHERE namespace = $1",
+                &[&namespace_str],
+            )
+            .await
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         let mut snaps = Vec::new();
         for row in rows {
             let seq: i64 = row.get(2);
-            snaps.push((
-                row.get::<_, String>(0),
-                row.get::<_, String>(1),
-                seq,
-            ));
+            snaps.push((row.get::<_, String>(0), row.get::<_, String>(1), seq));
         }
 
         let mut oplog_removed = 0;
@@ -531,11 +536,14 @@ impl Coordinator for PostgresCoordinator {
 
         // 2. Delete mutations with sequence <= snap.sequence
         for (doc_id, record_id, sequence) in snaps {
-            let deleted = tx.execute(
-                "DELETE FROM mutations
+            let deleted = tx
+                .execute(
+                    "DELETE FROM mutations
                  WHERE namespace = $1 AND doc_id = $2 AND record_id = $3 AND sequence <= $4",
-                &[&namespace_str, &doc_id, &record_id, &sequence],
-            ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                    &[&namespace_str, &doc_id, &record_id, &sequence],
+                )
+                .await
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
             if deleted > 0 {
                 oplog_removed += deleted as usize;
                 snapshots_collapsed += 1;
