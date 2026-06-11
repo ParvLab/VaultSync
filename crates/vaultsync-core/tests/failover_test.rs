@@ -1,10 +1,12 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use futures::Stream;
-use vaultsync_core::coordinator::traits::{Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId};
-use vaultsync_core::coordinator::memory::InMemoryCoordinator;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use vaultsync_core::coordinator::failover::FailoverCoordinator;
+use vaultsync_core::coordinator::memory::InMemoryCoordinator;
+use vaultsync_core::coordinator::traits::{
+    Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId,
+};
 
 #[derive(Debug)]
 struct PanickingCoordinator {
@@ -27,21 +29,34 @@ impl PanickingCoordinator {
 
 #[async_trait]
 impl Coordinator for PanickingCoordinator {
-    async fn push(&self, namespace: &str, mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>, CoordinatorError> {
+    async fn push(
+        &self,
+        namespace: &str,
+        mutations: Vec<EncryptedMutation>,
+    ) -> Result<Vec<SequenceId>, CoordinatorError> {
         if self.should_fail.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
         self.inner.push(namespace, mutations).await
     }
 
-    async fn pull(&self, namespace: &str, after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>, CoordinatorError> {
+    async fn pull(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        limit: usize,
+    ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         if self.should_fail.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
         self.inner.pull(namespace, after, limit).await
     }
 
-    async fn subscribe(&self, namespace: &str, from_sequence: SequenceId) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+    async fn subscribe(
+        &self,
+        namespace: &str,
+        from_sequence: SequenceId,
+    ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         if self.should_fail.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
@@ -79,10 +94,16 @@ impl Coordinator for PanickingCoordinator {
         if self.should_fail.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
-        self.inner.update_replica_key(namespace, replica_id, public_key, key_version).await
+        self.inner
+            .update_replica_key(namespace, replica_id, public_key, key_version)
+            .await
     }
 
-    async fn get_replica_key(&self, namespace: &str, replica_id: &str) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
+    async fn get_replica_key(
+        &self,
+        namespace: &str,
+        replica_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, CoordinatorError> {
         if self.should_fail.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
@@ -105,7 +126,8 @@ async fn test_failover_on_primary_down() {
     let primary = Arc::new(PanickingCoordinator::new(primary_inner));
     let fallback = Arc::new(PanickingCoordinator::new(fallback_inner));
 
-    let failover = FailoverCoordinator::new(vec![primary.clone(), fallback.clone()]).with_max_failures(2);
+    let failover =
+        FailoverCoordinator::new(vec![primary.clone(), fallback.clone()]).with_max_failures(2);
 
     let ns = "test-failover-ns";
     let rep = ReplicaInfo {
@@ -141,7 +163,8 @@ async fn test_no_mutation_loss_on_failover() {
     let primary = Arc::new(PanickingCoordinator::new(primary_inner));
     let fallback = Arc::new(PanickingCoordinator::new(fallback_inner));
 
-    let failover = FailoverCoordinator::new(vec![primary.clone(), fallback.clone()]).with_max_failures(1);
+    let failover =
+        FailoverCoordinator::new(vec![primary.clone(), fallback.clone()]).with_max_failures(1);
 
     let ns = "test-failover-ns";
     let mut1 = EncryptedMutation {
@@ -175,23 +198,29 @@ async fn test_failover_tracks_sequence() {
     let fallback_inner = Arc::new(InMemoryCoordinator::new());
 
     // Pre-populate fallback to have a higher sequence offset
-    let dummy_muts = (0..5).map(|i| EncryptedMutation {
-        id: format!("dummy-{}", i),
-        namespace: "test-failover-ns".to_string(),
-        replica_id: "rep-1".to_string(),
-        doc_id: "doc-1".to_string(),
-        record_id: "rec-1".to_string(),
-        encrypted_blob: vec![0],
-        timestamp: 1000,
-        schema_version: 0,
-        key_version: 1,
-    }).collect::<Vec<_>>();
-    fallback_inner.push("test-failover-ns", dummy_muts).await.unwrap();
+    let dummy_muts = (0..5)
+        .map(|i| EncryptedMutation {
+            id: format!("dummy-{}", i),
+            namespace: "test-failover-ns".to_string(),
+            replica_id: "rep-1".to_string(),
+            doc_id: "doc-1".to_string(),
+            record_id: "rec-1".to_string(),
+            encrypted_blob: vec![0],
+            timestamp: 1000,
+            schema_version: 0,
+            key_version: 1,
+        })
+        .collect::<Vec<_>>();
+    fallback_inner
+        .push("test-failover-ns", dummy_muts)
+        .await
+        .unwrap();
 
     let primary = Arc::new(PanickingCoordinator::new(primary_inner));
     let fallback = Arc::new(PanickingCoordinator::new(fallback_inner));
 
-    let failover = FailoverCoordinator::new(vec![primary.clone(), fallback.clone()]).with_max_failures(1);
+    let failover =
+        FailoverCoordinator::new(vec![primary.clone(), fallback.clone()]).with_max_failures(1);
 
     let ns = "test-failover-ns";
     let mut1 = EncryptedMutation {
@@ -238,7 +267,8 @@ async fn test_primary_recovers_stays_on_fallback() {
     let primary = Arc::new(PanickingCoordinator::new(primary_inner));
     let fallback = Arc::new(PanickingCoordinator::new(fallback_inner));
 
-    let failover = FailoverCoordinator::new(vec![primary.clone(), fallback.clone()]).with_max_failures(1);
+    let failover =
+        FailoverCoordinator::new(vec![primary.clone(), fallback.clone()]).with_max_failures(1);
 
     let ns = "test-failover-ns";
 
@@ -257,11 +287,19 @@ async fn test_primary_recovers_stays_on_fallback() {
 
 #[tokio::test]
 async fn test_multiple_fallbacks_chain() {
-    let primary = Arc::new(PanickingCoordinator::new(Arc::new(InMemoryCoordinator::new())));
-    let fallback1 = Arc::new(PanickingCoordinator::new(Arc::new(InMemoryCoordinator::new())));
-    let fallback2 = Arc::new(PanickingCoordinator::new(Arc::new(InMemoryCoordinator::new())));
+    let primary = Arc::new(PanickingCoordinator::new(Arc::new(
+        InMemoryCoordinator::new(),
+    )));
+    let fallback1 = Arc::new(PanickingCoordinator::new(Arc::new(
+        InMemoryCoordinator::new(),
+    )));
+    let fallback2 = Arc::new(PanickingCoordinator::new(Arc::new(
+        InMemoryCoordinator::new(),
+    )));
 
-    let failover = FailoverCoordinator::new(vec![primary.clone(), fallback1.clone(), fallback2.clone()]).with_max_failures(1);
+    let failover =
+        FailoverCoordinator::new(vec![primary.clone(), fallback1.clone(), fallback2.clone()])
+            .with_max_failures(1);
 
     let ns = "test-failover-ns";
 

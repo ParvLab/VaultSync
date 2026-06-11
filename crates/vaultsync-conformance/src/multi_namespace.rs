@@ -11,8 +11,14 @@ pub async fn run_multi_namespace_tests(coord: Arc<dyn Coordinator>, ns_a: &str, 
     };
     coord.register(ns_a, rep_a).await.expect("register in ns_a");
 
-    let list_b = coord.list_replicas(ns_b).await.expect("list replicas in ns_b");
-    assert!(list_b.iter().all(|r| r.replica_id != "rep-a"), "replica registered in ns_a should not show in ns_b");
+    let list_b = coord
+        .list_replicas(ns_b)
+        .await
+        .expect("list replicas in ns_b");
+    assert!(
+        list_b.iter().all(|r| r.replica_id != "rep-a"),
+        "replica registered in ns_a should not show in ns_b"
+    );
 
     // 2. schema_version_per_namespace
     // Note: since schema_version is u64 and defaults to 0, if the coordinator supports modifying schema version,
@@ -26,8 +32,14 @@ pub async fn run_multi_namespace_tests(coord: Arc<dyn Coordinator>, ns_a: &str, 
     };
     coord.register(ns_b, rep_b).await.expect("register in ns_b");
     // Memory and other coordinators update namespace schema version based on registration
-    let sv_a = coord.schema_version(ns_a).await.expect("schema version ns_a");
-    let sv_b = coord.schema_version(ns_b).await.expect("schema version ns_b");
+    let sv_a = coord
+        .schema_version(ns_a)
+        .await
+        .expect("schema version ns_a");
+    let sv_b = coord
+        .schema_version(ns_b)
+        .await
+        .expect("schema version ns_b");
     assert_eq!(sv_a, 0);
     // SQLite/Memory/etc. might update schema_version to max of replicas. Let's make sure they are independent if sv_b was registered as 5.
     // If coordinator doesn't track it this way, we just verify they are distinct/independent namespaces.
@@ -49,7 +61,10 @@ pub async fn run_multi_namespace_tests(coord: Arc<dyn Coordinator>, ns_a: &str, 
     assert_eq!(seqs_a.len(), 1);
 
     let pulled_b = coord.pull(ns_b, 0, 10).await.expect("pull ns_b");
-    assert!(pulled_b.is_empty(), "expected ns_b to be isolated from ns_a mutations");
+    assert!(
+        pulled_b.is_empty(),
+        "expected ns_b to be isolated from ns_a mutations"
+    );
 
     // 4. two_namespaces_independent_sequences
     let mut_b = EncryptedMutation {
@@ -68,11 +83,21 @@ pub async fn run_multi_namespace_tests(coord: Arc<dyn Coordinator>, ns_a: &str, 
 
     // 5. compact_one_namespace_not_other
     // compact ns_a, make sure ns_b mutations can still be pulled.
-    let pulled_b_before = coord.pull(ns_b, 0, 10).await.expect("pull ns_b before compact");
+    let pulled_b_before = coord
+        .pull(ns_b, 0, 10)
+        .await
+        .expect("pull ns_b before compact");
     assert_eq!(pulled_b_before.len(), 1);
 
     let _ = coord.compact_oplog(ns_a).await;
 
-    let pulled_b_after = coord.pull(ns_b, 0, 10).await.expect("pull ns_b after compact");
-    assert_eq!(pulled_b_after.len(), 1, "compacting ns_a should not remove mutations from ns_b");
+    let pulled_b_after = coord
+        .pull(ns_b, 0, 10)
+        .await
+        .expect("pull ns_b after compact");
+    assert_eq!(
+        pulled_b_after.len(),
+        1,
+        "compacting ns_a should not remove mutations from ns_b"
+    );
 }

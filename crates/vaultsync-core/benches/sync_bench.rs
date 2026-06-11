@@ -1,11 +1,11 @@
-use criterion::{criterion_group, criterion_main, Criterion, black_box};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
 use vaultsync_core::crdt::document::CRDTDocument;
 use vaultsync_core::crdt::types::CrdtValue;
-use vaultsync_core::oplog::entry::{OplogEntry, MutationType, SyncStatus};
-use vaultsync_core::sync::reconciler::Reconciler;
-use vaultsync_core::subscription::engine::SubscriptionEngine;
+use vaultsync_core::oplog::entry::{MutationType, OplogEntry, SyncStatus};
 use vaultsync_core::storage::memory::InMemoryStorage;
+use vaultsync_core::subscription::engine::SubscriptionEngine;
+use vaultsync_core::sync::reconciler::Reconciler;
 
 fn bench_reconciler_apply_update(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -14,37 +14,40 @@ fn bench_reconciler_apply_update(c: &mut Criterion) {
         .unwrap();
 
     c.bench_function("reconciler_apply_update", |b| {
-        b.iter_with_setup(|| {
-            let storage = Arc::new(InMemoryStorage::new());
-            let subs = Arc::new(std::sync::Mutex::new(SubscriptionEngine::new()));
-            let reconciler = Reconciler::new(storage, subs);
-            
-            let mut doc = CRDTDocument::new("doc-1", "rec-1", 0);
-            doc.set_field("v", CrdtValue::Number(0.0));
-            let snapshot = doc.to_snapshot();
-            
-            let entry = OplogEntry {
-                id: "e-init".to_string(),
-                replica_id: "rep-1".to_string(),
-                namespace: "ns".to_string(),
-                mutation_type: MutationType::CrdtInsert,
-                doc_id: "doc-1".to_string(),
-                record_id: "rec-1".to_string(),
-                yrs_update: snapshot,
-                encrypted_blob: None,
-                timestamp: 1000,
-                sequence: Some(1),
-                sync_status: SyncStatus::Synced,
-                synced_at: None,
-                created_at: 1000,
-            };
-            (reconciler, entry)
-        }, |(reconciler, entry)| {
-            rt.block_on(async {
-                reconciler.apply_remote_update(&entry).await.unwrap();
-                black_box(())
-            });
-        })
+        b.iter_with_setup(
+            || {
+                let storage = Arc::new(InMemoryStorage::new());
+                let subs = Arc::new(std::sync::Mutex::new(SubscriptionEngine::new()));
+                let reconciler = Reconciler::new(storage, subs);
+
+                let mut doc = CRDTDocument::new("doc-1", "rec-1", 0);
+                doc.set_field("v", CrdtValue::Number(0.0));
+                let snapshot = doc.to_snapshot();
+
+                let entry = OplogEntry {
+                    id: "e-init".to_string(),
+                    replica_id: "rep-1".to_string(),
+                    namespace: "ns".to_string(),
+                    mutation_type: MutationType::CrdtInsert,
+                    doc_id: "doc-1".to_string(),
+                    record_id: "rec-1".to_string(),
+                    yrs_update: snapshot,
+                    encrypted_blob: None,
+                    timestamp: 1000,
+                    sequence: Some(1),
+                    sync_status: SyncStatus::Synced,
+                    synced_at: None,
+                    created_at: 1000,
+                };
+                (reconciler, entry)
+            },
+            |(reconciler, entry)| {
+                rt.block_on(async {
+                    reconciler.apply_remote_update(&entry).await.unwrap();
+                    black_box(())
+                });
+            },
+        )
     });
 }
 

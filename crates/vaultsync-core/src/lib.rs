@@ -1,16 +1,16 @@
+pub mod coordinator;
 pub mod crdt;
 pub mod e2ee;
-pub mod storage;
+pub mod ipc;
 pub mod oplog;
 pub mod schema;
+pub mod storage;
 pub mod subscription;
 pub mod sync;
-pub mod coordinator;
-#[cfg(feature = "coordinator-http")]
-pub mod vaultsync_server;
-pub mod ipc;
 pub mod telemetry;
 pub mod time_utils;
+#[cfg(feature = "coordinator-http")]
+pub mod vaultsync_server;
 
 #[cfg(feature = "async-runtime")]
 mod client;

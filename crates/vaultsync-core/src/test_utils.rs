@@ -2,14 +2,17 @@
 //! Available under #[cfg(any(test, feature = "test-utils"))]
 
 use std::collections::HashMap;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use crate::{
     coordinator::traits::{Coordinator, EncryptedMutation},
     crdt::{document::CRDTDocument, types::CrdtValue},
     error::VaultSyncError,
-    oplog::entry::{OplogEntry, SyncStatus, MutationType},
+    oplog::entry::{MutationType, OplogEntry, SyncStatus},
     storage::traits::Storage,
     sync::state::SyncState,
 };
@@ -27,7 +30,9 @@ pub struct DeterministicClock {
 
 impl DeterministicClock {
     pub fn new() -> Self {
-        Self { time_ms: Arc::new(AtomicU64::new(1_000_000_000)) }
+        Self {
+            time_ms: Arc::new(AtomicU64::new(1_000_000_000)),
+        }
     }
 
     /// Advance the clock by `ms` milliseconds.
@@ -42,7 +47,9 @@ impl DeterministicClock {
 }
 
 impl Default for DeterministicClock {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,14 +122,18 @@ impl VaultSyncFixture {
             synced_at: None,
             created_at: self.clock.now_ms(),
         };
-        self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await?;
+        self.storage
+            .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
+            .await?;
         Ok(())
     }
 
     /// Flush pending ops to coordinator.
     pub async fn upload(&self) -> Result<usize, VaultSyncError> {
-        let pending = self.storage
-            .read_pending_oplog(&self.namespace, 1000).await?;
+        let pending = self
+            .storage
+            .read_pending_oplog(&self.namespace, 1000)
+            .await?;
         let count = pending.len();
         for entry in &pending {
             let mutation = EncryptedMutation {
@@ -136,9 +147,7 @@ impl VaultSyncFixture {
                 schema_version: 0,
                 key_version: 0,
             };
-            if let Ok(seqs) = self.coordinator
-                .push(&self.namespace, vec![mutation]).await
-            {
+            if let Ok(seqs) = self.coordinator.push(&self.namespace, vec![mutation]).await {
                 if let Some(&seq) = seqs.first() {
                     let _ = self.storage.mark_synced(&entry.id, seq).await;
                 }
@@ -149,7 +158,10 @@ impl VaultSyncFixture {
 
     /// Pull from coordinator and merge into local storage.
     pub async fn download(&self) -> Result<usize, VaultSyncError> {
-        let sync_state = self.storage.read_sync_state(&self.namespace).await?
+        let sync_state = self
+            .storage
+            .read_sync_state(&self.namespace)
+            .await?
             .unwrap_or_else(|| SyncState {
                 namespace: self.namespace.clone(),
                 replica_id: self.replica_id.clone(),
@@ -160,7 +172,8 @@ impl VaultSyncFixture {
                 last_sync_at: None,
                 schema_version: 0,
             });
-        let mutations = self.coordinator
+        let mutations = self
+            .coordinator
             .pull(&self.namespace, sync_state.last_synced_sequence, 1000)
             .await
             .map_err(|e| VaultSyncError::Coordinator(format!("{e:?}")))?;
@@ -191,7 +204,9 @@ impl VaultSyncFixture {
                 synced_at: Some(self.clock.now_ms() / 1000),
                 created_at: self.clock.now_ms(),
             };
-            self.storage.write_document_and_oplog(doc_id, record_id, &snapshot, &entry).await?;
+            self.storage
+                .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
+                .await?;
             if m.sequence > max_seq {
                 max_seq = m.sequence;
             }
@@ -212,11 +227,7 @@ impl VaultSyncFixture {
     }
 
     /// Get current document state.
-    pub async fn get_document(
-        &self,
-        doc_id: &str,
-        record_id: &str,
-    ) -> Option<CRDTDocument> {
+    pub async fn get_document(&self, doc_id: &str, record_id: &str) -> Option<CRDTDocument> {
         if let Ok(Some(bytes)) = self.storage.get_document(doc_id, record_id).await {
             CRDTDocument::from_snapshot(&bytes).ok()
         } else {
@@ -235,7 +246,8 @@ impl VaultSyncFixture {
         let b = other.get_document(doc_id, record_id).await;
         match (a, b) {
             (Some(da), Some(db)) => assert_eq!(
-                da.to_map(), db.to_map(),
+                da.to_map(),
+                db.to_map(),
                 "CRDT state diverged between fixtures"
             ),
             (None, None) => {}
@@ -273,8 +285,12 @@ impl Fault for NetworkPartitionFault {
 pub struct AllPartitionFault;
 
 impl Fault for AllPartitionFault {
-    fn apply(&self, replica: &mut SimulatedReplica) { replica.connected = false; }
-    fn remove(&self, replica: &mut SimulatedReplica) { replica.connected = true; }
+    fn apply(&self, replica: &mut SimulatedReplica) {
+        replica.connected = false;
+    }
+    fn remove(&self, replica: &mut SimulatedReplica) {
+        replica.connected = true;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -289,7 +305,9 @@ pub struct SimulatedReplica {
 }
 
 impl SimulatedReplica {
-    pub fn disconnect(&mut self) { self.connected = false; }
+    pub fn disconnect(&mut self) {
+        self.connected = false;
+    }
 
     pub async fn reconnect(&mut self) {
         self.connected = true;
@@ -314,12 +332,16 @@ impl SimulatedReplica {
     }
 
     pub async fn flush(&self) -> Result<usize, VaultSyncError> {
-        if !self.connected { return Ok(0); }
+        if !self.connected {
+            return Ok(0);
+        }
         self.fixture.upload().await
     }
 
     pub async fn pull(&self) -> Result<usize, VaultSyncError> {
-        if !self.connected { return Ok(0); }
+        if !self.connected {
+            return Ok(0);
+        }
         self.fixture.download().await
     }
 }
@@ -342,13 +364,8 @@ impl SimulatedNetwork {
         }
     }
 
-    pub fn add_replica(
-        &mut self,
-        id: &str,
-        storage: Arc<dyn Storage>,
-    ) {
-        let fixture = VaultSyncFixture::new(storage, self.coordinator.clone())
-            .with_replica_id(id);
+    pub fn add_replica(&mut self, id: &str, storage: Arc<dyn Storage>) {
+        let fixture = VaultSyncFixture::new(storage, self.coordinator.clone()).with_replica_id(id);
 
         self.replicas.push(SimulatedReplica {
             id: id.to_string(),
@@ -397,15 +414,19 @@ impl SimulatedNetwork {
             states.push(r.get_document(doc_id, record_id).await);
         }
 
-        let snapshots: Vec<_> = states.iter()
+        let snapshots: Vec<_> = states
+            .iter()
             .map(|d| d.as_ref().map(|doc| doc.to_map()))
             .collect();
 
         for (i, s) in snapshots[1..].iter().enumerate() {
             assert_eq!(
-                &snapshots[0], s,
+                &snapshots[0],
+                s,
                 "Replica {} (id: {}) diverged from replica 0 (id: {})",
-                i + 1, self.replicas[i + 1].id, self.replicas[0].id
+                i + 1,
+                self.replicas[i + 1].id,
+                self.replicas[0].id
             );
         }
     }

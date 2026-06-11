@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,17 +60,25 @@ impl CrdtValue {
 }
 
 impl From<String> for CrdtValue {
-    fn from(s: String) -> Self { CrdtValue::String(s) }
+    fn from(s: String) -> Self {
+        CrdtValue::String(s)
+    }
 }
 
 impl From<&str> for CrdtValue {
-    fn from(s: &str) -> Self { CrdtValue::String(s.to_string()) }
+    fn from(s: &str) -> Self {
+        CrdtValue::String(s.to_string())
+    }
 }
 
 impl From<f64> for CrdtValue {
-    fn from(n: f64) -> Self { CrdtValue::Number(n) }
+    fn from(n: f64) -> Self {
+        CrdtValue::Number(n)
+    }
 }
 
 impl From<bool> for CrdtValue {
-    fn from(b: bool) -> Self { CrdtValue::Boolean(b) }
+    fn from(b: bool) -> Self {
+        CrdtValue::Boolean(b)
+    }
 }

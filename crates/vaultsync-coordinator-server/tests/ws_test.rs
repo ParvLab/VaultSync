@@ -1,17 +1,20 @@
+use futures::StreamExt;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use futures::StreamExt;
-use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation, ReplicaInfo};
-use vaultsync_core::coordinator::http::{HttpCoordinator, HttpCoordinatorConfig};
-use vaultsync_core::coordinator::mux_coordinator::MuxCoordinator;
 use vaultsync_coordinator_server::{
     build_router,
     config::ServerConfig,
     state::AppState,
     token_store::{MemoryTokenStore, TokenStore},
 };
+use vaultsync_core::coordinator::http::{HttpCoordinator, HttpCoordinatorConfig};
+use vaultsync_core::coordinator::mux_coordinator::MuxCoordinator;
+use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation, ReplicaInfo};
 
-async fn spawn_test_server(auth_token: Option<String>, admin_token: Option<String>) -> (String, tokio::task::JoinHandle<()>) {
+async fn spawn_test_server(
+    auth_token: Option<String>,
+    admin_token: Option<String>,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://127.0.0.1:{}", addr.port());
@@ -26,7 +29,8 @@ async fn spawn_test_server(auth_token: Option<String>, admin_token: Option<Strin
         admin_token,
     };
 
-    let coordinator = Arc::new(vaultsync_coordinator_memory::coordinator::InMemoryCoordinator::new());
+    let coordinator =
+        Arc::new(vaultsync_coordinator_memory::coordinator::InMemoryCoordinator::new());
     let token_store: Option<Arc<dyn TokenStore>> = if config.admin_token.is_some() {
         let store: Arc<dyn TokenStore> = Arc::new(MemoryTokenStore::new());
         store.initialize().await.unwrap();
@@ -69,12 +73,18 @@ async fn test_ws_push_pull_flow() {
     let mut stream = std::pin::Pin::from(stream);
 
     // 2. Register replica (routes via WS)
-    coord.register(ns, ReplicaInfo {
-        replica_id: "replica-ws-1".to_string(),
-        namespace: ns.to_string(),
-        public_key: vec![10, 20, 30],
-        schema_version: 100,
-    }).await.unwrap();
+    coord
+        .register(
+            ns,
+            ReplicaInfo {
+                replica_id: "replica-ws-1".to_string(),
+                namespace: ns.to_string(),
+                public_key: vec![10, 20, 30],
+                schema_version: 100,
+            },
+        )
+        .await
+        .unwrap();
 
     // 3. Send heartbeat (routes via WS)
     coord.heartbeat(ns, "replica-ws-1").await.unwrap();
@@ -154,12 +164,18 @@ async fn test_mux_connect_single_namespace() {
     let mut stream = std::pin::Pin::from(stream);
 
     // 2. Register replica info
-    coord.register(ns, ReplicaInfo {
-        replica_id: "replica-mux-1".to_string(),
-        namespace: ns.to_string(),
-        public_key: vec![10, 20, 30],
-        schema_version: 1,
-    }).await.unwrap();
+    coord
+        .register(
+            ns,
+            ReplicaInfo {
+                replica_id: "replica-mux-1".to_string(),
+                namespace: ns.to_string(),
+                public_key: vec![10, 20, 30],
+                schema_version: 1,
+            },
+        )
+        .await
+        .unwrap();
 
     // 3. Heartbeat
     coord.heartbeat(ns, "replica-mux-1").await.unwrap();
@@ -216,19 +232,31 @@ async fn test_mux_two_namespaces_isolated() {
     let mut stream2 = std::pin::Pin::from(stream2);
 
     // Register both replicas
-    coord1.register(ns1, ReplicaInfo {
-        replica_id: "replica-mux-1".to_string(),
-        namespace: ns1.to_string(),
-        public_key: vec![1],
-        schema_version: 1,
-    }).await.unwrap();
+    coord1
+        .register(
+            ns1,
+            ReplicaInfo {
+                replica_id: "replica-mux-1".to_string(),
+                namespace: ns1.to_string(),
+                public_key: vec![1],
+                schema_version: 1,
+            },
+        )
+        .await
+        .unwrap();
 
-    coord2.register(ns2, ReplicaInfo {
-        replica_id: "replica-mux-2".to_string(),
-        namespace: ns2.to_string(),
-        public_key: vec![2],
-        schema_version: 1,
-    }).await.unwrap();
+    coord2
+        .register(
+            ns2,
+            ReplicaInfo {
+                replica_id: "replica-mux-2".to_string(),
+                namespace: ns2.to_string(),
+                public_key: vec![2],
+                schema_version: 1,
+            },
+        )
+        .await
+        .unwrap();
 
     // Push to ns1
     let mutations1 = vec![EncryptedMutation {
@@ -279,7 +307,7 @@ async fn test_mux_reconnect() {
     let addr = listener.local_addr().unwrap();
     let port = addr.port();
     let url = format!("http://127.0.0.1:{}", port);
-    
+
     let run_server = |std_listener: std::net::TcpListener| {
         let config = ServerConfig {
             host: "127.0.0.1".to_string(),
@@ -290,7 +318,8 @@ async fn test_mux_reconnect() {
             auth_token: None,
             admin_token: None,
         };
-        let coordinator = Arc::new(vaultsync_coordinator_memory::coordinator::InMemoryCoordinator::new());
+        let coordinator =
+            Arc::new(vaultsync_coordinator_memory::coordinator::InMemoryCoordinator::new());
         let state = AppState {
             coordinator,
             token_store: None,
@@ -323,25 +352,37 @@ async fn test_mux_reconnect() {
     let mut stream = std::pin::Pin::from(stream);
 
     // Register
-    coord.register(ns, ReplicaInfo {
-        replica_id: "replica-rec".to_string(),
-        namespace: ns.to_string(),
-        public_key: vec![5],
-        schema_version: 1,
-    }).await.unwrap();
+    coord
+        .register(
+            ns,
+            ReplicaInfo {
+                replica_id: "replica-rec".to_string(),
+                namespace: ns.to_string(),
+                public_key: vec![5],
+                schema_version: 1,
+            },
+        )
+        .await
+        .unwrap();
 
     // Push to make sure it works
-    coord.push(ns, vec![EncryptedMutation {
-        id: "m-before".to_string(),
-        namespace: ns.to_string(),
-        replica_id: "replica-rec".to_string(),
-        doc_id: "doc-1".to_string(),
-        record_id: "rec-1".to_string(),
-        encrypted_blob: vec![1],
-        timestamp: 100000,
-        schema_version: 1,
-        key_version: 1,
-    }]).await.unwrap();
+    coord
+        .push(
+            ns,
+            vec![EncryptedMutation {
+                id: "m-before".to_string(),
+                namespace: ns.to_string(),
+                replica_id: "replica-rec".to_string(),
+                doc_id: "doc-1".to_string(),
+                record_id: "rec-1".to_string(),
+                encrypted_blob: vec![1],
+                timestamp: 100000,
+                schema_version: 1,
+                key_version: 1,
+            }],
+        )
+        .await
+        .unwrap();
 
     let mut_before = stream.next().await.unwrap();
     assert_eq!(mut_before.id, "m-before");
@@ -354,7 +395,9 @@ async fn test_mux_reconnect() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Start a new server on the same port
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
     let std_listener = listener.into_std().unwrap();
     let _new_server_handle = run_server(std_listener);
 
@@ -362,17 +405,23 @@ async fn test_mux_reconnect() {
     tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
 
     // Push a new mutation on the reconnected socket
-    coord.push(ns, vec![EncryptedMutation {
-        id: "m-after".to_string(),
-        namespace: ns.to_string(),
-        replica_id: "replica-rec".to_string(),
-        doc_id: "doc-1".to_string(),
-        record_id: "rec-1".to_string(),
-        encrypted_blob: vec![2],
-        timestamp: 100001,
-        schema_version: 1,
-        key_version: 1,
-    }]).await.unwrap();
+    coord
+        .push(
+            ns,
+            vec![EncryptedMutation {
+                id: "m-after".to_string(),
+                namespace: ns.to_string(),
+                replica_id: "replica-rec".to_string(),
+                doc_id: "doc-1".to_string(),
+                record_id: "rec-1".to_string(),
+                encrypted_blob: vec![2],
+                timestamp: 100001,
+                schema_version: 1,
+                key_version: 1,
+            }],
+        )
+        .await
+        .unwrap();
 
     // Check if the stream receives it
     let mut_after = stream.next().await.unwrap();
@@ -393,28 +442,40 @@ async fn test_mux_namespace_drop() {
     let stream = coord.subscribe(ns, 0).await.unwrap();
     let mut stream = std::pin::Pin::from(stream);
 
-    coord.register(ns, ReplicaInfo {
-        replica_id: "replica-drop".to_string(),
-        namespace: ns.to_string(),
-        public_key: vec![9],
-        schema_version: 1,
-    }).await.unwrap();
+    coord
+        .register(
+            ns,
+            ReplicaInfo {
+                replica_id: "replica-drop".to_string(),
+                namespace: ns.to_string(),
+                public_key: vec![9],
+                schema_version: 1,
+            },
+        )
+        .await
+        .unwrap();
 
     // Leave the namespace
     coord.leave().await.unwrap();
 
     // Push a mutation
-    coord.push(ns, vec![EncryptedMutation {
-        id: "m-after-drop".to_string(),
-        namespace: ns.to_string(),
-        replica_id: "replica-drop".to_string(),
-        doc_id: "doc-1".to_string(),
-        record_id: "rec-1".to_string(),
-        encrypted_blob: vec![3],
-        timestamp: 100002,
-        schema_version: 1,
-        key_version: 1,
-    }]).await.unwrap();
+    coord
+        .push(
+            ns,
+            vec![EncryptedMutation {
+                id: "m-after-drop".to_string(),
+                namespace: ns.to_string(),
+                replica_id: "replica-drop".to_string(),
+                doc_id: "doc-1".to_string(),
+                record_id: "rec-1".to_string(),
+                encrypted_blob: vec![3],
+                timestamp: 100002,
+                schema_version: 1,
+                key_version: 1,
+            }],
+        )
+        .await
+        .unwrap();
 
     // The stream should be disconnected (returns None) or timeout without receiving any new mutations.
     // Wait, when we call `leave()`, the server cancels the subscription and the client removes the tx channel.
@@ -426,4 +487,3 @@ async fn test_mux_namespace_drop() {
         Err(_) => {} // Timeout is also acceptable since the stream did not receive any mutation
     }
 }
-

@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use std::sync::Mutex;
-use crate::error::VaultSyncError;
 use crate::crdt::document::CRDTDocument;
+use crate::error::VaultSyncError;
 use crate::oplog::entry::OplogEntry;
 use crate::storage::traits::Storage;
 use crate::subscription::engine::SubscriptionEngine;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 pub struct Reconciler {
     storage: Arc<dyn Storage>,
@@ -13,20 +13,31 @@ pub struct Reconciler {
 
 impl Reconciler {
     pub fn new(storage: Arc<dyn Storage>, subscriptions: Arc<Mutex<SubscriptionEngine>>) -> Self {
-        Self { storage, subscriptions }
+        Self {
+            storage,
+            subscriptions,
+        }
     }
 
     pub async fn apply_remote_update(&self, entry: &OplogEntry) -> Result<(), VaultSyncError> {
-        let existing = self.storage.get_document(&entry.doc_id, &entry.record_id).await?;
+        let existing = self
+            .storage
+            .get_document(&entry.doc_id, &entry.record_id)
+            .await?;
         let mut doc = match existing {
             Some(bytes) => CRDTDocument::from_snapshot(&bytes)?,
             None => CRDTDocument::new(&entry.doc_id, &entry.record_id, 0),
         };
         doc.apply_update(&entry.yrs_update)?;
         let snapshot = doc.to_snapshot();
-        self.storage.insert_document(&entry.doc_id, &entry.record_id, &snapshot).await?;
+        self.storage
+            .insert_document(&entry.doc_id, &entry.record_id, &snapshot)
+            .await?;
         let state = doc.to_map();
-        self.subscriptions.lock().unwrap().fire(&entry.doc_id, &entry.record_id, &state);
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .fire(&entry.doc_id, &entry.record_id, &state);
         Ok(())
     }
 
@@ -35,16 +46,24 @@ impl Reconciler {
         entry: &OplogEntry,
         plaintext_update: &[u8],
     ) -> Result<(), VaultSyncError> {
-        let existing = self.storage.get_document(&entry.doc_id, &entry.record_id).await?;
+        let existing = self
+            .storage
+            .get_document(&entry.doc_id, &entry.record_id)
+            .await?;
         let mut doc = match existing {
             Some(bytes) => CRDTDocument::from_snapshot(&bytes)?,
             None => CRDTDocument::new(&entry.doc_id, &entry.record_id, 0),
         };
         doc.apply_update(plaintext_update)?;
         let snapshot = doc.to_snapshot();
-        self.storage.insert_document(&entry.doc_id, &entry.record_id, &snapshot).await?;
+        self.storage
+            .insert_document(&entry.doc_id, &entry.record_id, &snapshot)
+            .await?;
         let state = doc.to_map();
-        self.subscriptions.lock().unwrap().fire(&entry.doc_id, &entry.record_id, &state);
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .fire(&entry.doc_id, &entry.record_id, &state);
         Ok(())
     }
 
@@ -81,7 +100,9 @@ impl Reconciler {
             final_states.push((doc_id, record_id, state));
         }
 
-        self.storage.write_batch_reconciliation(updated_docs).await?;
+        self.storage
+            .write_batch_reconciliation(updated_docs)
+            .await?;
 
         let subs = self.subscriptions.lock().unwrap();
         for (doc_id, record_id, state) in final_states {

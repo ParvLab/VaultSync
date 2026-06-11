@@ -1,8 +1,8 @@
-use std::sync::{Arc, Mutex, OnceLock};
-use std::collections::VecDeque;
-use serde_json::Value;
 #[cfg(feature = "telemetry")]
 use serde_json::json;
+use serde_json::Value;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Default)]
 pub struct SpanBuffer {
@@ -45,7 +45,8 @@ struct FieldVisitor<'a>(&'a mut std::collections::HashMap<String, Value>);
 #[cfg(feature = "telemetry")]
 impl<'a> tracing::field::Visit for FieldVisitor<'a> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.insert(field.name().to_string(), json!(format!("{:?}", value)));
+        self.0
+            .insert(field.name().to_string(), json!(format!("{:?}", value)));
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
@@ -73,7 +74,12 @@ impl<S> tracing_subscriber::Layer<S> for SpanCollectorLayer
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
-    fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         if let Some(span) = ctx.span(id) {
             let mut fields = std::collections::HashMap::new();
             let mut visitor = FieldVisitor(&mut fields);
@@ -93,8 +99,11 @@ where
 #[cfg(feature = "telemetry")]
 pub fn init_tracing(service_name: &str, otlp_endpoint: Option<&str>) {
     use opentelemetry::KeyValue;
-    use opentelemetry_sdk::{trace::{self, Sampler}, Resource};
     use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::{
+        trace::{self, Sampler},
+        Resource,
+    };
 
     let endpoint = otlp_endpoint
         .map(|s| s.to_string())
@@ -107,11 +116,7 @@ pub fn init_tracing(service_name: &str, otlp_endpoint: Option<&str>) {
     if let Some(ep) = endpoint {
         let tracer = opentelemetry_otlp::new_pipeline()
             .tracing()
-            .with_exporter(
-                opentelemetry_otlp::new_exporter()
-                    .tonic()
-                    .with_endpoint(ep),
-            )
+            .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(ep))
             .with_trace_config(
                 trace::config()
                     .with_sampler(Sampler::AlwaysOn)
@@ -133,7 +138,10 @@ pub fn init_tracing(service_name: &str, otlp_endpoint: Option<&str>) {
                 return;
             }
             Err(err) => {
-                eprintln!("Failed to initialize OTLP tracer: {}, falling back to JSON stdout", err);
+                eprintln!(
+                    "Failed to initialize OTLP tracer: {}, falling back to JSON stdout",
+                    err
+                );
             }
         }
     }

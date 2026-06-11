@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use crate::error::VaultSyncError;
 use aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use sha2::{Sha256, Digest};
 use hkdf::Hkdf;
-use crate::error::VaultSyncError;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -60,7 +60,9 @@ impl KeyRing {
 
     pub fn active_key(&self) -> NamespaceKeypair {
         let inner = self.inner.read().unwrap();
-        inner.keys.iter()
+        inner
+            .keys
+            .iter()
             .find(|k| k.version == inner.active_version)
             .cloned()
             .expect("active key always present")
@@ -88,19 +90,26 @@ impl KeyRing {
         let mut payload = Vec::with_capacity(64);
         payload.extend_from_slice(&active.private_key);
         payload.extend_from_slice(&active.public_key);
-        cipher.encrypt(nonce, payload.as_ref())
+        cipher
+            .encrypt(nonce, payload.as_ref())
             .map_err(|e| VaultSyncError::Encryption(format!("key encryption failed: {e}")))
     }
 
-    pub fn decrypt_private_key(encrypted: &[u8], device_key: &[u8]) -> Result<NamespaceKeypair, VaultSyncError> {
+    pub fn decrypt_private_key(
+        encrypted: &[u8],
+        device_key: &[u8],
+    ) -> Result<NamespaceKeypair, VaultSyncError> {
         let key = derive_encryption_key(device_key);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let nonce = Nonce::from_slice(&[0u8; 12]);
-        let plaintext = cipher.decrypt(nonce, encrypted)
+        let plaintext = cipher
+            .decrypt(nonce, encrypted)
             .map_err(|e| VaultSyncError::Encryption(format!("key decryption failed: {e}")))?;
 
         if plaintext.len() != 64 {
-            return Err(VaultSyncError::Encryption("invalid decrypted key length".into()));
+            return Err(VaultSyncError::Encryption(
+                "invalid decrypted key length".into(),
+            ));
         }
 
         let mut private_key = [0u8; 32];
@@ -167,7 +176,11 @@ impl KeyRing {
         inner.derived_keys_cache.clear(); // Clear all cache since keys are completely reloaded
     }
 
-    pub fn derive_namespace_key_for_version(&self, namespace: &str, version: u64) -> Option<[u8; 32]> {
+    pub fn derive_namespace_key_for_version(
+        &self,
+        namespace: &str,
+        version: u64,
+    ) -> Option<[u8; 32]> {
         if let Some(key) = self.get_cached_key(namespace, version) {
             return Some(key);
         }
@@ -184,12 +197,17 @@ impl KeyRing {
 
     fn get_cached_key(&self, namespace: &str, version: u64) -> Option<[u8; 32]> {
         let inner = self.inner.read().unwrap();
-        inner.derived_keys_cache.get(&(namespace.to_string(), version)).cloned()
+        inner
+            .derived_keys_cache
+            .get(&(namespace.to_string(), version))
+            .cloned()
     }
 
     fn insert_cached_key(&self, namespace: &str, version: u64, key: [u8; 32]) {
         let mut inner = self.inner.write().unwrap();
-        inner.derived_keys_cache.insert((namespace.to_string(), version), key);
+        inner
+            .derived_keys_cache
+            .insert((namespace.to_string(), version), key);
     }
 }
 
@@ -206,7 +224,11 @@ impl E2eeEncryptor {
         }
     }
 
-    pub fn encrypt(&self, plaintext: &[u8], recipient_pk: &[u8; 32]) -> Result<Vec<u8>, VaultSyncError> {
+    pub fn encrypt(
+        &self,
+        plaintext: &[u8],
+        recipient_pk: &[u8; 32],
+    ) -> Result<Vec<u8>, VaultSyncError> {
         let active = self.keyring.active_key();
         let key_version = active.version;
         let cache_key = (key_version, *recipient_pk);
@@ -229,20 +251,29 @@ impl E2eeEncryptor {
         super::encrypt::encrypt_with_shared_secret(plaintext, &shared_secret)
     }
 
-    pub fn encrypt_symmetric(&self, plaintext: &[u8], namespace: &str) -> Result<Vec<u8>, VaultSyncError> {
+    pub fn encrypt_symmetric(
+        &self,
+        plaintext: &[u8],
+        namespace: &str,
+    ) -> Result<Vec<u8>, VaultSyncError> {
         let start = crate::time_utils::PlatformInstant::now();
         let active_version = self.keyring.active_version();
-        let span = tracing::info_span!("e2ee.encrypt", namespace = namespace, key_version = active_version);
+        let span = tracing::info_span!(
+            "e2ee.encrypt",
+            namespace = namespace,
+            key_version = active_version
+        );
         let _enter = span.enter();
 
         let key = self.keyring.derive_namespace_key(namespace);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-        
+
         let mut nonce_bytes = [0u8; 12];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        
-        let ciphertext = cipher.encrypt(nonce, plaintext)
+
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
             .map_err(|e| VaultSyncError::Encryption(format!("symmetric encrypt failed: {e}")))?;
 
         let mut result = Vec::with_capacity(8 + 12 + ciphertext.len());
@@ -273,7 +304,11 @@ impl E2eeDecryptor {
         }
     }
 
-    pub fn decrypt(&self, ciphertext: &[u8], sender_pk: &[u8; 32]) -> Result<Vec<u8>, VaultSyncError> {
+    pub fn decrypt(
+        &self,
+        ciphertext: &[u8],
+        sender_pk: &[u8; 32],
+    ) -> Result<Vec<u8>, VaultSyncError> {
         let active = self.keyring.active_key();
         let key_version = active.version;
         let cache_key = (key_version, *sender_pk);
@@ -296,26 +331,41 @@ impl E2eeDecryptor {
         super::decrypt::decrypt_with_shared_secret(ciphertext, &shared_secret)
     }
 
-    pub fn decrypt_symmetric(&self, ciphertext: &[u8], namespace: &str) -> Result<Vec<u8>, VaultSyncError> {
+    pub fn decrypt_symmetric(
+        &self,
+        ciphertext: &[u8],
+        namespace: &str,
+    ) -> Result<Vec<u8>, VaultSyncError> {
         let start = crate::time_utils::PlatformInstant::now();
-        
+
         if ciphertext.len() < 20 {
-            return Err(VaultSyncError::Encryption("invalid ciphertext length (too short)".into()));
+            return Err(VaultSyncError::Encryption(
+                "invalid ciphertext length (too short)".into(),
+            ));
         }
         let key_version = u64::from_le_bytes(ciphertext[..8].try_into().unwrap());
-        
-        let span = tracing::info_span!("e2ee.decrypt", namespace = namespace, key_version = key_version);
+
+        let span = tracing::info_span!(
+            "e2ee.decrypt",
+            namespace = namespace,
+            key_version = key_version
+        );
         let _enter = span.enter();
 
         let nonce_bytes = &ciphertext[8..20];
         let actual_ciphertext = &ciphertext[20..];
 
-        let key = self.keyring.derive_namespace_key_for_version(namespace, key_version)
-            .ok_or_else(|| VaultSyncError::Encryption(format!("unknown key version {key_version}")))?;
-        
+        let key = self
+            .keyring
+            .derive_namespace_key_for_version(namespace, key_version)
+            .ok_or_else(|| {
+                VaultSyncError::Encryption(format!("unknown key version {key_version}"))
+            })?;
+
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let nonce = Nonce::from_slice(nonce_bytes);
-        let res = cipher.decrypt(nonce, actual_ciphertext)
+        let res = cipher
+            .decrypt(nonce, actual_ciphertext)
             .map_err(|e| VaultSyncError::Encryption(format!("symmetric decrypt failed: {e}")));
 
         if res.is_ok() {

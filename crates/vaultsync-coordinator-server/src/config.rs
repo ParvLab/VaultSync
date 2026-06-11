@@ -1,7 +1,10 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "vaultsync-coordinator-server", about = "VaultSync Coordinator HTTP Server")]
+#[command(
+    name = "vaultsync-coordinator-server",
+    about = "VaultSync Coordinator HTTP Server"
+)]
 pub struct ServerConfig {
     #[arg(long, default_value = "127.0.0.1", env = "VAULTSYNC_HOST")]
     pub host: String,
@@ -12,10 +15,18 @@ pub struct ServerConfig {
     #[arg(short, long, default_value = "sqlite", env = "VAULTSYNC_BACKEND")]
     pub backend: String, // "sqlite", "redis", or "memory"
 
-    #[arg(long, default_value = "./vaultsync_coordinator.db", env = "VAULTSYNC_DB_PATH")]
+    #[arg(
+        long,
+        default_value = "./vaultsync_coordinator.db",
+        env = "VAULTSYNC_DB_PATH"
+    )]
     pub db_path: String,
 
-    #[arg(long, default_value = "redis://127.0.0.1:6379", env = "VAULTSYNC_DB_URL")]
+    #[arg(
+        long,
+        default_value = "redis://127.0.0.1:6379",
+        env = "VAULTSYNC_DB_URL"
+    )]
     pub db_url: String,
 
     #[arg(long, env = "VAULTSYNC_AUTH_TOKEN")]

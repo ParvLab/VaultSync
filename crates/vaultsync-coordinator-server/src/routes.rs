@@ -1,13 +1,18 @@
+use crate::state::AppState;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{sse::{Event, Sse}, IntoResponse},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse,
+    },
     Json,
 };
-use vaultsync_core::coordinator::traits::{EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId};
 use futures::StreamExt;
 use std::convert::Infallible;
-use crate::state::AppState;
+use vaultsync_core::coordinator::traits::{
+    EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId,
+};
 
 // Helper to validate namespace token auth
 async fn authorize_namespace(
@@ -61,11 +66,10 @@ pub async fn push_mutations(
 ) -> Result<Json<Vec<SequenceId>>, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
 
-    let seq_ids = state.coordinator.push(&ns, mutations).await
-        .map_err(|e| {
-            tracing::error!("Failed to push mutations: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let seq_ids = state.coordinator.push(&ns, mutations).await.map_err(|e| {
+        tracing::error!("Failed to push mutations: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(seq_ids))
 }
@@ -84,7 +88,10 @@ pub async fn pull_mutations(
 ) -> Result<Json<Vec<PendingMutation>>, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
 
-    let mutations = state.coordinator.pull(&ns, query.after, query.limit).await
+    let mutations = state
+        .coordinator
+        .pull(&ns, query.after, query.limit)
+        .await
         .map_err(|e| {
             tracing::error!("Failed to pull mutations: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -101,11 +108,10 @@ pub async fn register_replica(
 ) -> Result<StatusCode, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
 
-    state.coordinator.register(&ns, info).await
-        .map_err(|e| {
-            tracing::error!("Failed to register replica: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    state.coordinator.register(&ns, info).await.map_err(|e| {
+        tracing::error!("Failed to register replica: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(StatusCode::OK)
 }
@@ -117,11 +123,10 @@ pub async fn list_replicas(
 ) -> Result<Json<Vec<ReplicaInfo>>, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
 
-    let replicas = state.coordinator.list_replicas(&ns).await
-        .map_err(|e| {
-            tracing::error!("Failed to list replicas: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let replicas = state.coordinator.list_replicas(&ns).await.map_err(|e| {
+        tracing::error!("Failed to list replicas: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(replicas))
 }
@@ -139,7 +144,10 @@ pub async fn heartbeat(
 ) -> Result<StatusCode, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
 
-    state.coordinator.heartbeat(&ns, &query.replica_id).await
+    state
+        .coordinator
+        .heartbeat(&ns, &query.replica_id)
+        .await
         .map_err(|e| {
             tracing::error!("Failed to send heartbeat: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -155,11 +163,10 @@ pub async fn get_schema_version(
 ) -> Result<Json<u64>, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
 
-    let version = state.coordinator.schema_version(&ns).await
-        .map_err(|e| {
-            tracing::error!("Failed to get schema version: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let version = state.coordinator.schema_version(&ns).await.map_err(|e| {
+        tracing::error!("Failed to get schema version: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(version))
 }
@@ -177,7 +184,10 @@ pub async fn events_stream(
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
 
-    let stream = state.coordinator.subscribe(&ns, query.after).await
+    let stream = state
+        .coordinator
+        .subscribe(&ns, query.after)
+        .await
         .map_err(|e| {
             tracing::error!("Failed to subscribe to events: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -215,23 +225,33 @@ pub async fn admin_register_namespace(
     payload: Option<Json<AdminRegisterPayload>>,
 ) -> Result<Json<AdminRegisterResponse>, StatusCode> {
     // Verify admin token
-    let admin_token = state.config.admin_token.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let auth_header = headers.get(axum::http::header::AUTHORIZATION)
+    let admin_token = state
+        .config
+        .admin_token
+        .as_ref()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let auth_str = auth_header.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
-    
+
     if auth_str != format!("Bearer {}", admin_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let token_store = state.token_store.as_ref().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let token_store = state
+        .token_store
+        .as_ref()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let token = match payload {
         Some(Json(p)) => p.token.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         None => uuid::Uuid::new_v4().to_string(),
     };
 
-    token_store.set_token(&ns, &token).await
+    token_store
+        .set_token(&ns, &token)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(AdminRegisterResponse {
@@ -246,20 +266,24 @@ pub async fn admin_compact(
     Path(ns): Path<String>,
 ) -> Result<Json<vaultsync_core::sync::compaction::CompactionStats>, StatusCode> {
     // Verify admin token
-    let admin_token = state.config.admin_token.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let auth_header = headers.get(axum::http::header::AUTHORIZATION)
+    let admin_token = state
+        .config
+        .admin_token
+        .as_ref()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let auth_str = auth_header.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
-    
+
     if auth_str != format!("Bearer {}", admin_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let stats = state.coordinator.compact_oplog(&ns).await
-        .map_err(|e| {
-            tracing::error!("Failed to compact oplog: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let stats = state.coordinator.compact_oplog(&ns).await.map_err(|e| {
+        tracing::error!("Failed to compact oplog: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(stats))
 }
@@ -270,26 +294,39 @@ pub async fn admin_get_snapshot(
     Path((ns, doc_id, record_id)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Verify admin token
-    let admin_token = state.config.admin_token.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let auth_header = headers.get(axum::http::header::AUTHORIZATION)
+    let admin_token = state
+        .config
+        .admin_token
+        .as_ref()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let auth_str = auth_header.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
-    
+
     if auth_str != format!("Bearer {}", admin_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let snapshot = state.coordinator.get_snapshot(&ns, &doc_id, &record_id).await
+    let snapshot = state
+        .coordinator
+        .get_snapshot(&ns, &doc_id, &record_id)
+        .await
         .map_err(|e| {
             tracing::error!("Failed to get snapshot: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let bytes = snapshot.encode().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let bytes = snapshot
+        .encode()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let mut headers = HeaderMap::new();
-    headers.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/octet-stream"));
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
 
     Ok((headers, bytes))
 }
@@ -312,7 +349,10 @@ pub async fn update_replica_key(
 ) -> Result<StatusCode, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
 
-    state.coordinator.update_replica_key(&ns, &replica_id, payload.public_key, payload.key_version).await
+    state
+        .coordinator
+        .update_replica_key(&ns, &replica_id, payload.public_key, payload.key_version)
+        .await
         .map_err(|e| {
             tracing::error!("Failed to update replica key: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -328,15 +368,20 @@ pub async fn get_replica_key(
 ) -> Result<Json<Option<UpdateReplicaKeyPayload>>, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
 
-    let result = state.coordinator.get_replica_key(&ns, &replica_id).await
+    let result = state
+        .coordinator
+        .get_replica_key(&ns, &replica_id)
+        .await
         .map_err(|e| {
             tracing::error!("Failed to get replica key: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok(Json(result.map(|(public_key, key_version)| UpdateReplicaKeyPayload {
-        public_key,
-        key_version,
+    Ok(Json(result.map(|(public_key, key_version)| {
+        UpdateReplicaKeyPayload {
+            public_key,
+            key_version,
+        }
     })))
 }
 
@@ -346,7 +391,10 @@ pub async fn get_snapshot(
     Path((ns, doc_id, record_id)): Path<(String, String, String)>,
 ) -> Result<Json<Option<vaultsync_core::crdt::snapshot::Snapshot>>, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
-    let snapshot = state.coordinator.get_snapshot(&ns, &doc_id, &record_id).await
+    let snapshot = state
+        .coordinator
+        .get_snapshot(&ns, &doc_id, &record_id)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(snapshot))
 }
@@ -358,7 +406,10 @@ pub async fn store_snapshot(
     Json(snapshot): Json<vaultsync_core::crdt::snapshot::Snapshot>,
 ) -> Result<StatusCode, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
-    state.coordinator.store_snapshot(&ns, &snapshot).await
+    state
+        .coordinator
+        .store_snapshot(&ns, &snapshot)
+        .await
         .map_err(|e| {
             println!("DEBUG ERROR in store_snapshot: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -372,7 +423,10 @@ pub async fn list_snapshots(
     Path(ns): Path<String>,
 ) -> Result<Json<Vec<vaultsync_core::crdt::snapshot::Snapshot>>, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
-    let snapshots = state.coordinator.list_snapshots(&ns).await
+    let snapshots = state
+        .coordinator
+        .list_snapshots(&ns)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(snapshots))
 }
@@ -383,7 +437,10 @@ pub async fn compact_oplog(
     Path(ns): Path<String>,
 ) -> Result<Json<vaultsync_core::sync::compaction::CompactionStats>, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
-    let stats = state.coordinator.compact_oplog(&ns).await
+    let stats = state
+        .coordinator
+        .compact_oplog(&ns)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(stats))
 }

@@ -1,8 +1,8 @@
-use std::sync::{Arc, Mutex};
-use crate::storage::traits::Storage;
-use crate::ipc::leader_election::LeaderElection;
-use crate::coordinator::mux_coordinator::{MuxCoordinator, NamespacedCoordinator};
 use crate::coordinator::http::HttpCoordinatorConfig;
+use crate::coordinator::mux_coordinator::{MuxCoordinator, NamespacedCoordinator};
+use crate::ipc::leader_election::LeaderElection;
+use crate::storage::traits::Storage;
+use std::sync::{Arc, Mutex};
 
 pub struct VaultSyncServer {
     pub storage: Arc<dyn Storage>,
@@ -23,7 +23,10 @@ impl std::fmt::Debug for VaultSyncServer {
 impl VaultSyncServer {
     pub fn new(storage: Arc<dyn Storage>, config: HttpCoordinatorConfig) -> Self {
         // Shared leader election across all namespaces (spec §27)
-        let leader_election = Arc::new(LeaderElection::new("__global__", &crate::storage::traits::StorageConfig::InMemory));
+        let leader_election = Arc::new(LeaderElection::new(
+            "__global__",
+            &crate::storage::traits::StorageConfig::InMemory,
+        ));
         Self {
             storage,
             leader_election,

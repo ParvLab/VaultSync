@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use vaultsync_conformance::run_full_conformance_suite;
-use vaultsync_coordinator_memory::coordinator::InMemoryCoordinator;
-use vaultsync_coordinator_sqlite::coordinator::SQLiteCoordinator;
 use vaultsync_coordinator_http::coordinator::{HttpCoordinator, HttpCoordinatorConfig};
-use vaultsync_coordinator_redis::coordinator::RedisCoordinator;
+use vaultsync_coordinator_memory::coordinator::InMemoryCoordinator;
 use vaultsync_coordinator_postgres::coordinator::PostgresCoordinator;
+use vaultsync_coordinator_redis::coordinator::RedisCoordinator;
+use vaultsync_coordinator_sqlite::coordinator::SQLiteCoordinator;
 
 #[tokio::test]
 async fn test_memory_conformance() {
@@ -21,12 +21,8 @@ async fn test_sqlite_conformance() {
 #[tokio::test]
 async fn test_http_conformance() {
     // Spin up real vaultsync-coordinator-server
-    use vaultsync_coordinator_server::{
-        config::ServerConfig,
-        state::AppState,
-        build_router,
-    };
     use std::net::SocketAddr;
+    use vaultsync_coordinator_server::{build_router, config::ServerConfig, state::AppState};
 
     let coordinator = Arc::new(InMemoryCoordinator::new());
     let state = AppState {
@@ -64,8 +60,9 @@ async fn test_http_conformance() {
 
 #[tokio::test]
 async fn test_redis_conformance() {
-    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+
     // Attempt connection, skip if offline
     match RedisCoordinator::new(&redis_url).await {
         Ok(coord) => {
@@ -90,7 +87,10 @@ async fn test_postgres_conformance() {
                     run_full_conformance_suite(coord, "postgres").await;
                 }
                 Err(e) => {
-                    println!("Skipping Postgres conformance tests (connection failed): {:?}", e);
+                    println!(
+                        "Skipping Postgres conformance tests (connection failed): {:?}",
+                        e
+                    );
                 }
             }
         }

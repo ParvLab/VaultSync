@@ -1,12 +1,12 @@
 use std::sync::Arc;
-use vaultsync_core::ipc::leader_election::LeaderElection;
-use vaultsync_core::ipc::crash_recovery::CrashRecovery;
-use vaultsync_core::sync::compaction::{CompactionEngine, CompactionConfig};
-use vaultsync_core::storage::traits::{Storage, StorageConfig};
-use vaultsync_core::storage::memory::InMemoryStorage;
-use vaultsync_core::oplog::entry::{OplogEntry, SyncStatus, MutationType};
 use vaultsync_core::crdt::document::CRDTDocument;
 use vaultsync_core::crdt::types::CrdtValue;
+use vaultsync_core::ipc::crash_recovery::CrashRecovery;
+use vaultsync_core::ipc::leader_election::LeaderElection;
+use vaultsync_core::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+use vaultsync_core::storage::memory::InMemoryStorage;
+use vaultsync_core::storage::traits::{Storage, StorageConfig};
+use vaultsync_core::sync::compaction::{CompactionConfig, CompactionEngine};
 
 #[tokio::test]
 async fn test_leader_election_acquire_and_release() {
@@ -36,7 +36,9 @@ async fn test_leader_election_second_acquire_fails() {
 
     le1.release();
 
-    let acquired2_again = le2.try_acquire().expect("second acquire succeeded after release");
+    let acquired2_again = le2
+        .try_acquire()
+        .expect("second acquire succeeded after release");
     assert!(acquired2_again);
 
     le2.release();
@@ -48,7 +50,9 @@ async fn test_crash_recovery_requeues_stale_pending() {
     let ns = "test-ns-recovery";
 
     let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
 
     // 1. Insert a failed entry created 100 seconds ago (stale)
     let stale_entry = OplogEntry {
@@ -104,7 +108,9 @@ async fn test_compaction_removes_synced_entries() {
     let ns = "test-ns-compaction";
 
     let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     // 1. Insert a synced entry from 10 days ago (stale, max_age is 7 days)
     let stale_entry = OplogEntry {
@@ -155,13 +161,18 @@ async fn test_compaction_removes_tombstoned_docs() {
     let ns = "test-ns-tombstone";
 
     let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
 
     // 1. Create a tombstoned document in storage
     let mut doc = CRDTDocument::new("doc-id-1", "rec-id-1", 0);
     doc.set_field("_deleted", CrdtValue::Boolean(true));
     let snapshot = doc.to_snapshot();
-    storage.insert_document("doc-id-1", "rec-id-1", &snapshot).await.unwrap();
+    storage
+        .insert_document("doc-id-1", "rec-id-1", &snapshot)
+        .await
+        .unwrap();
 
     // 2. Write the synced CrdtDelete oplog entry created 2 days ago (grace is 24h)
     let delete_entry = OplogEntry {

@@ -1,7 +1,7 @@
+use crate::crdt::types::CrdtValue;
+use crate::error::VaultSyncError;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::error::VaultSyncError;
-use crate::crdt::types::CrdtValue;
 
 pub type Callback = Box<dyn Fn(&str, &str, &HashMap<String, CrdtValue>) + Send>;
 
@@ -38,14 +38,18 @@ impl SubscriptionEngine {
     pub fn register(&mut self, doc_id: &str, callback: Callback) -> SubscriptionHandle {
         let handle_id = self.next_handle;
         let handle = SubscriptionHandle(handle_id);
-        
-        self.subscriptions.insert(handle_id, Subscription {
-            doc_id: doc_id.to_string(),
-            handle: handle.clone(),
-            callback,
-        });
-        
-        self.by_doc_id.entry(doc_id.to_string())
+
+        self.subscriptions.insert(
+            handle_id,
+            Subscription {
+                doc_id: doc_id.to_string(),
+                handle: handle.clone(),
+                callback,
+            },
+        );
+
+        self.by_doc_id
+            .entry(doc_id.to_string())
             .or_default()
             .push(handle_id);
 
@@ -54,16 +58,18 @@ impl SubscriptionEngine {
     }
 
     pub fn unregister(&mut self, handle: SubscriptionHandle) -> Result<(), VaultSyncError> {
-        let sub = self.subscriptions.remove(&handle.0)
+        let sub = self
+            .subscriptions
+            .remove(&handle.0)
             .ok_or_else(|| VaultSyncError::Storage("subscription not found".into()))?;
-        
+
         if let Some(handles) = self.by_doc_id.get_mut(&sub.doc_id) {
             handles.retain(|&h| h != handle.0);
             if handles.is_empty() {
                 self.by_doc_id.remove(&sub.doc_id);
             }
         }
-        
+
         Ok(())
     }
 
@@ -88,4 +94,3 @@ impl SubscriptionEngine {
         self.subscriptions.len()
     }
 }
-

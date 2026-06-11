@@ -1,7 +1,7 @@
 use crate::storage::traits::StorageConfig;
-use crate::sync::upload::UploadConfig;
 use crate::sync::download::DownloadConfig;
 use crate::sync::retry::RetryConfig;
+use crate::sync::upload::UploadConfig;
 
 #[derive(Debug, Clone)]
 pub struct VaultSyncConfig {
@@ -39,7 +39,7 @@ impl Default for VaultSyncConfig {
             enable_p2p: false,
             p2p_listen_addr: Some("/ip4/0.0.0.0/udp/0/quic-v1".to_string()),
             max_clock_skew: std::time::Duration::from_secs(24 * 3600), // 24 hours
-            max_document_size: 100 * 1024 * 1024, // 100 MB
+            max_document_size: 100 * 1024 * 1024,                      // 100 MB
         }
     }
 }

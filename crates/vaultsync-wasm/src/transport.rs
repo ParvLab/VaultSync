@@ -1,7 +1,7 @@
+use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{WebSocket, MessageEvent, BinaryType};
-use std::sync::{Arc, Mutex};
+use web_sys::{BinaryType, MessageEvent, WebSocket};
 
 #[wasm_bindgen]
 pub struct WasmTransport {
@@ -15,7 +15,8 @@ impl WasmTransport {
         let ws = WebSocket::new(url)?;
         ws.set_binary_type(BinaryType::Arraybuffer);
 
-        let on_message_callback: Arc<Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>> = Arc::new(Mutex::new(None));
+        let on_message_callback: Arc<Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>> =
+            Arc::new(Mutex::new(None));
         let callback_clone = on_message_callback.clone();
 
         let onmessage_callback = Closure::wrap(Box::new(move |e: MessageEvent| {

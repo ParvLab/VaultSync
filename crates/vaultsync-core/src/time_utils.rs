@@ -35,7 +35,10 @@ where
 pub async fn sleep(duration: std::time::Duration) {
     let mut cb = |resolve: js_sys::Function, _reject: js_sys::Function| {
         if let Some(window) = web_sys::window() {
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, duration.as_millis() as i32);
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                &resolve,
+                duration.as_millis() as i32,
+            );
         }
     };
     let promise = js_sys::Promise::new(&mut cb);

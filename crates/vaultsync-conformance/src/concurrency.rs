@@ -1,6 +1,6 @@
+use futures::StreamExt;
 use std::sync::Arc;
 use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation};
-use futures::StreamExt;
 
 pub async fn run_concurrency_tests(coord: Arc<dyn Coordinator>, ns: &str) {
     // 1. concurrent_push_from_two_replicas & concurrent_push_ordering
@@ -10,32 +10,36 @@ pub async fn run_concurrency_tests(coord: Arc<dyn Coordinator>, ns: &str) {
     let ns2 = ns.to_string();
 
     let task1 = tokio::spawn(async move {
-        let muts = (0..10).map(|i| EncryptedMutation {
-            id: format!("m-t1-{}", i),
-            namespace: ns1.clone(),
-            replica_id: "rep-1".to_string(),
-            doc_id: "doc-1".to_string(),
-            record_id: format!("rec-1-{}", i),
-            encrypted_blob: vec![i as u8],
-            timestamp: 1000 + i,
-            schema_version: 0,
-            key_version: 1,
-        }).collect::<Vec<_>>();
+        let muts = (0..10)
+            .map(|i| EncryptedMutation {
+                id: format!("m-t1-{}", i),
+                namespace: ns1.clone(),
+                replica_id: "rep-1".to_string(),
+                doc_id: "doc-1".to_string(),
+                record_id: format!("rec-1-{}", i),
+                encrypted_blob: vec![i as u8],
+                timestamp: 1000 + i,
+                schema_version: 0,
+                key_version: 1,
+            })
+            .collect::<Vec<_>>();
         coord1.push(&ns1, muts).await.expect("push task1")
     });
 
     let task2 = tokio::spawn(async move {
-        let muts = (0..10).map(|i| EncryptedMutation {
-            id: format!("m-t2-{}", i),
-            namespace: ns2.clone(),
-            replica_id: "rep-2".to_string(),
-            doc_id: "doc-1".to_string(),
-            record_id: format!("rec-2-{}", i),
-            encrypted_blob: vec![100 + i as u8],
-            timestamp: 1000 + i,
-            schema_version: 0,
-            key_version: 1,
-        }).collect::<Vec<_>>();
+        let muts = (0..10)
+            .map(|i| EncryptedMutation {
+                id: format!("m-t2-{}", i),
+                namespace: ns2.clone(),
+                replica_id: "rep-2".to_string(),
+                doc_id: "doc-1".to_string(),
+                record_id: format!("rec-2-{}", i),
+                encrypted_blob: vec![100 + i as u8],
+                timestamp: 1000 + i,
+                schema_version: 0,
+                key_version: 1,
+            })
+            .collect::<Vec<_>>();
         coord2.push(&ns2, muts).await.expect("push task2")
     });
 
@@ -55,7 +59,12 @@ pub async fn run_concurrency_tests(coord: Arc<dyn Coordinator>, ns: &str) {
     assert_eq!(pulled.len(), 20, "expected all 20 mutations to be stored");
 
     // 3. concurrent_subscribe_and_push
-    let mut stream = Box::into_pin(coord.subscribe(ns, 0).await.expect("subscribe for concurrency test"));
+    let mut stream = Box::into_pin(
+        coord
+            .subscribe(ns, 0)
+            .await
+            .expect("subscribe for concurrency test"),
+    );
     // Since subscribe might catch up immediately, let's drain the first 20 mutations
     let mut count = 0;
     while count < 20 {

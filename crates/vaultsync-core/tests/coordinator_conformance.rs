@@ -1,12 +1,12 @@
+use std::collections::HashMap;
 use std::sync::Arc;
-use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation, ReplicaInfo};
-use vaultsync_core::coordinator::memory::InMemoryCoordinator;
-use vaultsync_coordinator_sqlite::coordinator::SQLiteCoordinator;
+use std::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vaultsync_coordinator_http::coordinator::{HttpCoordinator, HttpCoordinatorConfig};
 use vaultsync_coordinator_redis::coordinator::RedisCoordinator;
-use std::sync::Mutex;
-use std::collections::HashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use vaultsync_coordinator_sqlite::coordinator::SQLiteCoordinator;
+use vaultsync_core::coordinator::memory::InMemoryCoordinator;
+use vaultsync_core::coordinator::traits::{Coordinator, EncryptedMutation, ReplicaInfo};
 
 pub async fn run_coordinator_conformance_suite(coord: Arc<dyn Coordinator>) {
     let ns = "coord-conformance-ns";
@@ -94,7 +94,7 @@ struct MockMutation {
 
 fn find_crlf(buf: &[u8]) -> Option<usize> {
     for i in 0..buf.len().saturating_sub(1) {
-        if buf[i] == b'\r' && buf[i+1] == b'\n' {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
             return Some(i);
         }
     }
@@ -105,12 +105,15 @@ fn parse_resp(buf: &[u8]) -> Option<(Vec<Vec<u8>>, usize)> {
     if buf.is_empty() || buf[0] != b'*' {
         return None;
     }
-    
+
     let mut pos = 1;
     let crlf_pos = find_crlf(&buf[pos..])? + pos;
-    let num_elements = std::str::from_utf8(&buf[pos..crlf_pos]).ok()?.parse::<usize>().ok()?;
+    let num_elements = std::str::from_utf8(&buf[pos..crlf_pos])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
     pos = crlf_pos + 2;
-    
+
     let mut args = Vec::with_capacity(num_elements);
     for _ in 0..num_elements {
         if pos >= buf.len() || buf[pos] != b'$' {
@@ -118,9 +121,12 @@ fn parse_resp(buf: &[u8]) -> Option<(Vec<Vec<u8>>, usize)> {
         }
         pos += 1;
         let crlf = find_crlf(&buf[pos..])? + pos;
-        let len = std::str::from_utf8(&buf[pos..crlf]).ok()?.parse::<isize>().ok()?;
+        let len = std::str::from_utf8(&buf[pos..crlf])
+            .ok()?
+            .parse::<isize>()
+            .ok()?;
         pos = crlf + 2;
-        
+
         if len == -1 {
             args.push(Vec::new());
         } else {
@@ -161,26 +167,26 @@ fn serialize_blob(b: &[u8]) -> Vec<u8> {
 async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    
+
     let mutations = Arc::new(Mutex::new(Vec::<MockMutation>::new()));
     let schema_version = Arc::new(Mutex::new(0u64));
     let replicas = Arc::new(Mutex::new(HashMap::<String, String>::new()));
     let heartbeats = Arc::new(Mutex::new(HashMap::<String, String>::new()));
-    
+
     let handle = tokio::spawn(async move {
         let mut last_ms = 0u64;
         let mut last_seq = 0u64;
-        
+
         while let Ok((mut socket, _)) = listener.accept().await {
             let mutations = mutations.clone();
             let schema_version = schema_version.clone();
             let replicas = replicas.clone();
             let heartbeats = heartbeats.clone();
-            
+
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
                 let mut data_len = 0;
-                
+
                 loop {
                     let n = match socket.read(&mut buf[data_len..]).await {
                         Ok(0) => break, // EOF
@@ -188,15 +194,16 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                         Err(_) => break,
                     };
                     data_len += n;
-                    
+
                     let mut parse_pos = 0;
                     while parse_pos < data_len {
-                        if let Some((args, bytes_consumed)) = parse_resp(&buf[parse_pos..data_len]) {
+                        if let Some((args, bytes_consumed)) = parse_resp(&buf[parse_pos..data_len])
+                        {
                             parse_pos += bytes_consumed;
                             if args.is_empty() {
                                 continue;
                             }
-                            
+
                             let cmd = std::str::from_utf8(&args[0]).unwrap_or("").to_uppercase();
                             let response: Vec<u8> = match cmd.as_str() {
                                 "PING" => b"+PONG\r\n".to_vec(),
@@ -209,27 +216,59 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                     let mut timestamp = 0;
                                     let mut s_version = 0;
                                     let mut k_version = 1;
-                                    
+
                                     for chunk in args[3..].chunks_exact(2) {
                                         let key = std::str::from_utf8(&chunk[0]).unwrap_or("");
                                         match key {
-                                            "id" => id = std::str::from_utf8(&chunk[1]).unwrap_or("").to_string(),
-                                            "replica_id" => replica_id = std::str::from_utf8(&chunk[1]).unwrap_or("").to_string(),
-                                            "doc_id" => doc_id = std::str::from_utf8(&chunk[1]).unwrap_or("").to_string(),
-                                            "record_id" => record_id = std::str::from_utf8(&chunk[1]).unwrap_or("").to_string(),
+                                            "id" => {
+                                                id = std::str::from_utf8(&chunk[1])
+                                                    .unwrap_or("")
+                                                    .to_string()
+                                            }
+                                            "replica_id" => {
+                                                replica_id = std::str::from_utf8(&chunk[1])
+                                                    .unwrap_or("")
+                                                    .to_string()
+                                            }
+                                            "doc_id" => {
+                                                doc_id = std::str::from_utf8(&chunk[1])
+                                                    .unwrap_or("")
+                                                    .to_string()
+                                            }
+                                            "record_id" => {
+                                                record_id = std::str::from_utf8(&chunk[1])
+                                                    .unwrap_or("")
+                                                    .to_string()
+                                            }
                                             "blob" => encrypted_blob = chunk[1].clone(),
-                                            "ts" => timestamp = std::str::from_utf8(&chunk[1]).unwrap_or("").parse().unwrap_or(0),
-                                            "schema_version" => s_version = std::str::from_utf8(&chunk[1]).unwrap_or("").parse().unwrap_or(0),
-                                            "key_version" => k_version = std::str::from_utf8(&chunk[1]).unwrap_or("").parse().unwrap_or(1),
+                                            "ts" => {
+                                                timestamp = std::str::from_utf8(&chunk[1])
+                                                    .unwrap_or("")
+                                                    .parse()
+                                                    .unwrap_or(0)
+                                            }
+                                            "schema_version" => {
+                                                s_version = std::str::from_utf8(&chunk[1])
+                                                    .unwrap_or("")
+                                                    .parse()
+                                                    .unwrap_or(0)
+                                            }
+                                            "key_version" => {
+                                                k_version = std::str::from_utf8(&chunk[1])
+                                                    .unwrap_or("")
+                                                    .parse()
+                                                    .unwrap_or(1)
+                                            }
                                             _ => {}
                                         }
                                     }
-                                    
+
                                     let now_ms = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
-                                        .as_millis() as u64;
-                                        
+                                        .as_millis()
+                                        as u64;
+
                                     let stream_id = if now_ms == last_ms {
                                         last_seq += 1;
                                         format!("{}-{}", now_ms, last_seq)
@@ -238,7 +277,7 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                         last_seq = 0;
                                         format!("{}-0", now_ms)
                                     };
-                                    
+
                                     {
                                         let mut db = mutations.lock().unwrap();
                                         db.push(MockMutation {
@@ -253,17 +292,24 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                             stream_id: stream_id.clone(),
                                         });
                                     }
-                                    
+
                                     serialize_string(&stream_id)
                                 }
                                 "XRANGE" => {
-                                    let start_seq = stream_id_to_seq(std::str::from_utf8(&args[2]).unwrap_or("0-0"));
-                                    let limit = if args.len() >= 6 && std::str::from_utf8(&args[4]).unwrap_or("") == "COUNT" {
-                                        std::str::from_utf8(&args[5]).unwrap_or("").parse::<usize>().unwrap_or(usize::MAX)
+                                    let start_seq = stream_id_to_seq(
+                                        std::str::from_utf8(&args[2]).unwrap_or("0-0"),
+                                    );
+                                    let limit = if args.len() >= 6
+                                        && std::str::from_utf8(&args[4]).unwrap_or("") == "COUNT"
+                                    {
+                                        std::str::from_utf8(&args[5])
+                                            .unwrap_or("")
+                                            .parse::<usize>()
+                                            .unwrap_or(usize::MAX)
                                     } else {
                                         usize::MAX
                                     };
-                                    
+
                                     let filtered: Vec<MockMutation> = {
                                         let db = mutations.lock().unwrap();
                                         db.iter()
@@ -272,48 +318,71 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                             .cloned()
                                             .collect()
                                     };
-                                    
+
                                     let mut entries_bytes = Vec::new();
                                     for m in &filtered {
                                         let mut entry_bytes = Vec::new();
                                         entry_bytes.extend_from_slice(b"*2\r\n");
-                                        entry_bytes.extend_from_slice(&serialize_string(&m.stream_id));
-                                        
+                                        entry_bytes
+                                            .extend_from_slice(&serialize_string(&m.stream_id));
+
                                         entry_bytes.extend_from_slice(b"*14\r\n");
                                         entry_bytes.extend_from_slice(&serialize_string("id"));
                                         entry_bytes.extend_from_slice(&serialize_string(&m.id));
                                         entry_bytes.extend_from_slice(&serialize_string("doc_id"));
                                         entry_bytes.extend_from_slice(&serialize_string(&m.doc_id));
-                                        entry_bytes.extend_from_slice(&serialize_string("record_id"));
-                                        entry_bytes.extend_from_slice(&serialize_string(&m.record_id));
+                                        entry_bytes
+                                            .extend_from_slice(&serialize_string("record_id"));
+                                        entry_bytes
+                                            .extend_from_slice(&serialize_string(&m.record_id));
                                         entry_bytes.extend_from_slice(&serialize_string("blob"));
-                                        entry_bytes.extend_from_slice(&serialize_blob(&m.encrypted_blob));
+                                        entry_bytes
+                                            .extend_from_slice(&serialize_blob(&m.encrypted_blob));
                                         entry_bytes.extend_from_slice(&serialize_string("ts"));
-                                        entry_bytes.extend_from_slice(&serialize_string(&m.timestamp.to_string()));
-                                        entry_bytes.extend_from_slice(&serialize_string("schema_version"));
-                                        entry_bytes.extend_from_slice(&serialize_string(&m.schema_version.to_string()));
-                                        entry_bytes.extend_from_slice(&serialize_string("key_version"));
-                                        entry_bytes.extend_from_slice(&serialize_string(&m.key_version.to_string()));
-                                        
+                                        entry_bytes.extend_from_slice(&serialize_string(
+                                            &m.timestamp.to_string(),
+                                        ));
+                                        entry_bytes
+                                            .extend_from_slice(&serialize_string("schema_version"));
+                                        entry_bytes.extend_from_slice(&serialize_string(
+                                            &m.schema_version.to_string(),
+                                        ));
+                                        entry_bytes
+                                            .extend_from_slice(&serialize_string("key_version"));
+                                        entry_bytes.extend_from_slice(&serialize_string(
+                                            &m.key_version.to_string(),
+                                        ));
+
                                         entries_bytes.extend_from_slice(&entry_bytes);
                                     }
-                                    
+
                                     let mut res = format!("*{}\r\n", filtered.len()).into_bytes();
                                     res.extend_from_slice(&entries_bytes);
                                     res
                                 }
                                 "XREAD" => {
-                                    let start_seq = stream_id_to_seq(std::str::from_utf8(&args[7]).unwrap_or("0-0"));
-                                    let limit = std::str::from_utf8(&args[4]).unwrap_or("").parse::<usize>().unwrap_or(100);
-                                    let timeout_ms = std::str::from_utf8(&args[2]).unwrap_or("").parse::<u64>().unwrap_or(500);
-                                    
+                                    let start_seq = stream_id_to_seq(
+                                        std::str::from_utf8(&args[7]).unwrap_or("0-0"),
+                                    );
+                                    let limit = std::str::from_utf8(&args[4])
+                                        .unwrap_or("")
+                                        .parse::<usize>()
+                                        .unwrap_or(100);
+                                    let timeout_ms = std::str::from_utf8(&args[2])
+                                        .unwrap_or("")
+                                        .parse::<u64>()
+                                        .unwrap_or(500);
+
                                     let mut elapsed = 0u64;
                                     let mut filtered: Vec<MockMutation>;
                                     loop {
                                         {
                                             let db = mutations.lock().unwrap();
-                                            filtered = db.iter()
-                                                .filter(|m| stream_id_to_seq(&m.stream_id) > start_seq)
+                                            filtered = db
+                                                .iter()
+                                                .filter(|m| {
+                                                    stream_id_to_seq(&m.stream_id) > start_seq
+                                                })
                                                 .take(limit)
                                                 .cloned()
                                                 .collect();
@@ -321,43 +390,66 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                         if !filtered.is_empty() || elapsed >= timeout_ms {
                                             break;
                                         }
-                                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                        tokio::time::sleep(std::time::Duration::from_millis(50))
+                                            .await;
                                         elapsed += 50;
                                     }
-                                    
+
                                     if filtered.is_empty() {
                                         b"$-1\r\n".to_vec()
                                     } else {
                                         let mut res = Vec::new();
                                         res.extend_from_slice(b"*1\r\n*2\r\n");
-                                        res.extend_from_slice(&serialize_string(std::str::from_utf8(&args[6]).unwrap()));
-                                        
+                                        res.extend_from_slice(&serialize_string(
+                                            std::str::from_utf8(&args[6]).unwrap(),
+                                        ));
+
                                         let mut entries_bytes = Vec::new();
                                         for m in &filtered {
                                             let mut entry_bytes = Vec::new();
                                             entry_bytes.extend_from_slice(b"*2\r\n");
-                                            entry_bytes.extend_from_slice(&serialize_string(&m.stream_id));
-                                            
+                                            entry_bytes
+                                                .extend_from_slice(&serialize_string(&m.stream_id));
+
                                             entry_bytes.extend_from_slice(b"*14\r\n");
                                             entry_bytes.extend_from_slice(&serialize_string("id"));
                                             entry_bytes.extend_from_slice(&serialize_string(&m.id));
-                                            entry_bytes.extend_from_slice(&serialize_string("doc_id"));
-                                            entry_bytes.extend_from_slice(&serialize_string(&m.doc_id));
-                                            entry_bytes.extend_from_slice(&serialize_string("record_id"));
-                                            entry_bytes.extend_from_slice(&serialize_string(&m.record_id));
-                                            entry_bytes.extend_from_slice(&serialize_string("blob"));
-                                            entry_bytes.extend_from_slice(&serialize_blob(&m.encrypted_blob));
+                                            entry_bytes
+                                                .extend_from_slice(&serialize_string("doc_id"));
+                                            entry_bytes
+                                                .extend_from_slice(&serialize_string(&m.doc_id));
+                                            entry_bytes
+                                                .extend_from_slice(&serialize_string("record_id"));
+                                            entry_bytes
+                                                .extend_from_slice(&serialize_string(&m.record_id));
+                                            entry_bytes
+                                                .extend_from_slice(&serialize_string("blob"));
+                                            entry_bytes.extend_from_slice(&serialize_blob(
+                                                &m.encrypted_blob,
+                                            ));
                                             entry_bytes.extend_from_slice(&serialize_string("ts"));
-                                            entry_bytes.extend_from_slice(&serialize_string(&m.timestamp.to_string()));
-                                            entry_bytes.extend_from_slice(&serialize_string("schema_version"));
-                                            entry_bytes.extend_from_slice(&serialize_string(&m.schema_version.to_string()));
-                                            entry_bytes.extend_from_slice(&serialize_string("key_version"));
-                                            entry_bytes.extend_from_slice(&serialize_string(&m.key_version.to_string()));
-                                            
+                                            entry_bytes.extend_from_slice(&serialize_string(
+                                                &m.timestamp.to_string(),
+                                            ));
+                                            entry_bytes.extend_from_slice(&serialize_string(
+                                                "schema_version",
+                                            ));
+                                            entry_bytes.extend_from_slice(&serialize_string(
+                                                &m.schema_version.to_string(),
+                                            ));
+                                            entry_bytes.extend_from_slice(&serialize_string(
+                                                "key_version",
+                                            ));
+                                            entry_bytes.extend_from_slice(&serialize_string(
+                                                &m.key_version.to_string(),
+                                            ));
+
                                             entries_bytes.extend_from_slice(&entry_bytes);
                                         }
-                                        
-                                        res.extend_from_slice(format!("*{}\r\n", filtered.len()).as_bytes());
+
+                                        res.extend_from_slice(
+                                            format!("*{}\r\n", filtered.len()).as_bytes(),
+                                        );
                                         res.extend_from_slice(&entries_bytes);
                                         res
                                     }
@@ -404,13 +496,13 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
                                 }
                                 _ => b"-ERR unknown command\r\n".to_vec(),
                             };
-                            
+
                             let _ = socket.write_all(&response).await;
                         } else {
                             break;
                         }
                     }
-                    
+
                     if parse_pos > 0 {
                         buf.copy_within(parse_pos..data_len, 0);
                         data_len -= parse_pos;
@@ -419,7 +511,7 @@ async fn run_mock_redis_server() -> (String, tokio::task::JoinHandle<()>) {
             });
         }
     });
-    
+
     (format!("redis://{}", addr), handle)
 }
 
@@ -455,9 +547,9 @@ async fn test_redis_coordinator_conformance() {
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::test]
 async fn test_libp2p_coordinator_implementation() {
-    use vaultsync_core::coordinator::traits::{EncryptedMutation, ReplicaInfo};
     use futures::StreamExt;
     use tokio::sync::mpsc;
+    use vaultsync_core::coordinator::traits::{EncryptedMutation, ReplicaInfo};
 
     let ns = "libp2p-coord-ns";
     let (incoming_tx1, _incoming_rx1) = mpsc::channel(10);
@@ -468,14 +560,18 @@ async fn test_libp2p_coordinator_implementation() {
         ns,
         Some("/ip4/127.0.0.1/tcp/0".to_string()),
         incoming_tx1,
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     // Node 2
     let (node2, handle2) = vaultsync_transport_libp2p::LibP2pTransport::new(
         ns,
         Some("/ip4/127.0.0.1/tcp/0".to_string()),
         incoming_tx2,
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     tokio::spawn(node1.run());
     tokio::spawn(node2.run());
