@@ -140,16 +140,26 @@ jobs:
     needs: [lint, build-rust]
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Set up Rust cache
         uses: swatinem/rust-cache@v2
+      - name: Cache benchmark history
+        uses: actions/cache@v4
+        with:
+          path: ./cache
+          key: ${{ runner.os }}-benchmark-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-benchmark-
       - name: Build benchmarks
         run: cargo bench -p vaultsync-core --bench coordinator_bench --bench crdt_bench --bench sync_bench --no-run
       - name: Run Criterion benchmarks
-        run: cargo bench -p vaultsync-core --bench coordinator_bench --bench crdt_bench --bench sync_bench -- --output-format bencher > bench_output.txt
+        run: |
+          mkdir -p cache
+          cargo bench -p vaultsync-core --bench coordinator_bench --bench crdt_bench --bench sync_bench -- --output-format bencher > bench_output.txt
       - name: Benchmark regression gate (>10% fails build)
         uses: benchmark-action/github-action-benchmark@v1
         with:
@@ -157,8 +167,7 @@ jobs:
           tool: cargo
           output-file-path: bench_output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: false
-          skip-fetch-gh-pages: true
+          external-data-json-path: ./cache/benchmark-data.json
           alert-threshold: "110%"
           fail-on-alert: true
           comment-on-alert: true
