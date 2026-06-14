@@ -41,7 +41,7 @@ export function VaultSyncProvider({ config, children }: VaultSyncProviderProps) 
         currentClient.shutdown().catch(() => {});
       }
     };
-  }, [config.namespace, config.replicaId, config.coordinatorUrl, config.authToken]);
+  }, [config.namespace, config.replicaId, config.coordinatorUrl, config.authToken, config.dbName, config.storageBackend]);
 
   if (error) {
     return (

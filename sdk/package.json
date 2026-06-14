@@ -7,9 +7,9 @@
   ],
   "scripts": {
     "build:wasm": "wasm-pack build ../crates/vaultsync-wasm --target web --out-dir ../../sdk/packages/web/wasm -- --jobs 1",
-    "build": "npm run build:wasm && npm -w @vaultsync/web run build && npm -w todo-basic run build",
-    "dev": "npm -w examples/react-collab-editor run dev",
-    "e2e": "playwright test --config examples/todo-basic/playwright.config.ts",
+    "build": "npm run build:wasm && npm -w @vaultsync/web run build && npm -w @vaultsync/react run build && npm -w @vaultsync/node run build && npm -w @vaultsync/next run build && npm -w notes run build",
+    "dev": "npm -w notes run dev",
+    "e2e": "playwright test --config examples/notes/playwright.config.ts",
     "docs": "typedoc"
   },
   "devDependencies": {

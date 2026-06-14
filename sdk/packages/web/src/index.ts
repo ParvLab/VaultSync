@@ -17,6 +17,7 @@ export class VaultSyncClient {
   private inner: any;
   private _keys?: KeyManager;
   private _db?: any;
+  private channel?: BroadcastChannel;
 
   private constructor(inner: any) {
     this.inner = inner;
@@ -36,6 +37,32 @@ export class VaultSyncClient {
     return this._keys;
   }
 
+  private setupBroadcastChannel(namespace: string) {
+    const channelName = `vaultsync-ipc-${namespace}`;
+    console.log(`[JS BC] Setting up BroadcastChannel: ${channelName}`);
+    this.channel = new BroadcastChannel(channelName);
+    this.channel.onmessage = (e) => {
+      console.log(`[JS BC] Received message on channel ${channelName}:`, e.data);
+      if (typeof e.data === 'string') {
+        try {
+          const val = JSON.parse(e.data);
+          if (val && typeof val.doc_id === 'string' && typeof val.record_id === 'string') {
+            setTimeout(async () => {
+              try {
+                console.log(`[JS BC] Firing subscription for doc_id=${val.doc_id}, record_id=${val.record_id}`);
+                await this.inner.fire_subscription(val.doc_id, val.record_id);
+              } catch (err) {
+                console.error("[JS BC] Failed to fire subscription in WASM: ", err);
+              }
+            }, 0);
+          }
+        } catch (err) {
+          console.error("[JS BC] Failed to parse message:", err);
+        }
+      }
+    };
+  }
+
   static async create(config: VaultSyncConfig): Promise<VaultSyncClient> {
     // Initialize the WebAssembly module
     await init();
@@ -46,13 +73,22 @@ export class VaultSyncClient {
         config.namespace,
         config.replicaId,
         config.coordinatorUrl,
-        config.authToken || null
+        config.authToken || null,
+        config.dbName || null,
+        config.storageBackend || null
       );
     } else {
-      inner = await WasmVaultSyncClient.new(config.namespace, config.replicaId);
+      inner = await WasmVaultSyncClient.new(
+        config.namespace,
+        config.replicaId,
+        config.dbName || null,
+        config.storageBackend || null
+      );
     }
 
-    return new VaultSyncClient(inner);
+    const client = new VaultSyncClient(inner);
+    client.setupBroadcastChannel(config.namespace);
+    return client;
   }
 
   async insert(docId: string, recordId: string, fields: RecordFields): Promise<void> {
@@ -89,7 +125,9 @@ export class VaultSyncClient {
 
   subscribe(docId: string, callback: SubscriptionCallback): UnsubscribeFn {
     const wasmCallback = (recordId: string, jsonStr: string) => {
-      callback(recordId, JSON.parse(jsonStr));
+      queueMicrotask(() => {
+        callback(recordId, JSON.parse(jsonStr));
+      });
     };
     const handle = this.inner.subscribe(docId, wasmCallback);
     return () => {
@@ -102,6 +140,10 @@ export class VaultSyncClient {
   }
 
   async shutdown(): Promise<void> {
+    if (this.channel) {
+      this.channel.close();
+      this.channel = undefined;
+    }
     await this.inner.shutdown();
   }
 }

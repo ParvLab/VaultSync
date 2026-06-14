@@ -9,8 +9,8 @@ extern "C" {
 struct ConsoleSubscriber;
 
 impl tracing::Subscriber for ConsoleSubscriber {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.level() <= &tracing::Level::INFO
     }
 
     fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {

@@ -82,25 +82,27 @@ impl WasmWsCoordinator {
         // 1. Wait for connection to open
         let (open_rx, close_rx) = {
             let (open_tx, open_rx) = oneshot::channel::<()>();
-            let mut open_tx_opt = Some(open_tx);
+            let open_tx_cell = std::cell::RefCell::new(Some(open_tx));
             let open_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
                 console_log!("[WasmWs] WebSocket opened!");
-                if let Some(tx) = open_tx_opt.take() {
+                if let Some(tx) = open_tx_cell.borrow_mut().take() {
                     let _ = tx.send(());
                 }
-            }) as Box<dyn FnMut(web_sys::Event)>);
+            }) as Box<dyn Fn(web_sys::Event)>);
             ws.set_onopen(Some(open_callback.as_ref().unchecked_ref()));
             open_callback.forget();
 
             // Also setup onclose/onerror to abort if open fails
             let (close_tx, close_rx) = oneshot::channel::<()>();
-            let mut close_tx_opt = Some(close_tx);
+            let close_tx_cell = std::cell::RefCell::new(Some(close_tx));
+            let inner_close_clone = self.inner.clone();
             let close_callback = Closure::wrap(Box::new(move |e: web_sys::Event| {
                 console_log!("[WasmWs] WebSocket closed/failed: {:?}", e);
-                if let Some(tx) = close_tx_opt.take() {
+                if let Some(tx) = close_tx_cell.borrow_mut().take() {
                     let _ = tx.send(());
                 }
-            }) as Box<dyn FnMut(web_sys::Event)>);
+                *inner_close_clone.ws.lock().unwrap() = None;
+            }) as Box<dyn Fn(web_sys::Event)>);
             ws.set_onclose(Some(close_callback.as_ref().unchecked_ref()));
             close_callback.forget();
 
@@ -119,15 +121,16 @@ impl WasmWsCoordinator {
 
         // Setup message handler
         let mut msg_rx = {
-            let (mut msg_tx, msg_rx) = mpsc::channel::<Vec<u8>>(128);
+            let (msg_tx, msg_rx) = mpsc::channel::<Vec<u8>>(128);
+            let msg_tx_cell = std::cell::RefCell::new(msg_tx);
             let msg_callback = Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
                 if let Ok(ab) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
                     let array = js_sys::Uint8Array::new(&ab);
                     let vec = array.to_vec();
-                    let _ = msg_tx.try_send(vec);
+                    let _ = msg_tx_cell.borrow_mut().try_send(vec);
                 }
             })
-                as Box<dyn FnMut(web_sys::MessageEvent)>);
+                as Box<dyn Fn(web_sys::MessageEvent)>);
             ws.set_onmessage(Some(msg_callback.as_ref().unchecked_ref()));
             msg_callback.forget();
 
@@ -332,9 +335,21 @@ impl WasmWsCoordinator {
             // Spawn discovery loop
             let peer_coord_clone = peer_coord.clone();
             let http_url = self.inner.url.clone();
+            let ws_check = ws.clone();
+            let inner_loop = self.inner.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 loop {
                     vaultsync_core::time_utils::sleep(std::time::Duration::from_secs(30)).await;
+                    {
+                        let ws_lock = inner_loop.ws.lock().unwrap();
+                        if let Some(ref current_ws) = *ws_lock {
+                            if current_ws != &ws_check {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
                     if let Ok(active_replicas) = fetch_replicas(&http_url, &ns_str).await {
                         for peer in active_replicas {
                             if peer.replica_id > my_replica_id {
@@ -402,11 +417,23 @@ impl Coordinator for WasmWsCoordinator {
         namespace: &str,
         mutations: Vec<EncryptedMutation>,
     ) -> Result<Vec<SequenceId>, CoordinatorError> {
-        console_log!(
-            "[WasmWs] push called for namespace={}, mutations count={}",
-            namespace,
-            mutations.len()
-        );
+        let is_connected = {
+            let ws_lock = self.inner.ws.lock().unwrap();
+            ws_lock.is_some()
+        };
+        if !is_connected {
+            if let Err(e) = self.connect_and_handshake(namespace, 0, None).await {
+                console_log!("[WasmWs] Reconnect failed during push: {:?}", e);
+                return Err(e);
+            }
+        }
+        if !mutations.is_empty() {
+            console_log!(
+                "[WasmWs] push called for namespace={}, mutations count={}",
+                namespace,
+                mutations.len()
+            );
+        }
         let req_id = uuid::Uuid::new_v4().to_string();
         let payload = PushPayload {
             request_id: req_id.clone(),
@@ -424,10 +451,12 @@ impl Coordinator for WasmWsCoordinator {
                 console_log!("[WasmWs] push failed with error: {}", err);
                 return Err(CoordinatorError::Internal(err));
             }
-            console_log!(
-                "[WasmWs] push ack success, returned sequences={:?}",
-                ack.sequences
-            );
+            if !ack.sequences.is_empty() {
+                console_log!(
+                    "[WasmWs] push ack success, returned sequences={:?}",
+                    ack.sequences
+                );
+            }
             Ok(ack.sequences)
         } else {
             console_log!("[WasmWs] push got invalid response type: {:02X}", msg_type);
@@ -443,12 +472,17 @@ impl Coordinator for WasmWsCoordinator {
         after: SequenceId,
         limit: usize,
     ) -> Result<Vec<PendingMutation>, CoordinatorError> {
-        console_log!(
-            "[WasmWs] pull called for namespace={}, after={}, limit={}",
-            namespace,
-            after,
-            limit
-        );
+        let is_connected = {
+            let ws_lock = self.inner.ws.lock().unwrap();
+            ws_lock.is_some()
+        };
+        if !is_connected {
+            if let Err(e) = self.connect_and_handshake(namespace, after, None).await {
+                console_log!("[WasmWs] Reconnect failed during pull: {:?}", e);
+                return Err(e);
+            }
+        }
+        // Suppress idle pull logs
         let req_id = uuid::Uuid::new_v4().to_string();
         let payload = PullPayload {
             request_id: req_id.clone(),
@@ -464,11 +498,13 @@ impl Coordinator for WasmWsCoordinator {
         if msg_type == MSG_PULL_RESPONSE {
             let resp: PullResponsePayload = serde_json::from_slice(payload)
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            console_log!(
-                "[WasmWs] pull returned {} mutations, has_more={}",
-                resp.mutations.len(),
-                resp.has_more
-            );
+            if !resp.mutations.is_empty() {
+                console_log!(
+                    "[WasmWs] pull returned {} mutations, has_more={}",
+                    resp.mutations.len(),
+                    resp.has_more
+                );
+            }
             Ok(resp.mutations)
         } else {
             console_log!("[WasmWs] pull got invalid response type: {:02X}", msg_type);

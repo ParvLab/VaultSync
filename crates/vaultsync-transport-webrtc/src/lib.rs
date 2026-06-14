@@ -196,7 +196,7 @@ impl PeerCoordinator {
                     }
                 }
             }
-        }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+        }) as Box<dyn Fn(web_sys::MessageEvent)>);
         dc.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
 
@@ -334,7 +334,7 @@ impl PeerCoordinator {
                     });
                 }
             })
-                as Box<dyn FnMut(web_sys::RtcPeerConnectionIceEvent)>);
+                as Box<dyn Fn(web_sys::RtcPeerConnectionIceEvent)>);
 
         pc.set_onicecandidate(Some(onicecandidate.as_ref().unchecked_ref()));
         onicecandidate.forget();
@@ -355,12 +355,12 @@ impl PeerCoordinator {
                         }
                     }
                 }
-            }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+            }) as Box<dyn Fn(web_sys::MessageEvent)>);
 
             dc.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
             onmessage.forget();
         })
-            as Box<dyn FnMut(web_sys::RtcDataChannelEvent)>);
+            as Box<dyn Fn(web_sys::RtcDataChannelEvent)>);
 
         pc.set_ondatachannel(Some(ondatachannel.as_ref().unchecked_ref()));
         ondatachannel.forget();

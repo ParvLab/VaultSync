@@ -10,24 +10,122 @@ use vaultsync_core::oplog::entry::{OplogEntry, SyncStatus};
 use vaultsync_core::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use vaultsync_core::sync::state::SyncState;
 use vaultsync_core::VaultSyncError;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
 use web_sys::*;
 
-struct SendJsFuture<T = JsValue>(JsFuture<T>);
+#[wasm_bindgen(inline_js = r#"
+export function register_promise_callbacks(promise, on_resolve, on_reject) {
+    let active = { value: true };
+    promise.then(
+        (val) => {
+            if (active.value) {
+                on_resolve(val);
+            }
+        },
+        (err) => {
+            if (active.value) {
+                on_reject(err);
+            }
+        }
+    );
+    return () => {
+        active.value = false;
+    };
+}
+"#)]
+extern "C" {
+    fn register_promise_callbacks(
+        promise: &wasm_bindgen::JsValue,
+        on_resolve: &js_sys::Function,
+        on_reject: &js_sys::Function,
+    ) -> js_sys::Function;
+}
+
+pub struct PromiseFuture {
+    rx: futures::channel::oneshot::Receiver<Result<JsValue, JsValue>>,
+    cancel_fn: js_sys::Function,
+    _closures: (Closure<dyn FnMut(JsValue)>, Closure<dyn FnMut(JsValue)>),
+}
+
+impl PromiseFuture {
+    pub fn new(promise: &JsValue) -> Self {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let tx_success = std::sync::Arc::new(Mutex::new(Some(tx)));
+        let tx_error = tx_success.clone();
+
+        let on_resolve = Closure::wrap(Box::new(move |val: JsValue| {
+            if let Ok(mut guard) = tx_success.lock() {
+                if let Some(tx) = guard.take() {
+                    let _ = tx.send(Ok(val));
+                }
+            }
+        }) as Box<dyn FnMut(JsValue)>);
+
+        let on_reject = Closure::wrap(Box::new(move |err: JsValue| {
+            if let Ok(mut guard) = tx_error.lock() {
+                if let Some(tx) = guard.take() {
+                    let _ = tx.send(Err(err));
+                }
+            }
+        }) as Box<dyn FnMut(JsValue)>);
+
+        let cancel_fn = register_promise_callbacks(
+            promise,
+            on_resolve.as_ref().unchecked_ref(),
+            on_reject.as_ref().unchecked_ref(),
+        );
+
+        Self {
+            rx,
+            cancel_fn,
+            _closures: (on_resolve, on_reject),
+        }
+    }
+}
+
+impl Future for PromiseFuture {
+    type Output = Result<JsValue, JsValue>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.rx).poll(cx) {
+            Poll::Ready(Ok(res)) => Poll::Ready(res),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(JsValue::from_str("PromiseFuture cancelled"))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for PromiseFuture {
+    fn drop(&mut self) {
+        let _ = self.cancel_fn.call0(&JsValue::NULL);
+    }
+}
+
+struct SendJsFuture<T = JsValue> {
+    inner: PromiseFuture,
+    _phantom: std::marker::PhantomData<T>,
+}
 
 unsafe impl<T> Send for SendJsFuture<T> {}
 
-impl<T> Future for SendJsFuture<T> {
+impl<T: From<JsValue>> Future for SendJsFuture<T> {
     type Output = Result<T, JsValue>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        unsafe { self.map_unchecked_mut(|s| &mut s.0) }.poll(cx)
+        match unsafe { self.map_unchecked_mut(|s| &mut s.inner) }.poll(cx) {
+            Poll::Ready(Ok(val)) => Poll::Ready(Ok(val.into())),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
 impl<T: wasm_bindgen::convert::FromWasmAbi + 'static> From<Promise<T>> for SendJsFuture<T> {
     fn from(p: Promise<T>) -> Self {
-        Self(JsFuture::from(p))
+        let js_val: JsValue = p.into();
+        Self {
+            inner: PromiseFuture::new(&js_val),
+            _phantom: std::marker::PhantomData,
+        }
     }
 }
 
@@ -75,7 +173,7 @@ impl OpfsInner {
 }
 
 impl OpfsStorage {
-    pub async fn new() -> Result<Self, VaultSyncError> {
+    pub async fn new(db_name: &str) -> Result<Self, VaultSyncError> {
         let window =
             web_sys::window().ok_or_else(|| VaultSyncError::Storage("no window".into()))?;
         let navigator = window.navigator();
@@ -86,14 +184,15 @@ impl OpfsStorage {
             .map_err(|e| VaultSyncError::Storage(format!("get_directory failed: {:?}", e)))?;
 
         let root_handle: FileSystemDirectoryHandle = root_val.clone().into();
-        Self::ensure_dir(&root_handle, "_system").await?;
-        Self::ensure_dir(&root_handle, "docs").await?;
+        let db_dir = Self::ensure_dir(&root_handle, db_name).await?;
+        Self::ensure_dir(&db_dir, "_system").await?;
+        Self::ensure_dir(&db_dir, "docs").await?;
 
-        let index = Self::load_index(&root_handle).await?;
+        let index = Self::load_index(&db_dir).await?;
 
         Ok(Self {
             inner: Mutex::new(OpfsInner {
-                root: root_val,
+                root: JsValue::from(db_dir),
                 index,
             }),
             tx_lock: futures::lock::Mutex::new(()),
@@ -167,8 +266,10 @@ impl OpfsStorage {
                 })?;
                 let writable: FileSystemWritableFileStream = writable_val.into();
 
+                let js_array = js_sys::Uint8Array::new_with_length(data.len() as u32);
+                js_array.copy_from(data);
                 let write_promise = writable
-                    .write_with_u8_array(data)
+                    .write_with_buffer_source(&js_array)
                     .map_err(|e| VaultSyncError::Storage(format!("write error: {:?}", e)))?;
                 SendJsFuture::from(write_promise)
                     .await
@@ -382,8 +483,10 @@ impl OpfsStorage {
                     .await
                     .map_err(|e| VaultSyncError::Storage(format!("create_writable: {:?}", e)))?;
                 let writable: FileSystemWritableFileStream = writable_val.into();
+                let js_array = js_sys::Uint8Array::new_with_length(json.len() as u32);
+                js_array.copy_from(&json);
                 let write_promise = writable
-                    .write_with_u8_array(&json)
+                    .write_with_buffer_source(&js_array)
                     .map_err(|e| VaultSyncError::Storage(format!("write: {:?}", e)))?;
                 SendJsFuture::from(write_promise)
                     .await
@@ -767,19 +870,48 @@ pub enum BrowserStorage {
 }
 
 impl BrowserStorage {
-    pub async fn new(db_name: &str) -> Result<Self, VaultSyncError> {
-        match OpfsStorage::new().await {
-            Ok(opfs) => {
-                tracing::info!("Using OPFS storage backend");
+    pub async fn new(db_name: &str, backend: Option<&str>) -> Result<Self, VaultSyncError> {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[Rust] BrowserStorage::new: db_name={}, requested_backend={:?}",
+            db_name, backend
+        )));
+
+        match backend {
+            Some("opfs") => {
+                let opfs = OpfsStorage::new(db_name).await?;
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                    "[Rust] Using forced OPFS storage backend"
+                ));
                 Ok(Self::Opfs(opfs))
             }
-            Err(e) => {
-                tracing::warn!(
-                    "OPFS storage not available, falling back to IndexedDB: {:?}",
-                    e
-                );
+            Some("indexeddb") => {
                 let idb = IndexedDbStorage::new(db_name).await?;
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                    "[Rust] Using forced IndexedDB storage backend"
+                ));
                 Ok(Self::Idb(idb))
+            }
+            _ => {
+                // OPFS is the preferred default: it is faster, quota-exempt, and
+                // not shared across browser profiles (avoids key-mismatch issues).
+                // Fall back to IndexedDB only when OPFS is unavailable (e.g. non-secure
+                // context or older browsers).
+                match OpfsStorage::new(db_name).await {
+                    Ok(opfs) => {
+                        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                            "[Rust] Using default OPFS storage backend",
+                        ));
+                        Ok(Self::Opfs(opfs))
+                    }
+                    Err(e) => {
+                        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                            "[Rust] OPFS unavailable, falling back to IndexedDB: {:?}",
+                            e
+                        )));
+                        let idb = IndexedDbStorage::new(db_name).await?;
+                        Ok(Self::Idb(idb))
+                    }
+                }
             }
         }
     }

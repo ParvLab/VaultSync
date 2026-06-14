@@ -8,7 +8,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 #[wasm_bindgen_test]
 async fn test_wasm_vaultsync_client_insert_get_update_delete() {
-    let client = WasmVaultSyncClient::new("test_ns", "replica_1")
+    let client = WasmVaultSyncClient::new("test_ns", "replica_1", None, None)
         .await
         .expect("Failed to create WasmVaultSyncClient");
 
@@ -75,7 +75,7 @@ async fn test_wasm_vaultsync_client_insert_get_update_delete() {
 
 #[wasm_bindgen_test]
 async fn test_find_returns_all_records() {
-    let client = WasmVaultSyncClient::new("test_ns_find", "replica_find")
+    let client = WasmVaultSyncClient::new("test_ns_find", "replica_find", None, None)
         .await
         .expect("Failed to create WasmVaultSyncClient");
 
@@ -120,7 +120,7 @@ async fn test_subscribe_fires_on_insert() {
     use std::sync::{Arc, Mutex};
     use wasm_bindgen::JsCast;
 
-    let client = WasmVaultSyncClient::new("test_ns_sub", "replica_sub")
+    let client = WasmVaultSyncClient::new("test_ns_sub", "replica_sub", None, None)
         .await
         .expect("Failed to create WasmVaultSyncClient");
 
@@ -172,7 +172,7 @@ async fn test_subscribe_fires_on_insert() {
 
 #[wasm_bindgen_test]
 async fn test_sync_status_returns_state() {
-    let client = WasmVaultSyncClient::new("test_ns_sync", "replica_sync")
+    let client = WasmVaultSyncClient::new("test_ns_sync", "replica_sync", None, None)
         .await
         .expect("Failed to create WasmVaultSyncClient");
 

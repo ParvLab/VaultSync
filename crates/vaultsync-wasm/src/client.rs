@@ -17,16 +17,21 @@ pub struct WasmVaultSyncClient {
 
 #[wasm_bindgen]
 impl WasmVaultSyncClient {
-    pub async fn new(namespace: &str, replica_id: &str) -> Result<WasmVaultSyncClient, JsValue> {
+    pub async fn new(
+        namespace: &str,
+        replica_id: &str,
+        db_name: Option<String>,
+        storage_backend: Option<String>,
+    ) -> Result<WasmVaultSyncClient, JsValue> {
         let mut config = VaultSyncConfig::default();
         config.namespace = namespace.to_string();
         config.replica_id = replica_id.to_string();
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
 
-        let db_name = format!("{}_db", namespace);
+        let final_db_name = db_name.unwrap_or_else(|| format!("{}_db", namespace));
         let storage = Arc::new(
-            BrowserStorage::new(&db_name)
+            BrowserStorage::new(&final_db_name, storage_backend.as_deref())
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?,
         );
@@ -46,32 +51,6 @@ impl WasmVaultSyncClient {
             JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e))
         })?;
 
-        let client_clone = client.clone();
-        let onmessage =
-            wasm_bindgen::closure::Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
-                if let Some(msg_str) = e.data().as_string() {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg_str) {
-                        if let (Some(doc_id), Some(record_id)) = (
-                            val.get("doc_id").and_then(|v| v.as_str()),
-                            val.get("record_id").and_then(|v| v.as_str()),
-                        ) {
-                            let doc_id = doc_id.to_string();
-                            let record_id = record_id.to_string();
-                            let client = client_clone.clone();
-                            wasm_bindgen_futures::spawn_local(async move {
-                                if let Ok(Some(state)) = client.get(&doc_id, &record_id).await {
-                                    client.fire_local_subscription(&doc_id, &record_id, &state);
-                                }
-                            });
-                        }
-                    }
-                }
-            })
-                as Box<dyn FnMut(web_sys::MessageEvent)>);
-
-        channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-        onmessage.forget();
-
         let channel_send = channel.clone();
         client.set_change_listener(Arc::new(move |doc_id, record_id| {
             let msg = serde_json::json!({
@@ -90,6 +69,8 @@ impl WasmVaultSyncClient {
         replica_id: &str,
         coordinator_url: &str,
         auth_token: Option<String>,
+        db_name: Option<String>,
+        storage_backend: Option<String>,
     ) -> Result<WasmVaultSyncClient, JsValue> {
         let mut config = VaultSyncConfig::default();
         config.namespace = namespace.to_string();
@@ -97,9 +78,9 @@ impl WasmVaultSyncClient {
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
 
-        let db_name = format!("{}_db", namespace);
+        let final_db_name = db_name.unwrap_or_else(|| format!("{}_db", namespace));
         let storage = Arc::new(
-            BrowserStorage::new(&db_name)
+            BrowserStorage::new(&final_db_name, storage_backend.as_deref())
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?,
         );
@@ -121,32 +102,6 @@ impl WasmVaultSyncClient {
         let channel = web_sys::BroadcastChannel::new(&channel_name).map_err(|e| {
             JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e))
         })?;
-
-        let client_clone = client.clone();
-        let onmessage =
-            wasm_bindgen::closure::Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
-                if let Some(msg_str) = e.data().as_string() {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg_str) {
-                        if let (Some(doc_id), Some(record_id)) = (
-                            val.get("doc_id").and_then(|v| v.as_str()),
-                            val.get("record_id").and_then(|v| v.as_str()),
-                        ) {
-                            let doc_id = doc_id.to_string();
-                            let record_id = record_id.to_string();
-                            let client = client_clone.clone();
-                            wasm_bindgen_futures::spawn_local(async move {
-                                if let Ok(Some(state)) = client.get(&doc_id, &record_id).await {
-                                    client.fire_local_subscription(&doc_id, &record_id, &state);
-                                }
-                            });
-                        }
-                    }
-                }
-            })
-                as Box<dyn FnMut(web_sys::MessageEvent)>);
-
-        channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-        onmessage.forget();
 
         let channel_send = channel.clone();
         client.set_change_listener(Arc::new(move |doc_id, record_id| {
@@ -223,6 +178,13 @@ impl WasmVaultSyncClient {
             .shutdown()
             .await
             .map_err(|e| JsValue::from_str(&format!("Shutdown failed: {:?}", e)))?;
+        Ok(())
+    }
+
+    pub async fn fire_subscription(&self, doc_id: &str, record_id: &str) -> Result<(), JsValue> {
+        if let Ok(Some(state)) = self.client.get(doc_id, record_id).await {
+            self.client.fire_local_subscription(doc_id, record_id, &state);
+        }
         Ok(())
     }
 
