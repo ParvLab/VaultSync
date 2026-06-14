@@ -18,11 +18,13 @@ export function useQuery(docId: string, options?: UseQueryOptions) {
     async function fetchInitial() {
       try {
         const records = await client.find(docId);
+        console.log(`[React useQuery] fetchInitial for ${docId}: found ${records.length} records`);
         if (active) {
           setData(records);
           setLoading(false);
         }
       } catch (err) {
+        console.error(`[React useQuery] fetchInitial error for ${docId}:`, err);
         if (active) {
           setError(err as Error);
           setLoading(false);
@@ -37,6 +39,7 @@ export function useQuery(docId: string, options?: UseQueryOptions) {
       if (!active) return;
       try {
         const records = await client.find(docId);
+        console.log(`[React useQuery] Subscription update for ${docId}: found ${records.length} records`);
         if (active) {
           setData(records);
         }

@@ -4,6 +4,7 @@ export interface VaultSyncConfig {
   coordinatorUrl?: string;
   authToken?: string;
   storageBackend?: 'opfs' | 'indexeddb';
+  dbName?: string;
 }
 
 export type RecordFields = Record<string, string | number | boolean | null>;
