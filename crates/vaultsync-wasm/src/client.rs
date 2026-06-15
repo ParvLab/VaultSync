@@ -250,7 +250,7 @@ impl WasmVaultSyncClient {
     }
 
     pub fn subscribe(&self, doc_id: &str, callback: js_sys::Function) -> WasmSubscriptionHandle {
-        let send_cb = SendFunction(callback);
+        let send_cb = SendFunction(JsValue::from(callback));
         let handle = self.client.subscribe(
             doc_id,
             Box::new(move |_doc_id, record_id, fields| {
@@ -269,9 +269,14 @@ impl WasmVaultSyncClient {
                     map.insert(k.clone(), json_val);
                 }
                 if let Ok(json_str) = serde_json::to_string(&serde_json::Value::Object(map)) {
-                    let record_id_js = JsValue::from_str(record_id);
-                    let json_js = JsValue::from_str(&json_str);
-                    let _ = send_cb.0.call2(&JsValue::NULL, &record_id_js, &json_js);
+                    let record_id_owned = record_id.to_string();
+                    let cb_clone = send_cb.0.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let func: js_sys::Function = cb_clone.unchecked_into();
+                        let record_id_js = JsValue::from_str(&record_id_owned);
+                        let json_js = JsValue::from_str(&json_str);
+                        let _ = func.call2(&JsValue::NULL, &record_id_js, &json_js);
+                    });
                 }
             }),
         );
@@ -353,7 +358,7 @@ impl WasmSubscriptionHandle {
     }
 }
 
-struct SendFunction(js_sys::Function);
+struct SendFunction(JsValue);
 
 unsafe impl Send for SendFunction {}
 unsafe impl Sync for SendFunction {}

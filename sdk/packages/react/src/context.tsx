@@ -2,7 +2,7 @@ import React, { createContext, useContext, useEffect, useState } from 'react';
 import { VaultSyncClient } from '@vaultsync/web';
 import type { VaultSyncConfig } from '@vaultsync/web';
 
-const VaultSyncContext = createContext<VaultSyncClient | null>(null);
+export const VaultSyncContext = createContext<VaultSyncClient | null>(null);
 
 export interface VaultSyncProviderProps {
   config: VaultSyncConfig;
@@ -61,12 +61,4 @@ export function VaultSyncProvider({ config, children }: VaultSyncProviderProps) 
       {children}
     </VaultSyncContext.Provider>
   );
-}
-
-export function useVaultSyncClient(): VaultSyncClient {
-  const client = useContext(VaultSyncContext);
-  if (!client) {
-    throw new Error('useVaultSyncClient must be used within a VaultSyncProvider');
-  }
-  return client;
 }

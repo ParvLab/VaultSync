@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useVaultSyncClient } from './context.js';
+import { useVaultSyncClient } from './useVaultSyncClient.js';
 import type { RecordFields } from '@vaultsync/web';
 
 export interface UseQueryOptions {

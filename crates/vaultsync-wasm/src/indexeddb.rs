@@ -47,6 +47,7 @@ impl Drop for IdbRequestFuture {
             if let Some(cleanup) = guard.take() {
                 cleanup.req.set_onsuccess(None);
                 cleanup.req.set_onerror(None);
+                vaultsync_core::time_utils::defer_drop(Box::new(vaultsync_core::time_utils::ForceSendSync(cleanup)));
             }
         }
     }
@@ -91,6 +92,7 @@ impl Drop for OpenDbFuture {
                 cleanup.req.set_onupgradeneeded(None);
                 cleanup.req.set_onsuccess(None);
                 cleanup.req.set_onerror(None);
+                vaultsync_core::time_utils::defer_drop(Box::new(vaultsync_core::time_utils::ForceSendSync(cleanup)));
             }
         }
     }
@@ -141,14 +143,18 @@ fn request_to_future(req: &IdbRequest) -> IdbRequestFuture {
         let req = target.dyn_into::<IdbRequest>().unwrap();
         let result = req.result().unwrap_or(JsValue::NULL);
         if let Some(tx) = tx_success.borrow_mut().take() {
-            let _ = tx.send(Ok(result));
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = tx.send(Ok(result));
+            });
         }
     }) as Box<dyn Fn(Event)>);
 
     let tx_error = shared_tx.clone();
     let onerror = Closure::wrap(Box::new(move |_event: Event| {
         if let Some(tx) = tx_error.borrow_mut().take() {
-            let _ = tx.send(Err(JsValue::from_str("IndexedDB request failed")));
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = tx.send(Err(JsValue::from_str("IndexedDB request failed")));
+            });
         }
     }) as Box<dyn Fn(Event)>);
 
@@ -193,14 +199,18 @@ impl IndexedDbStorage {
             let req = target.dyn_into::<IdbOpenDbRequest>().unwrap();
             let db = req.result().unwrap();
             if let Some(tx) = tx_success.borrow_mut().take() {
-                let _ = tx.send(Ok(db));
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = tx.send(Ok(db));
+                });
             }
         }) as Box<dyn Fn(Event)>);
 
         let tx_error = shared_tx.clone();
         let onerror = Closure::wrap(Box::new(move |_event: Event| {
             if let Some(tx) = tx_error.borrow_mut().take() {
-                let _ = tx.send(Err(JsValue::from_str("IndexedDB open failed")));
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = tx.send(Err(JsValue::from_str("IndexedDB open failed")));
+                });
             }
         }) as Box<dyn Fn(Event)>);
 
