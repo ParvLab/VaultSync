@@ -32,11 +32,53 @@ where
 }
 
 #[cfg(target_arch = "wasm32")]
+pub struct ForceSendSync<T>(pub T);
+
+#[cfg(target_arch = "wasm32")]
+unsafe impl<T> Send for ForceSendSync<T> {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl<T> Sync for ForceSendSync<T> {}
+
+#[cfg(target_arch = "wasm32")]
+static PENDING_DROPS: std::sync::OnceLock<std::sync::Mutex<Vec<Box<dyn std::any::Any + Send + Sync>>>> = std::sync::OnceLock::new();
+
+#[cfg(target_arch = "wasm32")]
+pub fn defer_drop(item: Box<dyn std::any::Any + Send + Sync>) {
+    use wasm_bindgen::JsCast;
+
+    let pending = PENDING_DROPS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut guard = pending.lock().unwrap();
+    let is_empty = guard.is_empty();
+    guard.push(item);
+
+    if is_empty {
+        let window = web_sys::window().expect("no window");
+        let closure = wasm_bindgen::closure::Closure::once(move || {
+            if let Some(pending) = PENDING_DROPS.get() {
+                if let Ok(mut guard) = pending.lock() {
+                    guard.clear();
+                }
+            }
+        });
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            0,
+        );
+        closure.forget();
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 pub struct SleepFuture {
     rx: futures::channel::oneshot::Receiver<()>,
     timeout_id: i32,
-    _closure: wasm_bindgen::closure::Closure<dyn FnMut()>,
+    _closure: Option<wasm_bindgen::closure::Closure<dyn FnMut()>>,
 }
+
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for SleepFuture {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl Sync for SleepFuture {}
 
 #[cfg(target_arch = "wasm32")]
 impl std::future::Future for SleepFuture {
@@ -55,6 +97,9 @@ impl Drop for SleepFuture {
         if let Some(window) = web_sys::window() {
             window.clear_timeout_with_handle(self.timeout_id);
         }
+        if let Some(closure) = self._closure.take() {
+            defer_drop(Box::new(ForceSendSync(closure)));
+        }
     }
 }
 
@@ -65,7 +110,9 @@ pub fn sleep(duration: std::time::Duration) -> SleepFuture {
     let mut tx_opt = Some(tx);
     let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
         if let Some(t) = tx_opt.take() {
-            let _ = t.send(());
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = t.send(());
+            });
         }
     }) as Box<dyn FnMut()>);
 
@@ -80,7 +127,7 @@ pub fn sleep(duration: std::time::Duration) -> SleepFuture {
     SleepFuture {
         rx,
         timeout_id,
-        _closure: closure,
+        _closure: Some(closure),
     }
 }
 
@@ -123,3 +170,79 @@ impl std::ops::Sub<std::time::Duration> for PlatformInstant {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub type PlatformInstant = std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+pub struct SendJsFuture<T = wasm_bindgen::JsValue> {
+    rx: futures::channel::oneshot::Receiver<Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>>,
+    _closures: Option<(wasm_bindgen::closure::Closure<dyn FnMut(wasm_bindgen::JsValue)>, wasm_bindgen::closure::Closure<dyn FnMut(wasm_bindgen::JsValue)>)>,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+#[cfg(target_arch = "wasm32")]
+unsafe impl<T> Send for SendJsFuture<T> {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl<T> Sync for SendJsFuture<T> {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T: From<wasm_bindgen::JsValue>> std::future::Future for SendJsFuture<T> {
+    type Output = Result<T, wasm_bindgen::JsValue>;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let mut rx = unsafe { self.map_unchecked_mut(|s| &mut s.rx) };
+        match std::pin::Pin::new(&mut *rx).poll(cx) {
+            std::task::Poll::Ready(Ok(Ok(val))) => std::task::Poll::Ready(Ok(val.into())),
+            std::task::Poll::Ready(Ok(Err(err))) => std::task::Poll::Ready(Err(err)),
+            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(wasm_bindgen::JsValue::from_str("SendJsFuture cancelled"))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<T> Drop for SendJsFuture<T> {
+    fn drop(&mut self) {
+        if let Some((onsuccess, onerror)) = self._closures.take() {
+            defer_drop(Box::new(ForceSendSync(onsuccess)));
+            defer_drop(Box::new(ForceSendSync(onerror)));
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<T: wasm_bindgen::convert::FromWasmAbi + 'static> From<js_sys::Promise<T>> for SendJsFuture<T> {
+    fn from(p: js_sys::Promise<T>) -> Self {
+        let js_val: wasm_bindgen::JsValue = p.into();
+        let promise: js_sys::Promise = js_val.into();
+        let (tx, rx) = futures::channel::oneshot::channel::<Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>>();
+        let shared_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+
+        let tx_success = shared_tx.clone();
+        let onsuccess = wasm_bindgen::closure::Closure::wrap(Box::new(move |val: wasm_bindgen::JsValue| {
+            let tx_opt = {
+                let mut guard = tx_success.lock().unwrap();
+                guard.take()
+            };
+            if let Some(tx) = tx_opt {
+                let _ = tx.send(Ok(val));
+            }
+        }) as Box<dyn FnMut(wasm_bindgen::JsValue)>);
+
+        let tx_error = shared_tx.clone();
+        let onerror = wasm_bindgen::closure::Closure::wrap(Box::new(move |val: wasm_bindgen::JsValue| {
+            let tx_opt = {
+                let mut guard = tx_error.lock().unwrap();
+                guard.take()
+            };
+            if let Some(tx) = tx_opt {
+                let _ = tx.send(Err(val));
+            }
+        }) as Box<dyn FnMut(wasm_bindgen::JsValue)>);
+
+        let _ = promise.then2(&onsuccess, &onerror);
+
+        Self {
+            rx,
+            _closures: Some((onsuccess, onerror)),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}

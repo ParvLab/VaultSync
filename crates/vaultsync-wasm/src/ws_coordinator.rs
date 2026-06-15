@@ -604,7 +604,7 @@ impl Coordinator for WasmWsCoordinator {
 }
 
 async fn fetch_replicas(url: &str, namespace: &str) -> Result<Vec<ReplicaInfo>, String> {
-    use wasm_bindgen_futures::JsFuture;
+    use vaultsync_core::time_utils::SendJsFuture;
     let window = web_sys::window().ok_or("No window object found".to_string())?;
     let req_url = format!(
         "{}/namespace/{}/replicas",
@@ -618,7 +618,7 @@ async fn fetch_replicas(url: &str, namespace: &str) -> Result<Vec<ReplicaInfo>, 
     let request = web_sys::Request::new_with_str_and_init(&req_url, &opts)
         .map_err(|e| format!("Failed to create request: {:?}", e))?;
 
-    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+    let resp_value = SendJsFuture::from(window.fetch_with_request(&request))
         .await
         .map_err(|e| format!("Fetch failed: {:?}", e))?;
 
@@ -630,7 +630,7 @@ async fn fetch_replicas(url: &str, namespace: &str) -> Result<Vec<ReplicaInfo>, 
         return Err(format!("HTTP error: {}", resp.status()));
     }
 
-    let text_value = JsFuture::from(resp.text().map_err(|e| format!("{:?}", e))?)
+    let text_value = SendJsFuture::from(resp.text().map_err(|e| format!("{:?}", e))?)
         .await
         .map_err(|e| format!("Failed to read text: {:?}", e))?;
 

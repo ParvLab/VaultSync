@@ -1,133 +1,16 @@
 use async_trait::async_trait;
-use js_sys::{Promise, Uint8Array};
+use js_sys::Uint8Array;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Mutex;
-use std::task::{Context, Poll};
 use vaultsync_core::oplog::entry::{OplogEntry, SyncStatus};
 use vaultsync_core::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use vaultsync_core::sync::state::SyncState;
 use vaultsync_core::VaultSyncError;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::*;
 
-#[wasm_bindgen(inline_js = r#"
-export function register_promise_callbacks(promise, on_resolve, on_reject) {
-    let active = { value: true };
-    promise.then(
-        (val) => {
-            if (active.value) {
-                on_resolve(val);
-            }
-        },
-        (err) => {
-            if (active.value) {
-                on_reject(err);
-            }
-        }
-    );
-    return () => {
-        active.value = false;
-    };
-}
-"#)]
-extern "C" {
-    fn register_promise_callbacks(
-        promise: &wasm_bindgen::JsValue,
-        on_resolve: &js_sys::Function,
-        on_reject: &js_sys::Function,
-    ) -> js_sys::Function;
-}
-
-pub struct PromiseFuture {
-    rx: futures::channel::oneshot::Receiver<Result<JsValue, JsValue>>,
-    cancel_fn: js_sys::Function,
-    _closures: (Closure<dyn FnMut(JsValue)>, Closure<dyn FnMut(JsValue)>),
-}
-
-impl PromiseFuture {
-    pub fn new(promise: &JsValue) -> Self {
-        let (tx, rx) = futures::channel::oneshot::channel();
-        let tx_success = std::sync::Arc::new(Mutex::new(Some(tx)));
-        let tx_error = tx_success.clone();
-
-        let on_resolve = Closure::wrap(Box::new(move |val: JsValue| {
-            if let Ok(mut guard) = tx_success.lock() {
-                if let Some(tx) = guard.take() {
-                    let _ = tx.send(Ok(val));
-                }
-            }
-        }) as Box<dyn FnMut(JsValue)>);
-
-        let on_reject = Closure::wrap(Box::new(move |err: JsValue| {
-            if let Ok(mut guard) = tx_error.lock() {
-                if let Some(tx) = guard.take() {
-                    let _ = tx.send(Err(err));
-                }
-            }
-        }) as Box<dyn FnMut(JsValue)>);
-
-        let cancel_fn = register_promise_callbacks(
-            promise,
-            on_resolve.as_ref().unchecked_ref(),
-            on_reject.as_ref().unchecked_ref(),
-        );
-
-        Self {
-            rx,
-            cancel_fn,
-            _closures: (on_resolve, on_reject),
-        }
-    }
-}
-
-impl Future for PromiseFuture {
-    type Output = Result<JsValue, JsValue>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.rx).poll(cx) {
-            Poll::Ready(Ok(res)) => Poll::Ready(res),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(JsValue::from_str("PromiseFuture cancelled"))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl Drop for PromiseFuture {
-    fn drop(&mut self) {
-        let _ = self.cancel_fn.call0(&JsValue::NULL);
-    }
-}
-
-struct SendJsFuture<T = JsValue> {
-    inner: PromiseFuture,
-    _phantom: std::marker::PhantomData<T>,
-}
-
-unsafe impl<T> Send for SendJsFuture<T> {}
-
-impl<T: From<JsValue>> Future for SendJsFuture<T> {
-    type Output = Result<T, JsValue>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match unsafe { self.map_unchecked_mut(|s| &mut s.inner) }.poll(cx) {
-            Poll::Ready(Ok(val)) => Poll::Ready(Ok(val.into())),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<T: wasm_bindgen::convert::FromWasmAbi + 'static> From<Promise<T>> for SendJsFuture<T> {
-    fn from(p: Promise<T>) -> Self {
-        let js_val: JsValue = p.into();
-        Self {
-            inner: PromiseFuture::new(&js_val),
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
+use vaultsync_core::time_utils::SendJsFuture;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OpfsIndex {
@@ -230,14 +113,7 @@ impl OpfsStorage {
     }
 
     async fn sleep(ms: u64) {
-        let mut cb = |resolve: js_sys::Function, _reject: js_sys::Function| {
-            if let Some(window) = web_sys::window() {
-                let _ = window
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms as i32);
-            }
-        };
-        let p = js_sys::Promise::new(&mut cb);
-        let _ = SendJsFuture::from(p).await;
+        vaultsync_core::time_utils::sleep(std::time::Duration::from_millis(ms)).await;
     }
 
     async fn write_doc_file(

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useVaultSyncClient } from './context.js';
+import { useVaultSyncClient } from './useVaultSyncClient.js';
 import type { RecordFields } from '@vaultsync/web';
 
 export function useVaultSyncOne(docId: string, recordId: string) {
@@ -28,7 +28,7 @@ export function useVaultSyncOne(docId: string, recordId: string) {
 
     fetchInitial();
 
-    const unsubscribe = client.subscribe(docId, async (changedRecordId) => {
+    const unsubscribe = client.subscribe(docId, async (changedRecordId: string) => {
       if (!active) return;
       if (changedRecordId === recordId) {
         try {
