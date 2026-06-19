@@ -4,6 +4,7 @@ use std::sync::Arc;
 use vaultsync_core::coordinator::memory::InMemoryCoordinator;
 use vaultsync_core::crdt::types::CrdtValue;
 use vaultsync_core::e2ee::keyring::KeyRing;
+use vaultsync_core::storage::traits::StorageConfig;
 use vaultsync_core::VaultSyncClient;
 use vaultsync_core::VaultSyncConfig;
 use wasm_bindgen::prelude::*;
@@ -35,6 +36,10 @@ impl WasmVaultSyncClient {
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?,
         );
+
+        config.storage = match &*storage {
+            BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
+        };
 
         let coordinator = Arc::new(InMemoryCoordinator::new());
         let keyring = Arc::new(KeyRing::generate());
@@ -84,6 +89,10 @@ impl WasmVaultSyncClient {
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?,
         );
+
+        config.storage = match &*storage {
+            BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
+        };
 
         let coordinator = Arc::new(crate::ws_coordinator::WasmWsCoordinator::new(
             coordinator_url,
