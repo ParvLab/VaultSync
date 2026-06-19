@@ -173,7 +173,11 @@ pub type PlatformInstant = std::time::Instant;
 
 #[cfg(target_arch = "wasm32")]
 pub struct SendJsFuture<T = wasm_bindgen::JsValue> {
-    inner: wasm_bindgen_futures::JsFuture,
+    rx: futures::channel::oneshot::Receiver<Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>>,
+    _closures: Option<(
+        wasm_bindgen::closure::Closure<dyn FnMut(wasm_bindgen::JsValue)>,
+        wasm_bindgen::closure::Closure<dyn FnMut(wasm_bindgen::JsValue)>,
+    )>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -186,11 +190,22 @@ unsafe impl<T> Sync for SendJsFuture<T> {}
 impl<T: From<wasm_bindgen::JsValue>> std::future::Future for SendJsFuture<T> {
     type Output = Result<T, wasm_bindgen::JsValue>;
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
-        match inner.poll(cx) {
-            std::task::Poll::Ready(Ok(val)) => std::task::Poll::Ready(Ok(val.into())),
-            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
+        let mut rx = unsafe { self.map_unchecked_mut(|s| &mut s.rx) };
+        match std::pin::Pin::new(&mut *rx).poll(cx) {
+            std::task::Poll::Ready(Ok(Ok(val))) => std::task::Poll::Ready(Ok(val.into())),
+            std::task::Poll::Ready(Ok(Err(err))) => std::task::Poll::Ready(Err(err)),
+            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(wasm_bindgen::JsValue::from_str("SendJsFuture cancelled"))),
             std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<T> Drop for SendJsFuture<T> {
+    fn drop(&mut self) {
+        if let Some((onsuccess, onerror)) = self._closures.take() {
+            defer_drop(Box::new(ForceSendSync(onsuccess)));
+            defer_drop(Box::new(ForceSendSync(onerror)));
         }
     }
 }
@@ -200,8 +215,36 @@ impl<T: wasm_bindgen::convert::FromWasmAbi + 'static> From<js_sys::Promise<T>> f
     fn from(p: js_sys::Promise<T>) -> Self {
         let js_val: wasm_bindgen::JsValue = p.into();
         let promise: js_sys::Promise = js_val.into();
+        let (tx, rx) = futures::channel::oneshot::channel::<Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>>();
+        let shared_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+
+        let tx_success = shared_tx.clone();
+        let onsuccess = wasm_bindgen::closure::Closure::wrap(Box::new(move |val: wasm_bindgen::JsValue| {
+            let tx_opt = {
+                let mut guard = tx_success.lock().unwrap();
+                guard.take()
+            };
+            if let Some(tx) = tx_opt {
+                let _ = tx.send(Ok(val));
+            }
+        }) as Box<dyn FnMut(wasm_bindgen::JsValue)>);
+
+        let tx_error = shared_tx.clone();
+        let onerror = wasm_bindgen::closure::Closure::wrap(Box::new(move |val: wasm_bindgen::JsValue| {
+            let tx_opt = {
+                let mut guard = tx_error.lock().unwrap();
+                guard.take()
+            };
+            if let Some(tx) = tx_opt {
+                let _ = tx.send(Err(val));
+            }
+        }) as Box<dyn FnMut(wasm_bindgen::JsValue)>);
+
+        let _ = promise.then2(&onsuccess, &onerror);
+
         Self {
-            inner: wasm_bindgen_futures::JsFuture::from(promise),
+            rx,
+            _closures: Some((onsuccess, onerror)),
             _phantom: std::marker::PhantomData,
         }
     }
