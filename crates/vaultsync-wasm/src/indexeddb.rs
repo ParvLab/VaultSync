@@ -47,7 +47,7 @@ impl Drop for IdbRequestFuture {
             if let Some(cleanup) = guard.take() {
                 cleanup.req.set_onsuccess(None);
                 cleanup.req.set_onerror(None);
-                vaultsync_core::time_utils::defer_drop(Box::new(vaultsync_core::time_utils::ForceSendSync(cleanup)));
+                drop(cleanup);
             }
         }
     }
@@ -92,7 +92,7 @@ impl Drop for OpenDbFuture {
                 cleanup.req.set_onupgradeneeded(None);
                 cleanup.req.set_onsuccess(None);
                 cleanup.req.set_onerror(None);
-                vaultsync_core::time_utils::defer_drop(Box::new(vaultsync_core::time_utils::ForceSendSync(cleanup)));
+                drop(cleanup);
             }
         }
     }
