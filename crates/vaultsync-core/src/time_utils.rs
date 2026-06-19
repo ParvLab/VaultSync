@@ -31,45 +31,9 @@ where
     tokio::spawn(future);
 }
 
-#[cfg(target_arch = "wasm32")]
-pub struct ForceSendSync<T>(pub T);
 
-#[cfg(target_arch = "wasm32")]
-unsafe impl<T> Send for ForceSendSync<T> {}
-#[cfg(target_arch = "wasm32")]
-unsafe impl<T> Sync for ForceSendSync<T> {}
 
-#[cfg(target_arch = "wasm32")]
-static PENDING_DROPS: std::sync::OnceLock<std::sync::Mutex<Vec<Box<dyn std::any::Any + Send + Sync>>>> = std::sync::OnceLock::new();
 
-#[cfg(target_arch = "wasm32")]
-static DEFER_FLUSH: std::sync::OnceLock<ForceSendSync<wasm_bindgen::closure::Closure<dyn FnMut()>>> = std::sync::OnceLock::new();
-
-#[cfg(target_arch = "wasm32")]
-pub fn defer_drop(item: Box<dyn std::any::Any + Send + Sync>) {
-    use wasm_bindgen::JsCast;
-
-    let pending = PENDING_DROPS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-    let mut guard = pending.lock().unwrap();
-    guard.push(item);
-
-    if guard.len() == 1 {
-        let closure = DEFER_FLUSH.get_or_init(|| {
-            ForceSendSync(wasm_bindgen::closure::Closure::wrap(Box::new(move || {
-                if let Some(p) = PENDING_DROPS.get() {
-                    if let Ok(mut g) = p.lock() {
-                        g.clear();
-                    }
-                }
-            }) as Box<dyn FnMut()>))
-        });
-        let window = web_sys::window().expect("no window for defer_drop");
-        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            closure.0.as_ref().unchecked_ref(),
-            0,
-        );
-    }
-}
 
 #[cfg(target_arch = "wasm32")]
 pub struct SleepFuture {
@@ -101,7 +65,7 @@ impl Drop for SleepFuture {
             window.clear_timeout_with_handle(self.timeout_id);
         }
         if let Some(closure) = self._closure.take() {
-            defer_drop(Box::new(ForceSendSync(closure)));
+            closure.forget();
         }
     }
 }
@@ -207,8 +171,8 @@ impl<T: From<wasm_bindgen::JsValue>> std::future::Future for SendJsFuture<T> {
 impl<T> Drop for SendJsFuture<T> {
     fn drop(&mut self) {
         if let Some((onsuccess, onerror)) = self._closures.take() {
-            defer_drop(Box::new(ForceSendSync(onsuccess)));
-            defer_drop(Box::new(ForceSendSync(onerror)));
+            onsuccess.forget();
+            onerror.forget();
         }
     }
 }

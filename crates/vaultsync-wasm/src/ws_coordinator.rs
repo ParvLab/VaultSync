@@ -362,7 +362,16 @@ impl WasmWsCoordinator {
             });
         }
 
-        *self.inner.ws.lock().unwrap() = Some(ws);
+        {
+            let mut ws_lock = self.inner.ws.lock().unwrap();
+            if let Some(old_ws) = ws_lock.take() {
+                old_ws.set_onopen(None);
+                old_ws.set_onclose(None);
+                old_ws.set_onmessage(None);
+                let _ = old_ws.close();
+            }
+            *ws_lock = Some(ws);
+        }
         Ok(())
     }
 
