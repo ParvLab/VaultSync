@@ -43,28 +43,31 @@ unsafe impl<T> Sync for ForceSendSync<T> {}
 static PENDING_DROPS: std::sync::OnceLock<std::sync::Mutex<Vec<Box<dyn std::any::Any + Send + Sync>>>> = std::sync::OnceLock::new();
 
 #[cfg(target_arch = "wasm32")]
+static DEFER_FLUSH: std::sync::OnceLock<ForceSendSync<wasm_bindgen::closure::Closure<dyn FnMut()>>> = std::sync::OnceLock::new();
+
+#[cfg(target_arch = "wasm32")]
 pub fn defer_drop(item: Box<dyn std::any::Any + Send + Sync>) {
     use wasm_bindgen::JsCast;
 
     let pending = PENDING_DROPS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
     let mut guard = pending.lock().unwrap();
-    let is_empty = guard.is_empty();
     guard.push(item);
 
-    if is_empty {
-        let window = web_sys::window().expect("no window");
-        let closure = wasm_bindgen::closure::Closure::once(move || {
-            if let Some(pending) = PENDING_DROPS.get() {
-                if let Ok(mut guard) = pending.lock() {
-                    guard.clear();
+    if guard.len() == 1 {
+        let closure = DEFER_FLUSH.get_or_init(|| {
+            ForceSendSync(wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+                if let Some(p) = PENDING_DROPS.get() {
+                    if let Ok(mut g) = p.lock() {
+                        g.clear();
+                    }
                 }
-            }
+            }) as Box<dyn FnMut()>))
         });
+        let window = web_sys::window().expect("no window for defer_drop");
         let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
+            closure.0.as_ref().unchecked_ref(),
             0,
         );
-        closure.forget();
     }
 }
 
