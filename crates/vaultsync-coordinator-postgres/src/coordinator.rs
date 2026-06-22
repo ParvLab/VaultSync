@@ -119,7 +119,7 @@ impl Coordinator for PostgresCoordinator {
             &[&namespace, &after_i64, &limit_i64];
 
         let rows = client_guard.query(
-            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
+            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
              FROM mutations
              WHERE namespace = $1 AND sequence > $2
              ORDER BY sequence ASC
@@ -141,6 +141,7 @@ impl Coordinator for PostgresCoordinator {
                 encrypted_blob: row.get(5),
                 timestamp: ts as u64,
                 key_version: kv as u64,
+                replica_id: row.get(8),
             });
         }
         Ok(res)
@@ -168,7 +169,7 @@ impl Coordinator for PostgresCoordinator {
                 let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
                     &[&namespace_str, &last_sent_i64, &pull_limit_i64];
                 let rows_res = client_guard.query(
-                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
+                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
                      FROM mutations
                      WHERE namespace = $1 AND sequence > $2
                      ORDER BY sequence ASC
@@ -196,6 +197,7 @@ impl Coordinator for PostgresCoordinator {
                                 encrypted_blob: row.get(5),
                                 timestamp: ts as u64,
                                 key_version: kv as u64,
+                                replica_id: row.get(8),
                             };
                             last_sent = last_sent.max(pm.sequence);
                             if tx_mpsc.send(pm).await.is_err() {
@@ -220,7 +222,7 @@ impl Coordinator for PostgresCoordinator {
                         let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
                             &[&namespace_str, &last_sent_i64, &pull_limit_i64];
                         let rows_res = client_guard.query(
-                            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
+                            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
                              FROM mutations
                              WHERE namespace = $1 AND sequence > $2
                              ORDER BY sequence ASC
@@ -248,6 +250,7 @@ impl Coordinator for PostgresCoordinator {
                                         encrypted_blob: row.get(5),
                                         timestamp: ts as u64,
                                         key_version: kv as u64,
+                                        replica_id: row.get(8),
                                     };
                                     last_sent = last_sent.max(pm.sequence);
                                     if tx_mpsc.send(pm).await.is_err() {

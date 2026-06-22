@@ -14,20 +14,16 @@ export function VaultSyncProvider({ config, children }: VaultSyncProviderProps) 
   const [error, setError] = useState<Error | null>(null);
 
   useEffect(() => {
-    let active = true;
-    let currentClient: VaultSyncClient | null = null;
+    let cancelled = false;
 
     async function init() {
       try {
         const c = await VaultSyncClient.create(config);
-        if (active) {
-          currentClient = c;
+        if (!cancelled) {
           setClient(c);
-        } else {
-          c.shutdown().catch(() => {});
         }
       } catch (err) {
-        if (active) {
+        if (!cancelled) {
           setError(err as Error);
         }
       }
@@ -35,11 +31,11 @@ export function VaultSyncProvider({ config, children }: VaultSyncProviderProps) 
 
     init();
 
+    // No shutdown in cleanup: the singleton cache in VaultSyncClient.create()
+    // manages the client lifecycle. Stopping StrictMode from creating a
+    // cross-instance WS echo loop (two clients with different replica_ids).
     return () => {
-      active = false;
-      if (currentClient) {
-        currentClient.shutdown().catch(() => {});
-      }
+      cancelled = true;
     };
   }, [config.namespace, config.replicaId, config.coordinatorUrl, config.authToken, config.dbName, config.storageBackend]);
 

@@ -411,6 +411,7 @@ impl Coordinator for PeerCoordinator {
                             encrypted_blob: m.encrypted_blob.clone(),
                             timestamp: m.timestamp,
                             key_version: m.key_version,
+                            replica_id: m.replica_id.clone(),
                         };
                         if let Ok(s) = serde_json::from_str::<serde_json::Value>(
                             &serde_json::to_string(&pm).unwrap(),

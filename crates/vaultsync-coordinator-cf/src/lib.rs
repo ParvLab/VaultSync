@@ -22,6 +22,8 @@ struct D1MutationRow {
     sequence: i64,
     #[serde(default)]
     key_version: i64,
+    #[serde(default)]
+    replica_id: String,
 }
 
 #[derive(Deserialize)]
@@ -139,7 +141,7 @@ impl DurableObject for NamespaceDurableObject {
                 let limit: i64 = limit_str.parse().unwrap_or(100);
 
                 let stmt = db.prepare(
-                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence, key_version
+                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence, key_version, replica_id
                      FROM mutations
                      WHERE namespace = ?1 AND sequence > ?2
                      ORDER BY sequence ASC
@@ -163,6 +165,7 @@ impl DurableObject for NamespaceDurableObject {
                         encrypted_blob: r.encrypted_blob,
                         timestamp: r.timestamp as u64,
                         key_version: r.key_version as u64,
+                        replica_id: r.replica_id,
                     })
                     .collect();
 
@@ -709,6 +712,7 @@ impl DurableObject for NamespaceDurableObject {
                             encrypted_blob: m.encrypted_blob,
                             timestamp: m.timestamp,
                             key_version: m.key_version,
+                            replica_id: m.replica_id,
                         },
                     );
                 }
@@ -767,7 +771,7 @@ impl DurableObject for NamespaceDurableObject {
                 };
 
                 let stmt = db.prepare(
-                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence, key_version
+                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence, key_version, replica_id
                      FROM mutations
                      WHERE namespace = ?1 AND sequence > ?2
                      ORDER BY sequence ASC
@@ -794,6 +798,7 @@ impl DurableObject for NamespaceDurableObject {
                         encrypted_blob: r.encrypted_blob,
                         timestamp: r.timestamp as u64,
                         key_version: r.key_version as u64,
+                        replica_id: r.replica_id,
                     })
                     .collect();
 
@@ -828,7 +833,7 @@ impl DurableObject for NamespaceDurableObject {
                 };
 
                 let stmt = db.prepare(
-                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence, key_version
+                    "SELECT id, namespace, doc_id, record_id, encrypted_blob, timestamp, sequence, key_version, replica_id
                      FROM mutations
                      WHERE namespace = ?1 AND sequence > ?2
                      ORDER BY sequence ASC"
@@ -849,6 +854,7 @@ impl DurableObject for NamespaceDurableObject {
                         encrypted_blob: r.encrypted_blob,
                         timestamp: r.timestamp as u64,
                         key_version: r.key_version as u64,
+                        replica_id: r.replica_id,
                     };
                     if let Ok(frame) = vaultsync_core::coordinator::ws_proto::encode_frame(
                         vaultsync_core::coordinator::ws_proto::MSG_MUTATION_PUSH,

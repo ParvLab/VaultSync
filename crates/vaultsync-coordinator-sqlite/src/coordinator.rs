@@ -10,6 +10,7 @@ use vaultsync_core::coordinator::traits::*;
 pub struct SQLiteCoordinator {
     conn: Arc<Mutex<rusqlite::Connection>>,
     tx: broadcast::Sender<PendingMutation>,
+    db_path: String,
 }
 
 impl SQLiteCoordinator {
@@ -25,6 +26,7 @@ impl SQLiteCoordinator {
         Self {
             conn: Arc::new(Mutex::new(conn)),
             tx,
+            db_path: path.to_string(),
         }
     }
 }
@@ -36,9 +38,12 @@ impl Coordinator for SQLiteCoordinator {
         namespace: &str,
         mutations: Vec<EncryptedMutation>,
     ) -> Result<Vec<SequenceId>, CoordinatorError> {
+        let db_path = self.db_path.clone();
         let conn = self.conn.clone();
         let namespace_str = namespace.to_string();
         let tx_sender = self.tx.clone();
+
+        tracing::info!("[push] db={} ns={} count={}", db_path, namespace_str, mutations.len());
 
         let push_res = tokio::task::spawn_blocking(move || {
             let mut conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
@@ -74,6 +79,7 @@ impl Coordinator for SQLiteCoordinator {
                         encrypted_blob: m.encrypted_blob,
                         timestamp: m.timestamp,
                         key_version: m.key_version,
+                        replica_id: m.replica_id,
                     });
                 }
             }
@@ -94,13 +100,26 @@ impl Coordinator for SQLiteCoordinator {
         after: SequenceId,
         limit: usize,
     ) -> Result<Vec<PendingMutation>, CoordinatorError> {
+        let db_path = self.db_path.clone();
         let conn = self.conn.clone();
         let namespace_str = namespace.to_string();
 
         tokio::task::spawn_blocking(move || {
             let conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+            // Check max sequence for diagnostic
+            let max_seq: i64 = conn_guard.query_row(
+                "SELECT COALESCE(MAX(sequence),0) FROM mutations WHERE namespace=?",
+                params![namespace_str],
+                |r| r.get(0),
+            ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            tracing::info!("[pull] db={} ns={} after={} max_seq={}", db_path, namespace_str, after, max_seq);
+            if max_seq < after as i64 {
+                tracing::warn!("[pull] cursor past end: after={} max_seq={}", after, max_seq);
+            }
+
             let mut stmt = conn_guard.prepare(
-                "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
+                "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
                  FROM mutations
                  WHERE namespace = ?1 AND sequence > ?2
                  ORDER BY sequence ASC
@@ -117,12 +136,20 @@ impl Coordinator for SQLiteCoordinator {
                     encrypted_blob: row.get(5)?,
                     timestamp: row.get(6)?,
                     key_version: row.get(7)?,
+                    replica_id: row.get(8)?,
                 })
             }).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
             let mut res = Vec::new();
             for row in rows {
                 res.push(row.map_err(|e| CoordinatorError::Internal(e.to_string()))?);
+            }
+            tracing::info!("[pull] returned {} rows", res.len());
+            if let Some(first) = res.first() {
+                tracing::info!("[pull] first seq={}", first.sequence);
+            }
+            if let Some(last) = res.last() {
+                tracing::info!("[pull] last seq={}", last.sequence);
             }
             Ok(res)
         }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
@@ -146,7 +173,7 @@ impl Coordinator for SQLiteCoordinator {
             let db_res = tokio::task::spawn_blocking(move || {
                 let conn_guard = conn.lock().ok()?;
                 let mut stmt = conn_guard.prepare(
-                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
+                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
                      FROM mutations
                      WHERE namespace = ?1 AND sequence > ?2
                      ORDER BY sequence ASC"
@@ -161,6 +188,7 @@ impl Coordinator for SQLiteCoordinator {
                         encrypted_blob: row.get(5)?,
                         timestamp: row.get(6)?,
                         key_version: row.get(7)?,
+                        replica_id: row.get(8)?,
                     })
                 }).ok()?;
                 let mut res = Vec::new();

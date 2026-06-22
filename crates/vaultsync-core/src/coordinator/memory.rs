@@ -75,6 +75,7 @@ impl Coordinator for InMemoryCoordinator {
                 encrypted_blob: m.encrypted_blob,
                 timestamp: m.timestamp,
                 key_version: m.key_version,
+                replica_id: m.replica_id,
             };
             ops.insert((namespace.to_string(), seq), pm.clone());
             seqs.push(seq);
