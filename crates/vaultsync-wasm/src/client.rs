@@ -8,8 +8,17 @@ use vaultsync_core::storage::traits::StorageConfig;
 use vaultsync_core::VaultSyncClient;
 use vaultsync_core::VaultSyncConfig;
 use wasm_bindgen::prelude::*;
-
 use wasm_bindgen::JsCast;
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = log)]
+    fn console_log_str(s: &str);
+}
+
+macro_rules! console_log {
+    ($($t:tt)*) => (console_log_str(&format!($($t)*)));
+}
 
 #[wasm_bindgen]
 pub struct WasmVaultSyncClient {
@@ -50,22 +59,6 @@ impl WasmVaultSyncClient {
                 .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
         );
 
-        // Setup BroadcastChannel for cross-tab sync
-        let channel_name = format!("vaultsync-ipc-{}", namespace);
-        let channel = web_sys::BroadcastChannel::new(&channel_name).map_err(|e| {
-            JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e))
-        })?;
-
-        let channel_send = channel.clone();
-        client.set_change_listener(Arc::new(move |doc_id, record_id| {
-            let msg = serde_json::json!({
-                "doc_id": doc_id,
-                "record_id": record_id,
-            })
-            .to_string();
-            let _ = channel_send.post_message(&JsValue::from_str(&msg));
-        }));
-
         Ok(Self { client })
     }
 
@@ -77,6 +70,7 @@ impl WasmVaultSyncClient {
         db_name: Option<String>,
         storage_backend: Option<String>,
     ) -> Result<WasmVaultSyncClient, JsValue> {
+        console_log!("[1/9] creating browser storage");
         let mut config = VaultSyncConfig::default();
         config.namespace = namespace.to_string();
         config.replica_id = replica_id.to_string();
@@ -94,34 +88,35 @@ impl WasmVaultSyncClient {
             BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
         };
 
+        console_log!("[2/9] creating ws coordinator");
         let coordinator = Arc::new(crate::ws_coordinator::WasmWsCoordinator::new(
             coordinator_url,
             auth_token,
         ));
+        // Clone the Arc BEFORE coercing to dyn Coordinator, so we keep a concrete reference
+        let coordinator_for_client: Arc<dyn vaultsync_core::coordinator::traits::Coordinator> =
+            coordinator.clone();
         let keyring = Arc::new(KeyRing::generate());
 
+        console_log!("[3/9] creating sync client");
         let client = Arc::new(
-            VaultSyncClient::new_with_storage(config, coordinator, keyring, storage)
+            VaultSyncClient::new_with_storage_skip_init(config, coordinator_for_client, keyring, storage)
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
         );
 
-        // Setup BroadcastChannel for cross-tab sync
-        let channel_name = format!("vaultsync-ipc-{}", namespace);
-        let channel = web_sys::BroadcastChannel::new(&channel_name).map_err(|e| {
-            JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e))
+        // Wire WS mutation push → download notification BEFORE initialize (no race)
+        coordinator.set_download_notify(client.events.download_notify.clone());
+
+        // Now start WS connection (background processor starts here, sender already set)
+        client.initialize().await.map_err(|e| {
+            JsValue::from_str(&format!("Initialize failed: {:?}", e))
         })?;
 
-        let channel_send = channel.clone();
-        client.set_change_listener(Arc::new(move |doc_id, record_id| {
-            let msg = serde_json::json!({
-                "doc_id": doc_id,
-                "record_id": record_id,
-            })
-            .to_string();
-            let _ = channel_send.post_message(&JsValue::from_str(&msg));
-        }));
+        // Bootstrap: same event-driven path as WS push notifications
+        client.events.notify_download();
 
+        console_log!("[9/9] client ready");
         Ok(Self { client })
     }
 

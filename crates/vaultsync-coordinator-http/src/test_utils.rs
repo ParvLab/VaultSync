@@ -40,6 +40,7 @@ pub async fn run_mock_server() -> (String, tokio::task::JoinHandle<()>) {
                                             encrypted_blob: m.encrypted_blob,
                                             timestamp: m.timestamp,
                                             key_version: m.key_version,
+                                            replica_id: m.replica_id,
                                         });
                                         seqs.push(seq);
                                     }

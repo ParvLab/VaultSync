@@ -417,6 +417,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                             match stream_res {
                                 Ok(stream) => {
                                     let tx_clone = tx.clone();
+                                    let connected_replica_id = replica_id.clone();
                                     tokio::spawn(async move {
                                         let mut pinned_stream = std::pin::Pin::from(stream);
                                         loop {
@@ -427,6 +428,10 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                                                 next = pinned_stream.next() => {
                                                     match next {
                                                         Some(mutation) => {
+                                                            // Server-side filter: skip mutations from the connected replica
+                                                            if mutation.replica_id == connected_replica_id {
+                                                                continue;
+                                                            }
                                                             if let Ok(frame) = encode_frame(MSG_MUTATION_PUSH, &mutation) {
                                                                 if tx_clone.send(Message::Binary(frame)).await.is_err() {
                                                                     break;

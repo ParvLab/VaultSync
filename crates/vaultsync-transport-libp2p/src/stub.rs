@@ -16,6 +16,8 @@ pub struct PendingMutation {
     pub encrypted_blob: Vec<u8>,
     pub timestamp: u64,
     pub key_version: u64,
+    #[serde(default)]
+    pub replica_id: String,
 }
 
 impl LibP2pTransportHandle {

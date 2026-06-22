@@ -13,14 +13,18 @@ export { PostgresCoordinator } from './coordinator/postgres.js';
 export { RedisCoordinator } from './coordinator/redis.js';
 export { CustomCoordinator } from './coordinator/custom.js';
 
+const instancePromises = new Map<string, Promise<VaultSyncClient>>();
+
 export class VaultSyncClient {
   private inner: any;
   private _keys?: KeyManager;
   private _db?: any;
   private channel?: BroadcastChannel;
+  private namespace: string;
 
-  private constructor(inner: any) {
+  private constructor(inner: any, namespace: string) {
     this.inner = inner;
+    this.namespace = namespace;
   }
 
   get db(): DbProxy & Record<string, Collection<any>> {
@@ -63,32 +67,43 @@ export class VaultSyncClient {
     };
   }
 
-  static async create(config: VaultSyncConfig): Promise<VaultSyncClient> {
-    // Initialize the WebAssembly module
-    await init();
-
-    let inner: any;
-    if (config.coordinatorUrl) {
-      inner = await WasmVaultSyncClient.new_with_coordinator(
-        config.namespace,
-        config.replicaId,
-        config.coordinatorUrl,
-        config.authToken || null,
-        config.dbName || null,
-        config.storageBackend || null
-      );
-    } else {
-      inner = await WasmVaultSyncClient.new(
-        config.namespace,
-        config.replicaId,
-        config.dbName || null,
-        config.storageBackend || null
-      );
+  static create(config: VaultSyncConfig): Promise<VaultSyncClient> {
+    const key = config.namespace;
+    const existing = instancePromises.get(key);
+    if (existing) {
+      console.log(`[VaultSync] Reusing existing client for namespace=${key}`);
+      return existing;
     }
 
-    const client = new VaultSyncClient(inner);
-    client.setupBroadcastChannel(config.namespace);
-    return client;
+    const promise = (async () => {
+      await init();
+
+      let inner: any;
+      if (config.coordinatorUrl) {
+        inner = await WasmVaultSyncClient.new_with_coordinator(
+          config.namespace,
+          config.replicaId,
+          config.coordinatorUrl,
+          config.authToken || null,
+          config.dbName || null,
+          config.storageBackend || null
+        );
+      } else {
+        inner = await WasmVaultSyncClient.new(
+          config.namespace,
+          config.replicaId,
+          config.dbName || null,
+          config.storageBackend || null
+        );
+      }
+
+      const client = new VaultSyncClient(inner, config.namespace);
+      client.setupBroadcastChannel(config.namespace);
+      return client;
+    })();
+
+    instancePromises.set(key, promise);
+    return promise;
   }
 
   async insert(docId: string, recordId: string, fields: RecordFields): Promise<void> {
@@ -144,6 +159,7 @@ export class VaultSyncClient {
       this.channel.close();
       this.channel = undefined;
     }
+    instancePromises.delete(this.namespace);
     await this.inner.shutdown();
   }
 }

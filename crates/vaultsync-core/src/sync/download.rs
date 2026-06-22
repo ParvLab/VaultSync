@@ -27,6 +27,7 @@ pub struct DownloadQueue {
     decryptor: Arc<E2eeDecryptor>,
     metrics: Arc<VaultSyncMetrics>,
     max_clock_skew: std::time::Duration,
+    self_replica_id: String,
 }
 
 impl DownloadQueue {
@@ -40,7 +41,10 @@ impl DownloadQueue {
         decryptor: Arc<E2eeDecryptor>,
         metrics: Arc<VaultSyncMetrics>,
         max_clock_skew: std::time::Duration,
+        self_replica_id: String,
     ) -> Self {
+        tracing::info!("[download_queue::new] cursor={}", last_sequence);
+
         Self {
             coordinator,
             storage,
@@ -51,6 +55,7 @@ impl DownloadQueue {
             decryptor,
             metrics,
             max_clock_skew,
+            self_replica_id,
         }
     }
 
@@ -63,17 +68,30 @@ impl DownloadQueue {
         );
         let _enter = span.enter();
 
-        match self
+        tracing::info!("[download_queue] pulling after={}", after);
+
+        let pull_result = self
             .coordinator
             .pull(&self.namespace, after, self.config.batch_size)
-            .await
-        {
+            .await;
+
+        match pull_result {
             Ok(mutations) => {
                 self.metrics.set_connection_status(&self.namespace, true);
                 let count = mutations.len();
+
+                tracing::info!("[download_queue] received {} mutations", count);
                 let mut entries = Vec::with_capacity(count);
 
                 for m in &mutations {
+                    // Skip our own mutations to prevent echo loops
+                    if m.replica_id == self.self_replica_id {
+                        tracing::debug!(
+                            mutation_id = m.id.as_str(),
+                            "Skipping own mutation to prevent echo loop"
+                        );
+                        continue;
+                    }
                     let local_time = crate::time_utils::system_time_now_ms();
                     let skew = if m.timestamp > local_time {
                         m.timestamp - local_time
@@ -132,9 +150,8 @@ impl DownloadQueue {
 
                 if let Some(last) = mutations.last() {
                     let new_seq = last.sequence;
-                    self.last_sequence
-                        .store(new_seq, std::sync::atomic::Ordering::SeqCst);
 
+                    // Persist cursor to storage FIRST
                     let mut state = match self.storage.read_sync_state(&self.namespace).await? {
                         Some(s) => s,
                         None => crate::sync::state::SyncState {
@@ -153,6 +170,14 @@ impl DownloadQueue {
                     state.last_sync_at = Some(now_ms);
                     self.storage.write_sync_state(&state).await?;
 
+                    // THEN advance in-memory cursor (only after persistence succeeds)
+                    self.last_sequence
+                        .store(new_seq, std::sync::atomic::Ordering::SeqCst);
+                    tracing::info!(
+                        "[download_queue] cursor advanced to {}",
+                        new_seq
+                    );
+
                     // Record sync lag using last mutation's timestamp
                     let lag = now_ms.saturating_sub(last.timestamp);
                     self.metrics.record_sync_lag(lag as f64);
@@ -161,6 +186,10 @@ impl DownloadQueue {
                 }
                 if count > 0 {
                     self.metrics.record_download(count);
+                }
+                tracing::info!("[download_queue] process_batch done count={}", count);
+                if count == 0 && after > 0 {
+                    tracing::warn!("[download_queue] cursor={} but pull returned empty", after);
                 }
                 Ok(count)
             }
@@ -172,6 +201,7 @@ impl DownloadQueue {
             Err(e) => {
                 self.metrics.set_connection_status(&self.namespace, false);
                 self.metrics.record_sync_error();
+                tracing::warn!("[download_queue] pull failed: {:?}", e);
                 Err(VaultSyncError::Coordinator(format!(
                     "download failed: {e:?}"
                 )))
@@ -187,6 +217,14 @@ impl DownloadQueue {
         &self,
         m: crate::coordinator::traits::PendingMutation,
     ) -> Result<(), VaultSyncError> {
+        // Skip our own mutations to prevent echo loops
+        if m.replica_id == self.self_replica_id {
+            tracing::debug!(
+                mutation_id = m.id.as_str(),
+                "Skipping own P2P mutation to prevent echo loop"
+            );
+            return Ok(());
+        }
         let local_time = crate::time_utils::system_time_now_ms();
         let skew = if m.timestamp > local_time {
             m.timestamp - local_time

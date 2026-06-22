@@ -27,6 +27,8 @@ pub struct PendingMutation {
     pub encrypted_blob: Vec<u8>,
     pub timestamp: u64,
     pub key_version: u64,
+    #[serde(default)]
+    pub replica_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +144,7 @@ impl Stream for LibP2pSubscription {
                 encrypted_blob: m.encrypted_blob,
                 timestamp: m.timestamp,
                 key_version: m.key_version,
+                replica_id: m.replica_id,
             })),
             std::task::Poll::Ready(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                 std::task::Poll::Ready(None)
@@ -173,6 +176,7 @@ impl Coordinator for vaultsync_transport_libp2p::LibP2pTransportHandle {
                 encrypted_blob: m.encrypted_blob,
                 timestamp: m.timestamp,
                 key_version: m.key_version,
+                replica_id: m.replica_id,
             };
             self.broadcast_mutation(pm)
                 .await
