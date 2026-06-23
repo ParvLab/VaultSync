@@ -67,7 +67,6 @@ impl DownloadQueue {
     }
 
     pub async fn process_batch(&self) -> Result<usize, VaultSyncError> {
-        let after = self.last_sequence.load(std::sync::atomic::Ordering::SeqCst);
         let span = tracing::info_span!(
             "transport.receive",
             batch_size = self.config.batch_size,
@@ -75,6 +74,10 @@ impl DownloadQueue {
         );
         let _enter = span.enter();
 
+        // ── Generation check: if server restarted, reset cursor ──
+        self.check_generation().await?;
+
+        let after = self.last_sequence.load(std::sync::atomic::Ordering::SeqCst);
         tracing::info!("[download_queue] pulling after={}", after);
 
         // If cursor is far behind, try snapshot-first catch-up
@@ -380,6 +383,32 @@ impl DownloadQueue {
         }
     }
 
+    /// Check server generation against local state. If the server restarted
+    /// (new generation_id), reset cursor to 0 so we re-download all mutations.
+    async fn check_generation(&self) -> Result<(), VaultSyncError> {
+        let server_gen = self.coordinator.generation_id().await;
+        if server_gen.is_empty() {
+            return Ok(());
+        }
+        if let Some(mut state) = self.storage.read_sync_state(&self.namespace).await? {
+            if state.generation_id != server_gen {
+                tracing::info!(
+                    "[download_queue] generation mismatch: local={} server={} -> resetting cursor",
+                    state.generation_id,
+                    server_gen
+                );
+                state.generation_id = server_gen;
+                state.last_synced_sequence = 0;
+                let now_ms = crate::time_utils::system_time_now_ms();
+                state.last_sync_at = Some(now_ms);
+                self.storage.write_sync_state(&state).await?;
+                self.last_sequence.store(0, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!("[download_queue] cursor reset to 0 due to server generation change");
+            }
+        }
+        Ok(())
+    }
+
     /// Process a single pushed mutation from the coordinator subscription
     /// or WebSocket transport. Decrypts, applies via reconciler, advances
     /// cursor, and persists state.
@@ -438,7 +467,7 @@ impl DownloadQueue {
         self.reconciler.apply_remote_update(&entry).await?;
         self.metrics.record_push_received();
 
-        // Advance cursor to the pushed mutation's sequence
+        // Advance cursor to the pushed mutation's sequence (monotonic: never go backwards)
         let new_seq = m.sequence;
         let mut state = match self.storage.read_sync_state(&self.namespace).await? {
             Some(s) => s,
@@ -454,19 +483,28 @@ impl DownloadQueue {
                 generation_id: String::new(),
             },
         };
-        state.last_synced_sequence = new_seq;
         let now_ms = crate::time_utils::system_time_now_ms();
-        state.last_sync_at = Some(now_ms);
-        self.storage.write_sync_state(&state).await?;
+        if new_seq > state.last_synced_sequence {
+            state.last_synced_sequence = new_seq;
+            state.last_sync_at = Some(now_ms);
+            self.storage.write_sync_state(&state).await?;
 
-        // Only advance in-memory cursor after persistence succeeds
-        let old = self.last_sequence.swap(new_seq, std::sync::atomic::Ordering::SeqCst);
-        tracing::info!(
-            "[download_queue] push cursor advanced {} -> {} (mutation={})",
-            old,
-            new_seq,
-            m.id
-        );
+            // Only advance in-memory cursor after persistence succeeds
+            let old = self.last_sequence.swap(new_seq, std::sync::atomic::Ordering::SeqCst);
+            tracing::info!(
+                "[download_queue] push cursor advanced {} -> {} (mutation={})",
+                old,
+                new_seq,
+                m.id
+            );
+        } else {
+            tracing::debug!(
+                "[download_queue] push cursor skipping {} (current={} >= {})",
+                new_seq,
+                state.last_synced_sequence,
+                new_seq
+            );
+        }
 
         let lag = now_ms.saturating_sub(m.timestamp);
         self.metrics.record_sync_lag(lag as f64);
