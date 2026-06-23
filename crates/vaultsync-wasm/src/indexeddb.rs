@@ -507,10 +507,7 @@ impl Storage for IndexedDbStorage {
             .iter()
             .filter(|e| {
                 e.namespace == namespace
-                    && matches!(
-                        e.sync_status,
-                        vaultsync_core::oplog::entry::SyncStatus::Pending
-                    )
+                    && e.sync_status.is_uploadable()
             })
             .take(limit)
             .cloned()

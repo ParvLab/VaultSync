@@ -54,6 +54,7 @@ pub struct VaultSyncClient {
     pub shared_memory: Arc<crate::ipc::shared_memory::SharedMemory>,
     pub events: crate::sync::events::SyncEvents,
     initialized: std::sync::atomic::AtomicBool,
+    clock: crate::clock::HybridLogicalClock,
 }
 
 impl VaultSyncClient {
@@ -409,6 +410,11 @@ impl VaultSyncClient {
 
         let _t = crate::time_utils::system_time_now_ms();
         let (events, upload_event_rx, download_event_rx) = crate::sync::events::SyncEvents::new();
+
+        // Clone before moving into Self (used by download worker below)
+        let coord_for_dl = coordinator.clone();
+        let ns_for_dl = config.namespace.clone();
+
         let client = Self {
             config,
             storage,
@@ -436,6 +442,7 @@ impl VaultSyncClient {
             shared_memory,
             events,
             initialized: std::sync::atomic::AtomicBool::new(false),
+            clock: crate::clock::HybridLogicalClock::new(),
         };
         tracing::info!("[client.new] construction done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
@@ -479,25 +486,89 @@ impl VaultSyncClient {
             }
         });
 
-        // ── Download worker (event-driven + 30s safety timer) ─────────────
+        // ── Download worker (push-driven + 30s safety timer) ─────────────
         let dq = download_queue.clone();
         let mut download_rx = download_events_rx;
+        let coord = coord_for_dl;
+        let ns = ns_for_dl;
+        let initial_seq = download_queue.last_sequence();
         crate::time_utils::spawn(async move {
-            tracing::info!("[download_worker] started");
+            tracing::info!("[download_worker] started cursor={}", initial_seq);
+
+            // Bridge: subscribe stream → mpsc channel (avoids Pin issues in select)
+            let (sub_tx, mut sub_rx) =
+                futures::channel::mpsc::unbounded::<crate::coordinator::traits::PendingMutation>();
+            {
+                let tx = sub_tx.clone();
+                match coord.subscribe(&ns, initial_seq).await {
+                    Ok(stream) => {
+                        tracing::info!("[download_worker] subscribe OK");
+                        let mut pinned = unsafe {
+                            std::pin::Pin::new_unchecked(stream)
+                        };
+                        crate::time_utils::spawn(async move {
+                            use futures::StreamExt;
+                            while let Some(m) = pinned.next().await {
+                                if tx.unbounded_send(m).is_err() {
+                                    break;
+                                }
+                            }
+                            tracing::debug!("[download_worker] subscribe bridge ended");
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("[download_worker] subscribe failed: {:?}", e);
+                    }
+                }
+            }
 
             loop {
                 tracing::debug!("[download_worker] waiting");
 
                 let notify_fut = download_rx.next();
+                let sub_fut = sub_rx.next();
                 let timeout = crate::time_utils::sleep(std::time::Duration::from_secs(30));
 
                 futures::pin_mut!(notify_fut);
+                futures::pin_mut!(sub_fut);
                 futures::pin_mut!(timeout);
 
-                futures::future::select(notify_fut, timeout).await;
+                // Select between the three sources
+                let mut mutation = None;
+                {
+                    use futures::future::Either;
+                    let s1 = futures::future::select(notify_fut, sub_fut);
+                    match futures::future::select(s1, timeout).await {
+                        Either::Left((Either::Left((notify, _)), _)) => {
+                            if let Some(Some(m)) = notify {
+                                mutation = Some(m);
+                            }
+                        }
+                        Either::Left((Either::Right((m, _)), _)) => {
+                            mutation = m;
+                        }
+                        Either::Right(_) => {
+                            tracing::debug!("[download_worker] timer wake");
+                        }
+                    }
+                }
 
-                tracing::debug!("[download_worker] awakened");
+                // Process push mutation if one arrived
+                if let Some(m) = mutation {
+                    tracing::debug!(
+                        "[download_worker] push seq={} id={}",
+                        m.sequence,
+                        m.id
+                    );
+                    if let Err(e) = dq.process_push_mutation(m).await {
+                        tracing::warn!(
+                            "[download_worker] process_push_mutation error: {:?}",
+                            e
+                        );
+                    }
+                }
 
+                // Drain batch mutations (backfill any gaps after push)
                 loop {
                     tracing::debug!("[download_worker] calling process_batch");
 
@@ -612,7 +683,7 @@ impl VaultSyncClient {
         }
         tracing::info!(namespace = %self.config.namespace, "VaultSync client initializing");
         tracing::info!("[4/9] coordinator register");
-        self.coordinator
+        if let Err(e) = self.coordinator
             .register(
                 &self.config.namespace,
                 ReplicaInfo {
@@ -623,7 +694,32 @@ impl VaultSyncClient {
                 },
             )
             .await
-            .map_err(|e| VaultSyncError::Coordinator(format!("register failed: {e:?}")))?;
+        {
+            tracing::warn!("Coordinator unavailable, continuing offline: {:?}", e);
+        } else {
+            // Check generation ID — reset cursor if server restarted
+            let server_gen = self.coordinator.generation_id().await;
+            if !server_gen.is_empty() {
+                tracing::info!("[5/9] generation check server_gen={}", server_gen);
+                if let Some(mut state) = self.storage.read_sync_state(&self.config.namespace).await? {
+                    if state.generation_id != server_gen {
+                        tracing::info!(
+                            "[sync_state] generation mismatch: local={} server={} -> resetting cursor",
+                            state.generation_id,
+                            server_gen
+                        );
+                        state.generation_id = server_gen.clone();
+                        state.last_synced_sequence = 0;
+                        let now_ms = crate::time_utils::system_time_now_ms();
+                        state.last_sync_at = Some(now_ms);
+                        self.storage.write_sync_state(&state).await?;
+                        self.download_queue.reset_cursor(0);
+                        tracing::info!("[sync_state] cursor reset to 0 due to server generation change");
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -671,7 +767,11 @@ impl VaultSyncClient {
             .encryptor
             .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-        let epoch = crate::time_utils::system_time_now_ms();
+        let hlc = self.clock.now();
+        if self.clock.did_logical_wrap() {
+            self.metrics.record_hlc_wrap();
+            self.clock.clear_logical_wrap();
+        }
         let entry = OplogEntry {
             id: uuid::Uuid::new_v4().to_string(),
             replica_id: self.config.replica_id.clone(),
@@ -681,11 +781,11 @@ impl VaultSyncClient {
             record_id: record_id.to_string(),
             yrs_update: update_bytes,
             encrypted_blob: Some(encrypted_blob),
-            timestamp: epoch,
+            timestamp: hlc.wall,
             sequence: None,
-            sync_status: SyncStatus::Pending,
+            sync_status: SyncStatus::Optimistic,
             synced_at: None,
-            created_at: epoch,
+            created_at: hlc.wall,
         };
 
         let append_span = tracing::info_span!(
@@ -706,6 +806,8 @@ impl VaultSyncClient {
                 let key_version = self.keyring.active_key().version;
                 self.broadcast_p2p(&entry, key_version).await;
                 self.events.notify_upload();
+                self.metrics
+                    .record_optimistic_write();
                 self.metrics
                     .record_mutation_attempt(&self.config.namespace, "success");
                 let pending = self.pending_uploads().await.unwrap_or(0);
@@ -777,7 +879,11 @@ impl VaultSyncClient {
             .encryptor
             .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-        let epoch = crate::time_utils::system_time_now_ms();
+        let hlc = self.clock.now();
+        if self.clock.did_logical_wrap() {
+            self.metrics.record_hlc_wrap();
+            self.clock.clear_logical_wrap();
+        }
         let entry = OplogEntry {
             id: uuid::Uuid::new_v4().to_string(),
             replica_id: self.config.replica_id.clone(),
@@ -787,11 +893,11 @@ impl VaultSyncClient {
             record_id: record_id.to_string(),
             yrs_update: update_bytes,
             encrypted_blob: Some(encrypted_blob),
-            timestamp: epoch,
+            timestamp: hlc.wall,
             sequence: None,
-            sync_status: SyncStatus::Pending,
+            sync_status: SyncStatus::Optimistic,
             synced_at: None,
-            created_at: epoch,
+            created_at: hlc.wall,
         };
 
         let append_span = tracing::info_span!(
@@ -812,6 +918,8 @@ impl VaultSyncClient {
                 let key_version = self.keyring.active_key().version;
                 self.broadcast_p2p(&entry, key_version).await;
                 self.events.notify_upload();
+                self.metrics
+                    .record_optimistic_write();
                 self.metrics
                     .record_mutation_attempt(&self.config.namespace, "success");
                 let pending = self.pending_uploads().await.unwrap_or(0);
@@ -868,7 +976,11 @@ impl VaultSyncClient {
                 .encryptor
                 .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-            let epoch = crate::time_utils::system_time_now_ms();
+            let hlc = self.clock.now();
+            if self.clock.did_logical_wrap() {
+                self.metrics.record_hlc_wrap();
+                self.clock.clear_logical_wrap();
+            }
             let entry = OplogEntry {
                 id: uuid::Uuid::new_v4().to_string(),
                 replica_id: self.config.replica_id.clone(),
@@ -878,11 +990,11 @@ impl VaultSyncClient {
                 record_id: record_id.to_string(),
                 yrs_update: update_bytes,
                 encrypted_blob: Some(encrypted_blob),
-                timestamp: epoch,
+                timestamp: hlc.wall,
                 sequence: None,
-                sync_status: SyncStatus::Pending,
+                sync_status: SyncStatus::Optimistic,
                 synced_at: None,
-                created_at: epoch,
+                created_at: hlc.wall,
             };
 
             let append_span = tracing::info_span!(
@@ -903,6 +1015,8 @@ impl VaultSyncClient {
                     let key_version = self.keyring.active_key().version;
                     self.broadcast_p2p(&entry, key_version).await;
                     self.events.notify_upload();
+                    self.metrics
+                        .record_optimistic_write();
                     self.metrics
                         .record_mutation_attempt(&self.config.namespace, "success");
                     let pending = self.pending_uploads().await.unwrap_or(0);
@@ -1035,6 +1149,7 @@ impl VaultSyncClient {
                 last_connected_at: None,
                 last_sync_at: None,
                 schema_version: 0,
+                generation_id: String::new(),
             })
         }
     }

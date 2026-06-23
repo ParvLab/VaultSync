@@ -553,7 +553,7 @@ impl Storage for OpfsStorage {
         let results: Vec<OplogEntry> = index
             .oplog
             .iter()
-            .filter(|e| e.namespace == namespace && matches!(e.sync_status, SyncStatus::Pending))
+            .filter(|e| e.namespace == namespace && e.sync_status.is_uploadable())
             .take(limit)
             .cloned()
             .collect();

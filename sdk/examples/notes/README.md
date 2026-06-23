@@ -12,7 +12,8 @@ This application is built with **React**, **Vite**, and **TypeScript**, showcasi
 * **Seamless Offline-First Sync:** Disconnect from the network, make edits, and reconnect. Mutations are queued in the local oplog and sync automatically when connection is restored.
 * **Multi-Tab Leader Election:** Open the app in multiple browser tabs on the same namespace. One tab is elected as the "Leader" to handle coordinator communication, while other tabs ("Followers") instantly sync via shared state.
 * **End-to-End Encryption (E2EE) with Key Rotation:** All data is encrypted client-side using WebCrypto APIs before syncing. The coordinator only sees encrypted blobs. Rotate keys instantly with a single click from the UI.
-* **Real-Time Presence & Status:** Live display of sync status (connected, offline, syncing), pending mutation counters, and E2EE key versions.
+* **Real-Time Presence & Status:** Live display of sync status (connected, offline, syncing), active peer count (from BroadcastChannel heartbeat), pending mutation counters, and E2EE key versions.
+* **Built-in Metrics:** Monitor push mutations received, snapshots applied, optimistic writes, and active peers — accessible via `vaultsync.metrics()`.
 
 ---
 
@@ -20,26 +21,42 @@ This application is built with **React**, **Vite**, and **TypeScript**, showcasi
 
 ```
                        BROWSER WORKSPACE (Local Device)
- ┌────────────────────────────────────────────────────────────────────────┐
- │                                                                        │
- │   Multiple Browser Tabs (Followers)    Main Browser Tab (Leader)       │
- │  ┌───────────────────────────────┐    ┌─────────────────────────────┐  │
- │  │        React UI App           │    │        React UI App         │  │
- │  │  useQuery() useSyncStatus()   │    │  useQuery() useSyncStatus() │  │
- │  └───────────────┬───────────────┘    └──────────────┬──────────────┘  │
- │                  │ BroadcastChannel                  │                 │
- │                  └───────────────────────────────────┼────────┐        │
- │                                                      │        │        │
- │                                                      ▼        ▼        │
- │                                             ┌───────────────────────┐  │
- │                                             │    VaultSyncClient    │  │
- │                                             │      (WASM Core)      │  │
- │                                             └──────────┬────────────┘  │
- │                                                        │               │
- │                                                        ▼               │
- │                                              Local IndexedDB / OPFS    │
- │                                              (Encrypted SQLite)        │
- └──────────────────────────────────────────────────────┬─────────────────┘
+ ┌───────────────────────────────────────────────────────────────────────────┐
+ │                                                                           │
+ │   Multiple Browser Tabs (Followers)     Main Browser Tab (Leader)         │
+ │  ┌──────────────────────────────┐      ┌────────────────────────────────┐ │
+ │  │        React UI App          │      │        React UI App            │ │
+ │  │  useQuery() useSyncStatus()  │      │  useQuery() useSyncStatus()   │ │
+ │  └──────────────┬───────────────┘      └──────────────────┬─────────────┘ │
+ │                 │ BroadcastChannel                        │               │
+ │                 └─────────────────────────────────────────┼───────┐       │
+ │                                                           │       │       │
+ │                                                           ▼       ▼       │
+ │                                          ┌────────────────────────────┐   │
+ │                                          │      VaultSyncClient       │   │
+ │                                          │        (WASM Core)         │   │
+ │                                          │  ┌──────────────────────┐  │   │
+ │                                          │  │  HybridLogicalClock  │  │   │
+ │                                          │  │  (HLC — CAS-based)   │  │   │
+ │                                          │  └──────────────────────┘  │   │
+ │                                          │  ┌──────────────────────┐  │   │
+ │                                          │  │   TransportRouter    │  │   │
+ │                                          │  │  BC + WS merge       │  │   │
+ │                                          │  └──────────────────────┘  │   │
+ │                                          │  ┌──────────────────────┐  │   │
+ │                                          │  │   MutationStore      │  │   │
+ │                                          │  │  (OPFS-backed queue) │  │   │
+ │                                          │  └──────────────────────┘  │   │
+ │                                          │  ┌──────────────────────┐  │   │
+ │                                          │  │   PresenceManager   │  │   │
+ │                                          │  │  (BC heartbeat)     │  │   │
+ │                                          │  └──────────────────────┘  │   │
+ │                                          └──────────┬─────────────────┘   │
+ │                                                     │                     │
+ │                                                     ▼                     │
+ │                                            Local IndexedDB / OPFS         │
+ │                                            (Encrypted SQLite)             │
+ └──────────────────────────────────────────────────────┬────────────────────┘
                                                         │
                                                         │ Secure WebSockets (TLS)
                                                         ▼
@@ -82,6 +99,7 @@ To test multi-tab synchronization and real-time updates:
 1. Open [http://localhost:5173/?ns=test-workspace&replica=tab-a](http://localhost:5173/?ns=test-workspace&replica=tab-a)
 2. Open a second window next to it at [http://localhost:5173/?ns=test-workspace&replica=tab-b](http://localhost:5173/?ns=test-workspace&replica=tab-b)
 3. Write a note in the first window and watch it sync to the second window instantly!
+4. Observe the SyncBar in each window — it shows the active peer count, confirming real-time presence detection via BroadcastChannel heartbeat.
 
 ---
 
@@ -106,6 +124,8 @@ export default function App() {
   );
 }
 ```
+
+> **Note:** Presence is enabled automatically via an internal BroadcastChannel. No extra configuration is needed — the `PresenceManager` starts on client initialization and exposes peer state through `vaultsync.presence().activePeers()`.
 
 ### 2. Querying Collections
 Bind data reactively to your UI:
@@ -142,4 +162,27 @@ export function NoteEditor({ noteId }) {
     });
   };
 }
+
+### 4. Accessing Presence & Metrics
+
+The VaultSync client exposes APIs for monitoring real-time collaboration and engine health:
+
+```tsx
+import { useVaultSync } from '@vaultsync/react';
+
+function SyncBar() {
+  const vaultsync = useVaultSync();
+  const peers = vaultsync.presence().activePeers();
+  const metrics = vaultsync.metrics().snapshot();
+
+  return (
+    <div className="sync-bar">
+      <span>Active peers: {peers.length}</span>
+      <span>Push mutations: {metrics.pushMutationsReceived}</span>
+      <span>Snapshots applied: {metrics.snapshotsApplied}</span>
+      <span>Optimistic writes: {metrics.optimisticWrites}</span>
+    </div>
+  );
+}
+```
 ```

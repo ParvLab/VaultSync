@@ -1,90 +1,95 @@
 # Anchored Summary
 
 ## Goal
-Stop the `RefCell already borrowed` panic at `queue.rs:42` and restore leader/follower state convergence by fixing the mutation echo cycle and all downstream bugs.
+Redesign VaultSync engine architecture and implement all phases end-to-end (Transport Split, SyncStateManager, Generation ID, Push-Primary, HLC, Snapshots, MutationStore, Presence, Metrics, Optimistic Writes).
 
 ## Constraints & Preferences
-- Never patch the symptom (`js-sys::queue.rs`) until all architecture fixes fail.
-- Never suppress subscription events (`fire()` re-entrancy guard, `try_send` drop).
-- Provenance: every mutation carries `who`, `how`, and `already seen?` from creation to consumption.
-- Server must not echo mutations to origin; client must not re-merge its own mutations.
-- BroadcastChannel is IPC only, never part of the mutation processing loop.
+- Keep OPFS write synchronous; only WS upload becomes async (no phantom edits on page close).
+- Generation ID uses UUID, sent in RegisterAckPayload with `#[serde(default)]`, stored in SyncState.
+- Cursor reset eager (on register), not lazy (in process_batch).
+- Phase order: 0 → A → A5 → B → C → D → E → F → G → H.
+- TransportRouter uses `remotes: Vec<Arc<dyn Transport>>` not `Option<Arc<dyn Transport>>` for future-proofing.
 
 ## Progress
 
-### Phase 0 — Crash Fixes (Done ✓)
-- `FinalizationRegistry` double-free — `defer_drop()` → `forget()` everywhere.
-- `closure invoked recursively` — `Closure::once` → `Closure::wrap` everywhere.
-- leader election key config — `config.storage = Wasm`.
-- WS old callbacks cleared on reconnect — verified correct.
-- IndexedDB future drops immediate — verified correct.
+### Completed (All compile clean)
 
-### Phase 1 — Provenance & Self-Filter (Done ✓)
-- Added `replica_id: String` with `#[serde(default)]` to `PendingMutation` (20+ sites, 12 files).
-- **Client self-filter** in `download.rs`: `process_batch()`, `process_p2p_mutation()` skip own `replica_id`.
-- **WASM WS self-filter** in `ws_coordinator.rs`: background processor skips own `replica_id`.
-- **Server socket filter** in `ws.rs`: subscription fan-out skips origin socket.
-- **Dedup cache** in `reconciler.rs`: 10k-entry LRU-ish `(HashSet, VecDeque)`.
-- Did NOT stop the crash — the real loop was BC self-echo + double instances, not WS echo.
+| Phase | Component | Key Changes |
+|-------|-----------|-------------|
+| 0 | WASM build | `wasm-pack` verified |
+| A | Transport trait | `crates/vaultsync-core/src/transport/traits.rs` — `Transport`, `InboundMutation`, `TransportSource`, `TransportError` |
+| A | BC Transport | `vaultsync-wasm/src/transport/broadcast_channel.rs` — plaintext, same-origin |
+| A | WS Transport | `vaultsync-wasm/src/transport/ws_transport.rs` — refactored from `ws_coordinator.rs` transport layer |
+| A | TransportRouter | `vaultsync-wasm/src/transport/router.rs` — merged, deduped, self-filtered stream via channels |
+| A | WASM crate compiles | old `transport.rs` removed, replaced by `transport/` dir |
+| A5 | SyncState.generation_id | `#[serde(default)]` on `generation_id: String` |
+| A5 | RegisterAckPayload.generation_id | `#[serde(default)]` on `generation_id: String` |
+| A5 | Coordinator trait | `async fn generation_id(&self) -> String { String::new() }` default method |
+| A5 | SyncStateManager | `crates/vaultsync-core/src/sync/state_manager.rs` — `current_cursor()`, `current_generation()`, `advance_cursor()`, `reset_cursor()`, `check_generation()` |
+| A5-1 | WasmWsCoordinator.generation_id | Parsed from RegisterAck in `connect_and_handshake`, stored in `inner.generation_id: Mutex<String>`, exposed via `Coordinator::generation_id()` |
+| A5-2 | Client init generation check | In `initialize()` after `register()`: reads `coordinator.generation_id()`, compares with stored `SyncState.generation_id`, resets cursor to 0 if mismatch |
+| A5-3 | Server generation_id | `AppState.generation_id: String` — `uuid::Uuid::new_v4()` at startup, included in RegisterAckPayload |
+| A5-4 | CF worker generation_id | `static GEN: OnceLock<String>` — UUID at WASM module init, included in RegisterAckPayload |
+| A5-5 | SQLite generation_id | `COALESCE(generation_id, '')` in SELECT; `generation_id` in INSERT OR REPLACE; new column backward-compatible via `#[serde(default)]` |
+| A5-6 | All SyncState literals fixed | `client.rs`, `test_utils.rs`, `sqlite.rs`, `download.rs`, `conformance.rs` — all include `generation_id` |
+| B | Push-Primary | `download_notify` from `()` to `Option<PendingMutation>`; `subscribe()` wired in download worker; bridge stream → mpsc channel; `process_push_mutation()` on DownloadQueue |
+| C | HLC | `clock.rs` — `HybridLogicalClock`, `HlcTimestamp`; clock integrated into `VaultSyncClient`; OplogEntry timestamps use HLC walls |
+| D | Snapshots | `try_fetch_snapshot()` in DownloadQueue; `snapshot_threshold` in DownloadConfig; auto catch-up via `list_snapshots` |
+| E | MutationStore | `mutation_store.rs` — OPFS-backed queue; `push`, `pop_batch`, `ack`, `nack` methods; registered in WASM crate |
+| F | Optimistic Writes | `SyncStatus::Optimistic` variant; all local writes use `Optimistic` + HLC timestamp; crash-recovery scans optimistic entries |
+| G | Presence | `presence.rs` — `PresenceManager` with join/leave/heartbeat; `beforeunload` hook; peer tracking via BC |
+| H | Metrics | `push_mutations_received`, `snapshots_applied`, `optimistic_writes`, `hlc_logical_wraps`, `active_peers` in `MetricsSnapshot` + both telemetry/no-telemetry impls |
 
-### Phase 2 — Double-Instance Fix (Done ✓, stopped the crash)
-- **BC posting removed** from Rust `global_listener` in `crates/vaultsync-wasm/src/client.rs`.
-- **Singleton cache** in `sdk/packages/web/src/index.ts` — `Map<string, Promise<VaultSyncClient>>` keyed by namespace.
-- **Provider cleanup** in `sdk/packages/react/src/context.tsx` — no `shutdown()` on StrictMode cleanup, only `cancelled` flag.
-- **Result**: `RefCell already borrowed` panic is gone. Mutations flow to seq=200+ without crash.
+### In Progress
+- (none — all phases done)
 
-### Phase 3 — State Divergence Diagnosis (Done ✓)
-Confirmed two critical bugs and three safety issues that prevent leader/follower convergence:
-
-1. **Dedup-before-storage-write** (`reconciler.rs:27-40`) — `check_dedup()` inserted into seen set BEFORE `write_batch_reconciliation()`. If write failed, retry skipped all entries (dedup'd) and cursor advanced past lost data.
-
-2. **Cursor advances before storage persist** (`download.rs:146-165`) — in-memory cursor advanced BEFORE `write_sync_state()` to storage. If persist failed, in-memory cursor was ahead of storage — page reload regressed cursor.
-
-3. **`onclose` kills active WebSocket** (`ws_coordinator.rs:106`) — unconditional `*inner.ws = None` in `onclose` closure. If WS1 fired `onclose` after WS2 was stored, WS2 was killed.
-
-4. **Zombie tasks on reconnect** — `connect_and_handshake` spawned 5 `spawn_local` tasks. Old tasks never cancelled. Background processor (#1) leaked forever (leaked `msg_tx` sender in `forget()`-ed closure kept `msg_rx` alive).
-
-5. **WebSocket send without ready_state guard** — `send_with_u8_array` called without checking `ws.ready_state() == OPEN`. Explains "CLOSING or CLOSED" console errors.
-
-### Phase 4 — Fixes Applied (Done ✓)
-All P0 fixes deployed across 3 files (~80 lines changed):
-
-| Fix | File | Lines | What Changed |
-|-----|------|-------|-------------|
-| Dedup after write | `reconciler.rs` | 27-40, 42-67, 69-98, 100-157 | Split `check_dedup` into `is_deduped()` (read-only) + `mark_dedup()` (after write). All three apply methods stage IDs then commit dedup only after storage persists. |
-| Cursor after persist | `download.rs` | 144-175 | Moved `last_sequence.store()` to AFTER `write_sync_state()`. Cursor survives page reload. |
-| Generation counter | `ws_coordinator.rs` | `WasmWsCoordinatorInner` | Added `ws_gen: AtomicU64`. Incremented before creating WS. `onclose` closure captures its generation and only nullifies `ws` if `current_gen == my_gen`. |
-| Zombie task cancellation | `ws_coordinator.rs` | `connect_and_handshake` | Added `cancel_flag: Arc<AtomicBool>`. Old flag set to true before creating new tasks. Background processor uses `select!` between `msg_rx.next()` and polling cancel flag. Heartbeat, discovery loops check flag. |
-| ready_state guard | `ws_coordinator.rs` | `send_request`, `subscribe`, `register`, `heartbeat`, signal handler | All `send_with_u8_array` calls now check `ws.ready_state() == 1` first. |
-| Coordinator UUID tracing | `ws_coordinator.rs` | `connect_and_handshake`, all spawned tasks | Each connection logs `[coordinator=<uuid>]` prefix in all task lifecycle messages. |
-
-### Files Modified in Phase 4
-- `crates/vaultsync-core/src/sync/reconciler.rs` — dedup ordering fix
-- `crates/vaultsync-core/src/sync/download.rs` — cursor ordering fix
-- `crates/vaultsync-wasm/src/ws_coordinator.rs` — generation counter, cancel flag, ready_state guards, UUID tracing
+### Blocked
+- (none currently)
 
 ## Next Steps
-1. **Build and deploy** — compile with `wasm-pack`, deploy to CF/serve, test.
-2. **Verify leader/follower convergence** — open two tabs, type in leader, confirm follower converges within 1-2 sync cycles.
-3. **Verify `RefCell` panic stays gone** — long-running test with rapid edits.
-4. **Verify OPFS files appear** — after convergence is stable.
-5. **Phase 5 (if needed):** Make PUSH useful — call `coordinator.subscribe()` in sync loop, integrate subscription stream with DownloadQueue cursor.
-6. **Phase 6 (if needed):** IndexedDB schema wipe — last resort if protocol fixes don't unstick persistent state.
+1. Wire Phase H metric recording calls into DownloadQueue (`record_push_mutation`, `record_snapshot_applied`, `record_optimistic_write`), client.rs, and PresenceManager.
+2. Test all phases compile end-to-end on native + WASM targets.
+3. Write integration tests for Phase B (push mutation flow), C (HLC monotonicity), D (snapshot catch-up), F (optimistic → synced transition), G (presence join/leave detection).
+4. Deploy server with new generation ID to staging and verify cursor-reset on restart.
 
 ## Key Decisions
-- **The `RefCell` crash was caused by StrictMode double-mount → 2 clients → BC self-echo → executor overload.** Phase 1's WS-focused filters couldn't stop a BC loop.
-- **Singleton cache by namespace is correct** for StrictMode. Different tabs have independent JS contexts (no cross-tab singleton), so per-tab replica_ids differ naturally.
-- **`replica_id` self-filter is correct** (tabs have different IDs, so cross-tab mutations pass through).
-- **Dedup must mark after storage write**, not before. Otherwise a single storage failure causes permanent mutation loss for the session.
-- **In-memory cursor must advance only after storage persist.** Otherwise a crash after in-memory advance but before storage persist regresses cursor on reload.
-- **Generation counter** is the cleanest fix for the `onclose` race — no complex locking, just a check at the start of the callback.
-- **`select!` over cancel flag** is the only reliable way to kill a task blocked on `mpsc::Receiver::next()` when the sender is leaked inside a `forget()`-ed Closure.
-- OPFS investigation is deferred until protocol stability is confirmed.
+- Generation ID in RegisterAckPayload (not separate message) — no extra RTT, backward compatible.
+- SyncStateManager centralizes cursor + generation (replaces scattered cursor logic in DownloadQueue, client init, storage).
+- `check_generation()` returns `bool` (true if reset happened). Server with empty gen = no generation tracking.
+- TransportRouter uses internal unbounded channels + `wasm_bindgen_futures::spawn_local` for WASM-compatible stream merging.
+- BC transport sends PendingMutation (plaintext, no encryption). WS transport sends via MSG_PUSH frame with encryption.
+- CF worker generation_id: module-level `OnceLock<String>` (persists for worker isolate lifetime). Changes on restart, which is acceptable — D1 DB reset is rare enough that false positives on DO eviction are tolerable.
+- Server generation_id: `AppState` field, UUID at startup. Restart = new gen = all clients reset cursor and re-download. Safe because mutations are durable in SQLite.
+- HLC NOT added as a field on mutation structs (96+ breakage sites avoided). Instead, `HybridLogicalClock` lives on `VaultSyncClient` and its `.now().wall` replaces all client-side timestamp generation.
+- Subscribe stream bridged through `futures::channel::mpsc::unbounded()` channel instead of directly using `Pin<Box<dyn Stream>>` in `select!` — avoids complex pinning lifetime issues in WASM-compatible code.
+- Snapshot fetch is an optimization in `process_batch()` (before pull when cursor is behind), not a replacement for mutation pull. Falls back to normal pull if no snapshot available.
+- Optimistic writes use `SyncStatus::Optimistic` variant instead of new bool field — minimal diff, backward-compatible serialization.
+- Presence uses its own BroadcastChannel listeners rather than sharing the Transport BC — avoids message type confusion and keeps transport layer focused on mutations.
+- Cursor reset during generation check is EAGER (in `initialize()`, before spawning workers), not lazy.
 
 ## Relevant Files
-- `crates/vaultsync-core/src/sync/reconciler.rs` — `is_deduped()` + `mark_dedup()` split. Entry IDs only committed to dedup set after `write_batch_reconciliation()` succeeds.
-- `crates/vaultsync-core/src/sync/download.rs` — Cursor `last_sequence.store()` moved to AFTER `write_sync_state()`.
-- `crates/vaultsync-wasm/src/ws_coordinator.rs` — `ws_gen: AtomicU64` with generation-gated `onclose`; `cancel_flag: Arc<AtomicBool>` for zombie task cancellation; `ready_state()` guards on all sends; `[coordinator=<uuid>]` tracing.
-- `crates/vaultsync-wasm/src/client.rs` — BC posting removed (Phase 2).
-- `sdk/packages/web/src/index.ts` — Singleton promise cache (Phase 2).
-- `sdk/packages/react/src/context.tsx` — No shutdown on cleanup (Phase 2).
+- `crates/vaultsync-core/src/transport/traits.rs` — `Transport` trait, `InboundMutation`, `TransportSource`, `TransportError`
+- `crates/vaultsync-core/src/transport/mod.rs` — Core transport module re-export
+- `crates/vaultsync-wasm/src/transport/broadcast_channel.rs` — `BroadcastChannelTransport` impl
+- `crates/vaultsync-wasm/src/transport/ws_transport.rs` — `WasmWsTransport` impl
+- `crates/vaultsync-wasm/src/transport/router.rs` — `TransportRouter` with merged incoming stream + channel-based dedup
+- `crates/vaultsync-wasm/src/transport/mod.rs` — WASM transport module declaration
+- `crates/vaultsync-core/src/sync/state.rs` — `SyncState` with `generation_id`
+- `crates/vaultsync-core/src/sync/state_manager.rs` — `SyncStateManager` — centralized cursor + generation
+- `crates/vaultsync-core/src/sync/events.rs` — `SyncEvents.download_notify` now `UnboundedSender<Option<PendingMutation>>`
+- `crates/vaultsync-core/src/sync/download.rs` — `process_push_mutation()`, `try_fetch_snapshot()`, `DownloadConfig.snapshot_threshold`
+- `crates/vaultsync-core/src/clock.rs` — `HlcTimestamp`, `HybridLogicalClock` — CAS-based `now()` and `update_with_received()`
+- `crates/vaultsync-core/src/client.rs` — HLC clock, download worker with subscribe bridge + select loop, generation check, `SyncStatus::Optimistic`
+- `crates/vaultsync-core/src/oplog/entry.rs` — `SyncStatus::Optimistic` variant
+- `crates/vaultsync-core/src/telemetry/metrics.rs` — `MetricsSnapshot` with push/snapshot/optimistic/hlc/presence fields
+- `crates/vaultsync-core/src/coordinator/ws_proto.rs` — `RegisterAckPayload` with `generation_id`
+- `crates/vaultsync-core/src/coordinator/traits.rs` — `Coordinator` trait with `generation_id()` default method
+- `crates/vaultsync-wasm/src/ws_coordinator.rs` — `generation_id()` impl, RegisterAck parsing, subscription + push notify
+- `crates/vaultsync-wasm/src/mutation_store.rs` — `MutationStore` with OPFS-backed `push()`, `pop_batch()`, `ack()`, `nack()`
+- `crates/vaultsync-wasm/src/presence.rs` — `PresenceManager` with join/leave/heartbeat over BroadcastChannel
+- `crates/vaultsync-wasm/src/client.rs` — `notify_download(None)` bootstrap call
+- `crates/vaultsync-coordinator-server/src/state.rs` — `AppState.generation_id`
+- `crates/vaultsync-coordinator-server/src/ws.rs` — RegisterAck includes `state.generation_id`
+- `crates/vaultsync-coordinator-server/src/main.rs` — UUID generation at startup
+- `crates/vaultsync-coordinator-cf/src/lib.rs` — `server_generation_id()` static + RegisterAck payload
+- `crates/vaultsync-core/src/storage/sqlite.rs` — SELECT/INSERT with `generation_id` column

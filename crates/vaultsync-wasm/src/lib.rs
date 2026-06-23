@@ -70,6 +70,10 @@ pub mod indexeddb;
 #[cfg(target_arch = "wasm32")]
 pub mod ipc;
 #[cfg(target_arch = "wasm32")]
+pub mod mutation_store;
+#[cfg(target_arch = "wasm32")]
+pub mod presence;
+#[cfg(target_arch = "wasm32")]
 pub mod storage;
 #[cfg(target_arch = "wasm32")]
 pub mod transport;

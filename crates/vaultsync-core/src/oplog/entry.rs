@@ -22,6 +22,17 @@ pub enum SyncStatus {
     Pending,
     Synced,
     Failed,
+    /// Applied locally but server confirmation pending.
+    /// Same as Pending but explicitly marks the optimistic write.
+    Optimistic,
+}
+
+impl SyncStatus {
+    /// Returns `true` for statuses that should be picked up by the upload queue.
+    /// Adding new uploadable variants requires updating this method.
+    pub fn is_uploadable(&self) -> bool {
+        matches!(self, SyncStatus::Pending | SyncStatus::Optimistic)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

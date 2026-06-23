@@ -8,6 +8,10 @@ export function useSyncStatus() {
     connected: false,
     pendingMutations: 0,
     lastSyncedSequence: 0,
+    optimisticWrites: 0,
+    pushMutationsReceived: 0,
+    snapshotsApplied: 0,
+    activePeers: 0,
   });
 
   useEffect(() => {

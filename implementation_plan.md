@@ -37,6 +37,15 @@ Each phase builds on the previous. Phase 1 starts immediately.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### Engine Architecture (already built)
+
+These engine-level components are already implemented and power all client-side sync:
+
+- **TransportRouter** — merges BroadcastChannel (same-origin, unencrypted) and WebSocket (encrypted, remote) transport streams into a single deduplicated mutation stream via internal channels and `wasm_bindgen_futures::spawn_local`
+- **MutationStore** — OPFS-backed mutation queue for crash recovery; `push`, `pop_batch`, `ack`, `nack` survive page close without phantom edits
+- **HLC Clock** — `HybridLogicalClock` with CAS-based `now()` and `update_with_received()`; all client timestamps use HLC walls for causal ordering
+- **Generation ID** — per-server UUID sent in `RegisterAckPayload` (`#[serde(default)]` for backward compat); client compares on init and resets cursor to 0 if mismatch (handles server restart without stale state)
+
 ---
 
 ## Phase 1 — Example Projects (NOW)
@@ -71,11 +80,11 @@ Each phase builds on the previous. Phase 1 starts immediately.
 - `examples/notes/vite.config.ts` — dev on port 9876 (E2E compat)
 - `examples/notes/tsconfig.json`
 - `examples/notes/index.html` — semantic HTML5, meta tags, dark-mode
-- `examples/notes/src/main.tsx` — VaultSyncProvider bootstrap
+- `examples/notes/src/main.tsx` — VaultSyncProvider bootstrap (supports presence and metrics out of the box: `useSyncStatus()` returns `activePeers` and metric fields)
 - `examples/notes/src/App.tsx` — sidebar + main editor layout
 - `examples/notes/src/components/NoteList.tsx` — `useQuery('notes')`, search filter, new button
 - `examples/notes/src/components/NoteEditor.tsx` — `useVaultSyncOne`, debounced auto-save
-- `examples/notes/src/components/SyncBar.tsx` — `useSyncStatus()`, pending count, leader/follower
+- `examples/notes/src/components/SyncBar.tsx` — `useSyncStatus()`, pending count, leader/follower, active peers via `SyncIndicator.showPeers`, expanded sync status with metrics
 - `examples/notes/src/components/EncryptionBadge.tsx` — E2EE indicator, key fingerprint
 - `examples/notes/src/style.css` — premium dark-mode, Inter font, micro-animations
 - `examples/notes/e2e/offline.spec.ts` — write offline, reconnect, verify sync
@@ -99,7 +108,7 @@ Each phase builds on the previous. Phase 1 starts immediately.
 - `examples/collab-docs/src/main.tsx`
 - `examples/collab-docs/src/App.tsx` — two `VaultSyncProvider` instances (same namespace, different replicaId)
 - `examples/collab-docs/src/components/DocPane.tsx` — editor for one replica, `useVaultSyncOne`
-- `examples/collab-docs/src/components/PresenceBar.tsx` — which replicas are connected
+- `examples/collab-docs/src/components/PresenceBar.tsx` — which replicas are connected, uses `PresenceManager` wasm_bindgen export with dedicated BroadcastChannel for join/leave/heartbeat (separate from mutation transport)
 - `examples/collab-docs/src/components/MergeLog.tsx` — live CRDT event stream
 - `examples/collab-docs/src/style.css` — split-pane layout, dark-mode
 - `examples/collab-docs/README.md`
@@ -146,7 +155,7 @@ Each phase builds on the previous. Phase 1 starts immediately.
 - `VaultSyncPlugin` — Vue plugin (`app.use(VaultSyncPlugin, config)`)
 - `useQuery(docId)` → `{ data: Ref<RecordFields[]>, loading: Ref<boolean> }`
 - `useVaultSyncOne(docId, recordId)` → `{ record: Ref<RecordFields | null> }`
-- `useSyncStatus()` → `{ connected: Ref<boolean>, pendingMutations: Ref<number> }`
+- `useSyncStatus()` → `{ connected: Ref<boolean>, pendingMutations: Ref<number>, activePeers: Ref<number>, metrics: Ref<MetricsSnapshot> }`
 - `useVaultSyncMutations(docId)` → `{ insert, update, delete }`
 - `SyncIndicator.vue` — drop-in status component
 
@@ -168,7 +177,7 @@ Each phase builds on the previous. Phase 1 starts immediately.
 
 - `createVaultSync(config)` — returns a client context
 - `queryStore(docId)` → Svelte readable store of `RecordFields[]`
-- `syncStatusStore()` → Svelte readable store of `SyncStatus`
+- `syncStatusStore()` → Svelte readable store of `SyncStatus` (includes `activePeers` and `metrics`)
 - `mutations(docId)` → `{ insert, update, delete }`
 - `SyncIndicator.svelte` — drop-in component
 

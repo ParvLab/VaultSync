@@ -15,6 +15,7 @@
 - 🪝 **Convenient Hooks** — Clear hooks for querying collections (`useQuery`), single documents (`useVaultSyncOne`), mutation handlers (`useVaultSyncMutations`), and tracking status (`useSyncStatus`).
 - 📡 **Offline State Awareness** — Visual component hooks to easily display online/offline sync indicators.
 - 🔒 **Secure-By-Default** — Automatically inherits E2EE client encryption under the hood.
+- 👥 **Presence awareness** — Built-in peer tracking; use `activePeers` from `useSyncStatus()`.
 
 ---
 
@@ -71,7 +72,7 @@ export default function TodoList() {
     <div>
       <header style={{ display: 'flex', justifyContent: 'space-between' }}>
         <h1>My Tasks</h1>
-        <SyncIndicator />
+        <SyncIndicator showPeers />
       </header>
 
       <button onClick={() => insert(crypto.randomUUID(), { text: 'New Task', done: false })}>
@@ -150,7 +151,23 @@ const { insert, update, delete: remove } = useVaultSyncMutations('todos');
 Access the sync progress state.
 
 ```typescript
-const { connected, pendingMutations, lastSyncedSequence } = useSyncStatus();
+const { connected, pendingMutations, lastSyncedSequence, activePeers } = useSyncStatus();
+```
+
+| Field | Description |
+|-------|-------------|
+| `connected` | `boolean` — `true` when connected to the sync coordinator |
+| `pendingMutations` | `number` — Count of local writes not yet confirmed by the server. Includes **optimistic writes** (local mutations that have been applied but not yet uploaded). |
+| `lastSyncedSequence` | `number` — The last sequence number confirmed by the server |
+| `activePeers` | `number` — Number of other peers currently connected to the same namespace (requires presence enabled on the coordinator) |
+
+### `<SyncIndicator showPeers />`
+
+Renders a compact sync status badge. Shows connection state, pending mutation count, E2EE key version, and — when `showPeers` is `true` — the number of active peers.
+
+```tsx
+<SyncIndicator />           // connection + pending + E2EE key version
+<SyncIndicator showPeers />  // also shows active peer count
 ```
 
 ---

@@ -23,6 +23,7 @@ macro_rules! console_log {
 #[wasm_bindgen]
 pub struct WasmVaultSyncClient {
     client: Arc<VaultSyncClient>,
+    presence: Option<crate::presence::PresenceManager>,
 }
 
 #[wasm_bindgen]
@@ -59,7 +60,10 @@ impl WasmVaultSyncClient {
                 .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
         );
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            presence: None,
+        })
     }
 
     pub async fn new_with_coordinator(
@@ -114,10 +118,16 @@ impl WasmVaultSyncClient {
         })?;
 
         // Bootstrap: same event-driven path as WS push notifications
-        client.events.notify_download();
+        client.events.notify_download(None);
+
+        // Create presence manager for cross-tab awareness
+        let presence = crate::presence::PresenceManager::new(namespace, replica_id).ok();
 
         console_log!("[9/9] client ready");
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            presence,
+        })
     }
 
     pub async fn insert(&self, doc_id: &str, record_id: &str, json: &str) -> Result<(), JsValue> {
@@ -237,6 +247,8 @@ impl WasmVaultSyncClient {
         let connected =
             state.connection_status != vaultsync_core::sync::state::ConnectionStatus::Disconnected;
 
+        let metrics = self.client.metrics.snapshot();
+
         let mut map = serde_json::Map::new();
         map.insert("connected".to_string(), serde_json::Value::Bool(connected));
         map.insert(
@@ -246,6 +258,22 @@ impl WasmVaultSyncClient {
         map.insert(
             "lastSyncedSequence".to_string(),
             serde_json::Value::Number(serde_json::Number::from(state.last_synced_sequence)),
+        );
+        map.insert(
+            "optimisticWrites".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(metrics.optimistic_writes)),
+        );
+        map.insert(
+            "pushMutationsReceived".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(metrics.push_mutations_received)),
+        );
+        map.insert(
+            "snapshotsApplied".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(metrics.snapshots_applied)),
+        );
+        map.insert(
+            "activePeers".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(metrics.active_peers)),
         );
 
         let json_str = serde_json::to_string(&serde_json::Value::Object(map))
@@ -341,6 +369,19 @@ impl WasmVaultSyncClient {
 
     pub fn is_leader(&self) -> bool {
         self.client.leader_election.is_leader()
+    }
+
+    /// Returns a clone of the PresenceManager if available.
+    #[wasm_bindgen]
+    pub fn presence(&self) -> Option<crate::presence::PresenceManager> {
+        self.presence.clone()
+    }
+
+    /// Returns a JSON snapshot of all metrics counters.
+    #[wasm_bindgen(js_name = metricsSnapshot)]
+    pub fn metrics_snapshot(&self) -> String {
+        let snapshot = self.client.metrics.snapshot();
+        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
     }
 }
 

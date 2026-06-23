@@ -1,5 +1,6 @@
 import init, { WasmVaultSyncClient } from '../wasm/vaultsync_wasm.js';
-import type { VaultSyncConfig, RecordFields, SyncStatus, SubscriptionCallback, UnsubscribeFn } from './types.js';
+import type { VaultSyncConfig, RecordFields, SyncStatus, MetricsSnapshot, SubscriptionCallback, UnsubscribeFn } from './types.js';
+import type { PresenceManager } from '../wasm/vaultsync_wasm.js';
 import { KeyManager } from './keys.js';
 import { createDbProxy, DbProxy, Collection } from './db.js';
 import { defineSchema, FieldDef, SchemaDefinition } from './schema.js';
@@ -12,6 +13,7 @@ export { SyncStatusObservable } from './sync.js';
 export { PostgresCoordinator } from './coordinator/postgres.js';
 export { RedisCoordinator } from './coordinator/redis.js';
 export { CustomCoordinator } from './coordinator/custom.js';
+export type { MetricsSnapshot } from './types.js';
 
 const instancePromises = new Map<string, Promise<VaultSyncClient>>();
 
@@ -136,6 +138,17 @@ export class VaultSyncClient {
   async syncStatus(): Promise<SyncStatus> {
     const statusStr = await this.inner.sync_status();
     return JSON.parse(statusStr);
+  }
+
+  /** Returns a snapshot of all metrics counters. */
+  async metrics(): Promise<MetricsSnapshot> {
+    const jsonStr = await this.inner.metricsSnapshot();
+    return JSON.parse(jsonStr);
+  }
+
+  /** Returns the PresenceManager for observing cross-tab peers, or null. */
+  presence(): PresenceManager | null {
+    return this.inner.presence();
   }
 
   subscribe(docId: string, callback: SubscriptionCallback): UnsubscribeFn {

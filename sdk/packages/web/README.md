@@ -19,6 +19,8 @@
 - 🔀 **CRDT-based** — Automatic conflict-free merge — no conflict resolution code needed
 - 💾 **Persistent storage** — Data stored via IndexedDB / OPFS, survives page reloads
 - 🔑 **Key management** — Built-in encryption key rotation via `KeyManager`
+- 👥 **Presence** — Real-time peer awareness across tabs via BroadcastChannel
+- 📊 **Metrics & Observability** — Built-in counters for mutations, snapshots, optimistic writes, HLC wraps, active peers
 
 ---
 
@@ -181,11 +183,64 @@ Returns the current sync state.
 ```typescript
 const status = await client.syncStatus();
 // {
-//   connected: boolean,       // Is the coordinator connection active?
-//   pendingMutations: number, // How many local writes are unsynced?
-//   lastSyncedSequence: number // Last confirmed server sequence
+//   connected: boolean,              // Is the coordinator connection active?
+//   pendingMutations: number,        // How many local writes are unsynced?
+//   lastSyncedSequence: number,      // Last confirmed server sequence
+//   optimisticWrites: number,        // Optimistic writes pending confirmation
+//   activePeers: number,             // Active peers across tabs
+//   pushMutationsReceived: number,   // Push mutations received via coordinator
+//   snapshotsApplied: number,        // Snapshots applied during catch-up
+//   hlcLogicalWraps: number          // HLC logical counter wraps
 // }
 ```
+
+---
+
+### `client.metrics()`
+
+Returns a `MetricsSnapshot` JSON string with all recorded counter values.
+
+```typescript
+const metrics = JSON.parse(await client.metrics());
+// {
+//   mutations_downloaded: number,
+//   mutations_uploaded: number,
+//   optimistic_writes: number,
+//   push_mutations_received: number,
+//   snapshots_applied: number,
+//   hlc_logical_wraps: number,
+//   active_peers: number,
+//   sync_errors: number,
+//   mutations_failed: number
+// }
+```
+
+---
+
+### `client.presence()`
+
+Returns an optional `PresenceManager` instance for multi-tab peer awareness.
+
+```typescript
+const presence = client.presence();
+
+if (presence) {
+  const count = presence.peer_count();
+  console.log('Active peers:', count);
+
+  const peersJson = presence.active_peers_json();
+  // '{"replica-1": 1719000000000, "replica-2": 1719000000123}'
+}
+```
+
+The `PresenceManager` is created automatically during client initialization and uses a dedicated BroadcastChannel (`vaultsync-presence-{namespace}`). It is available only in browser environments that support `BroadcastChannel`.
+
+#### `PresenceManager` methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `peer_count()` | `number` | Number of currently active peers |
+| `active_peers_json()` | `string` | JSON map of `replica_id` → `last_seen_epoch_ms` |
 
 ---
 
@@ -271,6 +326,34 @@ Built-in coordinators:
 - **`PostgresCoordinator`** — PostgreSQL-backed server coordinator
 - **`RedisCoordinator`** — Redis-backed coordinator for high-throughput
 - **`CustomCoordinator`** — Implement your own coordinator interface
+
+---
+
+## Presence
+
+Multi-tab presence is achieved via a dedicated **BroadcastChannel** (`vaultsync-presence-{namespace}`) separate from the mutation transport channel. Each tab sends periodic heartbeat messages (Join / Heartbeat / Leave) to announce its presence to other tabs.
+
+- **Join** — Sent on client initialization to announce a new replica
+- **Heartbeat** — Sent every 30s to maintain active status
+- **Leave** — Sent on `beforeunload` to immediately signal departure
+
+This channel is distinct from the mutation BroadcastChannel to avoid message type confusion. The `PresenceManager` is only available in environments that support `BroadcastChannel`; in other environments `client.presence()` returns `undefined`.
+
+---
+
+## Metrics & Observability
+
+VaultSync automatically records internal counters during sync operations:
+
+- **Mutations downloaded / uploaded** — Total mutations synced
+- **Optimistic writes** — Locally applied writes awaiting server confirmation
+- **Push mutations received** — Remote mutations pushed via the coordinator
+- **Snapshots applied** — Full-state snapshots applied during catch-up
+- **HLC logical wraps** — Hybrid Logical Clock wraps (tracks clock drift)
+- **Active peers** — Concurrent tabs/peers in the same namespace
+- **Sync errors / mutations failed** — Error counters for diagnostics
+
+Call `client.metrics()` to snapshot all counters as a JSON string. For React applications, `useSyncStatus()` includes metric fields (`optimisticWrites`, `activePeers`, `pushMutationsReceived`, `snapshotsApplied`, `hlcLogicalWraps`) directly in the status object.
 
 ---
 

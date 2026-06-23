@@ -11,6 +11,8 @@ pub struct SyncState {
     pub last_connected_at: Option<u64>,
     pub last_sync_at: Option<u64>,
     pub schema_version: u64,
+    #[serde(default)]
+    pub generation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

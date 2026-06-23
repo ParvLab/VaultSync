@@ -199,6 +199,7 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             last_connected_at: Some(10000),
             last_sync_at: Some(20000),
             schema_version: 2,
+            generation_id: String::new(),
         };
 
         storage.write_sync_state(&state).await.unwrap();

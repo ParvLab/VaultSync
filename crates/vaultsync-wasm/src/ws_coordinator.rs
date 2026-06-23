@@ -4,6 +4,7 @@ use futures::future::Either;
 use futures::FutureExt;
 use futures::{Stream, StreamExt};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use vaultsync_core::coordinator::traits::{
     Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId,
@@ -28,15 +29,27 @@ pub struct WasmWsCoordinator {
     inner: Arc<WasmWsCoordinatorInner>,
 }
 
+struct ConnectionState {
+    ws: Option<WebSocket>,
+    /// true while a connect_and_handshake is in progress
+    connecting: bool,
+    /// One-shot senders for callers waiting on an in-flight connection.
+    waiters: Vec<oneshot::Sender<Result<(), CoordinatorError>>>,
+    /// Generation ID of the current connection — used for generation-aware cleanup.
+    generation: u64,
+}
+
 struct WasmWsCoordinatorInner {
     url: String,
     auth_token: Option<String>,
     replica_id: Mutex<String>,
-    ws: Mutex<Option<WebSocket>>,
+    connection: Mutex<ConnectionState>,
     pending_requests: Mutex<HashMap<String, oneshot::Sender<Vec<u8>>>>,
     subscribers: Mutex<Vec<mpsc::Sender<PendingMutation>>>,
     peer_coord: Mutex<Option<vaultsync_transport_webrtc::PeerCoordinator>>,
-    download_notify: Mutex<Option<mpsc::UnboundedSender<()>>>,
+    download_notify: Mutex<Option<mpsc::UnboundedSender<Option<PendingMutation>>>>,
+    generation_id: Mutex<String>,
+    conn_gen: AtomicU64,
 }
 
 impl std::fmt::Debug for WasmWsCoordinatorInner {
@@ -58,16 +71,23 @@ impl WasmWsCoordinator {
                 url: url.to_string(),
                 auth_token,
                 replica_id: Mutex::new(String::new()),
-                ws: Mutex::new(None),
+                connection: Mutex::new(ConnectionState {
+                    ws: None,
+                    connecting: false,
+                    waiters: Vec::new(),
+                    generation: 0,
+                }),
                 pending_requests: Mutex::new(HashMap::new()),
                 subscribers: Mutex::new(Vec::new()),
                 peer_coord: Mutex::new(Some(peer_coord)),
                 download_notify: Mutex::new(None),
+                generation_id: Mutex::new(String::new()),
+                conn_gen: AtomicU64::new(0),
             }),
         }
     }
 
-    pub fn set_download_notify(&self, tx: mpsc::UnboundedSender<()>) {
+    pub fn set_download_notify(&self, tx: mpsc::UnboundedSender<Option<PendingMutation>>) {
         *self.inner.download_notify.lock().unwrap() = Some(tx);
         console_log!("[WasmWs] download_notify registered");
     }
@@ -80,6 +100,67 @@ impl WasmWsCoordinator {
     ) -> Result<(), CoordinatorError> {
         console_log!("[5/9] coordinator connect");
 
+        // ── Single-flight guard: only one caller connects, others wait ──
+        let wait_for_connection = {
+            let mut state = self.inner.connection.lock().unwrap();
+            if state.ws.is_some() {
+                console_log!("[WasmWs] already connected");
+                return Ok(());
+            }
+            if state.connecting {
+                console_log!("[WasmWs] connection in progress, waiting...");
+                let (tx, rx) = oneshot::channel();
+                state.waiters.push(tx);
+                Some(rx)
+            } else {
+                state.connecting = true;
+                None
+            }
+        };
+        if let Some(rx) = wait_for_connection {
+            return rx.await.unwrap_or(Err(CoordinatorError::NotAvailable));
+        }
+
+        // Increment generation BEFORE spawning tasks so reader/heartbeat/signal
+        // capture the correct generation and survive.
+        let generation = self.inner.conn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Perform connection handshake
+        let result = self.do_connect(namespace, after, info, generation).await;
+
+        // Notify waiters and finalize state
+        {
+            let mut state = self.inner.connection.lock().unwrap();
+            state.connecting = false;
+            if result.is_ok() {
+                state.generation = generation;
+            } else if state.generation == generation {
+                // Only clean up our own generation's socket to avoid killing a
+                // newer connection that was established concurrently.
+                if let Some(old_ws) = state.ws.take() {
+                    old_ws.set_onopen(None);
+                    old_ws.set_onclose(None);
+                    old_ws.set_onmessage(None);
+                    let _ = old_ws.close();
+                }
+            }
+            for tx in state.waiters.drain(..) {
+                let _ = tx.send(result.clone());
+            }
+        }
+
+        result
+    }
+
+    /// Performs the actual WebSocket connection and handshake.
+    /// Returns the established WebSocket on success.
+    async fn do_connect(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        info: Option<&ReplicaInfo>,
+        generation: u64,
+    ) -> Result<(), CoordinatorError> {
         let ws_url = get_ws_url(&self.inner.url, namespace);
         console_log!("[WasmWs] connecting to url={}", ws_url);
         let ws = WebSocket::new(&ws_url).map_err(|e| {
@@ -109,7 +190,7 @@ impl WasmWsCoordinator {
                 if let Some(tx) = close_tx_cell.borrow_mut().take() {
                     let _ = tx.send(());
                 }
-                *inner_close_clone.ws.lock().unwrap() = None;
+                inner_close_clone.connection.lock().unwrap().ws = None;
             }) as Box<dyn Fn(web_sys::Event)>);
             ws.set_onclose(Some(close_callback.as_ref().unchecked_ref()));
             close_callback.forget();
@@ -206,7 +287,8 @@ impl WasmWsCoordinator {
         // Wait for REGISTER_ACK with 5s timeout
         let reg_resp = recv_with_timeout(&mut msg_rx, 5).await?;
 
-        let (msg_type, _) = decode_frame(&reg_resp).map_err(|e| CoordinatorError::Internal(e))?;
+        let (msg_type, payload) =
+            decode_frame(&reg_resp).map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type != MSG_REGISTER_ACK {
             console_log!(
@@ -218,6 +300,19 @@ impl WasmWsCoordinator {
                 msg_type
             )));
         }
+
+        // Extract generation_id from RegisterAck
+        if let Ok(ack) = serde_json::from_slice::<RegisterAckPayload>(payload) {
+            if !ack.generation_id.is_empty() {
+                let mut gen = self.inner.generation_id.lock().unwrap();
+                *gen = ack.generation_id.clone();
+                console_log!(
+                    "[WasmWs] server generation_id={}",
+                    ack.generation_id
+                );
+            }
+        }
+
         console_log!("[WasmWs] register successful!");
 
         // 4. Perform SUBSCRIBE
@@ -232,10 +327,20 @@ impl WasmWsCoordinator {
         ws.send_with_u8_array(&sub_frame)
             .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
 
-        // Spawn background message processor
+        // Spawn background message processor with generation guard
         let inner_clone = self.inner.clone();
+        let reader_gen = generation;
+        console_log!("[WasmWs] reader started gen={}", reader_gen);
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(bin) = msg_rx.next().await {
+                if inner_clone.conn_gen.load(Ordering::SeqCst) != reader_gen {
+                    console_log!(
+                        "[WasmWs] reader exiting gen={} current={}",
+                        reader_gen,
+                        inner_clone.conn_gen.load(Ordering::SeqCst)
+                    );
+                    break; // connection was replaced, zombie reader exits
+                }
                 if let Ok((msg_type, payload)) = decode_frame(&bin) {
                     if msg_type == MSG_MUTATION_PUSH {
                         if let Ok(mutat) = serde_json::from_slice::<PendingMutation>(payload) {
@@ -267,9 +372,9 @@ impl WasmWsCoordinator {
                                 );
                             }
                             if let Some(ref notify) = *inner_clone.download_notify.lock().unwrap() {
-                                match notify.unbounded_send(()) {
+                                match notify.unbounded_send(Some(mutat.clone())) {
                                     Ok(_) => {
-                                        console_log!("[ws] download notify sent");
+                                        console_log!("[ws] download notify sent seq={}", mutat.sequence);
                                     }
                                     Err(e) => {
                                         console_log!("[ws] download notify FAILED {:?}", e);
@@ -290,27 +395,46 @@ impl WasmWsCoordinator {
                             }
                         }
                     } else {
+                        console_log!("[reader] message type={:02X} len={}", msg_type, payload.len());
                         if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(payload) {
                             if let Some(req_id) =
                                 json_val.get("request_id").and_then(|v| v.as_str())
                             {
                                 let mut reqs = inner_clone.pending_requests.lock().unwrap();
+                                console_log!(
+                                    "[reader] routing req={} pending_requests={}",
+                                    req_id,
+                                    reqs.len()
+                                );
                                 if let Some(tx) = reqs.remove(req_id) {
+                                    console_log!("[reader] delivering response for req={}", req_id);
                                     let _ = tx.send(bin);
+                                } else {
+                                    console_log!("[reader] NO WAITER for req={}", req_id);
                                 }
+                            } else {
+                                console_log!("[reader] no request_id in payload");
                             }
+                        } else {
+                            console_log!("[reader] failed to parse payload as JSON");
                         }
                     }
                 }
             }
         });
 
-        // Spawn heartbeat loop
+        // Spawn heartbeat loop with generation guard
+        let hb_inner = self.inner.clone();
+        let hb_gen = generation;
+        console_log!("[WasmWs] heartbeat started gen={}", hb_gen);
         let ws_clone = ws.clone();
         let replica_id_hb = auth.replica_id.clone();
         wasm_bindgen_futures::spawn_local(async move {
             loop {
                 vaultsync_core::time_utils::sleep(std::time::Duration::from_secs(30)).await;
+                if hb_inner.conn_gen.load(Ordering::SeqCst) != hb_gen {
+                    break; // connection was replaced, zombie heartbeat exits
+                }
                 let hb = HeartbeatPayload {
                     replica_id: replica_id_hb.clone(),
                     namespace: "".to_string(),
@@ -330,10 +454,16 @@ impl WasmWsCoordinator {
             let ns_str = namespace.to_string();
             let my_replica_id = auth.replica_id.clone();
 
-            // Set signaling handler
+            // Set signaling handler with generation guard
+            let signal_inner = self.inner.clone();
+            let signal_gen = generation;
+            console_log!("[WasmWs] signal loop started gen={}", signal_gen);
             wasm_bindgen_futures::spawn_local(async move {
                 peer_coord_clone
                     .set_signal_handler(move |target_id, signal_type, data| {
+                        if signal_inner.conn_gen.load(Ordering::SeqCst) != signal_gen {
+                            return;
+                        }
                         let ws_send = ws_sender.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             if ws_send.ready_state() != 1 {
@@ -375,8 +505,8 @@ impl WasmWsCoordinator {
                 loop {
                     vaultsync_core::time_utils::sleep(std::time::Duration::from_secs(30)).await;
                     {
-                        let ws_lock = inner_loop.ws.lock().unwrap();
-                        if let Some(ref current_ws) = *ws_lock {
+                        let state = inner_loop.connection.lock().unwrap();
+                        if let Some(ref current_ws) = state.ws {
                             if current_ws != &ws_check {
                                 break;
                             }
@@ -397,15 +527,17 @@ impl WasmWsCoordinator {
         }
 
         {
-            let mut ws_lock = self.inner.ws.lock().unwrap();
-            if let Some(old_ws) = ws_lock.take() {
+            let mut state = self.inner.connection.lock().unwrap();
+            if let Some(old_ws) = state.ws.take() {
                 old_ws.set_onopen(None);
                 old_ws.set_onclose(None);
                 old_ws.set_onmessage(None);
                 let _ = old_ws.close();
             }
-            *ws_lock = Some(ws);
+            state.ws = Some(ws);
+            state.generation = generation;
         }
+
         Ok(())
     }
 
@@ -418,6 +550,12 @@ impl WasmWsCoordinator {
         let (tx, rx) = oneshot::channel::<Vec<u8>>();
         {
             let mut reqs = self.inner.pending_requests.lock().unwrap();
+            console_log!(
+                "[ws] send_request req={} type={:02X} pending_requests={}",
+                request_id,
+                msg_type,
+                reqs.len()
+            );
             reqs.insert(request_id.to_string(), tx);
         }
 
@@ -425,19 +563,24 @@ impl WasmWsCoordinator {
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
         {
-            let ws_lock = self.inner.ws.lock().unwrap();
-            if let Some(ref ws) = *ws_lock {
+            let state = self.inner.connection.lock().unwrap();
+            if let Some(ref ws) = state.ws {
                 if ws.ready_state() == 1 {
+                    console_log!("[ws] sending frame req={} type={:02X}", request_id, msg_type);
                     ws.send_with_u8_array(&frame)
                         .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+                    console_log!("[ws] frame sent req={}", request_id);
                 } else {
+                    console_log!("[ws] send_request NOT_AVAILABLE (ready_state={}) req={}", ws.ready_state(), request_id);
                     return Err(CoordinatorError::NotAvailable);
                 }
             } else {
+                console_log!("[ws] send_request NOT_AVAILABLE (no ws) req={}", request_id);
                 return Err(CoordinatorError::NotAvailable);
             }
         }
 
+        console_log!("[ws] waiting for response req={}", request_id);
         let timeout =
             vaultsync_core::time_utils::sleep(std::time::Duration::from_secs(10));
 
@@ -445,13 +588,18 @@ impl WasmWsCoordinator {
         futures::pin_mut!(rx);
 
         match futures::future::select(rx, timeout).await {
-            Either::Left((Ok(resp), _)) => Ok(resp),
+            Either::Left((Ok(resp), _)) => {
+                console_log!("[ws] got response req={} len={}", request_id, resp.len());
+                Ok(resp)
+            }
 
             Either::Left((Err(_), _)) => {
+                console_log!("[ws] request cancelled req={}", request_id);
                 Err(CoordinatorError::Internal("request cancelled".into()))
             }
 
             Either::Right(_) => {
+                console_log!("[ws] request timed out after 10s req={}", request_id);
                 tracing::warn!("[ws] request timed out after 10s");
                 Err(CoordinatorError::Timeout)
             }
@@ -496,8 +644,8 @@ impl Coordinator for WasmWsCoordinator {
         mutations: Vec<EncryptedMutation>,
     ) -> Result<Vec<SequenceId>, CoordinatorError> {
         let is_connected = {
-            let ws_lock = self.inner.ws.lock().unwrap();
-            ws_lock.is_some()
+            let state = self.inner.connection.lock().unwrap();
+            state.ws.is_some()
         };
         if !is_connected {
             if let Err(e) = self.connect_and_handshake(namespace, 0, None).await {
@@ -551,8 +699,8 @@ impl Coordinator for WasmWsCoordinator {
         limit: usize,
     ) -> Result<Vec<PendingMutation>, CoordinatorError> {
         let is_connected = {
-            let ws_lock = self.inner.ws.lock().unwrap();
-            ws_lock.is_some()
+            let state = self.inner.connection.lock().unwrap();
+            state.ws.is_some()
         };
         if !is_connected {
             if let Err(e) = self.connect_and_handshake(namespace, after, None).await {
@@ -598,8 +746,8 @@ impl Coordinator for WasmWsCoordinator {
         from_sequence: SequenceId,
     ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
         let is_connected = {
-            let ws_lock = self.inner.ws.lock().unwrap();
-            ws_lock.is_some()
+            let state = self.inner.connection.lock().unwrap();
+            state.ws.is_some()
         };
 
         if !is_connected {
@@ -613,8 +761,8 @@ impl Coordinator for WasmWsCoordinator {
             };
             let sub_frame = encode_frame(MSG_SUBSCRIBE, &sub)
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            let ws_lock = self.inner.ws.lock().unwrap();
-            if let Some(ref ws) = *ws_lock {
+            let state = self.inner.connection.lock().unwrap();
+            if let Some(ref ws) = state.ws {
                 if ws.ready_state() == 1 {
                     ws.send_with_u8_array(&sub_frame)
                         .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
@@ -639,8 +787,8 @@ impl Coordinator for WasmWsCoordinator {
         }
 
         let is_connected = {
-            let ws_lock = self.inner.ws.lock().unwrap();
-            ws_lock.is_some()
+            let state = self.inner.connection.lock().unwrap();
+            state.ws.is_some()
         };
 
         if !is_connected {
@@ -657,8 +805,8 @@ impl Coordinator for WasmWsCoordinator {
             };
             let frame = encode_frame(MSG_REGISTER, &reg)
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            let ws_lock = self.inner.ws.lock().unwrap();
-            if let Some(ref ws) = *ws_lock {
+            let state = self.inner.connection.lock().unwrap();
+            if let Some(ref ws) = state.ws {
                 if ws.ready_state() == 1 {
                     ws.send_with_u8_array(&frame)
                         .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
@@ -676,8 +824,8 @@ impl Coordinator for WasmWsCoordinator {
         let frame = encode_frame(MSG_HEARTBEAT, &hb)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
-        let ws_lock = self.inner.ws.lock().unwrap();
-        if let Some(ref ws) = *ws_lock {
+        let state = self.inner.connection.lock().unwrap();
+        if let Some(ref ws) = state.ws {
             if ws.ready_state() == 1 {
                 ws.send_with_u8_array(&frame)
                     .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
@@ -692,6 +840,10 @@ impl Coordinator for WasmWsCoordinator {
 
     async fn schema_version(&self, _namespace: &str) -> Result<u64, CoordinatorError> {
         Ok(0)
+    }
+
+    async fn generation_id(&self) -> String {
+        self.inner.generation_id.lock().unwrap().clone()
     }
 }
 

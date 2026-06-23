@@ -171,6 +171,7 @@ impl VaultSyncFixture {
                 last_connected_at: None,
                 last_sync_at: None,
                 schema_version: 0,
+                generation_id: String::new(),
             });
         let mutations = self
             .coordinator

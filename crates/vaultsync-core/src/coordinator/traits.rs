@@ -70,6 +70,11 @@ pub trait Coordinator: Send + Sync + std::fmt::Debug {
     async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError>;
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError>;
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError>;
+    /// Returns the server's generation ID (UUID) if the coordinator supports it.
+    /// Empty string means "generation tracking not supported" — cursor reset is skipped.
+    async fn generation_id(&self) -> String {
+        String::new()
+    }
     async fn update_replica_key(
         &self,
         _namespace: &str,

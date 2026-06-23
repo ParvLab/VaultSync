@@ -139,7 +139,7 @@ impl Storage for InMemoryStorage {
             .iter()
             .filter(|e| {
                 e.namespace == namespace
-                    && matches!(e.sync_status, crate::oplog::entry::SyncStatus::Pending)
+                    && e.sync_status.is_uploadable()
             })
             .take(limit)
             .cloned()
