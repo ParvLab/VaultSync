@@ -394,6 +394,8 @@ impl WasmWsCoordinator {
                                     .await;
                             }
                         }
+                    } else if matches!(msg_type, MSG_HEARTBEAT | MSG_HEARTBEAT_ACK | MSG_ERROR) {
+                        // System messages — no response routing needed
                     } else {
                         console_log!("[reader] message type={:02X} len={}", msg_type, payload.len());
                         if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(payload) {
