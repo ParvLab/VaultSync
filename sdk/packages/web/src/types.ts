@@ -13,6 +13,25 @@ export type SyncStatus = {
   connected: boolean;
   pendingMutations: number;
   lastSyncedSequence: number;
+  optimisticWrites: number;
+  pushMutationsReceived: number;
+  snapshotsApplied: number;
+  activePeers: number;
+};
+
+export type MetricsSnapshot = {
+  mutationsUploaded: number;
+  mutationsDownloaded: number;
+  syncErrors: number;
+  lastSyncLagMs: number;
+  pendingMutations: number;
+  replicaCount: number;
+  docCount: number;
+  pushMutationsReceived: number;
+  snapshotsApplied: number;
+  optimisticWrites: number;
+  hlcLogicalWraps: number;
+  activePeers: number;
 };
 
 export type SubscriptionCallback = (recordId: string, fields: RecordFields) => void;

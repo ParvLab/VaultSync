@@ -21,17 +21,18 @@
 14. [Offline Support & Durability](#14-offline-support--durability)
 15. [Retry & Reconnection System](#15-retry--reconnection-system)
 16. [Reactive Subscriptions](#16-reactive-subscriptions)
-17. [Coordinator Abstraction Layer](#17-coordinator-abstraction-layer)
-18. [Full Database Schema](#18-full-database-schema)
-19. [Performance Model](#19-performance-model)
-20. [Observability & Debuggability](#20-observability--debuggability)
-21. [SDK Reference](#21-sdk-reference)
-22. [Deployment Modes](#22-deployment-modes)
-23. [Security Model](#23-security-model)
-24. [Integrations (Optional Plugins)](#24-integrations-optional-plugins)
-25. [Development Roadmap](#25-development-roadmap)
-26. [Real-World Use Cases](#26-real-world-use-cases)
-27. [Multi-Namespace & Multi-Tenant Architecture](#27-multi-namespace--multi-tenant-architecture)
+17. [Presence Manager](#17-presence-manager)
+18. [Coordinator Abstraction Layer](#18-coordinator-abstraction-layer)
+19. [Full Database Schema](#19-full-database-schema)
+20. [Performance Model](#20-performance-model)
+21. [Observability & Debuggability](#21-observability--debuggability)
+22. [SDK Reference](#22-sdk-reference)
+23. [Deployment Modes](#23-deployment-modes)
+24. [Security Model](#24-security-model)
+25. [Integrations (Optional Plugins)](#25-integrations-optional-plugins)
+26. [Development Roadmap](#26-development-roadmap)
+27. [Real-World Use Cases](#27-real-world-use-cases)
+28. [Multi-Namespace & Multi-Tenant Architecture](#28-multi-namespace--multi-tenant-architecture)
 
 ---
 
@@ -367,6 +368,87 @@ Presents a unified interface for all storage backends. Stores:
 
 **Transport Abstraction**
 Presents a unified `Transport` trait. The primary transport connects to the chosen coordinator via WebSocket. Optional transports (P2P via WebRTC, Mesh via libp2p) can be enabled per namespace or per table.
+
+The Transport layer is split into three components (Phase A):
+
+#### Transport Trait (`crates/vaultsync-core/src/transport/traits.rs`)
+
+Defines the core interface for sending and receiving mutations over any transport medium:
+
+```rust
+#[async_trait]
+pub trait Transport: Send + Sync + Debug {
+    /// Send a PendingMutation to the network.
+    async fn send(&self, mutation: PendingMutation) -> Result<(), TransportError>;
+
+    /// Subscribe to incoming mutations from this transport.
+    fn subscribe(&self) -> Box<dyn Stream<Item = InboundMutation> + Unpin>;
+
+    /// Return a human-readable source identifier (e.g. "ws", "bc").
+    fn source(&self) -> TransportSource;
+}
+
+pub struct InboundMutation {
+    pub mutation: PendingMutation,
+    pub source: TransportSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportSource {
+    WebSocket,
+    BroadcastChannel,
+    // future: WebRTC, Mesh
+}
+
+#[derive(Debug)]
+pub enum TransportError {
+    SendFailed(String),
+    NetworkUnavailable,
+    Disconnected,
+}
+```
+
+#### BroadcastChannelTransport (`vaultsync-wasm/src/transport/broadcast_channel.rs`)
+
+A same-origin, plaintext transport that uses the browser's `BroadcastChannel` API. It sends `PendingMutation` as JSON over the BroadcastChannel. Designed for multi-tab communication within the same origin:
+
+- **No encryption** — the broadcast channel is same-origin only; data never leaves the browser
+- **Self-filtering** — the `TransportRouter` filters out mutations originating from the same `replica_id`
+- **Registration** — subscribes to a channel named `vaultsync-ns-{namespace}`
+
+```rust
+pub struct BroadcastChannelTransport {
+    channel: BroadcastChannel,
+    source: TransportSource,
+    tx: mpsc::UnboundedSender<InboundMutation>,
+    rx: RefCell<Option<mpsc::UnboundedReceiver<InboundMutation>>>,
+}
+```
+
+#### WasmWsTransport (`vaultsync-wasm/src/transport/ws_transport.rs`)
+
+Refactored from the old `ws_coordinator.rs` transport layer. Full-duplex WebSocket communication over WSS:
+
+- **Encrypted** — mutations are sent via the `MSG_PUSH` frame (encrypted blob, coordinator never sees plaintext)
+- **Reconnect** — automatic reconnection with exponential backoff
+- **Heartbeat** — 30-second keep-alive pings
+- **Stream-based** — incoming mutations flow through a channel-based stream
+
+#### TransportRouter (`vaultsync-wasm/src/transport/router.rs`)
+
+Merges incoming streams from all registered transports into a single unified stream. Handles deduplication and self-filtering:
+
+```rust
+pub struct TransportRouter {
+    remotes: Vec<Arc<dyn Transport>>,
+    out_rx: RefCell<Option<mpsc::UnboundedReceiver<InboundMutation>>>,
+}
+```
+
+- **Stream merging** — each transport's `subscribe()` stream is forwarded into an internal `mpsc::UnboundedSender` via `wasm_bindgen_futures::spawn_local`
+- **Deduplication** — incoming mutations are deduplicated by `mutation.id` within a short time window
+- **Self-filtering** — mutations with the local `replica_id` are filtered out (preventing echo from BroadcastChannel)
+- **Future-proofing** — uses `Vec<Arc<dyn Transport>>` for `remotes` (not `Option<Arc<dyn Transport>>`), allowing multiple transport backends to be active simultaneously
 
 **Observability**
 Every operation is traced with OpenTelemetry. The trace spans cover: CRDT merge → encrypt → write to oplog → transport → coordinator acknowledgment → decrypt → CRDT merge on remote. Debug HTTP API exposes full internal state without requiring external tools.
@@ -706,7 +788,59 @@ VaultSync schema migrations (user-defined field additions) do **not** increment 
 
 IndexedDB is slower due to browser IPC overhead per transaction. Use OPFS (SQLite via WASM) when available for production performance.
 
-### 8.5 Tombstone GC Safety with Offline Replicas
+### 8.6 MutationStore — OPFS Crash-Recovery Outbox (Phase E)
+
+The `MutationStore` is an OPFS-backed queue that serves as a durable outbox for mutations awaiting upload. It is separate from the main SQLite oplog and is designed for crash-recovery safety in browser environments where OPFS writes are synchronous.
+
+#### Storage Model
+
+The MutationStore uses OPFS (Origin Private File System) directly — not SQLite — to avoid contention with the main CRDT document store. Each namespace gets its own OPFS file:
+
+```
+/namespace_{namespace_hash}/mutation_queue.dat
+```
+
+#### Interface
+
+```rust
+pub struct MutationStore { ... }
+
+impl MutationStore {
+    /// Push a mutation to the end of the queue.
+    async fn push(&self, mutation: PendingMutation) -> Result<()>;
+
+    /// Pop a batch of up to `count` mutations from the front of the queue.
+    async fn pop_batch(&self, count: usize) -> Result<Vec<PendingMutation>>;
+
+    /// Acknowledge a mutation (remove from queue) after successful upload.
+    async fn ack(&self, mutation_id: &str) -> Result<()>;
+
+    /// Negative-acknowledge a mutation (return to front of queue) after failed upload.
+    async fn nack(&self, mutation_id: &str) -> Result<()>;
+
+    /// Returns the number of mutations currently in the queue.
+    async fn pending_count(&self) -> Result<usize>;
+}
+```
+
+#### Design Decisions
+
+- **OPFS writes are synchronous** — the `push()` operation completes before returning, ensuring the mutation is durable before any async upload begins. Only the WebSocket upload path is truly async, preventing phantom edits on page close.
+- **No phantom edits** — if the user closes the page before an upload completes, the mutation remains in the OPFS queue and is picked up on the next page load.
+- **Binary format** — mutations are stored as bincode-encoded `PendingMutation` structs (not JSON) for compactness and fast serialization.
+- **File-per-namespace** — prevents cross-namespace corruption and simplifies garbage collection.
+
+#### Crash Recovery
+
+On startup, `VaultSyncClient` scans the MutationStore for any leftover mutations. Entries found are re-pushed into the upload queue:
+
+1. Scan all mutation files in the OPFS namespace directory
+2. For each file, deserialize and push into the in-memory upload queue
+3. If a mutation has `sync_status = Optimistic`, determine whether to promote (upload) or discard (stale write from a crashed session)
+
+---
+
+### 8.7 Tombstone GC Safety with Offline Replicas
 
 CRDT tombstone garbage collection (GC) has a well-known safety hazard that must be explicitly managed.
 
@@ -764,7 +898,7 @@ Coordinator returns: { error: "REPLICA_TOO_STALE", bootstrapFrom: latestSnapshot
 Replica discards local CRDT state
          │
          ▼
-Replica bootstraps from latest coordinator snapshot (Section 17.3)
+Replica bootstraps from latest coordinator snapshot (Section 18.3)
          │
          ▼
 All local pending mutations are re-uploaded
@@ -816,11 +950,29 @@ interface Mutation {
   recordId:    string     // record identifier
   yrsUpdate:   Uint8Array // Yrs binary diff (encoded CRDT mutation)
   encrypted:   Uint8Array // AEAD ciphertext of yrsUpdate
-  timestamp:   number     // local wall clock (Unix ms)
+  timestamp:   number     // HLC wall clock (Unix ms), generated by HybridLogicalClock
   sequence?:   number     // coordinator-assigned ordering (null until synced)
-  syncStatus:  "pending" | "synced" | "failed"
+  syncStatus:  "optimistic" | "pending" | "synced" | "failed"
   createdAt:   Date
 }
+```
+
+### SyncStatus Enum
+
+Every oplog entry carries a `sync_status` field drawn from the following enum:
+
+| Variant | Lifecycle Phase | Description |
+|---|---|---|
+| `Optimistic` | Write → Pre-Upload | All local CRDT mutations start here. Written with an HLC timestamp. Crash-recovery scans for stale optimistic entries on startup (Phase F) |
+| `Pending` | Upload Queue | Mutation is in the upload queue, waiting to be sent to the coordinator. Promoted from `Optimistic` by the upload worker |
+| `Synced` | Confirmed | Coordinator acknowledged the mutation and assigned a sequence number. The mutation is durable on the coordinator |
+| `Failed` | Retry | Upload failed (network error, auth failure, etc.). The retry engine will re-attempt with exponential backoff |
+
+**Lifecycle:**
+```
+Optimistic ──► Pending ──► Synced
+                    │
+                    └──► Failed (permanent or retryable)
 ```
 
 ### Operation Capture (Inside Transaction)
@@ -878,7 +1030,7 @@ CREATE INDEX idx_oplog_record      ON vaultsync_oplog(doc_id, record_id);
 | Opaque JSON payload | Yrs binary diff | CRDT diff is smaller, self-contained, and merge-safe |
 | `previous_payload` field for undo | Not stored (CRDT document snapshot handles undo) | Yrs documents can be rolled back by reloading a prior snapshot |
 | Separate conflict_info column | Not needed | CRDTs have no conflicts to record |
-| `pending_sync → synced → failed → conflict` statuses | `pending → synced → failed` | CRDTs never enter a "conflict" state |
+| `pending_sync → synced → failed → conflict` statuses | `optimistic → pending → synced → failed` | CRDTs never enter a "conflict" state; optimistic adds pre-upload lifecycle |
 
 ### 9.5 Batch Operation Encoding
 
@@ -1671,11 +1823,14 @@ Step 6: Other Replicas Receive Mutation
 ### Sync States per Mutation
 
 ```
+optimistic    ← written locally, not yet in oplog; crash-recovery scans these on startup
 pending       ← written locally, not yet uploaded
 uploading     ← currently being sent to coordinator
 synced        ← coordinator confirmed receipt and assigned sequence
 failed        ← upload failed; in retry queue
 ```
+
+**Optimistic writes** (Phase F): All local insert/update/delete mutations start as `SyncStatus::Optimistic` with an HLC timestamp. The upload worker promotes them to `Pending` before sending. On crash recovery, the client scans for stale `Optimistic` entries and either promotes or discards them.
 
 ### Why "conflict" State Is Removed
 
@@ -1760,6 +1915,7 @@ Total header: 5 bytes. Payload: length bytes.
 ```json
 {
   "status":              "ok",
+  "generation_id":       "uuid-1234-5678",
   "coordinator_sequence": 150,
   "snapshot_available":  true,
   "snapshot_sequence":   100,
@@ -1767,6 +1923,8 @@ Total header: 5 bytes. Payload: length bytes.
   "error":               null
 }
 ```
+
+The `generation_id` field is a UUID generated by the coordinator server at startup. The server stores it in `AppState.generation_id` (or `OnceLock<String>` for CF workers). It is sent with `#[serde(default)]` for backward compatibility with older clients. The client compares this value against its stored `SyncState.generation_id`; on mismatch the client resets its cursor to 0 (eager cursor reset in `initialize()` after `register()`). This prevents stale clients from using a cursor that belongs to a previous coordinator generation.
 
 **`PUSH` (0x05)**
 ```json
@@ -1895,6 +2053,101 @@ If the WebSocket connection drops mid-stream:
 
 Partially sent `PUSH` frames (TCP half-open): the 5-byte frame header includes the `length` field. If the connection closes before `length` bytes are received, the server discards the partial frame and the client re-sends the full message on reconnect.
 
+### 13.2 Push-Primary Mutation Flow (Phase B)
+
+In addition to the client-initiated `PULL` model, VaultSync supports a **push-primary** flow where the coordinator pushes new mutations to replicas in real-time via the `SUBSCRIBE` → `MUTATION_PUSH` path.
+
+#### Stream Architecture
+
+```
+coordinator.subscribe(namespace, from_sequence)
+         │
+         ▼
+Returns: Pin<Box<dyn Stream<Item = PendingMutation>>>
+         │
+         ▼
+Bridged through futures::channel::mpsc::unbounded() channel
+         │
+         ▼
+Consumed in download worker's select! loop (30s timer fallback)
+```
+
+The `Coordinator::subscribe()` method returns a `Stream<Item = PendingMutation>`. Because WASM targets cannot use `Pin<Box<dyn Stream>>` directly in a `select!` macro, the stream is bridged to an `mpsc::UnboundedSender<Option<PendingMutation>>` channel. The download worker runs a `select!` loop:
+
+```
+loop {
+    select! {
+        mutation = push_channel.next() => {
+            if let Some(mutation) = mutation {
+                process_push_mutation(mutation);
+            }
+        }
+        _ = sleep(Duration::from_secs(30)) => {
+            // Fallback poll via PULL if no push received
+            pull_and_apply(after = cursor).await;
+        }
+    }
+}
+```
+
+#### `process_push_mutation()` in DownloadQueue
+
+When a push mutation arrives:
+
+1. **Decrypt** — decrypt the `encrypted_blob` with the namespace private key
+2. **Validate** — verify schema compatibility and mutation integrity
+3. **Apply** — merge the Yrs update into the local CRDT document
+4. **Advance cursor** — update `last_synced_sequence` to the mutation's sequence
+5. **Fire subscriptions** — notify all active subscribers of the affected documents
+
+The `download_notify` field in `SyncEvents` was changed from `()` to `Option<PendingMutation>` to carry the pushed mutation through the event channel.
+
+#### Deduplication
+
+Push mutations are deduplicated by mutation ID in `process_push_mutation()` — if a mutation with the same ID was already applied (e.g., from a concurrent PULL response), it is silently skipped.
+
+### 13.3 Hybrid Logical Clock (HLC — Phase C)
+
+VaultSync uses a Hybrid Logical Clock (HLC) to generate monotonic timestamps for all CRDT mutations. The HLC combines physical wall-clock time with a logical counter to ensure timestamps are always monotonically increasing, even across clock adjustments (NTP sync, daylight saving, manual changes).
+
+#### HlcTimestamp
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HlcTimestamp {
+    pub wall:   u64,   // Unix milliseconds (physical clock)
+    pub logical: u32,  // Monotonic counter, resets on wall change
+}
+```
+
+#### HybridLogicalClock
+
+```rust
+pub struct HybridLogicalClock {
+    last_wall:   AtomicU64,
+    last_logical: AtomicU32,
+}
+```
+
+The clock lives on `VaultSyncClient` and provides two methods:
+
+- **`now()`** — CAS-based: reads the system clock, compares with `last_wall`:
+  - If system time > `last_wall`: use system time, reset `logical` to 0
+  - If system time ≤ `last_wall`: increment `logical` counter, use `last_wall`
+- **`update_with_received(remote: HlcTimestamp)`** — called when merging remote mutations: ensures local clock ≥ max(local, remote) by advancing both `wall` and `logical` if needed
+
+#### Integration with Mutations
+
+All client-side timestamp generation uses `self.clock.now().wall` — no fields were added to mutation structs. This avoids 96+ breakage sites while ensuring every local write receives a monotonic HLC timestamp. The logical counter prevents backward-clock issues (e.g., system clock jumps back 1 second would previously produce a timestamp in the past; now the logical counter increments through the gap).
+
+#### Clock Initialization
+
+The HLC is initialized with the current system wall clock on `VaultSyncClient::new()`. On process restart, the clock starts fresh — the last persisted sequence number from `SyncState` provides the ordering anchor, not the clock value.
+
+#### Metrics
+
+The clock tracks logical counter wraps in the `hlc_logical_wraps` metric (Phase H). A logical counter wrap (u32 overflow) is extremely rare (~4 billion increments) but is recorded when it occurs.
+
 ---
 
 ## 14. Offline Support & Durability
@@ -1978,7 +2231,8 @@ CREATE TABLE vaultsync_sync_state (
   leader_status         TEXT    NOT NULL DEFAULT 'leader',
   last_connected_at     DATETIME,
   last_sync_at          DATETIME,
-  schema_version        INTEGER NOT NULL DEFAULT 1
+  schema_version        INTEGER NOT NULL DEFAULT 1,
+  generation_id         TEXT    NOT NULL DEFAULT ''
 );
 ```
 
@@ -2167,7 +2421,92 @@ function SyncIndicator() {
 
 ---
 
-## 17. Coordinator Abstraction Layer
+## 17. Presence Manager (Phase G)
+
+The `PresenceManager` provides real-time peer awareness within a namespace using the browser's `BroadcastChannel` API. It tracks which replicas are currently online, enabling features like "Who's editing this document" indicators.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────┐
+│            PresenceManager                    │
+│                                               │
+│  ┌─────────────┐  ┌───────────────────────┐  │
+│  │ BC Listener  │  │  Peer Table           │  │
+│  │ (presence    │  │  HashMap<replica_id,  │  │
+│  │  channel)    │  │    last_seen>         │  │
+│  └──────┬──────┘  └───────────┬───────────┘  │
+│         │                     │               │
+│         ▼                     ▼               │
+│  ┌───────────────────────────────────────┐    │
+│  │  Heartbeat Timer (every 5s)          │    │
+│  │  Stale Peer Eviction (>15s stale)    │    │
+│  └───────────────────────────────────────┘    │
+│                                               │
+│  WASM Exports:                                │
+│    peer_count() → u32                         │
+│    active_peers_json() → String               │
+└──────────────────────────────────────────────┘
+```
+
+### Message Types
+
+The PresenceManager uses its own `BroadcastChannel` (channel name: `vaultsync-presence-{namespace}`) to avoid message type confusion with the transport layer:
+
+| Message | Direction | Payload | Frequency |
+|---|---|---|---|
+| `Join` | Broadcast | `{ type: "join", replica_id, display_name, joined_at }` | On `initialize()` |
+| `Leave` | Broadcast | `{ type: "leave", replica_id }` | On `beforeunload` |
+| `Heartbeat` | Broadcast | `{ type: "heartbeat", replica_id, timestamp }` | Every 5 seconds |
+
+### Lifecycle
+
+```
+Client initializes
+  │
+  ├── PresenceManager.start()
+  │     ├── Register beforeunload handler
+  │     ├── Start heartbeat interval (5s)
+  │     ├── Send Join message
+  │     └── Start listening for peer messages
+  │
+  ├── On receive: update peer HashMap
+  │     ├── Join → add peer, increment active_peers metric
+  │     ├── Leave → remove peer, decrement active_peers metric
+  │     └── Heartbeat → update last_seen timestamp
+  │
+  ├── Heartbeat tick (every 5s):
+  │     └── Send Heartbeat message with current timestamp
+  │
+  ├── Stale eviction (every 15s):
+  │     └── Remove peers with last_seen > 15s ago
+  │
+  └── Client closes:
+        └── beforeunload fires → Send Leave message
+```
+
+### WASM Exports
+
+The PresenceManager exposes two methods to JavaScript via `wasm-bindgen`:
+
+```rust
+#[wasm_bindgen]
+impl PresenceManager {
+    pub fn peer_count(&self) -> u32;
+    pub fn active_peers_json(&self) -> String;
+}
+```
+
+- `peer_count()` — returns the number of currently active peers (excluding self)
+- `active_peers_json()` — returns a JSON array of peer objects: `[{ "replica_id": "...", "display_name": "...", "last_seen": 1234567890 }]`
+
+### Metrics
+
+The `active_peers` metric (Phase H) is updated on every join/leave/heartbeat event. The PresenceManager records `active_peers` as a gauge per namespace.
+
+---
+
+## 18. Coordinator Abstraction Layer
 
 ### Why a Trait?
 
@@ -2220,6 +2559,14 @@ pub trait Coordinator: Send + Sync + Debug {
 
     /// Report sync state for observability.
     async fn report_metrics(&self, metrics: CoordinatorMetrics) -> Result<(), CoordinatorError>;
+
+    /// Return the generation ID of the coordinator.
+    /// The generation ID is a UUID set at coordinator startup. It is included
+    /// in the RegisterAckPayload with #[serde(default)] for backward compatibility.
+    /// Default: empty string (no generation tracking — cursor reset is disabled).
+    async fn generation_id(&self) -> String {
+        String::new()
+    }
 }
 ```
 
@@ -2289,10 +2636,47 @@ const vaultsync = new VaultSync({
 })
 ```
 
-### Bootstrapping a New Replica
+### Client Initialization Flow (Generation Check & Cursor Reset)
+
+After the coordinator's `register()` handshake completes, the client performs an **eager generation check** before spawning the upload/download workers:
 
 ```
-New replica connects
+initialize()
+  │
+  ├── register() with coordinator
+  │
+  ├── let server_gen = coordinator.generation_id().await
+  │
+  ├── if server_gen.is_empty():
+  │     → coordinator does not track generations; skip check
+  │
+  ├── let local_gen = sync_state_manager.current_generation()
+  │
+  ├── if server_gen != local_gen:
+  │     → generation mismatch (coordinator restarted)
+  │     → sync_state_manager.reset_cursor(0)
+  │     → sync_state_manager.set_generation(server_gen)
+  │     → log: "Generation mismatch — cursor reset to 0"
+  │
+  └── else:
+        → generation matches; cursor is valid
+        → continue with normal init
+```
+
+The cursor reset is **eager** (happens in `initialize()` before spawning workers), not lazy (not deferred to `process_batch()`). This ensures that all downstream operations start from a known-good cursor. The `SyncStateManager` centralizes cursor and generation management:
+
+```rust
+// SyncStateManager methods
+fn current_cursor(&self) -> Result<i64>
+fn current_generation(&self) -> Result<String>
+fn advance_cursor(&self, seq: i64) -> Result<()>
+fn reset_cursor(&self, seq: i64) -> Result<()>
+fn check_generation(&self, server_gen: &str) -> Result<bool>  // returns true if reset happened
+```
+
+The `generation_id` is stored in `SyncState.generation_id TEXT NOT NULL DEFAULT ''` and is backward-compatible via `#[serde(default)]`. When a server with empty generation ID is used, no generation tracking occurs and cursor reset is disabled.
+
+### Bootstrapping a New Replica
          │
          ▼
 Sends: { replicaId, namespace, publicKey, schemaVersion, lastSequence: 0 }
@@ -2319,7 +2703,7 @@ Replica marks sync_status = "connected"
 Normal real-time sync begins
 ```
 
-### 17.1 Coordinator Server — Deployable Binary
+### 18.1 Coordinator Server — Deployable Binary
 
 The `Coordinator` trait defines what a coordinator backend does (push, pull, subscribe, register, heartbeat). This section defines the **coordinator server** — the deployable process that exposes those capabilities over WebSocket (Protocol §13.1) to VaultSync replicas.
 
@@ -2398,7 +2782,7 @@ heartbeat_timeout_seconds     = 90
 
 [compaction]
 snapshot_interval_mutations   = 10000
-mutation_retention_days       = 90       # matches tombstone GC threshold (§8.5)
+mutation_retention_days       = 90       # matches tombstone GC threshold (§8.7)
 ```
 
 #### Session Lifecycle
@@ -2415,7 +2799,7 @@ WebSocket connected
   → WebSocket closed → removed from fan-out group
 ```
 
-### 17.2 Partial Sync
+### 18.2 Partial Sync
 
 Partial sync allows a replica to synchronize only a subset of records from a namespace rather than all records. This is essential for multi-tenant apps (sync only records belonging to this user) and large datasets.
 
@@ -2462,7 +2846,7 @@ On PULL request: coordinator filters response by sync_filter
 
 Partial sync is **enforced by the coordinator**, not the client. The client declares the filter; the coordinator applies it before delivery. This ensures:
 1. Replicas only receive mutations they declared interest in (bandwidth efficiency)
-2. A replica cannot "declare away" records it should sync (filter is advisory, not a security boundary — see Authorization §23.1 for security)
+2. A replica cannot "declare away" records it should sync (filter is advisory, not a security boundary — see Authorization §24.1 for security)
 
 #### E2EE Constraint
 
@@ -2513,7 +2897,7 @@ Coordinator sends "RECORD_EVICTED" notification:
 Replica soft-deletes the local CRDT document
 ```
 
-### 17.3 Snapshot Bootstrap Protocol
+### 18.3 Snapshot Bootstrap Protocol
 
 This section details how coordinator-side snapshots are created, stored, and used to onboard new replicas without replaying the full mutation history.
 
@@ -2583,6 +2967,45 @@ Replica sends PULL(after=snapshot_sequence) for mutations since snapshot
 Normal sync begins from snapshot_sequence
 ```
 
+#### Client-Side Snapshot Optimization: `try_fetch_snapshot()`
+
+In addition to the bootstrap snapshot flow above, the client's `process_batch()` method in `DownloadQueue` includes an optimization: **before pulling mutations, check if a snapshot is available** for fast catch-up.
+
+```
+process_batch()
+  │
+  ├── let behind = cursor < (latest_sequence - snapshot_threshold)
+  │
+  ├── if behind:
+  │     → try_fetch_snapshot(cursor)
+  │         │
+  │         ├── coordinator.list_snapshots()
+  │         │
+  │         ├── find best snapshot where snapshot.sequence > cursor
+  │         │   (prefers largest sequence <= latest to minimize replay)
+  │         │
+  │         ├── download and apply snapshot
+  │         ├── advance cursor to snapshot.sequence
+  │         └── return true (snapshot applied)
+  │
+  └── if !snapshot_applied:
+        → normal pull from cursor
+        
+  → pull_and_apply(after = cursor, limit = batch_size)
+```
+
+**Configurable via `DownloadConfig.snapshot_threshold`** (default: 500). If the cursor is more than `snapshot_threshold` mutations behind the coordinator's latest sequence, the client attempts a snapshot catch-up before falling back to normal pull. If no suitable snapshot exists (e.g., the coordinator hasn't created one yet, or no snapshot covers the cursor position), the client falls through to normal pull without error.
+
+```rust
+pub struct DownloadConfig {
+    pub batch_size: usize,
+    pub max_pending_mutations: usize,
+    pub snapshot_threshold: u64,  // default: 500
+}
+```
+
+When a snapshot is applied, the `snapshots_applied` metric (Phase H) is incremented.
+
 #### Snapshot Integrity
 
 The new replica validates snapshot integrity by:
@@ -2598,7 +3021,7 @@ The new replica validates snapshot integrity by:
 | 10K–100K mutations | Every 10K mutations |
 | > 100K mutations | Every 10K mutations, older snapshots pruned after 2× tombstone retention |
 
-### 17.4 Coordinator Fan-Out Mechanism
+### 18.4 Coordinator Fan-Out Mechanism
 
 When a mutation is stored by the coordinator, it must be delivered in real-time to all other connected replicas in the same namespace. This section specifies how each coordinator backend handles fan-out.
 
@@ -2650,7 +3073,7 @@ impl ConnectionManager {
 
 For multi-instance coordinator deployments (HA), the in-memory fan-out is replaced with the backend pub/sub mechanism — Postgres LISTEN/NOTIFY or Redis PUBLISH ensures mutations are fanned out across all server instances.
 
-### 17.5 Coordinator High Availability
+### 18.5 Coordinator High Availability
 
 For production deployments requiring uptime guarantees, the coordinator can run in high-availability configuration.
 
@@ -2702,7 +3125,7 @@ const vaultsync = new VaultSync({
 
 On connection failure, the client rotates to the next endpoint automatically. The new connection's `REGISTER` message includes `last_sequence`, so the coordinator catches the client up from where it left off.
 
-### 17.6 Coordinator-Side Compaction
+### 18.6 Coordinator-Side Compaction
 
 As months of mutations accumulate, the coordinator's `vaultsync_coordinator_mutations` table grows unboundedly. Compaction prunes old entries while maintaining correctness.
 
@@ -2735,7 +3158,7 @@ Background job runs daily (or triggered by mutation count threshold):
 If a new replica joins and requests `PULL(after=0)`, but the coordinator has compacted mutations before sequence 5000:
 - Coordinator returns `PULL_RESPONSE` starting from the oldest available sequence
 - `REGISTER_ACK` includes `compaction_floor: 5000` — sequences below this are unavailable
-- Client bootstraps from the latest snapshot (§17.3) which covers the compacted range
+- Client bootstraps from the latest snapshot (§18.3) which covers the compacted range
 
 #### Stale Replica Detection
 
@@ -2746,7 +3169,7 @@ If a replica's `last_sequence` is below the `compaction_floor` when it reconnect
 
 ---
 
-## 18. Full Database Schema
+## 19. Full Database Schema
 
 ### Local (Client-Side) Tables
 
@@ -2794,8 +3217,17 @@ CREATE TABLE vaultsync_sync_state (
   leader_status         TEXT    NOT NULL DEFAULT 'leader',
   last_connected_at     DATETIME,
   last_sync_at          DATETIME,
-  schema_version        INTEGER NOT NULL DEFAULT 1
+  schema_version        INTEGER NOT NULL DEFAULT 1,
+  generation_id         TEXT    NOT NULL DEFAULT ''
 );
+
+-- The generation_id column stores the coordinator's startup UUID.
+-- On coordinator restart, a mismatched generation_id causes the client
+-- to reset its cursor (eager reset in initialize()). The DEFAULT ''
+-- and COALESCE handling in SQLite SELECT ensure backward compatibility
+-- with clients upgraded before this column existed.
+-- Migration: ALTER TABLE vaultsync_sync_state ADD COLUMN
+--   generation_id TEXT NOT NULL DEFAULT '';
 
 -- Schema metadata
 CREATE TABLE vaultsync_schema_meta (
@@ -2885,13 +3317,14 @@ CREATE TABLE vaultsync_coordinator_snapshots (
 | `vaultsync_oplog` — `previous_payload` | **Removed** | CRDT document snapshots handle rollback |
 | `vaultsync_oplog` — `sync_status conflict` | **Removed** | CRDT mutations never conflict |
 | `vaultsync_sync_state` — `replica_id` PK (old section 11) vs `namespace` PK (old section 16) | **Fixed**: `namespace` PK consistently | Resolved schema contradiction |
+| `vaultsync_sync_state` — `generation_id` | **New column** | Coordinator generation tracking for cursor reset on server restart |
 | `vaultsync_conflicts` | **Removed** | No conflict log needed |
 | `vaultsync_keys` | **New** | E2EE key storage table |
 | `vaultsync_documents` — `doc_bytes BLOB` | **New** | CRDT document snapshot storage |
 
 ---
 
-## 19. Performance Model
+## 20. Performance Model
 
 ### Honest Performance Targets
 
@@ -2954,7 +3387,7 @@ full_operation_path                     22.1 µs  +5%     ✅
 
 ---
 
-## 20. Observability & Debuggability
+## 21. Observability & Debuggability
 
 ### Full Observability — No Black Box
 
@@ -2986,6 +3419,11 @@ Traces are exportable to Jaeger, Datadog, Grafana Tempo, or any OTLP-compatible 
 | `vaultsync_mutations_total` | Counter (labels: status, namespace) | Total mutations processed |
 | `vaultsync_mutations_pending` | Gauge (labels: namespace) | Current pending upload queue depth |
 | `vaultsync_mutations_failed` | Counter (labels: namespace, reason) | Mutations in failed state |
+| `vaultsync_push_mutations_received` | Counter (labels: namespace) | Mutations received via push-primary path (Phase H) — recorded in `DownloadQueue::process_push_mutation()` |
+| `vaultsync_snapshots_applied` | Counter (labels: namespace) | Snapshots applied by client during catch-up (Phase H) — recorded in `DownloadQueue::try_fetch_snapshot()` |
+| `vaultsync_optimistic_writes` | Counter (labels: namespace) | Local writes that entered `Optimistic` status (Phase H) — recorded in client.rs on insert/update/delete |
+| `vaultsync_hlc_logical_wraps` | Counter | Number of times the HLC logical counter wrapped around (Phase H) — recorded in `HybridLogicalClock::now()` |
+| `vaultsync_active_peers` | Gauge (labels: namespace) | Current number of active peers detected by `PresenceManager` (Phase H) — updated on join/leave/heartbeat |
 | `vaultsync_sync_lag_ms` | Histogram (labels: namespace) | Time from local write to coordinator ACK |
 | `vaultsync_download_lag_ms` | Histogram (labels: namespace) | Time from coordinator sequence to replica apply |
 | `vaultsync_encryption_time_us` | Histogram (labels: operation) | E2EE encrypt/decrypt duration |
@@ -3067,7 +3505,7 @@ $ vaultsync replay trace.json
 
 ---
 
-## 21. SDK Reference
+## 22. SDK Reference
 
 ### Installation
 
@@ -3259,7 +3697,7 @@ await vaultsync.shutdown()
 
 ---
 
-## 22. Deployment Modes
+## 23. Deployment Modes
 
 ### Mode 1: Embedded Local-Only (No Sync)
 
@@ -3332,7 +3770,7 @@ const vaultsync = new VaultSync({
 
 ---
 
-## 23. Security Model
+## 24. Security Model
 
 ### Transport Security
 
@@ -3387,7 +3825,7 @@ Mutations failing validation are rejected with a specific error code. The client
 
 Each mutation includes a client-generated unique ID (`mut_abc123`). The coordinator deduplicates by mutation ID. A replayed mutation is silently dropped — idempotent by design. The E2EE layer also prevents meaningful replay since the coordinator cannot produce new valid ciphertexts without the private key.
 
-### 23.1 Authorization Plugin Interface
+### 24.1 Authorization Plugin Interface
 
 By default, any replica with a valid JWT for a namespace can push and pull any mutation in that namespace. For finer-grained control, the coordinator supports an authorization plugin interface.
 
@@ -3449,7 +3887,7 @@ If field-level authorization is required, those fields must be extracted from th
 
 ---
 
-## 24. Integrations (Optional Plugins)
+## 25. Integrations (Optional Plugins)
 
 ### Aegis (Authorization)
 
@@ -3500,7 +3938,7 @@ vaultsync.schema.define("todos", {
 
 ---
 
-## 25. Development Roadmap
+## 26. Development Roadmap
 
 ### Alpha — Core Foundation
 
@@ -3569,7 +4007,7 @@ Deliver a single-tab, single-coordinator (Postgres) system with all foundational
 
 ---
 
-## 26. Real-World Use Cases
+## 27. Real-World Use Cases
 
 ### Collaborative Todo / Project Management
 
@@ -3657,7 +4095,7 @@ Two developers on the same office Wi-Fi:
 
 ---
 
-## 27. Multi-Namespace & Multi-Tenant Architecture
+## 28. Multi-Namespace & Multi-Tenant Architecture
 
 VaultSync isolates data by `namespace`. The spec generally describes one replica syncing one namespace. This section defines how applications handle multiple namespaces concurrently.
 

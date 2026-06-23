@@ -1,8 +1,10 @@
+pub mod clock;
 pub mod coordinator;
 pub mod crdt;
 pub mod e2ee;
 pub mod ipc;
 pub mod oplog;
+pub mod transport;
 pub mod schema;
 pub mod storage;
 pub mod subscription;

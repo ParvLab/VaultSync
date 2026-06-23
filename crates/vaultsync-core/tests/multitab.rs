@@ -144,6 +144,7 @@ async fn test_readers_receive_via_shared_memory() {
         last_connected_at: Some(99999),
         last_sync_at: Some(88888),
         schema_version: 5,
+        generation_id: String::new(),
     };
 
     let encoded = encode_sync_state(&state).unwrap();

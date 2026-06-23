@@ -2,6 +2,7 @@ import { VaultSyncClient } from './index.js';
 import { SyncStatusObservable } from './sync.js';
 import { KeyManager } from './keys.js';
 import type { VaultSyncConfig } from './types.js';
+import type { MetricsSnapshot } from './types.js';
 
 export class VaultSync {
   private client: VaultSyncClient;
@@ -38,6 +39,16 @@ export class VaultSync {
 
   get leader(): boolean {
     return this.client.isLeader();
+  }
+
+  /** Returns a metrics snapshot. */
+  async metrics(): Promise<MetricsSnapshot> {
+    return this.client.metrics();
+  }
+
+  /** Returns the PresenceManager for cross-tab awareness, or null. */
+  presence() {
+    return this.client.presence();
   }
 
   async shutdown(): Promise<void> {

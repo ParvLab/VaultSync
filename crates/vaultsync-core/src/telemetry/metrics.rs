@@ -10,6 +10,11 @@ pub struct MetricsSnapshot {
     pub pending_mutations: u64,
     pub replica_count: u64,
     pub doc_count: u64,
+    pub push_mutations_received: u64,
+    pub snapshots_applied: u64,
+    pub optimistic_writes: u64,
+    pub hlc_logical_wraps: u64,
+    pub active_peers: u64,
 }
 
 #[cfg(feature = "telemetry")]
@@ -254,6 +259,26 @@ impl VaultSyncMetrics {
         // No-op or we can increment key rotation counters if registry exists.
     }
 
+    pub fn record_push_received(&self) {
+        // TODO: add gauge/counter for push mutations in telemetry registry
+    }
+
+    pub fn record_snapshot_applied(&self) {
+        // TODO: add gauge/counter for snapshots in telemetry registry
+    }
+
+    pub fn record_optimistic_write(&self) {
+        // TODO: add gauge/counter for optimistic writes in telemetry registry
+    }
+
+    pub fn record_hlc_wrap(&self) {
+        // TODO: add gauge/counter for hlc wraps in telemetry registry
+    }
+
+    pub fn set_active_peers(&self, _count: u64) {
+        // TODO: add gauge for active peers in telemetry registry
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             mutations_uploaded: self
@@ -275,6 +300,11 @@ impl VaultSyncMetrics {
             pending_mutations: self.mutations_pending.with_label_values(&["default"]).get() as u64,
             replica_count: self.replica_count.with_label_values(&["default"]).get() as u64,
             doc_count: 0,
+            push_mutations_received: 0,
+            snapshots_applied: 0,
+            optimistic_writes: 0,
+            hlc_logical_wraps: 0,
+            active_peers: 0,
         }
     }
 }
@@ -305,6 +335,11 @@ pub struct VaultSyncMetrics {
     pub mutations_downloaded: AtomicU64,
     pub sync_errors: AtomicU64,
     pub last_sync_lag_ms: AtomicU64,
+    pub push_mutations_received: AtomicU64,
+    pub snapshots_applied: AtomicU64,
+    pub optimistic_writes: AtomicU64,
+    pub hlc_logical_wraps: AtomicU64,
+    pub active_peers: AtomicU64,
 }
 
 #[cfg(not(feature = "telemetry"))]
@@ -315,6 +350,11 @@ impl VaultSyncMetrics {
             mutations_downloaded: AtomicU64::new(0),
             sync_errors: AtomicU64::new(0),
             last_sync_lag_ms: AtomicU64::new(0),
+            push_mutations_received: AtomicU64::new(0),
+            snapshots_applied: AtomicU64::new(0),
+            optimistic_writes: AtomicU64::new(0),
+            hlc_logical_wraps: AtomicU64::new(0),
+            active_peers: AtomicU64::new(0),
         }
     }
 
@@ -350,6 +390,31 @@ impl VaultSyncMetrics {
     pub fn record_crdt_merge_time(&self, _doc_id: &str, _us: f64) {}
     pub fn record_key_rotation(&self, _namespace: &str) {}
 
+    /// Record a push mutation received from subscription / WS.
+    pub fn record_push_received(&self) {
+        self.push_mutations_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a snapshot applied during catch-up.
+    pub fn record_snapshot_applied(&self) {
+        self.snapshots_applied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an optimistic write (local apply before server ack).
+    pub fn record_optimistic_write(&self) {
+        self.optimistic_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record HLC logical counter wrap (rare — clock stalled).
+    pub fn record_hlc_wrap(&self) {
+        self.hlc_logical_wraps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set number of active peer tabs.
+    pub fn set_active_peers(&self, count: u64) {
+        self.active_peers.store(count, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             mutations_uploaded: self.mutations_uploaded.load(Ordering::Relaxed),
@@ -359,6 +424,11 @@ impl VaultSyncMetrics {
             pending_mutations: 0,
             replica_count: 0,
             doc_count: 0,
+            push_mutations_received: self.push_mutations_received.load(Ordering::Relaxed),
+            snapshots_applied: self.snapshots_applied.load(Ordering::Relaxed),
+            optimistic_writes: self.optimistic_writes.load(Ordering::Relaxed),
+            hlc_logical_wraps: self.hlc_logical_wraps.load(Ordering::Relaxed),
+            active_peers: self.active_peers.load(Ordering::Relaxed),
         }
     }
 }

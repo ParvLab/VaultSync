@@ -234,6 +234,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         snapshot_sequence: 0,
         snapshot_url: None,
         error: None,
+        generation_id: state.generation_id.clone(),
     };
 
     let mut available_snapshots = Vec::new();
@@ -336,17 +337,29 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                 match msg_type {
                     MSG_PUSH => {
                         if let Ok(push) = serde_json::from_slice::<PushPayload>(payload) {
+                            let req_id = push.request_id.clone();
+                            tracing::info!(
+                                "[ws] MSG_PUSH received count={} req={}",
+                                push.mutations.len(),
+                                req_id
+                            );
                             let res = state.coordinator.push(&ns, push.mutations).await;
                             let (sequences, error) = match res {
                                 Ok(seqs) => (seqs, None),
                                 Err(e) => (vec![], Some(format!("{:?}", e))),
                             };
+                            tracing::info!("[ws] MSG_PUSH stored, sending ACK req={}", req_id);
                             let ack = PushAckPayload {
                                 request_id: push.request_id,
-                                sequences,
+                                sequences: sequences.clone(),
                                 error,
                             };
                             if let Ok(frame) = encode_frame(MSG_PUSH_ACK, &ack) {
+                                tracing::info!(
+                                    "[ws] sending PUSH_ACK req={} sequences={:?}",
+                                    req_id,
+                                    sequences
+                                );
                                 let _ = tx.send(Message::Binary(frame)).await;
                             }
                         }

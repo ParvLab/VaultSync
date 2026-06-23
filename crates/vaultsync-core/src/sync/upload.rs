@@ -43,6 +43,7 @@ impl UploadQueue {
 
     pub async fn process_batch(&self) -> Result<usize, VaultSyncError> {
         let raw_entries = self.oplog.read_pending(self.config.batch_size).await?;
+        tracing::info!("[upload_queue] read_pending found {} entries", raw_entries.len());
         if raw_entries.is_empty() {
             return Ok(0);
         }
@@ -93,12 +94,19 @@ impl UploadQueue {
         );
         let _enter = span.enter();
 
-        match self
+        tracing::info!(
+            "[upload_queue] calling coordinator.push count={}",
+            mutations.len()
+        );
+        let push_result = self
             .coordinator
             .push(&self.oplog.namespace(), mutations)
-            .await
+            .await;
+        tracing::info!("[upload_queue] push returned: {:?}", &push_result);
+        match push_result
         {
             Ok(sequences) => {
+                tracing::info!("[upload_queue] push success seqs={:?}", sequences);
                 self.metrics
                     .set_connection_status(&self.oplog.namespace(), true);
                 for (entry, seq) in entries.iter().zip(sequences.iter()) {

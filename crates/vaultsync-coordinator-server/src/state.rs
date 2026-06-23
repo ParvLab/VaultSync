@@ -18,4 +18,5 @@ pub struct AppState {
     pub token_store: Option<Arc<dyn TokenStore>>,
     pub config: ServerConfig,
     pub sessions: SessionRegistry,
+    pub generation_id: String,
 }

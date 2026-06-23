@@ -31,6 +31,11 @@ struct D1SchemaVersionRow {
     version: i64,
 }
 
+fn server_generation_id() -> &'static str {
+    static GEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    GEN.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     let url = req.url()?;
@@ -589,6 +594,7 @@ impl DurableObject for NamespaceDurableObject {
                     snapshot_sequence: 0,
                     snapshot_url: None,
                     error: None,
+                    generation_id: server_generation_id().to_string(),
                 };
                 if let Ok(Some(row)) = db
                     .prepare("SELECT version FROM schema_versions WHERE namespace = ?1")

@@ -58,6 +58,8 @@ pub struct RegisterAckPayload {
     pub snapshot_sequence: u64,
     pub snapshot_url: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub generation_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
