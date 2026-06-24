@@ -52,13 +52,16 @@ impl Coordinator for SQLiteCoordinator {
             let mut seq_ids = Vec::new();
             let mut pending_to_broadcast = Vec::new();
             {
-                let mut stmt = tx.prepare(
-                    "INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version)
+                let mut insert = tx.prepare(
+                    "INSERT OR IGNORE INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                let mut lookup = tx.prepare(
+                    "SELECT sequence FROM mutations WHERE id = ?1"
                 ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
                 for m in mutations {
-                    stmt.execute(params![
+                    let inserted = insert.execute(params![
                         m.id,
                         namespace_str,
                         m.replica_id,
@@ -68,7 +71,12 @@ impl Coordinator for SQLiteCoordinator {
                         m.timestamp as i64,
                         m.key_version as i64
                     ]).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-                    let seq = tx.last_insert_rowid() as u64;
+                    let seq = if inserted > 0 {
+                        tx.last_insert_rowid() as u64
+                    } else {
+                        lookup.query_row(params![m.id], |row| row.get::<_, i64>(0))
+                            .map_err(|e| CoordinatorError::Internal(e.to_string()))? as u64
+                    };
                     seq_ids.push(seq);
                     pending_to_broadcast.push(PendingMutation {
                         id: m.id,

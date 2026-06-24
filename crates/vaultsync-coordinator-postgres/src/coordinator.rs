@@ -82,14 +82,26 @@ impl Coordinator for PostgresCoordinator {
                 &(m.key_version as i64),
             ];
 
-            let row = tx.query_one(
+            // Try INSERT with ON CONFLICT DO NOTHING — if row already exists, RETURNING
+            // yields no row and we fall back to SELECTing the existing sequence.
+            let rows = tx.query(
                 "INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (id) DO NOTHING
                  RETURNING sequence",
                 params,
             ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
-            let seq: i64 = row.get(0);
+            let seq: i64 = if let Some(row) = rows.first() {
+                row.get(0)
+            } else {
+                let lookup_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&m.id];
+                tx.query_one(
+                    "SELECT sequence FROM mutations WHERE id = $1",
+                    lookup_params,
+                ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
+                .get(0)
+            };
             seqs.push(seq as u64);
         }
 
