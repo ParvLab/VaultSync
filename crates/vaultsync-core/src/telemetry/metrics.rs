@@ -35,6 +35,11 @@ pub struct VaultSyncMetrics {
     pub download_lag_ms: HistogramVec,
     pub encryption_time_us: HistogramVec,
     pub crdt_merge_time_us: HistogramVec,
+    pub push_mutations_received: IntCounterVec,
+    pub snapshots_applied: IntCounterVec,
+    pub optimistic_writes: IntCounterVec,
+    pub hlc_logical_wraps: IntCounterVec,
+    pub active_peers: IntGaugeVec,
 }
 
 #[cfg(feature = "telemetry")]
@@ -136,6 +141,27 @@ impl VaultSyncMetrics {
         )
         .unwrap();
 
+        let push_mutations_received = IntCounterVec::new(
+            Opts::new("vaultsync_push_mutations_received", "Push mutations received via subscription"),
+            &[],
+        ).unwrap();
+        let snapshots_applied = IntCounterVec::new(
+            Opts::new("vaultsync_snapshots_applied", "Snapshots applied during catch-up"),
+            &[],
+        ).unwrap();
+        let optimistic_writes = IntCounterVec::new(
+            Opts::new("vaultsync_optimistic_writes", "Optimistic writes applied locally"),
+            &[],
+        ).unwrap();
+        let hlc_logical_wraps = IntCounterVec::new(
+            Opts::new("vaultsync_hlc_logical_wraps", "HLC logical counter wraps"),
+            &[],
+        ).unwrap();
+        let active_peers = IntGaugeVec::new(
+            Opts::new("vaultsync_active_peers", "Number of active peer tabs"),
+            &[],
+        ).unwrap();
+
         let _ = registry.register(Box::new(mutations_total.clone()));
         let _ = registry.register(Box::new(mutations_failed.clone()));
         let _ = registry.register(Box::new(conflicts_total.clone()));
@@ -149,6 +175,11 @@ impl VaultSyncMetrics {
         let _ = registry.register(Box::new(download_lag_ms.clone()));
         let _ = registry.register(Box::new(encryption_time_us.clone()));
         let _ = registry.register(Box::new(crdt_merge_time_us.clone()));
+        let _ = registry.register(Box::new(push_mutations_received.clone()));
+        let _ = registry.register(Box::new(snapshots_applied.clone()));
+        let _ = registry.register(Box::new(optimistic_writes.clone()));
+        let _ = registry.register(Box::new(hlc_logical_wraps.clone()));
+        let _ = registry.register(Box::new(active_peers.clone()));
 
         Self {
             mutations_total,
@@ -164,6 +195,11 @@ impl VaultSyncMetrics {
             download_lag_ms,
             encryption_time_us,
             crdt_merge_time_us,
+            push_mutations_received,
+            snapshots_applied,
+            optimistic_writes,
+            hlc_logical_wraps,
+            active_peers,
         }
     }
 
@@ -260,23 +296,23 @@ impl VaultSyncMetrics {
     }
 
     pub fn record_push_received(&self) {
-        // TODO: add gauge/counter for push mutations in telemetry registry
+        self.push_mutations_received.with_label_values(&[]).inc();
     }
 
     pub fn record_snapshot_applied(&self) {
-        // TODO: add gauge/counter for snapshots in telemetry registry
+        self.snapshots_applied.with_label_values(&[]).inc();
     }
 
     pub fn record_optimistic_write(&self) {
-        // TODO: add gauge/counter for optimistic writes in telemetry registry
+        self.optimistic_writes.with_label_values(&[]).inc();
     }
 
     pub fn record_hlc_wrap(&self) {
-        // TODO: add gauge/counter for hlc wraps in telemetry registry
+        self.hlc_logical_wraps.with_label_values(&[]).inc();
     }
 
-    pub fn set_active_peers(&self, _count: u64) {
-        // TODO: add gauge for active peers in telemetry registry
+    pub fn set_active_peers(&self, count: u64) {
+        self.active_peers.with_label_values(&[]).set(count as i64);
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -300,11 +336,11 @@ impl VaultSyncMetrics {
             pending_mutations: self.mutations_pending.with_label_values(&["default"]).get() as u64,
             replica_count: self.replica_count.with_label_values(&["default"]).get() as u64,
             doc_count: 0,
-            push_mutations_received: 0,
-            snapshots_applied: 0,
-            optimistic_writes: 0,
-            hlc_logical_wraps: 0,
-            active_peers: 0,
+            push_mutations_received: self.push_mutations_received.with_label_values(&[]).get(),
+            snapshots_applied: self.snapshots_applied.with_label_values(&[]).get(),
+            optimistic_writes: self.optimistic_writes.with_label_values(&[]).get(),
+            hlc_logical_wraps: self.hlc_logical_wraps.with_label_values(&[]).get(),
+            active_peers: self.active_peers.with_label_values(&[]).get() as u64,
         }
     }
 }
