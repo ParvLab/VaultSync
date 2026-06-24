@@ -89,7 +89,19 @@ impl Coordinator for SQLiteCoordinator {
 
         let (seq_ids, pending_to_broadcast) = push_res;
         for pm in pending_to_broadcast {
-            let _ = tx_sender.send(pm);
+            let seq = pm.sequence;
+            match tx_sender.send(pm) {
+                Ok(receivers) => {
+                    if receivers == 0 {
+                        tracing::warn!("[push] broadcast to 0 receivers seq={}", seq);
+                    } else {
+                        tracing::debug!("[push] broadcasted seq={} to {} receivers", seq, receivers);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[push] broadcast channel closed seq={}", e.0.sequence);
+                }
+            }
         }
         Ok(seq_ids)
     }
@@ -167,11 +179,12 @@ impl Coordinator for SQLiteCoordinator {
 
         tokio::spawn(async move {
             let mut last_sent = from_sequence;
+            let ns_db = namespace_str.clone();
 
             // 1. Query existing mutations from DB that occurred after `from_sequence`
-            let ns_db = namespace_str.clone();
+            let db_conn = conn.clone();
             let db_res = tokio::task::spawn_blocking(move || {
-                let conn_guard = conn.lock().ok()?;
+                let conn_guard = db_conn.lock().ok()?;
                 let mut stmt = conn_guard.prepare(
                     "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
                      FROM mutations
@@ -209,12 +222,75 @@ impl Coordinator for SQLiteCoordinator {
                 }
             }
 
-            // 2. Stream new mutations from the broadcast channel
-            while let Ok(m) = rx_broadcast.recv().await {
-                if m.namespace == namespace_str && m.sequence > last_sent {
-                    last_sent = m.sequence;
-                    if tx_mpsc.send(m).await.is_err() {
-                        return;
+            // 2. Stream new mutations from the broadcast channel.
+            //    Handle Lagged gracefully: re-query DB to catch missed mutations.
+            loop {
+                match rx_broadcast.recv().await {
+                    Ok(m) => {
+                        if m.namespace == namespace_str && m.sequence > last_sent {
+                            last_sent = m.sequence;
+                            if tx_mpsc.send(m).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            "subscription lagged by {} messages ns={} — re-querying DB",
+                            n,
+                            namespace_str
+                        );
+                        // Re-query DB from last_sent to recover missed mutations
+                        let catchup_conn = conn.clone();
+                        let catchup_ns = namespace_str.clone();
+                        let after = last_sent;
+                        let catchup = tokio::task::spawn_blocking(move || {
+                            let conn_guard = catchup_conn.lock().ok()?;
+                            let mut stmt = conn_guard.prepare(
+                                "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
+                                 FROM mutations
+                                 WHERE namespace = ?1 AND sequence > ?2
+                                 ORDER BY sequence ASC"
+                            ).ok()?;
+                            let rows = stmt.query_map(params![catchup_ns, after], |row| {
+                                Ok(PendingMutation {
+                                    id: row.get(0)?,
+                                    namespace: row.get(1)?,
+                                    sequence: row.get(2)?,
+                                    doc_id: row.get(3)?,
+                                    record_id: row.get(4)?,
+                                    encrypted_blob: row.get(5)?,
+                                    timestamp: row.get(6)?,
+                                    key_version: row.get(7)?,
+                                    replica_id: row.get(8)?,
+                                })
+                            }).ok()?;
+                            let mut res = Vec::new();
+                            for r in rows {
+                                if let Ok(m) = r {
+                                    res.push(m);
+                                }
+                            }
+                            Some(res)
+                        }).await;
+                        if let Ok(Some(mutations)) = catchup {
+                            let caught = mutations.len();
+                            for m in mutations {
+                                last_sent = last_sent.max(m.sequence);
+                                if tx_mpsc.send(m).await.is_err() {
+                                    return;
+                                }
+                            }
+                            tracing::info!(
+                                "subscription DB catchup delivered {} mutations ns={}",
+                                caught,
+                                namespace_str
+                            );
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::info!("subscription broadcast channel closed ns={}", namespace_str);
+                        break;
                     }
                 }
             }

@@ -84,7 +84,19 @@ impl Coordinator for InMemoryCoordinator {
         drop(ops);
 
         for pm in to_broadcast {
-            let _ = self.tx.send(pm);
+            let seq = pm.sequence;
+            match self.tx.send(pm) {
+                Ok(receivers) => {
+                    if receivers == 0 {
+                        tracing::warn!("[push] broadcast to 0 receivers seq={}", seq);
+                    } else {
+                        tracing::debug!("[push] broadcasted seq={} to {} receivers", seq, receivers);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[push] broadcast channel closed seq={}", e.0.sequence);
+                }
+            }
         }
 
         Ok(seqs)
@@ -141,12 +153,28 @@ impl Coordinator for InMemoryCoordinator {
                 }
             }
 
-            // 2. Stream new mutations from the broadcast channel
-            while let Ok(m) = rx_broadcast.recv().await {
-                if m.namespace == namespace_str && m.sequence > last_sent {
-                    last_sent = m.sequence;
-                    if tx_mpsc.send(m).await.is_err() {
-                        return;
+            // 2. Stream new mutations from the broadcast channel.
+            //    Handle Lagged gracefully (best-effort, no-persistence backend).
+            loop {
+                match rx_broadcast.recv().await {
+                    Ok(m) => {
+                        if m.namespace == namespace_str && m.sequence > last_sent {
+                            last_sent = m.sequence;
+                            if tx_mpsc.send(m).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            "InMemory subscription lagged by {} messages ns={}",
+                            n,
+                            namespace_str
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
                     }
                 }
             }
