@@ -213,10 +213,12 @@ impl Coordinator for PostgresCoordinator {
             }
 
             // 2. Poll/listen for new notifications
-            while let Ok(notif_ns) = rx_broadcast.recv().await {
-                if notif_ns == namespace_str {
-                    loop {
-                        let client_guard = client.lock().await;
+            loop {
+                match rx_broadcast.recv().await {
+                    Ok(notif_ns) => {
+                        if notif_ns == namespace_str {
+                            loop {
+                                let client_guard = client.lock().await;
                         let last_sent_i64 = last_sent as i64;
                         let pull_limit_i64 = pull_limit as i64;
                         let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
@@ -260,9 +262,23 @@ impl Coordinator for PostgresCoordinator {
                                 if rows.len() < pull_limit {
                                     break;
                                 }
+                                    }
+                                    Err(_) => break,
+                                }
                             }
-                            Err(_) => break,
                         }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            "Postgres subscription lagged by {} notifications ns={}",
+                            n,
+                            namespace_str
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::info!("Postgres subscription broadcast channel closed ns={}", namespace_str);
+                        break;
                     }
                 }
             }

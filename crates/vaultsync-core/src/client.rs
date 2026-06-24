@@ -475,9 +475,14 @@ impl VaultSyncClient {
             loop {
                 match upload_rx.next().await {
                     Some(_) => {
-                        while let Ok(count) = uq.process_batch().await {
-                            if count == 0 {
-                                break;
+                        loop {
+                            match uq.process_batch().await {
+                                Ok(0) => break,
+                                Ok(_) => continue,
+                                Err(e) => {
+                                    tracing::warn!("[upload_worker] batch failed: {:?}", e);
+                                    break;
+                                }
                             }
                         }
                     }
