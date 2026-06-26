@@ -1,0 +1,16 @@
+{
+  "name": "vaultsync-wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "license": "MIT",
+  "files": [
+    "vaultsync_wasm_bg.wasm",
+    "vaultsync_wasm.js",
+    "vaultsync_wasm.d.ts"
+  ],
+  "main": "vaultsync_wasm.js",
+  "types": "vaultsync_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
