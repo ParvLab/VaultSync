@@ -1,10 +1,22 @@
 use crate::coordinator::traits::{Coordinator, CoordinatorError};
 use crate::e2ee::keyring::E2eeDecryptor;
 use crate::error::VaultSyncError;
-use crate::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+use crate::oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus};
 use crate::sync::reconciler::Reconciler;
 use crate::telemetry::metrics::VaultSyncMetrics;
 use std::sync::Arc;
+
+/// Result of processing a single push mutation.
+/// Used by the download worker to decide whether to backfill via pull.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// Push sequence was exactly cursor + 1 (no gap). No pull needed.
+    Contiguous,
+    /// Push sequence skipped ahead (gap detected). Pull recommended.
+    GapDetected,
+    /// Push was stale (seq <= cursor) or an own-mutation echo. No pull needed.
+    Stale,
+}
 
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
@@ -50,7 +62,7 @@ impl DownloadQueue {
         max_clock_skew: std::time::Duration,
         self_replica_id: String,
     ) -> Self {
-        tracing::info!("[download_queue::new] cursor={}", last_sequence);
+        tracing::trace!("[download_queue::new] cursor={}", last_sequence);
 
         Self {
             coordinator,
@@ -78,7 +90,7 @@ impl DownloadQueue {
         self.check_generation().await?;
 
         let after = self.last_sequence.load(std::sync::atomic::Ordering::SeqCst);
-        tracing::info!("[download_queue] pulling after={}", after);
+        tracing::trace!("[download_queue] pulling after={}", after);
 
         // If cursor is far behind, try snapshot-first catch-up
         if self.config.snapshot_threshold > 0 && after > 0 {
@@ -86,7 +98,7 @@ impl DownloadQueue {
                 Ok(true) => {
                     let new_after = self.last_sequence.load(std::sync::atomic::Ordering::SeqCst);
                     if new_after > after {
-                        tracing::info!(
+                        tracing::debug!(
                             "[download_queue] snapshot catch-up: cursor {} -> {}",
                             after,
                             new_after
@@ -107,7 +119,7 @@ impl DownloadQueue {
                 self.metrics.set_connection_status(&self.namespace, true);
                 let count = mutations.len();
 
-                tracing::info!("[download_queue] received {} mutations", count);
+                tracing::trace!("[download_queue] received {} mutations", count);
                 let mut entries = Vec::with_capacity(count);
 
                 for m in &mutations {
@@ -119,22 +131,8 @@ impl DownloadQueue {
                         );
                         continue;
                     }
-                    let local_time = crate::time_utils::system_time_now_ms();
-                    let skew = if m.timestamp > local_time {
-                        m.timestamp - local_time
-                    } else {
-                        local_time - m.timestamp
-                    };
-                    if skew > self.max_clock_skew.as_millis() as u64 {
-                        tracing::warn!(
-                            mutation_id = m.id.as_str(),
-                            timestamp = m.timestamp,
-                            local_time = local_time,
-                            "Rejecting mutation due to clock skew exceeding threshold"
-                        );
-                        continue;
-                    }
 
+                    // No clock skew check for pull mutations — coordinator already validated them
                     if m.encrypted_blob.len() >= 8 {
                         let header_version =
                             u64::from_le_bytes(m.encrypted_blob[..8].try_into().unwrap());
@@ -150,21 +148,23 @@ impl DownloadQueue {
                         .decryptor
                         .decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
-                    let entry = OplogEntry {
-                        id: m.id.clone(),
-                        namespace: m.namespace.clone(),
-                        replica_id: "".to_string(),
-                        mutation_type: MutationType::CrdtUpdate,
-                        doc_id: m.doc_id.clone(),
-                        record_id: m.record_id.clone(),
-                        yrs_update: decrypted_bytes,
-                        encrypted_blob: Some(m.encrypted_blob.clone()),
-                        timestamp: m.timestamp,
-                        sequence: Some(m.sequence),
-                        sync_status: SyncStatus::Synced,
-                        synced_at: None,
-                        created_at: m.timestamp,
-                    };
+                    let entry = OplogEntry::new(
+                        m.id.clone(),
+                        "".to_string(),
+                        m.namespace.clone(),
+                        MutationType::CrdtUpdate,
+                        m.doc_id.clone(),
+                        m.record_id.clone(),
+                        decrypted_bytes,
+                        Some(m.encrypted_blob.clone()),
+                        m.timestamp,
+                        Some(m.sequence),
+                        SyncStatus::Synced,
+                        None,
+                        m.timestamp,
+                        MutationOrigin::RemotePull,
+                        "",
+                    );
                     entries.push(entry);
                 }
 
@@ -172,7 +172,7 @@ impl DownloadQueue {
                     let merge_remote_span =
                         tracing::info_span!("crdt.merge_remote_batch", count = entries.len());
                     let _merge_guard = merge_remote_span.enter();
-                    self.reconciler.apply_batch(&entries).await?;
+                    self.reconciler.apply_batch("pull", &entries).await?;
                 }
 
                 if let Some(last) = mutations.last() {
@@ -197,11 +197,16 @@ impl DownloadQueue {
                     let now_ms = crate::time_utils::system_time_now_ms();
                     state.last_sync_at = Some(now_ms);
                     self.storage.write_sync_state(&state).await?;
+                    tracing::debug!(
+                        "[download_queue] write_sync_state cursor={} gen={} (from process_batch pull)",
+                        state.last_synced_sequence,
+                        state.generation_id
+                    );
 
                     // THEN advance in-memory cursor (only after persistence succeeds)
                     self.last_sequence
                         .store(new_seq, std::sync::atomic::Ordering::SeqCst);
-                    tracing::info!(
+                    tracing::trace!(
                         "[download_queue] cursor advanced to {}",
                         new_seq
                     );
@@ -215,7 +220,11 @@ impl DownloadQueue {
                 if count > 0 {
                     self.metrics.record_download(count);
                 }
-                tracing::info!("[download_queue] process_batch done count={}", count);
+                tracing::debug!(
+                    "[download_queue] process_batch done count={} t={}",
+                    count,
+                    crate::time_utils::system_time_now_ms(),
+                );
                 if count == 0 && after > 0 {
                     tracing::warn!("[download_queue] cursor={} but pull returned empty", after);
                 }
@@ -277,23 +286,25 @@ impl DownloadQueue {
             .decryptor
             .decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
-        let entry = OplogEntry {
-            id: m.id.clone(),
-            namespace: m.namespace.clone(),
-            replica_id: "".to_string(),
-            mutation_type: MutationType::CrdtUpdate,
-            doc_id: m.doc_id.clone(),
-            record_id: m.record_id.clone(),
-            yrs_update: decrypted_bytes,
-            encrypted_blob: Some(m.encrypted_blob.clone()),
-            timestamp: m.timestamp,
-            sequence: None,
-            sync_status: SyncStatus::Synced,
-            synced_at: None,
-            created_at: m.timestamp,
-        };
+        let entry = OplogEntry::new(
+            m.id.clone(),
+            "".to_string(),
+            m.namespace.clone(),
+            MutationType::CrdtUpdate,
+            m.doc_id.clone(),
+            m.record_id.clone(),
+            decrypted_bytes,
+            Some(m.encrypted_blob.clone()),
+            m.timestamp,
+            None,
+            SyncStatus::Synced,
+            None,
+            m.timestamp,
+            MutationOrigin::P2PBroadcast,
+            "",
+        );
 
-        self.reconciler.apply_remote_update(&entry).await?;
+        self.reconciler.apply_remote_update("p2p", &entry).await?;
         Ok(())
     }
 
@@ -334,22 +345,24 @@ impl DownloadQueue {
                     snapshot.sequence
                 );
 
-                let entry = OplogEntry {
-                    id: format!("snap-{}", snapshot.sequence),
-                    replica_id: String::new(),
-                    namespace: self.namespace.clone(),
-                    mutation_type: crate::oplog::entry::MutationType::CrdtUpdate,
-                    doc_id: snapshot.doc_id.clone(),
-                    record_id: snapshot.record_id.clone(),
-                    yrs_update: snapshot.bytes.clone(),
-                    encrypted_blob: None,
-                    timestamp: snapshot.created_at,
-                    sequence: Some(snapshot.sequence),
-                    sync_status: crate::oplog::entry::SyncStatus::Synced,
-                    synced_at: None,
-                    created_at: snapshot.created_at,
-                };
-                self.reconciler.apply_remote_update(&entry).await?;
+                let entry = OplogEntry::new(
+                    format!("snap-{}", snapshot.sequence),
+                    String::new(),
+                    self.namespace.clone(),
+                    MutationType::CrdtUpdate,
+                    snapshot.doc_id.clone(),
+                    snapshot.record_id.clone(),
+                    snapshot.bytes.clone(),
+                    None,
+                    snapshot.created_at,
+                    Some(snapshot.sequence),
+                    SyncStatus::Synced,
+                    None,
+                    snapshot.created_at,
+                    MutationOrigin::Snapshot,
+                    "",
+                );
+                self.reconciler.apply_remote_update("snapshot", &entry).await?;
                 self.metrics.record_snapshot_applied();
 
                 // Advance cursor past the snapshot sequence
@@ -371,8 +384,13 @@ impl DownloadQueue {
                 let now_ms = crate::time_utils::system_time_now_ms();
                 state.last_sync_at = Some(now_ms);
                 self.storage.write_sync_state(&state).await?;
+                tracing::debug!(
+                    "[download_queue] write_sync_state cursor={} gen={} (from snapshot)",
+                    state.last_synced_sequence,
+                    state.generation_id
+                );
                 let old = self.last_sequence.swap(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
-                tracing::info!(
+                tracing::trace!(
                     "[download_queue] cursor advanced via snapshot {} -> {}",
                     old,
                     snapshot.sequence
@@ -383,27 +401,21 @@ impl DownloadQueue {
         }
     }
 
-    /// Check server generation against local state. If the server restarted
-    /// (new generation_id), reset cursor to 0 so we re-download all mutations.
+    /// Verify server generation matches local state. If mismatch is detected, log
+    /// but do NOT reset cursor — that responsibility belongs to `initialize()`.
+    /// This is a defense-in-depth verification layer only.
     async fn check_generation(&self) -> Result<(), VaultSyncError> {
         let server_gen = self.coordinator.generation_id().await;
         if server_gen.is_empty() {
             return Ok(());
         }
-        if let Some(mut state) = self.storage.read_sync_state(&self.namespace).await? {
+        if let Some(state) = self.storage.read_sync_state(&self.namespace).await? {
             if state.generation_id != server_gen {
-                tracing::info!(
-                    "[download_queue] generation mismatch: local={} server={} -> resetting cursor",
+                tracing::warn!(
+                    "[download_queue] generation mismatch: local={} server={} (verify only, cursor NOT reset here)",
                     state.generation_id,
                     server_gen
                 );
-                state.generation_id = server_gen;
-                state.last_synced_sequence = 0;
-                let now_ms = crate::time_utils::system_time_now_ms();
-                state.last_sync_at = Some(now_ms);
-                self.storage.write_sync_state(&state).await?;
-                self.last_sequence.store(0, std::sync::atomic::Ordering::SeqCst);
-                tracing::info!("[download_queue] cursor reset to 0 due to server generation change");
             }
         }
         Ok(())
@@ -412,28 +424,24 @@ impl DownloadQueue {
     /// Process a single pushed mutation from the coordinator subscription
     /// or WebSocket transport. Decrypts, applies via reconciler, advances
     /// cursor, and persists state.
+    ///
+    /// Returns [`PushOutcome::Contiguous`] when no pull is needed (push filled
+    /// the next expected slot), or [`PushOutcome::GapDetected`] when a backfill
+    /// pull is recommended.
     pub async fn process_push_mutation(
         &self,
         m: crate::coordinator::traits::PendingMutation,
-    ) -> Result<(), VaultSyncError> {
+    ) -> Result<PushOutcome, VaultSyncError> {
         // Skip our own mutations to prevent echo loops
         if m.replica_id == self.self_replica_id {
             tracing::debug!(
                 mutation_id = m.id.as_str(),
                 "Skipping own push mutation to prevent echo loop"
             );
-            return Ok(());
-        }
-        let local_time = crate::time_utils::system_time_now_ms();
-        let skew = if m.timestamp > local_time {
-            m.timestamp - local_time
-        } else {
-            local_time - m.timestamp
-        };
-        if skew > self.max_clock_skew.as_millis() as u64 {
-            return Err(VaultSyncError::ClockSkew(m.timestamp, local_time));
+            return Ok(PushOutcome::Stale);
         }
 
+        // No clock skew check for push mutations — coordinator already validated them
         if m.encrypted_blob.len() >= 8 {
             let header_version = u64::from_le_bytes(m.encrypted_blob[..8].try_into().unwrap());
             if header_version != m.key_version {
@@ -448,23 +456,39 @@ impl DownloadQueue {
             .decryptor
             .decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
-        let entry = OplogEntry {
-            id: m.id.clone(),
-            namespace: m.namespace.clone(),
-            replica_id: "".to_string(),
-            mutation_type: MutationType::CrdtUpdate,
-            doc_id: m.doc_id.clone(),
-            record_id: m.record_id.clone(),
-            yrs_update: decrypted_bytes,
-            encrypted_blob: Some(m.encrypted_blob.clone()),
-            timestamp: m.timestamp,
-            sequence: Some(m.sequence),
-            sync_status: SyncStatus::Synced,
-            synced_at: None,
-            created_at: m.timestamp,
-        };
+        let entry = OplogEntry::new(
+            m.id.clone(),
+            "".to_string(),
+            m.namespace.clone(),
+            MutationType::CrdtUpdate,
+            m.doc_id.clone(),
+            m.record_id.clone(),
+            decrypted_bytes,
+            Some(m.encrypted_blob.clone()),
+            m.timestamp,
+            Some(m.sequence),
+            SyncStatus::Synced,
+            None,
+            m.timestamp,
+            MutationOrigin::PushMutation,
+            "",
+        );
 
-        self.reconciler.apply_remote_update(&entry).await?;
+        // ── Cursor gate: skip if already processed (seq <= last_sequence) ──
+        let cursor_before = self.last_sequence.load(std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(
+            "[download_queue] push seq={} cursor={} stale={} id={}",
+            m.sequence, cursor_before, m.sequence <= cursor_before, m.id,
+        );
+        if m.sequence <= cursor_before {
+            tracing::debug!(
+                "[download_queue] cursor gate: skip stale push seq={} (cursor={})",
+                m.sequence, cursor_before,
+            );
+            return Ok(PushOutcome::Stale);
+        }
+
+        self.reconciler.apply_remote_update("push", &entry).await?;
         self.metrics.record_push_received();
 
         // Advance cursor to the pushed mutation's sequence (monotonic: never go backwards)
@@ -484,33 +508,35 @@ impl DownloadQueue {
             },
         };
         let now_ms = crate::time_utils::system_time_now_ms();
-        if new_seq > state.last_synced_sequence {
-            state.last_synced_sequence = new_seq;
-            state.last_sync_at = Some(now_ms);
-            self.storage.write_sync_state(&state).await?;
+        state.last_synced_sequence = new_seq;
+        state.last_sync_at = Some(now_ms);
+        self.storage.write_sync_state(&state).await?;
+        tracing::debug!(
+            "[download_queue] write_sync_state cursor={} gen={} (from push mutation)",
+            state.last_synced_sequence,
+            state.generation_id
+        );
 
-            // Only advance in-memory cursor after persistence succeeds
-            let old = self.last_sequence.swap(new_seq, std::sync::atomic::Ordering::SeqCst);
-            tracing::info!(
-                "[download_queue] push cursor advanced {} -> {} (mutation={})",
-                old,
-                new_seq,
-                m.id
-            );
+        // Only advance in-memory cursor after persistence succeeds
+        self.last_sequence.store(new_seq, std::sync::atomic::Ordering::SeqCst);
+        tracing::debug!(
+            "[download_queue] push cursor advanced {} -> {} (mutation={})",
+            cursor_before,
+            new_seq,
+            m.id
+        );
+
+        let outcome = if new_seq == cursor_before.wrapping_add(1) {
+            PushOutcome::Contiguous
         } else {
-            tracing::debug!(
-                "[download_queue] push cursor skipping {} (current={} >= {})",
-                new_seq,
-                state.last_synced_sequence,
-                new_seq
-            );
-        }
+            PushOutcome::GapDetected
+        };
 
         let lag = now_ms.saturating_sub(m.timestamp);
         self.metrics.record_sync_lag(lag as f64);
         self.metrics
             .record_download_lag(&self.namespace, lag as f64);
 
-        Ok(())
+        Ok(outcome)
     }
 }
