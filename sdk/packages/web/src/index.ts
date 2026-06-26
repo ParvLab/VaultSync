@@ -152,8 +152,11 @@ export class VaultSyncClient {
   }
 
   subscribe(docId: string, callback: SubscriptionCallback): UnsubscribeFn {
-    const wasmCallback = (recordId: string, jsonStr: string) => {
+    const wasmCallback = (recordId: string, jsonStr: string, notifySeq?: number) => {
+      const t0 = Date.now();
+      console.log('[notify] seq=' + (notifySeq ?? '?') + ' record=' + recordId + ' phase=js_callback t=' + t0);
       queueMicrotask(() => {
+        console.log('[notify] seq=' + (notifySeq ?? '?') + ' record=' + recordId + ' phase=microtask_exec t=' + Date.now() + ' (elapsed=' + (Date.now() - t0) + 'ms)');
         callback(recordId, JSON.parse(jsonStr));
       });
     };
