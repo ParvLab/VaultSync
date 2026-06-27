@@ -84,15 +84,15 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
+    readonly presencemanager_activePeers: (a: number) => [number, number];
+    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly presencemanager_peer_count: (a: number) => number;
     readonly __wbg_wasmipc_free: (a: number, b: number) => void;
     readonly wasmipc_new: (a: number, b: number) => [number, number, number];
     readonly wasmipc_on_message: (a: number, b: any) => void;
     readonly wasmipc_receive: (a: number) => [number, number];
     readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
-    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
-    readonly presencemanager_activePeers: (a: number) => [number, number];
-    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
-    readonly presencemanager_peer_count: (a: number) => number;
     readonly init: () => void;
     readonly __wbg_wasmsubscriptionhandle_free: (a: number, b: number) => void;
     readonly __wbg_wasmvaultsyncclient_free: (a: number, b: number) => void;

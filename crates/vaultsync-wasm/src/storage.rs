@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use js_sys::Uint8Array;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Mutex;
 use vaultsync_core::oplog::entry::{OplogEntry, SyncStatus};
 use vaultsync_core::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
@@ -282,6 +283,38 @@ impl OpfsStorage {
         }
     }
 
+    /// Snapshot the index state for diagnostic logging.
+    fn index_state(label: &str, index: &OpfsIndex) {
+        let pending: Vec<&str> = index
+            .oplog
+            .iter()
+            .filter(|e| e.sync_status.is_uploadable())
+            .map(|e| e.id.as_str())
+            .collect();
+        let synced: Vec<&str> = index
+            .oplog
+            .iter()
+            .filter(|e| matches!(e.sync_status, SyncStatus::Synced))
+            .map(|e| e.id.as_str())
+            .collect();
+        let mut hasher = DefaultHasher::new();
+        index.oplog.len().hash(&mut hasher);
+        pending.len().hash(&mut hasher);
+        for id in &pending {
+            id.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[INDEX] {} hash={:#x} oplog={} pending={} synced={} pending_ids={:?}",
+            label,
+            hash,
+            index.oplog.len(),
+            pending.len(),
+            synced.len(),
+            pending,
+        )));
+    }
+
     async fn load_index(root: &FileSystemDirectoryHandle) -> Result<OpfsIndex, VaultSyncError> {
         let opts = FileSystemGetFileOptions::new();
         opts.set_create(false);
@@ -340,7 +373,10 @@ impl OpfsStorage {
             .await;
 
             match res {
-                Ok(index) => return Ok(index),
+                Ok(index) => {
+                    Self::index_state("LOAD", &index);
+                    return Ok(index);
+                }
                 Err(e) => {
                     attempts += 1;
                     if attempts >= max_attempts {
@@ -357,6 +393,7 @@ impl OpfsStorage {
         root: &FileSystemDirectoryHandle,
         index: &OpfsIndex,
     ) -> Result<(), VaultSyncError> {
+        Self::index_state("FLUSH_BEFORE", index);
         let json = serde_json::to_vec(index)
             .map_err(|e| VaultSyncError::Storage(format!("json: {:?}", e)))?;
         let sys_dir = Self::get_dir(root, &["_system"]).await?;
@@ -549,7 +586,8 @@ impl Storage for OpfsStorage {
         namespace: &str,
         limit: usize,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
-        let index = self.get_cached_index();
+        let _guard = self.tx_lock.lock().await;
+        let (_, index) = self.load_index_from_disk().await?;
         let results: Vec<OplogEntry> = index
             .oplog
             .iter()
@@ -557,19 +595,59 @@ impl Storage for OpfsStorage {
             .take(limit)
             .cloned()
             .collect();
+        let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[PENDING_READ] ns={} count={} ids={:?}",
+            namespace,
+            results.len(),
+            ids,
+        )));
         Ok(results)
     }
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), VaultSyncError> {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[MARK_SYNCED] id={} seq={}",
+            id, sequence,
+        )));
         let _guard = self.tx_lock.lock().await;
         let (root, mut index) = self.load_index_from_disk().await?;
+        let before_ids: Vec<String> = index
+            .oplog
+            .iter()
+            .filter(|e| e.sync_status.is_uploadable())
+            .map(|e| e.id.clone())
+            .collect();
         if let Some(entry) = index.oplog.iter_mut().find(|e| e.id == id) {
+            let old_status = format!("{:?}", entry.sync_status);
             entry.sync_status = SyncStatus::Synced;
             entry.sequence = Some(sequence);
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[MARK_SYNCED] found id={} old_status={} origin={:?} ctx={}",
+                id, old_status, entry.origin, entry.origin_context,
+            )));
+        } else {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[MARK_SYNCED] NOT FOUND id={} in oplog (oplog_len={})",
+                id,
+                index.oplog.len(),
+            )));
         }
         Self::flush_index(&root, &index).await?;
         let mut inner = self.inner.lock().unwrap();
         inner.index = index;
+        let after_ids: Vec<String> = inner
+            .index
+            .oplog
+            .iter()
+            .filter(|e| e.sync_status.is_uploadable())
+            .map(|e| e.id.clone())
+            .collect();
+        drop(inner);
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[MARK_SYNCED] done id={} pending_before={:?} pending_after={:?}",
+            id, before_ids, after_ids,
+        )));
         Ok(())
     }
 
@@ -605,6 +683,10 @@ impl Storage for OpfsStorage {
     }
 
     async fn write_sync_state(&self, state: &SyncState) -> Result<(), VaultSyncError> {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[storage.write_sync_state] ns={} cursor={} gen={}",
+            state.namespace, state.last_synced_sequence, state.generation_id
+        )));
         let _guard = self.tx_lock.lock().await;
         let (root, mut index) = self.load_index_from_disk().await?;
         index

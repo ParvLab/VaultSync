@@ -106,8 +106,13 @@ impl Coordinator for SimulatedNetworkCoordinator {
         self.inner.subscribe(namespace, from_sequence).await
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
-        self.inner.register(namespace, info).await
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
+        self.inner.register(namespace, info, last_sequence).await
     }
 
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError> {

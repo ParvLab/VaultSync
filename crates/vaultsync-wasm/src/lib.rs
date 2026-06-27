@@ -54,11 +54,16 @@ impl tracing::Subscriber for ConsoleSubscriber {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
+pub const BUILD_ID: &str = concat!(env!("VAULTSYNC_BUILD_DATE"), "-", env!("VAULTSYNC_GIT_HASH"));
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
     let _ = tracing::subscriber::set_global_default(ConsoleSubscriber);
+    tracing::warn!("================================================");
+    tracing::warn!("VaultSync WASM BUILD: {} instrumentation=v3", BUILD_ID);
+    tracing::warn!("================================================");
 }
 
 #[cfg(target_arch = "wasm32")]

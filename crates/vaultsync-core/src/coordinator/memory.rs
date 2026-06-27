@@ -183,7 +183,12 @@ impl Coordinator for InMemoryCoordinator {
         Ok(Box::new(InMemorySubscription { rx: Some(rx_mpsc) }))
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         let mut reps = self
             .replicas
             .write()

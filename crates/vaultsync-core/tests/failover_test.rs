@@ -63,11 +63,16 @@ impl Coordinator for PanickingCoordinator {
         self.inner.subscribe(namespace, from_sequence).await
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         if self.should_fail.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
-        self.inner.register(namespace, info).await
+        self.inner.register(namespace, info, _last_sequence).await
     }
 
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError> {
@@ -138,19 +143,19 @@ async fn test_failover_on_primary_down() {
     };
 
     // Primary works initially
-    failover.register(ns, rep.clone()).await.unwrap();
+    failover.register(ns, rep.clone(), 0).await.unwrap();
     assert_eq!(failover.active_index(), 0);
 
     // Primary goes down
     primary.set_fail(true);
 
     // First attempt fails, but active index doesn't switch yet because max_failures is 2
-    let res = failover.register(ns, rep.clone()).await;
+    let res = failover.register(ns, rep.clone(), 0).await;
     assert!(res.is_ok());
     assert_eq!(failover.active_index(), 0);
 
     // Second attempt fails, which triggers the switch to fallback (idx 1)
-    let res = failover.register(ns, rep).await;
+    let res = failover.register(ns, rep, 0).await;
     assert!(res.is_ok());
     assert_eq!(failover.active_index(), 1);
 }

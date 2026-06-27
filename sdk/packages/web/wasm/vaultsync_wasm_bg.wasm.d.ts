@@ -1,15 +1,15 @@
 /* tslint:disable */
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
+export const __wbg_presencemanager_free: (a: number, b: number) => void;
+export const presencemanager_activePeers: (a: number) => [number, number];
+export const presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
+export const presencemanager_peer_count: (a: number) => number;
 export const __wbg_wasmipc_free: (a: number, b: number) => void;
 export const wasmipc_new: (a: number, b: number) => [number, number, number];
 export const wasmipc_on_message: (a: number, b: any) => void;
 export const wasmipc_receive: (a: number) => [number, number];
 export const wasmipc_send: (a: number, b: number, c: number) => [number, number];
-export const __wbg_presencemanager_free: (a: number, b: number) => void;
-export const presencemanager_activePeers: (a: number) => [number, number];
-export const presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
-export const presencemanager_peer_count: (a: number) => number;
 export const init: () => void;
 export const __wbg_wasmsubscriptionhandle_free: (a: number, b: number) => void;
 export const __wbg_wasmvaultsyncclient_free: (a: number, b: number) => void;

@@ -7,7 +7,7 @@ use vaultsync_core::crdt::document::CRDTDocument;
 use vaultsync_core::crdt::snapshot::Snapshot;
 use vaultsync_core::crdt::types::CrdtValue;
 use vaultsync_core::e2ee::keyring::{E2eeDecryptor, E2eeEncryptor, KeyRing};
-use vaultsync_core::oplog::entry::{OplogEntry, SyncStatus};
+use vaultsync_core::oplog::entry::{MutationOrigin, OplogEntry, SyncStatus};
 use vaultsync_core::storage::memory::InMemoryStorage;
 use vaultsync_core::subscription::engine::SubscriptionEngine;
 use vaultsync_core::sync::download::{DownloadConfig, DownloadQueue};
@@ -59,7 +59,7 @@ async fn test_push_mutation_decrypt_and_apply() {
             namespace: "test".into(),
             public_key: vec![],
             schema_version: 0,
-        }).await.unwrap();
+        }, 0).await.unwrap();
         (c, s, k)
     };
 
@@ -123,12 +123,14 @@ async fn test_push_mutation_decrypt_and_apply() {
             sync_status: SyncStatus::Synced,
             synced_at: None,
             created_at: m.timestamp,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
         }
     };
 
     let subscriptions = Arc::new(Mutex::new(SubscriptionEngine::new()));
     let reconciler = Arc::new(Reconciler::new(storage.clone(), subscriptions));
-    reconciler.apply_remote_update(&entry).await.unwrap();
+    reconciler.apply_remote_update("test", &entry).await.unwrap();
 
     // Verify data is accessible
     let result = storage.get_document("doc-1", "rec-1").await.unwrap();
@@ -238,7 +240,7 @@ async fn test_snapshot_catch_up_skips_mutations() {
             namespace: "test".into(),
             public_key: vec![],
             schema_version: 0,
-        }).await.unwrap();
+        }, 0).await.unwrap();
         (c, s, k)
     };
 
@@ -465,7 +467,7 @@ async fn test_push_mutation_via_subscription() {
             namespace: "sub-test".into(),
             public_key: vec![],
             schema_version: 0,
-        })
+        }, 0)
         .await
         .unwrap();
 
@@ -501,7 +503,7 @@ async fn test_push_mutation_subscription_replays_existing() {
             namespace: "sub-replay".into(),
             public_key: vec![],
             schema_version: 0,
-        })
+        }, 0)
         .await
         .unwrap();
 
@@ -546,7 +548,7 @@ async fn test_process_push_mutation_advances_cursor() {
             namespace: "push-cursor".into(),
             public_key: vec![],
             schema_version: 0,
-        })
+        }, 0)
         .await
         .unwrap();
 
@@ -624,7 +626,7 @@ async fn test_process_push_mutation_monotonic_never_rewinds() {
             namespace: "push-mono".into(),
             public_key: vec![],
             schema_version: 0,
-        })
+        }, 0)
         .await
         .unwrap();
 
@@ -871,7 +873,7 @@ async fn test_optimistic_write_promoted_to_pending_on_upload_scan() {
             namespace: "default".into(),
             public_key: vec![],
             schema_version: 0,
-        })
+        }, 0)
         .await
         .unwrap();
 
@@ -900,6 +902,8 @@ async fn test_optimistic_write_promoted_to_pending_on_upload_scan() {
         sync_status: SyncStatus::Optimistic,
         synced_at: None,
         created_at: 1000,
+        origin: MutationOrigin::Unknown,
+        origin_context: String::new(),
     };
     storage.write_document_and_oplog("doc-scan", "rec-scan", &vec![], &entry).await.unwrap();
 

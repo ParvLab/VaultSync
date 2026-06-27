@@ -307,7 +307,12 @@ impl Coordinator for SQLiteCoordinator {
         Ok(Box::new(SqliteSubscription { rx: rx_mpsc }))
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         let conn = self.conn.clone();
         let namespace_str = namespace.to_string();
 

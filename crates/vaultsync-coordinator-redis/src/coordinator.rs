@@ -209,7 +209,12 @@ impl Coordinator for RedisCoordinator {
         Ok(mutations)
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         let mut conn = self.conn.clone();
         let replicas_key = format!("vaultsync:{}:replicas", namespace);
         let schema_key = format!("vaultsync:{}:schema_version", namespace);

@@ -3,6 +3,9 @@ use crate::e2ee::keyring::E2eeDecryptor;
 use crate::error::VaultSyncError;
 use crate::oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus};
 use crate::sync::reconciler::Reconciler;
+use yrs::updates::decoder::Decode;
+use yrs::Update;
+use sha2::{Digest, Sha256};
 use crate::telemetry::metrics::VaultSyncMetrics;
 use std::sync::Arc;
 
@@ -144,11 +147,22 @@ impl DownloadQueue {
                             );
                         }
                     }
-                    let decrypted_bytes = self
-                        .decryptor
-                        .decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
+        let decrypted_bytes = self
+            .decryptor
+            .decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
-                    let entry = OplogEntry::new(
+        // ── Phase 2 diagnostic: state vector + hash of decrypted push payload ──
+        let content_hash = hex::encode(&Sha256::digest(&decrypted_bytes)[..8]);
+        if let Ok(decoded) = Update::decode_v1(&decrypted_bytes) {
+            let sv = decoded.state_vector();
+            let entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
+            tracing::info!(
+                "[download_queue] push_decrypted source=push seq={} sha256={} state_vector={:?} len={}",
+                m.sequence, content_hash, entries, decrypted_bytes.len(),
+            );
+        }
+
+        let entry = OplogEntry::new(
                         m.id.clone(),
                         "".to_string(),
                         m.namespace.clone(),

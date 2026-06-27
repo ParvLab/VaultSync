@@ -14,10 +14,22 @@ use wasm_bindgen::JsCast;
 extern "C" {
     #[wasm_bindgen(js_namespace = console, js_name = log)]
     fn console_log_str(s: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = debug)]
+    fn console_debug_str(s: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = warn)]
+    fn console_warn_str(s: &str);
 }
 
 macro_rules! console_log {
     ($($t:tt)*) => (console_log_str(&format!($($t)*)));
+}
+
+macro_rules! console_debug {
+    ($($t:tt)*) => (console_debug_str(&format!($($t)*)));
+}
+
+macro_rules! console_warn {
+    ($($t:tt)*) => (console_warn_str(&format!($($t)*)));
 }
 
 #[wasm_bindgen]
@@ -74,6 +86,8 @@ impl WasmVaultSyncClient {
         db_name: Option<String>,
         storage_backend: Option<String>,
     ) -> Result<WasmVaultSyncClient, JsValue> {
+        let _t0 = js_sys::Date::now();
+        let t = || -> f64 { js_sys::Date::now() - _t0 };
         console_log!("[1/9] creating browser storage");
         let mut config = VaultSyncConfig::default();
         config.namespace = namespace.to_string();
@@ -92,6 +106,7 @@ impl WasmVaultSyncClient {
             BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
         };
 
+        console_debug!("[timing] storage ready t={:.0}ms", t());
         console_log!("[2/9] creating ws coordinator");
         let coordinator = Arc::new(crate::ws_coordinator::WasmWsCoordinator::new(
             coordinator_url,
@@ -108,14 +123,18 @@ impl WasmVaultSyncClient {
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
         );
+        console_debug!("[timing] client built t={:.0}ms", t());
 
-        // Wire WS mutation push → download notification BEFORE initialize (no race)
+        // Wire WS mutation push → download/upload notifications BEFORE initialize (no race)
         coordinator.set_download_notify(client.events.download_notify.clone());
+        coordinator.set_upload_notify(client.events.upload_notify.clone());
 
         // Now start WS connection (background processor starts here, sender already set)
+        console_debug!("[timing] calling initialize t={:.0}ms", t());
         client.initialize().await.map_err(|e| {
             JsValue::from_str(&format!("Initialize failed: {:?}", e))
         })?;
+        console_debug!("[timing] initialize done t={:.0}ms", t());
 
         // Bootstrap: same event-driven path as WS push notifications
         client.events.notify_download(None);
@@ -203,6 +222,7 @@ impl WasmVaultSyncClient {
     }
 
     pub async fn find(&self, doc_id: &str) -> Result<js_sys::Array, JsValue> {
+        console_debug!("[timing] find call doc={} t={:.0}ms", doc_id, js_sys::Date::now());
         let records = self
             .client
             .find(doc_id, None)
@@ -282,10 +302,19 @@ impl WasmVaultSyncClient {
     }
 
     pub fn subscribe(&self, doc_id: &str, callback: js_sys::Function) -> WasmSubscriptionHandle {
+        console_debug!("[timing] subscribe call doc={} t={:.0}ms", doc_id, js_sys::Date::now());
+        static NOTIFY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let send_cb = SendFunction(JsValue::from(callback));
         let handle = self.client.subscribe(
             doc_id,
             Box::new(move |_doc_id, record_id, fields| {
+                let notify_seq = NOTIFY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                console_log!(
+                    "[notify] seq={} record={} phase=wasm_callback t={:.0}ms",
+                    notify_seq,
+                    record_id,
+                    js_sys::Date::now()
+                );
                 let mut map = serde_json::Map::new();
                 for (k, v) in fields {
                     let json_val = match v {
@@ -303,11 +332,19 @@ impl WasmVaultSyncClient {
                 if let Ok(json_str) = serde_json::to_string(&serde_json::Value::Object(map)) {
                     let record_id_owned = record_id.to_string();
                     let cb_clone = send_cb.0.clone();
+                    let seq = notify_seq;
                     wasm_bindgen_futures::spawn_local(async move {
+                        console_log!(
+                            "[notify] seq={} record={} phase=spawn_local t={:.0}ms",
+                            seq,
+                            record_id_owned,
+                            js_sys::Date::now()
+                        );
                         let func: js_sys::Function = cb_clone.unchecked_into();
                         let record_id_js = JsValue::from_str(&record_id_owned);
                         let json_js = JsValue::from_str(&json_str);
-                        let _ = func.call2(&JsValue::NULL, &record_id_js, &json_js);
+                        let seq_js = JsValue::from_f64(seq as f64);
+                        let _ = func.call3(&JsValue::NULL, &record_id_js, &json_js, &seq_js);
                     });
                 }
             }),

@@ -226,7 +226,10 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         schema_version: reg_payload.schema_version,
     };
 
-    let reg_result = state.coordinator.register(&ns, replica_info).await;
+    let reg_result = state
+        .coordinator
+        .register(&ns, replica_info, reg_payload.last_sequence)
+        .await;
     let mut reg_ack = RegisterAckPayload {
         status: "ok".to_string(),
         coordinator_sequence: 0,
@@ -419,6 +422,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                     }
                     MSG_SUBSCRIBE => {
                         if let Ok(sub) = serde_json::from_slice::<SubscribePayload>(payload) {
+                            info!("[ws] subscribe namespace={} after={}", sub.namespace, sub.after);
                             if let Some(cancel) = active_sub_tx.take() {
                                 let _ = cancel.send(());
                             }

@@ -18,7 +18,7 @@ pub async fn run_coordinator_conformance_suite(coord: Arc<dyn Coordinator>) {
         public_key: vec![1, 2, 3],
         schema_version: 0,
     };
-    coord.register(ns, replica).await.unwrap();
+    coord.register(ns, replica, 0).await.unwrap();
 
     // 2. Heartbeat
     coord.heartbeat(ns, "rep-1").await.unwrap();
@@ -606,7 +606,7 @@ async fn test_libp2p_coordinator_implementation() {
         public_key: vec![1, 2, 3],
         schema_version: 0,
     };
-    handle1.register(ns, replica).await.unwrap();
+    handle1.register(ns, replica, 0).await.unwrap();
     handle1.heartbeat(ns, "rep-1").await.unwrap();
     assert_eq!(handle1.schema_version(ns).await.unwrap(), 0);
 

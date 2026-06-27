@@ -18,10 +18,22 @@ use web_sys::{BinaryType, WebSocket};
 extern "C" {
     #[wasm_bindgen(js_namespace = console, js_name = log)]
     fn console_log_str(s: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = debug)]
+    fn console_debug_str(s: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = warn)]
+    fn console_warn_str(s: &str);
 }
 
 macro_rules! console_log {
     ($($t:tt)*) => (console_log_str(&format!($($t)*)));
+}
+
+macro_rules! console_debug {
+    ($($t:tt)*) => (console_debug_str(&format!($($t)*)));
+}
+
+macro_rules! console_warn {
+    ($($t:tt)*) => (console_warn_str(&format!($($t)*)));
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +60,7 @@ struct WasmWsCoordinatorInner {
     subscribers: Mutex<Vec<mpsc::Sender<PendingMutation>>>,
     peer_coord: Mutex<Option<vaultsync_transport_webrtc::PeerCoordinator>>,
     download_notify: Mutex<Option<mpsc::UnboundedSender<Option<PendingMutation>>>>,
+    upload_notify: Mutex<Option<mpsc::UnboundedSender<()>>>,
     generation_id: Mutex<String>,
     conn_gen: AtomicU64,
 }
@@ -81,6 +94,7 @@ impl WasmWsCoordinator {
                 subscribers: Mutex::new(Vec::new()),
                 peer_coord: Mutex::new(Some(peer_coord)),
                 download_notify: Mutex::new(None),
+                upload_notify: Mutex::new(None),
                 generation_id: Mutex::new(String::new()),
                 conn_gen: AtomicU64::new(0),
             }),
@@ -90,6 +104,11 @@ impl WasmWsCoordinator {
     pub fn set_download_notify(&self, tx: mpsc::UnboundedSender<Option<PendingMutation>>) {
         *self.inner.download_notify.lock().unwrap() = Some(tx);
         console_log!("[WasmWs] download_notify registered");
+    }
+
+    pub fn set_upload_notify(&self, tx: mpsc::UnboundedSender<()>) {
+        *self.inner.upload_notify.lock().unwrap() = Some(tx);
+        console_log!("[WasmWs] upload_notify registered");
     }
 
     async fn connect_and_handshake(
@@ -149,6 +168,17 @@ impl WasmWsCoordinator {
             }
         }
 
+        // On successful reconnect, wake workers to resume syncing
+        if result.is_ok() {
+            console_debug!("[reconnect] state=Connected");
+            if let Some(ref notify) = *self.inner.upload_notify.lock().unwrap() {
+                let _ = notify.unbounded_send(());
+            }
+            if let Some(ref notify) = *self.inner.download_notify.lock().unwrap() {
+                let _ = notify.unbounded_send(None);
+            }
+        }
+
         result
     }
 
@@ -162,7 +192,7 @@ impl WasmWsCoordinator {
         generation: u64,
     ) -> Result<(), CoordinatorError> {
         let ws_url = get_ws_url(&self.inner.url, namespace);
-        console_log!("[WasmWs] connecting to url={}", ws_url);
+        console_debug!("[reconnect] state=Connecting url={}", ws_url);
         let ws = WebSocket::new(&ws_url).map_err(|e| {
             CoordinatorError::Internal(format!("Failed to create WebSocket: {:?}", e))
         })?;
@@ -227,6 +257,7 @@ impl WasmWsCoordinator {
         };
 
         // 2. Perform AUTH
+        console_debug!("[reconnect] state=Authenticating");
         console_log!("[6/9] auth");
         let token = self.inner.auth_token.clone().unwrap_or_default();
         let replica_id = info
@@ -316,7 +347,7 @@ impl WasmWsCoordinator {
         console_log!("[WasmWs] register successful!");
 
         // 4. Perform SUBSCRIBE
-        console_log!("[8/9] subscribe");
+        console_log!("[8/9] subscribe after={}", after);
         let sub = SubscribePayload {
             request_id: uuid::Uuid::new_v4().to_string(),
             namespace: namespace.to_string(),
@@ -330,11 +361,11 @@ impl WasmWsCoordinator {
         // Spawn background message processor with generation guard
         let inner_clone = self.inner.clone();
         let reader_gen = generation;
-        console_log!("[WasmWs] reader started gen={}", reader_gen);
+        console_debug!("[WasmWs] reader started gen={}", reader_gen);
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(bin) = msg_rx.next().await {
                 if inner_clone.conn_gen.load(Ordering::SeqCst) != reader_gen {
-                    console_log!(
+                    console_debug!(
                         "[WasmWs] reader exiting gen={} current={}",
                         reader_gen,
                         inner_clone.conn_gen.load(Ordering::SeqCst)
@@ -347,7 +378,7 @@ impl WasmWsCoordinator {
                             // Self-filter: skip mutations from our own replica
                             let self_rid = inner_clone.replica_id.lock().unwrap();
                             if mutat.replica_id == *self_rid {
-                                console_log!(
+                                console_debug!(
                                     "[WasmWs] skipping own mutation: seq={}",
                                     mutat.sequence
                                 );
@@ -355,31 +386,14 @@ impl WasmWsCoordinator {
                             }
                             drop(self_rid);
                             console_log!(
-                                "[WasmWs] received MSG_MUTATION_PUSH: seq={}",
-                                mutat.sequence
-                            );
-                            console_log!(
-                                "[ws] forwarding mutation seq={}",
+                                "[WasmWs] push seq={}",
                                 mutat.sequence
                             );
                             let mut subs = inner_clone.subscribers.lock().unwrap();
                             subs.retain_mut(|sub| sub.try_send(mutat.clone()).is_ok());
                             drop(subs);
-                            if cfg!(debug_assertions) {
-                                console_log!(
-                                    "[WasmWs] notify download seq={}",
-                                    mutat.sequence
-                                );
-                            }
                             if let Some(ref notify) = *inner_clone.download_notify.lock().unwrap() {
-                                match notify.unbounded_send(Some(mutat.clone())) {
-                                    Ok(_) => {
-                                        console_log!("[ws] download notify sent seq={}", mutat.sequence);
-                                    }
-                                    Err(e) => {
-                                        console_log!("[ws] download notify FAILED {:?}", e);
-                                    }
-                                }
+                                let _ = notify.unbounded_send(Some(mutat.clone()));
                             }
                         }
                     } else if msg_type == MSG_P2P_SIGNAL_ACK {
@@ -397,28 +411,22 @@ impl WasmWsCoordinator {
                     } else if matches!(msg_type, MSG_HEARTBEAT | MSG_HEARTBEAT_ACK | MSG_ERROR) {
                         // System messages — no response routing needed
                     } else {
-                        console_log!("[reader] message type={:02X} len={}", msg_type, payload.len());
                         if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(payload) {
                             if let Some(req_id) =
                                 json_val.get("request_id").and_then(|v| v.as_str())
                             {
                                 let mut reqs = inner_clone.pending_requests.lock().unwrap();
-                                console_log!(
+                                console_debug!(
                                     "[reader] routing req={} pending_requests={}",
                                     req_id,
                                     reqs.len()
                                 );
                                 if let Some(tx) = reqs.remove(req_id) {
-                                    console_log!("[reader] delivering response for req={}", req_id);
                                     let _ = tx.send(bin);
                                 } else {
-                                    console_log!("[reader] NO WAITER for req={}", req_id);
+                                    console_debug!("[reader] NO WAITER for req={}", req_id);
                                 }
-                            } else {
-                                console_log!("[reader] no request_id in payload");
                             }
-                        } else {
-                            console_log!("[reader] failed to parse payload as JSON");
                         }
                     }
                 }
@@ -428,7 +436,7 @@ impl WasmWsCoordinator {
         // Spawn heartbeat loop with generation guard
         let hb_inner = self.inner.clone();
         let hb_gen = generation;
-        console_log!("[WasmWs] heartbeat started gen={}", hb_gen);
+        console_debug!("[WasmWs] heartbeat started gen={}", hb_gen);
         let ws_clone = ws.clone();
         let replica_id_hb = auth.replica_id.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -459,7 +467,7 @@ impl WasmWsCoordinator {
             // Set signaling handler with generation guard
             let signal_inner = self.inner.clone();
             let signal_gen = generation;
-            console_log!("[WasmWs] signal loop started gen={}", signal_gen);
+            console_debug!("[WasmWs] signal loop started gen={}", signal_gen);
             wasm_bindgen_futures::spawn_local(async move {
                 peer_coord_clone
                     .set_signal_handler(move |target_id, signal_type, data| {
@@ -495,7 +503,7 @@ impl WasmWsCoordinator {
             let peer_coord_clone = peer_coord.clone();
             let ns_str_clone = ns_str.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = peer_coord_clone.register(&ns_str_clone, peer_info).await;
+                let _ = peer_coord_clone.register(&ns_str_clone, peer_info, 0).await;
             });
 
             // Spawn discovery loop
@@ -552,12 +560,6 @@ impl WasmWsCoordinator {
         let (tx, rx) = oneshot::channel::<Vec<u8>>();
         {
             let mut reqs = self.inner.pending_requests.lock().unwrap();
-            console_log!(
-                "[ws] send_request req={} type={:02X} pending_requests={}",
-                request_id,
-                msg_type,
-                reqs.len()
-            );
             reqs.insert(request_id.to_string(), tx);
         }
 
@@ -568,21 +570,20 @@ impl WasmWsCoordinator {
             let state = self.inner.connection.lock().unwrap();
             if let Some(ref ws) = state.ws {
                 if ws.ready_state() == 1 {
-                    console_log!("[ws] sending frame req={} type={:02X}", request_id, msg_type);
+                    console_debug!("[ws] sending frame req={} type={:02X}", request_id, msg_type);
                     ws.send_with_u8_array(&frame)
                         .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
-                    console_log!("[ws] frame sent req={}", request_id);
                 } else {
-                    console_log!("[ws] send_request NOT_AVAILABLE (ready_state={}) req={}", ws.ready_state(), request_id);
+                    console_debug!("[ws] send_request NOT_AVAILABLE (ready_state={}) req={}", ws.ready_state(), request_id);
                     return Err(CoordinatorError::NotAvailable);
                 }
             } else {
-                console_log!("[ws] send_request NOT_AVAILABLE (no ws) req={}", request_id);
+                console_debug!("[ws] send_request NOT_AVAILABLE (no ws) req={}", request_id);
                 return Err(CoordinatorError::NotAvailable);
             }
         }
 
-        console_log!("[ws] waiting for response req={}", request_id);
+        console_debug!("[ws] waiting for response req={}", request_id);
         let timeout =
             vaultsync_core::time_utils::sleep(std::time::Duration::from_secs(10));
 
@@ -591,17 +592,15 @@ impl WasmWsCoordinator {
 
         match futures::future::select(rx, timeout).await {
             Either::Left((Ok(resp), _)) => {
-                console_log!("[ws] got response req={} len={}", request_id, resp.len());
                 Ok(resp)
             }
 
             Either::Left((Err(_), _)) => {
-                console_log!("[ws] request cancelled req={}", request_id);
                 Err(CoordinatorError::Internal("request cancelled".into()))
             }
 
             Either::Right(_) => {
-                console_log!("[ws] request timed out after 10s req={}", request_id);
+                console_warn!("[ws] request timed out after 10s req={}", request_id);
                 tracing::warn!("[ws] request timed out after 10s");
                 Err(CoordinatorError::Timeout)
             }
@@ -651,7 +650,7 @@ impl Coordinator for WasmWsCoordinator {
         };
         if !is_connected {
             if let Err(e) = self.connect_and_handshake(namespace, 0, None).await {
-                console_log!("[WasmWs] Reconnect failed during push: {:?}", e);
+                console_warn!("[WasmWs] Reconnect failed during push: {:?}", e);
                 return Err(e);
             }
         }
@@ -781,7 +780,16 @@ impl Coordinator for WasmWsCoordinator {
         Ok(Box::new(rx))
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
+        console_log!(
+            "[WasmWs] register last_sequence={}",
+            last_sequence
+        );
         // Store our replica_id for self-filtering
         {
             let mut rid = self.inner.replica_id.lock().unwrap();
@@ -794,7 +802,7 @@ impl Coordinator for WasmWsCoordinator {
         };
 
         if !is_connected {
-            self.connect_and_handshake(namespace, 0, Some(&info))
+            self.connect_and_handshake(namespace, last_sequence, Some(&info))
                 .await?;
         } else {
             let reg = RegisterPayload {
@@ -802,7 +810,7 @@ impl Coordinator for WasmWsCoordinator {
                 namespace: namespace.to_string(),
                 public_key: info.public_key.clone(),
                 schema_version: info.schema_version,
-                last_sequence: 0,
+                last_sequence,
                 key_version: 1,
             };
             let frame = encode_frame(MSG_REGISTER, &reg)
@@ -842,6 +850,25 @@ impl Coordinator for WasmWsCoordinator {
 
     async fn schema_version(&self, _namespace: &str) -> Result<u64, CoordinatorError> {
         Ok(0)
+    }
+
+    async fn disconnect(&self) -> Result<(), CoordinatorError> {
+        console_log!("[WasmWs] disconnect requested");
+        let mut state = self.inner.connection.lock().unwrap();
+        if let Some(ws) = state.ws.take() {
+            ws.set_onopen(None);
+            ws.set_onclose(None);
+            ws.set_onmessage(None);
+            let _ = ws.close();
+            console_log!("[WasmWs] existing connection closed");
+        }
+        state.connecting = false;
+        state.waiters.clear();
+        drop(state);
+        // Bump conn_gen to invalidate background readers from the old connection
+        self.inner.conn_gen.fetch_add(1, Ordering::SeqCst);
+        console_log!("[WasmWs] disconnect complete");
+        Ok(())
     }
 
     async fn generation_id(&self) -> String {

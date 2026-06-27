@@ -78,6 +78,11 @@ impl SyncStateManager {
             generation_id: generation_id.to_string(),
         };
         self.storage.write_sync_state(&state).await?;
+        tracing::trace!(
+            "[sync_state] write_sync_state cursor={} gen={} (from state_manager persist)",
+            state.last_synced_sequence,
+            state.generation_id
+        );
         Ok(())
     }
 

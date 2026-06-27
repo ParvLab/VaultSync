@@ -1,6 +1,6 @@
 use super::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use crate::error::VaultSyncError;
-use crate::oplog::entry::OplogEntry;
+use crate::oplog::entry::{MutationOrigin, OplogEntry};
 use crate::sync::state::SyncState;
 use async_trait::async_trait;
 use rusqlite::params;
@@ -753,6 +753,8 @@ impl SQLiteStorage {
             sync_status,
             synced_at: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
             created_at: row.get::<_, i64>(12)? as u64,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
         })
     }
 }

@@ -67,9 +67,19 @@ pub trait Coordinator: Send + Sync + std::fmt::Debug {
         namespace: &str,
         from_sequence: SequenceId,
     ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError>;
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError>;
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError>;
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError>;
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError>;
+    /// Forcefully disconnect from the coordinator.
+    /// After disconnect, `register()` can be called again to reconnect.
+    async fn disconnect(&self) -> Result<(), CoordinatorError> {
+        Ok(())
+    }
     /// Returns the server's generation ID (UUID) if the coordinator supports it.
     /// Empty string means "generation tracking not supported" — cursor reset is skipped.
     async fn generation_id(&self) -> String {
@@ -209,7 +219,12 @@ impl Coordinator for vaultsync_transport_libp2p::LibP2pTransportHandle {
         }))
     }
 
-    async fn register(&self, _namespace: &str, _info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        _namespace: &str,
+        _info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         Ok(())
     }
 

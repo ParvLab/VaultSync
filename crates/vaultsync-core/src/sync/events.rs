@@ -13,24 +13,30 @@ pub struct SyncEvents {
     /// or WS transport. The download worker processes them immediately
     /// and advances the cursor. `None` is a wakeup-only signal (bootstrap / timer).
     pub download_notify: mpsc::UnboundedSender<Option<PendingMutation>>,
+    /// Fired whenever the pending upload count changes (after local writes
+    /// or after the upload worker finishes a batch). Holds the new count.
+    pub pending_count: mpsc::UnboundedSender<usize>,
 }
 
 impl SyncEvents {
-    pub fn new(
-    ) -> (
+    pub fn new() -> (
         Self,
         mpsc::UnboundedReceiver<()>,
         mpsc::UnboundedReceiver<Option<PendingMutation>>,
+        mpsc::UnboundedReceiver<usize>,
     ) {
         let (upload_tx, upload_rx) = mpsc::unbounded();
         let (download_tx, download_rx) = mpsc::unbounded();
+        let (pending_tx, pending_rx) = mpsc::unbounded();
         (
             Self {
                 upload_notify: upload_tx,
                 download_notify: download_tx,
+                pending_count: pending_tx,
             },
             upload_rx,
             download_rx,
+            pending_rx,
         )
     }
 
@@ -43,5 +49,10 @@ impl SyncEvents {
     /// runs the next pull batch cycle.
     pub fn notify_download(&self, push: Option<PendingMutation>) {
         let _ = self.download_notify.unbounded_send(push);
+    }
+
+    /// Notify listeners that the pending upload count has changed.
+    pub fn notify_pending_count(&self, count: usize) {
+        let _ = self.pending_count.unbounded_send(count);
     }
 }

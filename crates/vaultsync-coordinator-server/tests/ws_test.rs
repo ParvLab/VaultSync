@@ -82,6 +82,7 @@ async fn test_ws_push_pull_flow() {
                 public_key: vec![10, 20, 30],
                 schema_version: 100,
             },
+            0,
         )
         .await
         .unwrap();
@@ -173,6 +174,7 @@ async fn test_mux_connect_single_namespace() {
                 public_key: vec![10, 20, 30],
                 schema_version: 1,
             },
+            0,
         )
         .await
         .unwrap();
@@ -241,6 +243,7 @@ async fn test_mux_two_namespaces_isolated() {
                 public_key: vec![1],
                 schema_version: 1,
             },
+            0,
         )
         .await
         .unwrap();
@@ -254,6 +257,7 @@ async fn test_mux_two_namespaces_isolated() {
                 public_key: vec![2],
                 schema_version: 1,
             },
+            0,
         )
         .await
         .unwrap();
@@ -361,6 +365,7 @@ async fn test_mux_reconnect() {
                 public_key: vec![5],
                 schema_version: 1,
             },
+            0,
         )
         .await
         .unwrap();
@@ -451,6 +456,7 @@ async fn test_mux_namespace_drop() {
                 public_key: vec![9],
                 schema_version: 1,
             },
+            0,
         )
         .await
         .unwrap();

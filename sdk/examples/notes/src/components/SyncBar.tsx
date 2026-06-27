@@ -5,6 +5,17 @@ export function SyncBar() {
   const status = useSyncStatus();
   const client = useVaultSyncClient();
   const [isLeader, setIsLeader] = useState(false);
+  const [showSyncing, setShowSyncing] = useState(false);
+
+  // Debounce: keep "Syncing..." visible for at least 1.5s after pending drops to 0
+  useEffect(() => {
+    if (status.pendingMutations > 0) {
+      setShowSyncing(true);
+    } else if (showSyncing) {
+      const timer = setTimeout(() => setShowSyncing(false), 1500);
+      return () => clearTimeout(timer);
+    }
+  }, [status.pendingMutations, showSyncing]);
 
   useEffect(() => {
     const checkLeader = () => {
@@ -18,6 +29,8 @@ export function SyncBar() {
     const interval = setInterval(checkLeader, 1000);
     return () => clearInterval(interval);
   }, [client]);
+
+  const isSyncing = status.connected && (status.pendingMutations > 0 || showSyncing);
 
   return (
     <div className="status-bar">
@@ -37,11 +50,11 @@ export function SyncBar() {
       <div className="status-indicators">
         <div className="indicator-item">
           <div 
-            className={`status-dot ${status.connected ? (status.pendingMutations > 0 ? 'syncing' : 'connected') : 'disconnected'}`}
+            className={`status-dot ${isSyncing ? 'syncing' : status.connected ? 'connected' : 'disconnected'}`}
             data-testid="sync-status"
             data-status={status.connected ? 'connected' : 'disconnected'}
           />
-          <span>{status.connected ? (status.pendingMutations > 0 ? 'Syncing...' : 'Connected') : 'Offline'}</span>
+          <span>{isSyncing ? 'Syncing...' : status.connected ? 'Connected' : 'Offline'}</span>
         </div>
 
         {status.pendingMutations > 0 && (

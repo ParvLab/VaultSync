@@ -19,7 +19,7 @@ impl CoordinatorMigrationManager {
         // 1. Migrate Replicas and their Encryption Keys
         let replicas = from.list_replicas(namespace).await?;
         for r in &replicas {
-            to.register(namespace, r.clone()).await?;
+            to.register(namespace, r.clone(), 0).await?;
             if let Some((pub_key, key_ver)) = from.get_replica_key(namespace, &r.replica_id).await?
             {
                 to.update_replica_key(namespace, &r.replica_id, pub_key, key_ver)
@@ -96,6 +96,7 @@ mod tests {
                 public_key: vec![1, 2, 3],
                 schema_version: 3,
             },
+            0,
         )
         .await
         .unwrap();

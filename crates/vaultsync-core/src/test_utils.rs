@@ -12,7 +12,7 @@ use crate::{
     coordinator::traits::{Coordinator, EncryptedMutation},
     crdt::{document::CRDTDocument, types::CrdtValue},
     error::VaultSyncError,
-    oplog::entry::{MutationType, OplogEntry, SyncStatus},
+    oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus},
     storage::traits::Storage,
     sync::state::SyncState,
 };
@@ -107,21 +107,23 @@ impl VaultSyncFixture {
         let snapshot = doc.to_snapshot();
 
         let update = doc.encode_update();
-        let entry = OplogEntry {
-            id: uuid::Uuid::new_v4().to_string(),
-            replica_id: self.replica_id.clone(),
-            namespace: self.namespace.clone(),
-            mutation_type: MutationType::CrdtUpdate,
-            doc_id: doc_id.to_string(),
-            record_id: record_id.to_string(),
-            yrs_update: update,
-            encrypted_blob: None,
-            timestamp: self.clock.now_ms(),
-            sequence: None,
-            sync_status: SyncStatus::Pending,
-            synced_at: None,
-            created_at: self.clock.now_ms(),
-        };
+        let entry = OplogEntry::new(
+            uuid::Uuid::new_v4().to_string(),
+            self.replica_id.clone(),
+            self.namespace.clone(),
+            MutationType::CrdtUpdate,
+            doc_id.to_string(),
+            record_id.to_string(),
+            update,
+            None,
+            self.clock.now_ms(),
+            None,
+            SyncStatus::Pending,
+            None,
+            self.clock.now_ms(),
+            MutationOrigin::TestUtils,
+            "",
+        );
         self.storage
             .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
             .await?;
@@ -190,21 +192,23 @@ impl VaultSyncFixture {
             };
             doc.apply_update(&m.encrypted_blob)?;
             let snapshot = doc.to_snapshot();
-            let entry = OplogEntry {
-                id: m.id.clone(),
-                replica_id: self.replica_id.clone(), // or mutation replica id
-                namespace: self.namespace.clone(),
-                mutation_type: MutationType::CrdtUpdate,
-                doc_id: doc_id.clone(),
-                record_id: record_id.clone(),
-                yrs_update: m.encrypted_blob.clone(),
-                encrypted_blob: None,
-                timestamp: m.timestamp,
-                sequence: Some(m.sequence),
-                sync_status: SyncStatus::Synced,
-                synced_at: Some(self.clock.now_ms() / 1000),
-                created_at: self.clock.now_ms(),
-            };
+            let entry = OplogEntry::new(
+                m.id.clone(),
+                self.replica_id.clone(),
+                self.namespace.clone(),
+                MutationType::CrdtUpdate,
+                doc_id.clone(),
+                record_id.clone(),
+                m.encrypted_blob.clone(),
+                None,
+                m.timestamp,
+                Some(m.sequence),
+                SyncStatus::Synced,
+                Some(self.clock.now_ms() / 1000),
+                self.clock.now_ms(),
+                MutationOrigin::TestUtils,
+                "download",
+            );
             self.storage
                 .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
                 .await?;

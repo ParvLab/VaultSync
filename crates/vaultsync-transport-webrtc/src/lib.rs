@@ -92,7 +92,12 @@ impl Coordinator for PeerCoordinator {
         ))
     }
 
-    async fn register(&self, _namespace: &str, _info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        _namespace: &str,
+        _info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         Err(CoordinatorError::NotSupported(
             "WebRTC P2P transport is only supported in WASM (browser) targets. \
              For server-to-server P2P, use vaultsync-transport-libp2p instead."
@@ -444,7 +449,12 @@ impl Coordinator for PeerCoordinator {
         Ok(Box::new(WasmWebRtcSubscription { rx }))
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         let mut inner = self.inner.lock().await;
         inner.replica_id = info.replica_id;
         inner.namespace = namespace.to_string();

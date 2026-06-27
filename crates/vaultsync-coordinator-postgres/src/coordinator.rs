@@ -299,7 +299,12 @@ impl Coordinator for PostgresCoordinator {
         Ok(Box::new(PostgresSubscription { rx: rx_mpsc }))
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         let mut client_guard = self.client.lock().await;
         let namespace_str = namespace.to_string();
         let now = std::time::SystemTime::now()

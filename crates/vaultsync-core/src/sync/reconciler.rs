@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use yrs::updates::decoder::Decode;
 use yrs::Update;
+use sha2::{Digest, Sha256};
 
 const DEDUP_CACHE_SIZE: usize = 10_000;
 
@@ -49,13 +50,15 @@ impl Reconciler {
     }
 
     pub async fn apply_remote_update(&self, source: &str, entry: &OplogEntry) -> Result<(), VaultSyncError> {
+        let content_hash = hex::encode(&Sha256::digest(&entry.yrs_update)[..8]);
         tracing::info!(
-            "[reconciler] ENTER source={} seq={:?} doc={} record={} id={} update_bytes={}",
+            "[reconciler] ENTER source={} seq={:?} doc={} record={} id={} sha256={} update_bytes={}",
             source,
             entry.sequence,
             entry.doc_id,
             entry.record_id,
             entry.id,
+            content_hash,
             entry.yrs_update.len(),
         );
         if self.is_deduped(&entry.id, &entry.record_id) {
@@ -155,9 +158,10 @@ impl Reconciler {
         entry: &OplogEntry,
         plaintext_update: &[u8],
     ) -> Result<(), VaultSyncError> {
+        let content_hash = hex::encode(&Sha256::digest(plaintext_update)[..8]);
         tracing::info!(
-            "[reconciler] ENTER source={} encrypted doc={} record={} id={} update_bytes={}",
-            source, entry.doc_id, entry.record_id, entry.id, plaintext_update.len(),
+            "[reconciler] ENTER source={} encrypted doc={} record={} id={} sha256={} update_bytes={}",
+            source, entry.doc_id, entry.record_id, entry.id, content_hash, plaintext_update.len(),
         );
 
         // ── Phase 1 diagnostic: inspect the incoming encrypted update ──

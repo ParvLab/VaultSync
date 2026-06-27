@@ -495,7 +495,12 @@ impl Coordinator for HttpCoordinator {
         Ok(Box::new(HttpSubscription { rx }))
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         let handle_opt = self.ws_client.lock().await.clone();
         if let Some(handle) = handle_opt {
             let reg = RegisterPayload {
@@ -503,7 +508,7 @@ impl Coordinator for HttpCoordinator {
                 namespace: namespace.to_string(),
                 public_key: info.public_key.clone(),
                 schema_version: info.schema_version,
-                last_sequence: 0,
+                last_sequence,
                 key_version: 1,
             };
             if let Ok(frame) = encode_frame(MSG_REGISTER, &reg) {

@@ -1,4 +1,4 @@
-use crate::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+use crate::oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus};
 use crate::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use crate::sync::state::SyncState;
 use std::sync::Arc;
@@ -74,6 +74,8 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: 1000,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
         };
 
         storage
@@ -104,6 +106,8 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: 1001,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
         };
         storage
             .delete_document_and_oplog(doc_id, rec_id, &del_entry)
@@ -138,6 +142,8 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: 2000,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
         };
         let entry2 = OplogEntry {
             id: "e-2".to_string(),
@@ -153,6 +159,8 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: 3000,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
         };
 
         storage.append_oplog(&entry1).await.unwrap();
@@ -280,6 +288,8 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Failed,
             synced_at: None,
             created_at: 100, // 100ms epoch - very old
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
         };
         storage.append_oplog(&stale_failed).await.unwrap();
 
@@ -334,6 +344,8 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Synced,
             synced_at: Some(10), // 10 seconds epoch
             created_at: 100,     // 100ms epoch
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
         };
         storage.append_oplog(&tombstone_entry).await.unwrap();
 
