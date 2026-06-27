@@ -6,6 +6,8 @@ use crate::subscription::engine::SubscriptionEngine;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
+use yrs::updates::decoder::Decode;
+use yrs::Update;
 
 const DEDUP_CACHE_SIZE: usize = 10_000;
 
@@ -78,7 +80,34 @@ impl Reconciler {
             "[reconciler] doc_load source={} exists={} old_len={}",
             source, doc_exists, old_len,
         );
+
+        // ── Phase 1 diagnostic: state vector before apply ──
+        let old_sv = doc.state_vector();
+        let old_entries: Vec<_> = old_sv.iter().map(|(c, cl)| (c, cl)).collect();
+        tracing::info!(
+            "[reconciler] old_state_vector source={} entries={:?}",
+            source, old_entries,
+        );
+
+        // ── Phase 1 diagnostic: inspect the incoming update ──
+        if let Ok(decoded) = Update::decode_v1(&entry.yrs_update) {
+            let update_sv = decoded.state_vector();
+            let update_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
+            tracing::info!(
+                "[reconciler] incoming_update source={} state_vector={:?}",
+                source, update_entries,
+            );
+        }
+
         doc.apply_update(&entry.yrs_update)?;
+
+        // ── Phase 1 diagnostic: state vector after apply ──
+        let new_sv = doc.state_vector();
+        let new_entries: Vec<_> = new_sv.iter().map(|(c, cl)| (c, cl)).collect();
+        tracing::info!(
+            "[reconciler] new_state_vector source={} entries={:?}",
+            source, new_entries,
+        );
         let snapshot = doc.to_snapshot();
         tracing::info!(
             "[reconciler] apply_update source={} update_bytes={} new_snapshot_len={}",
@@ -130,6 +159,17 @@ impl Reconciler {
             "[reconciler] ENTER source={} encrypted doc={} record={} id={} update_bytes={}",
             source, entry.doc_id, entry.record_id, entry.id, plaintext_update.len(),
         );
+
+        // ── Phase 1 diagnostic: inspect the incoming encrypted update ──
+        if let Ok(decoded) = Update::decode_v1(plaintext_update) {
+            let update_sv = decoded.state_vector();
+            let update_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
+            tracing::info!(
+                "[reconciler] incoming_encrypted_update source={} state_vector={:?}",
+                source, update_entries,
+            );
+        }
+
         if self.is_deduped(&entry.id, &entry.record_id) {
             tracing::info!(
                 "[reconciler] EXIT source={} dedup=true id={}",
@@ -147,7 +187,24 @@ impl Reconciler {
             Some(bytes) => CRDTDocument::from_snapshot(&bytes)?,
             None => CRDTDocument::new(&entry.doc_id, &entry.record_id, 0),
         };
+
+        // ── Phase 1 diagnostic: state vector before encrypted apply ──
+        let old_sv = doc.state_vector();
+        let old_entries: Vec<_> = old_sv.iter().map(|(c, cl)| (c, cl)).collect();
+        tracing::info!(
+            "[reconciler] old_state_vector_enc source={} entries={:?}",
+            source, old_entries,
+        );
+
         doc.apply_update(plaintext_update)?;
+
+        // ── Phase 1 diagnostic: state vector after encrypted apply ──
+        let new_sv = doc.state_vector();
+        let new_entries: Vec<_> = new_sv.iter().map(|(c, cl)| (c, cl)).collect();
+        tracing::info!(
+            "[reconciler] new_state_vector_enc source={} entries={:?}",
+            source, new_entries,
+        );
         let snapshot = doc.to_snapshot();
         self.storage
             .insert_document(&entry.doc_id, &entry.record_id, &snapshot)
