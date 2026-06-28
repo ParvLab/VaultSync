@@ -93,14 +93,34 @@ impl Reconciler {
         );
 
         // ── Phase 1 diagnostic: inspect the incoming update ──
-        if let Ok(decoded) = Update::decode_v1(&entry.yrs_update) {
-            let update_sv = decoded.state_vector();
-            let update_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
-            tracing::info!(
-                "[reconciler] incoming_update source={} state_vector={:?}",
-                source, update_entries,
-            );
-        }
+        // ── Phase C: redundancy check (scoped tightly: yrs::Update !Send) ──
+        let redundant = {
+            let decoded = Update::decode_v1(&entry.yrs_update);
+            match decoded {
+                Ok(decoded_update) => {
+                    let update_sv = decoded_update.state_vector();
+                    let update_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
+                    tracing::info!(
+                        "[reconciler] incoming_update source={} state_vector={:?}",
+                        source, update_entries,
+                    );
+                    update_sv.iter().all(|(client_id, clock)| {
+                        old_sv.get(client_id) >= *clock
+                    })
+                }
+                Err(_) => {
+                    tracing::info!(
+                        "[reconciler] incoming_update source={} decode_failed=true",
+                        source,
+                    );
+                    false
+                }
+            }
+        };
+
+        // ── Phase C: content fingerprint before apply ──
+        let before_snap = doc.to_snapshot();
+        let before_hash = hex::encode(&Sha256::digest(&before_snap)[..8]);
 
         doc.apply_update(&entry.yrs_update)?;
 
@@ -112,6 +132,15 @@ impl Reconciler {
             source, new_entries,
         );
         let snapshot = doc.to_snapshot();
+        let after_hash = hex::encode(&Sha256::digest(&snapshot)[..8]);
+
+        tracing::info!(
+            "[reconciler] crt_diag source={} id={} incoming={} before={} after={} snapshot_changed={} redundant={} sv_entries_old={} sv_entries_new={}",
+            source, entry.id, content_hash, before_hash, after_hash,
+            before_hash != after_hash, redundant,
+            old_entries.len(), new_entries.len(),
+        );
+
         tracing::info!(
             "[reconciler] apply_update source={} update_bytes={} new_snapshot_len={}",
             source, entry.yrs_update.len(), snapshot.len(),

@@ -118,6 +118,15 @@ impl CRDTDocument {
         self.inner.transact().encode_diff_v1(&sv)
     }
 
+    pub fn capture_incremental_update<F>(&mut self, f: F) -> Vec<u8>
+    where
+        F: FnOnce(&mut Self),
+    {
+        let sv = self.state_vector();
+        f(self);
+        self.inner.transact().encode_diff_v1(&sv)
+    }
+
     pub fn delete_field(&mut self, field: &str) -> Vec<u8> {
         let sv = self.state_vector();
         let mut txn = self.inner.transact_mut();

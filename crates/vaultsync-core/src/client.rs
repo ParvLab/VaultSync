@@ -779,11 +779,13 @@ impl VaultSyncClient {
         self.metrics
             .record_mutation_attempt(&self.config.namespace, "attempt");
 
+        let mutation_id = uuid::Uuid::new_v4().to_string();
         let mut doc = CRDTDocument::new(doc_id, record_id, 0);
-        for (field, value) in &fields {
-            doc.set_field(field, value.clone());
-        }
-        let update_bytes = doc.to_snapshot();
+        let update_bytes = doc.capture_incremental_update(|doc| {
+            for (field, value) in &fields {
+                doc.set_field(field, value.clone());
+            }
+        });
 
         // ── Phase 1 diagnostic: state vector + hash of outgoing yrs_update ──
         let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
@@ -791,8 +793,8 @@ impl VaultSyncClient {
             let sv = decoded.state_vector();
             let entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
             tracing::info!(
-                "[client.insert] yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
-                doc_id, record_id, content_hash, entries, update_bytes.len(),
+                "[client.insert] id={} yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
+                mutation_id, doc_id, record_id, content_hash, entries, update_bytes.len(),
             );
         }
 
@@ -802,7 +804,7 @@ impl VaultSyncClient {
                 self.config.max_document_size,
             ));
         }
-        let snapshot = update_bytes.clone();
+        let snapshot = doc.to_snapshot();
 
         let encrypted_blob = self
             .encryptor
@@ -814,7 +816,7 @@ impl VaultSyncClient {
             self.clock.clear_logical_wrap();
         }
         let entry = OplogEntry::new(
-            uuid::Uuid::new_v4().to_string(),
+            mutation_id,
             self.config.replica_id.clone(),
             self.config.namespace.clone(),
             MutationType::CrdtInsert,
@@ -907,10 +909,12 @@ impl VaultSyncClient {
             Some(bytes) => CRDTDocument::from_snapshot(&bytes)?,
             None => CRDTDocument::new(doc_id, record_id, 0),
         };
-        for (field, value) in &fields {
-            doc.set_field(field, value.clone());
-        }
-        let update_bytes = doc.to_snapshot();
+        let mutation_id = uuid::Uuid::new_v4().to_string();
+        let update_bytes = doc.capture_incremental_update(|doc| {
+            for (field, value) in &fields {
+                doc.set_field(field, value.clone());
+            }
+        });
 
         // ── Phase 1 diagnostic: state vector + hash of outgoing yrs_update ──
         let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
@@ -918,8 +922,8 @@ impl VaultSyncClient {
             let sv = decoded.state_vector();
             let entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
             tracing::info!(
-                "[client.update] yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
-                doc_id, record_id, content_hash, entries, update_bytes.len(),
+                "[client.update] id={} yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
+                mutation_id, doc_id, record_id, content_hash, entries, update_bytes.len(),
             );
         }
 
@@ -929,7 +933,7 @@ impl VaultSyncClient {
                 self.config.max_document_size,
             ));
         }
-        let snapshot = update_bytes.clone();
+        let snapshot = doc.to_snapshot();
 
         let encrypted_blob = self
             .encryptor
@@ -941,7 +945,7 @@ impl VaultSyncClient {
             self.clock.clear_logical_wrap();
         }
         let entry = OplogEntry::new(
-            uuid::Uuid::new_v4().to_string(),
+            mutation_id,
             self.config.replica_id.clone(),
             self.config.namespace.clone(),
             MutationType::CrdtUpdate,
@@ -1027,8 +1031,8 @@ impl VaultSyncClient {
         let existing = self.storage.get_document(doc_id, record_id).await?;
         if let Some(bytes) = existing {
             let mut doc = CRDTDocument::from_snapshot(&bytes)?;
-            doc.set_field("_deleted", CrdtValue::Boolean(true));
-            let update_bytes = doc.to_snapshot();
+            let mutation_id = uuid::Uuid::new_v4().to_string();
+            let update_bytes = doc.set_field("_deleted", CrdtValue::Boolean(true));
 
             // ── Phase 1 diagnostic: state vector + hash of outgoing yrs_update ──
             let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
@@ -1036,12 +1040,12 @@ impl VaultSyncClient {
                 let sv = decoded.state_vector();
                 let entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
                 tracing::info!(
-                    "[client.delete] yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
-                    doc_id, record_id, content_hash, entries, update_bytes.len(),
+                    "[client.delete] id={} yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
+                    mutation_id, doc_id, record_id, content_hash, entries, update_bytes.len(),
                 );
             }
 
-            let snapshot = update_bytes.clone();
+            let snapshot = doc.to_snapshot();
 
             let encrypted_blob = self
                 .encryptor
@@ -1053,7 +1057,7 @@ impl VaultSyncClient {
                 self.clock.clear_logical_wrap();
             }
             let entry = OplogEntry::new(
-                uuid::Uuid::new_v4().to_string(),
+                mutation_id,
                 self.config.replica_id.clone(),
                 self.config.namespace.clone(),
                 MutationType::CrdtDelete,
