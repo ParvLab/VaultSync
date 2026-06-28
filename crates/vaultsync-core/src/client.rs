@@ -672,7 +672,12 @@ impl VaultSyncClient {
         if self.initialized.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
-        tracing::info!(namespace = %self.config.namespace, "VaultSync client initializing");
+        tracing::info!(namespace = %self.config.namespace, mode = ?self.config.coordinator_mode, "VaultSync client initializing");
+
+        if self.config.coordinator_mode == crate::config::CoordinatorMode::Offline {
+            tracing::info!("Coordinator mode: offline, skipping register/generation check");
+            return Ok(());
+        }
 
         let replica_info = ReplicaInfo {
             replica_id: self.config.replica_id.clone(),

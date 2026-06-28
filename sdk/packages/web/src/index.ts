@@ -85,8 +85,9 @@ export class VaultSyncClient {
     const promise = (async () => {
       await init();
 
+      const mode = config.mode || (config.coordinatorUrl ? 'online' : 'offline');
       let inner: any;
-      if (config.coordinatorUrl) {
+      if (mode === 'online' && config.coordinatorUrl) {
         inner = await WasmVaultSyncClient.new_with_coordinator(
           config.namespace,
           config.replicaId,

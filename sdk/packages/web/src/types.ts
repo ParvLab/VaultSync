@@ -1,6 +1,7 @@
 export interface VaultSyncConfig {
   namespace: string;
   replicaId: string;
+  mode?: 'online' | 'offline';
   coordinatorUrl?: string;
   authToken?: string;
   storageBackend?: 'opfs' | 'indexeddb';

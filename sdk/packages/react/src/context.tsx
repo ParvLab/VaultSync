@@ -37,7 +37,7 @@ export function VaultSyncProvider({ config, children }: VaultSyncProviderProps) 
     return () => {
       cancelled = true;
     };
-  }, [config.namespace, config.replicaId, config.coordinatorUrl, config.authToken, config.dbName, config.storageBackend]);
+  }, [config.namespace, config.replicaId, config.mode, config.coordinatorUrl, config.authToken, config.dbName, config.storageBackend]);
 
   if (error) {
     return (

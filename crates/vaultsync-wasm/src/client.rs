@@ -51,6 +51,7 @@ impl WasmVaultSyncClient {
         let mut config = VaultSyncConfig::default();
         config.namespace = namespace.to_string();
         config.replica_id = replica_id.to_string();
+        config.coordinator_mode = vaultsync_core::CoordinatorMode::Offline;
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
 

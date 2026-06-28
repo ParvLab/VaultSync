@@ -24,5 +24,5 @@ pub mod test_utils;
 
 #[cfg(feature = "async-runtime")]
 pub use client::VaultSyncClient;
-pub use config::VaultSyncConfig;
+pub use config::{CoordinatorMode, VaultSyncConfig};
 pub use error::VaultSyncError;

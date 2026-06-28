@@ -3,11 +3,24 @@ use crate::sync::download::DownloadConfig;
 use crate::sync::retry::RetryConfig;
 use crate::sync::upload::UploadConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorMode {
+    Online,
+    Offline,
+}
+
+impl Default for CoordinatorMode {
+    fn default() -> Self {
+        Self::Online
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VaultSyncConfig {
     pub namespace: String,
     pub replica_id: String,
     pub storage: StorageConfig,
+    pub coordinator_mode: CoordinatorMode,
     pub coordinator_endpoint: String,
     pub auth_token: Option<String>,
     pub upload: UploadConfig,
@@ -28,6 +41,7 @@ impl Default for VaultSyncConfig {
             namespace: "default".to_string(),
             replica_id: uuid::Uuid::new_v4().to_string(),
             storage: StorageConfig::InMemory,
+            coordinator_mode: CoordinatorMode::default(),
             coordinator_endpoint: "http://localhost:9876".to_string(),
             auth_token: None,
             upload: UploadConfig::default(),
