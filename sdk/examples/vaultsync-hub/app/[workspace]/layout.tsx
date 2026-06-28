@@ -1,5 +1,7 @@
 import { WorkspaceProvider } from '@/components/workspace/WorkspaceProvider';
 import { WorkspaceSwitcher } from '@/components/workspace/WorkspaceSwitcher';
+import { OfflineBanner } from '@/components/sync/OfflineBanner';
+import { SyncStatusBar } from '@/components/sync/SyncStatusBar';
 import Link from 'next/link';
 
 export default async function WorkspaceLayout({
@@ -59,7 +61,10 @@ export default async function WorkspaceLayout({
           </div>
 
           {/* Sidebar Footer with Sign Out */}
-          <div className="p-4 border-t border-zinc-900 bg-zinc-950/80">
+          <div className="p-4 border-t border-zinc-900 bg-zinc-950/80 space-y-3">
+            <div className="flex justify-center">
+              <SyncStatusBar />
+            </div>
             <form action="/api/auth/logout" method="POST">
               <button
                 type="submit"
@@ -74,6 +79,7 @@ export default async function WorkspaceLayout({
 
         {/* Content Area */}
         <main className="flex-1 flex flex-col min-w-0 bg-zinc-950 overflow-y-auto">
+          <OfflineBanner />
           {children}
         </main>
       </div>
