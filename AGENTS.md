@@ -1,7 +1,7 @@
 # Anchored Summary
 
 ## Goal
-Eliminate timer-based polling from the download worker, making it fully event-driven. The worker now only wakes on push mutations or bootstrap notifications — no 30s safety timer, no redundant `pull(after=N)` returning 0.
+Same-browser CRDT sync via BroadcastChannel invalidation + shared OPFS, with deterministic offline mode that fully decouples tab-to-tab sync from the coordinator server.
 
 ## Constraints & Preferences
 - Keep OPFS write synchronous; only WS upload becomes async (no phantom edits on page close).
@@ -41,40 +41,38 @@ Eliminate timer-based polling from the download worker, making it fully event-dr
 | H | Metrics | `push_mutations_received`, `snapshots_applied`, `optimistic_writes`, `hlc_logical_wraps`, `active_peers` in `MetricsSnapshot` + both telemetry/no-telemetry impls |
 
 ### In Progress
-- **Phase C: Follower push → reconciler gap** — Fixed via cursor gate. Two root causes converged: (1) `process_push_mutation()` called reconciler BEFORE checking cursor, so deduped pushes from a previous session bypassed `seen_ids` on a new session, hit `changed=false` inside reconciler, and never fired subscriptions. (2) Pull-path pushes (gen mismatch reconnect) were also deduped by `seen_ids` but cursor still advanced, causing the same symptom on next session.
-- **Fix**: Moved cursor check (`seq <= last_sequence`) to the TOP of `process_push_mutation()`, before the reconciler call. Stale pushes rejected early. Post-reconciler logic simplified: always advance + persist, since gate guarantees `new_seq > cursor_before`.
-- **Instrumentation**: Decision-point `info!` logs at every stage of `apply_remote_update()` (ENTER, dedup, doc_load, apply_update, snapshot_cmp, fire, EXIT).
+- **Cross-device CRDT sync** — `capture_incremental_update()` replaces `to_snapshot()` in `insert()`/`update()`/`delete()`; network now sends incremental diffs. Built but untested in production.
+- **Same-browser CRDT sync** — BC notification (`cross_tab_channel` with `{doc_id, record_id, tab_id}`) + OPFS re-read. Built, compiled, and pushed.
 
 ### Blocked
 - (none currently)
 
-## Current Session — Phases 1-4 end-to-end
+## Current Session — Same-Browser Sync + Offline Mode
 
 ### Key Findings from Logs
 
-**1. Generation mismatch on every refresh** (root cause):
-- `read_sync_state cursor=58` then `generation mismatch: local=148bd163... server=61162831...` → cursor resets to 0
-- Server gen `61162831...` is stable across sessions, so the `148bd163...` stored locally comes from a non-server source
-- NOT from BroadcastChannel — gen check runs (step [5/9]) before BC setup (step after [9/9])
-- Need to trace EVERY `write_sync_state` call to find who writes the stale gen
+**1. Same-browser sync breaks because shared OPFS makes server push redundant:**
+- Tab A writes → OPFS → server receives push → Tab B gets server push notification
+- Tab B calls `process_push_mutation()` → reconciler reads OPFS → Tab A's data already visible (shared OPFS)
+- `apply_update()` sees `redundant=true snapshot_changed=false` → no React re-render
+- Fix not in the reconciler — fix is to notify via BC before server push even arrives
 
-**2. Subscribe runs BEFORE generation check** (confirmed ordering bug):
-- `do_connect()` issues subscribe INSIDE `register()`, using cursor before generation check
-- `initialize()` runs generation check AFTER `register()` returns
-- If mismatch detected, cursor is reset to 0 — but subscribe was already issued with old cursor
-- Server pushes seq 1…N as historical replay (thinks client is behind)
-- `process_push_mutation(seq=1)` compares `new_seq(1) > state.last_synced_sequence(58)` → FALSE → skips advance → cursor stays stale
+**2. `broadcast_p2p` is a no-op on WASM** (`client.rs:1458`):
+- `#[cfg(target_arch = "wasm32")] async fn broadcast_p2p(...) {}` — empty function
+- No P2P mutation transport exists for same-browser tabs
+- Confirmed: zero `postMessage` calls in the entire codebase for `vaultsync-ipc-*` channels
 
-**3. PushOutcome is NOT the right fix for stale pushes** (user vetoed):
-- Changing `PushOutcome::Contiguous` to `GapDetected` for stale (new_seq <= cursor) pushes would cause a pull on EVERY duplicate during normal reconnect
-- Correct fix: stop the replays from arriving at all (fix the subscribe timing)
+**3. JS BroadcastChannel listener already exists and works:**
+- `index.ts:46-70` — `setupBroadcastChannel()` creates `vaultsync-ipc-{namespace}` listener
+- Parses `{doc_id, record_id}`, calls `fire_subscription()` via `setTimeout(0)`
+- `fire_subscription()` does a real OPFS read (`self.client.get().await`), not a cache hit
+- Confirmed alive via console logs — but nothing was sending to it
 
-**4. React subscription race** (independent of transport):
-- `reconciler firing 0 subscription notifications` while storage has data
-- `fetchInitial found 1 record` — React can read storage but subscriptions aren't registered yet
-- Pure startup ordering bug: React subscribes after `new_with_coordinator()` resolves, missing the initial batch of subscription firings
-
-**5. UI "3 pending" vs Rust "0 pending"** — stale React state cache, not a Rust bug
+**4. CoordinatorMode::Offline gives deterministic startup:**
+- No WS connection attempt, no heartbeat, no reconnect loop
+- Register/gen check skipped entirely — clean startup in 2 lines
+- Download worker sleeps forever (no pushes, no timer) — harmless
+- All reads/writes/subscriptions/BC notifications work without coordinator
 
 ### Changes This Session
 
@@ -92,6 +90,18 @@ Eliminate timer-based polling from the download worker, making it fully event-dr
 | 3 | `process_push_mutation()` | Upgraded stale-push skip from `debug!` to `warn!` with "should not happen after Phase 2 fix" |
 | 4 | `useQuery.ts` | Swapped order: `client.subscribe()` before `fetchInitial()` |
 | 4 | `useVaultSyncOne.ts` | Swapped order: `client.subscribe()` before `fetchInitial()` |
+| 10 | `WasmVaultSyncClient` | Added `cross_tab_channel: Option<BroadcastChannel>` and `tab_id: String` fields |
+| 10 | `WasmVaultSyncClient::new()` | Initializes `cross_tab_channel` and `tab_id` |
+| 10 | `WasmVaultSyncClient::new_with_coordinator()` | Same initialization |
+| 10 | `notify_cross_tab()` | Posts `{doc_id, record_id, tab_id}` to persistent BC after insert/update/delete |
+| 10 | `index.ts` `VaultSyncClient` | Added `tabId` field, constructor stores `replicaId` as `tabId` |
+| 10 | `index.ts` `setupBroadcastChannel()` | Added self-filter: `if (val.tab_id && val.tab_id === this.tabId) return` |
+| 11 | `config.rs` | Added `CoordinatorMode { Online, Offline }` enum |
+| 11 | `VaultSyncConfig` | Added `coordinator_mode: CoordinatorMode` field |
+| 11 | `client.rs` `initialize()` | Guards register/gen-check behind `coordinator_mode == Online` |
+| 11 | `WasmVaultSyncClient::new()` | Sets `coordinator_mode = Offline` |
+| 11 | `types.ts` | Added `mode?: 'online' | 'offline'` to `VaultSyncConfig` |
+| 11 | `index.ts` `VaultSyncClient.create()` | Routes based on `mode` — offline skips WS entirely |
 
 ### Completed Phases
 
@@ -106,6 +116,8 @@ Eliminate timer-based polling from the download worker, making it fully event-dr
 | 7 | **Notification tracing** — `[notify] seq=N record=... phase=... t=...` logs at every stage (WASM callback → spawn_local → JS callback → microtask → React setData); `NOTIFY_SEQ` counter in WASM bridge correlates across boundary | ✅ Done |
 | 8 | **DownloadQueue gen check** — converted from read-write (mutates cursor) to read-only verify (logs mismatch, does NOT reset cursor); authority lives in `initialize()` only | ✅ Done |
 | 9 | **Clock skew removed from pull/push** — pull path (`process_batch`) and push path (`process_push_mutation`) no longer reject coordinator-validated mutations; P2P path retains strict check | ✅ Done |
+| 10 | **BC notification for same-browser sync** — persistent `cross_tab_channel` on `WasmVaultSyncClient`; `notify_cross_tab()` posts `{doc_id, record_id, tab_id}` after every write; JS-side self-filtering via `tab_id` comparison | ✅ Done |
+| 11 | **CoordinatorMode enum** — `CoordinatorMode { Online, Offline }` in `VaultSyncConfig`; deterministic offline init skips register, gen check, WS entirely; JS SDK exposes `mode: 'online' | 'offline'` | ✅ Done |
 | | **WASM build** | ✅ `wasm-pack build --target web` succeeded, pkg at `crates/vaultsync-wasm/pkg/` |
 
 ### Generation ID Instability
@@ -158,6 +170,10 @@ After reconnect, server pushes from seq 0 and all historical pushes arrive with 
 - **Clock skew: trust the coordinator, not the wall clock.** Mutations the coordinator accepted and serialized should not be rejected by the download worker. P2P retains strict checking because there is no central authority.
 - **DownloadQueue::check_generation() is now read-only.** It logs a warning if generation mismatches but does NOT reset cursor. Authority is in `initialize()` only.
 - **SyncStateManager is defined but NOT yet wired in.** It was designed as the single authority for cursor+gen management, but `initialize()` and `DownloadQueue` still read/write storage directly. Future work: wire SyncStateManager into the client struct and route all gen/cursor operations through it.
+- **Same-browser sync uses BC invalidation, not server push.** Shared OPFS means push will always be redundant. BC notification + OPFS re-read is the correct pattern.
+- **CoordinatorMode enum (`Online`/`Offline`) instead of `skip_coordinator: bool`.** Enums evolve better than booleans — future modes (P2P, LAN, Testing) slot in without refactoring.
+- **Deterministic offline init:** `CoordinatorMode::Offline` skips register, gen check, and WS entirely. No failed connection attempts, no heartbeat timers, no log noise. Not reactive (try-fail-continue) — intentionally offline.
+- **BC payload is an invalidation bus, not a data channel.** Only `{doc_id, record_id, tab_id}` — no document data, no CRDT ops, no encryption concerns.
 
 ## Relevant Files
 - `crates/vaultsync-core/src/transport/traits.rs` — `Transport` trait, `InboundMutation`, `TransportSource`, `TransportError`
@@ -190,3 +206,8 @@ After reconnect, server pushes from seq 0 and all historical pushes arrive with 
 - `sdk/packages/web/src/index.ts` — `[notify]` logs at js_callback/microtask_exec phases
 - `sdk/packages/react/src/useQuery.ts` — `[notify]` logs at react_callback/react_setData phases
 - `sdk/packages/react/src/useVaultSyncOne.ts` — `[notify]` logs at react_callback_one/react_setData_one phases
+- `crates/vaultsync-core/src/config.rs` — `VaultSyncConfig` with `coordinator_mode: CoordinatorMode`
+- `crates/vaultsync-core/src/lib.rs` — re-exports `CoordinatorMode`
+- `sdk/packages/web/src/index.ts` — `VaultSyncClient.create()` routes by `mode`, BC self-filter by `tabId`
+- `sdk/packages/web/src/types.ts` — `VaultSyncConfig.mode?: 'online' | 'offline'`
+- `sdk/packages/react/src/context.tsx` — `VaultSyncProvider` includes `config.mode` in deps
