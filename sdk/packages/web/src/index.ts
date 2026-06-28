@@ -23,10 +23,12 @@ export class VaultSyncClient {
   private _db?: any;
   private channel?: BroadcastChannel;
   private namespace: string;
+  private tabId: string;
 
-  private constructor(inner: any, namespace: string) {
+  private constructor(inner: any, namespace: string, replicaId: string) {
     this.inner = inner;
     this.namespace = namespace;
+    this.tabId = replicaId;
   }
 
   get db(): DbProxy & Record<string, Collection<any>> {
@@ -53,6 +55,9 @@ export class VaultSyncClient {
         try {
           const val = JSON.parse(e.data);
           if (val && typeof val.doc_id === 'string' && typeof val.record_id === 'string') {
+            if (val.tab_id && val.tab_id === this.tabId) {
+              return; // skip own notification
+            }
             setTimeout(async () => {
               try {
                 console.log(`[JS BC] Firing subscription for doc_id=${val.doc_id}, record_id=${val.record_id}`);
@@ -99,7 +104,7 @@ export class VaultSyncClient {
         );
       }
 
-      const client = new VaultSyncClient(inner, config.namespace);
+      const client = new VaultSyncClient(inner, config.namespace, config.replicaId);
       client.setupBroadcastChannel(config.namespace);
       return client;
     })();

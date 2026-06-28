@@ -36,6 +36,8 @@ macro_rules! console_warn {
 pub struct WasmVaultSyncClient {
     client: Arc<VaultSyncClient>,
     presence: Option<crate::presence::PresenceManager>,
+    cross_tab_channel: Option<web_sys::BroadcastChannel>,
+    tab_id: String,
 }
 
 #[wasm_bindgen]
@@ -72,9 +74,14 @@ impl WasmVaultSyncClient {
                 .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
         );
 
+        let channel_name = format!("vaultsync-ipc-{}", namespace);
+        let cross_tab_channel = web_sys::BroadcastChannel::new(&channel_name).ok();
+
         Ok(Self {
             client,
             presence: None,
+            cross_tab_channel,
+            tab_id: replica_id.to_string(),
         })
     }
 
@@ -143,10 +150,27 @@ impl WasmVaultSyncClient {
         let presence = crate::presence::PresenceManager::new(namespace, replica_id).ok();
 
         console_log!("[9/9] client ready");
+        let channel_name = format!("vaultsync-ipc-{}", namespace);
+        let cross_tab_channel = web_sys::BroadcastChannel::new(&channel_name).ok();
+
         Ok(Self {
             client,
             presence,
+            cross_tab_channel,
+            tab_id: replica_id.to_string(),
         })
+    }
+
+    fn notify_cross_tab(&self, doc_id: &str, record_id: &str) {
+        if let Some(ref bc) = self.cross_tab_channel {
+            let msg = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&msg, &"doc_id".into(), &doc_id.into());
+            let _ = js_sys::Reflect::set(&msg, &"record_id".into(), &record_id.into());
+            let _ = js_sys::Reflect::set(&msg, &"tab_id".into(), &self.tab_id.clone().into());
+            if let Ok(json) = js_sys::JSON::stringify(&msg) {
+                let _ = bc.post_message(&json);
+            }
+        }
     }
 
     pub async fn insert(&self, doc_id: &str, record_id: &str, json: &str) -> Result<(), JsValue> {
@@ -155,6 +179,7 @@ impl WasmVaultSyncClient {
             .insert(doc_id, record_id, fields)
             .await
             .map_err(|e| JsValue::from_str(&format!("Insert failed: {:?}", e)))?;
+        self.notify_cross_tab(doc_id, record_id);
         Ok(())
     }
 
@@ -164,6 +189,7 @@ impl WasmVaultSyncClient {
             .update(doc_id, record_id, fields)
             .await
             .map_err(|e| JsValue::from_str(&format!("Update failed: {:?}", e)))?;
+        self.notify_cross_tab(doc_id, record_id);
         Ok(())
     }
 
@@ -172,6 +198,7 @@ impl WasmVaultSyncClient {
             .delete(doc_id, record_id)
             .await
             .map_err(|e| JsValue::from_str(&format!("Delete failed: {:?}", e)))?;
+        self.notify_cross_tab(doc_id, record_id);
         Ok(())
     }
 
