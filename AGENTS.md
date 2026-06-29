@@ -41,8 +41,8 @@ Same-browser CRDT sync via BroadcastChannel invalidation + shared OPFS, with det
 | H | Metrics | `push_mutations_received`, `snapshots_applied`, `optimistic_writes`, `hlc_logical_wraps`, `active_peers` in `MetricsSnapshot` + both telemetry/no-telemetry impls |
 
 ### In Progress
-- **Cross-device CRDT sync** — `capture_incremental_update()` replaces `to_snapshot()` in `insert()`/`update()`/`delete()`; network now sends incremental diffs. Built but untested in production.
-- **Same-browser CRDT sync** — BC notification (`cross_tab_channel` with `{doc_id, record_id, tab_id}`) + OPFS re-read. Built, compiled, and pushed.
+- **Cross-browser test (Chrome ↔ Firefox)** — only path where BC doesn't apply; push path must carry the full sync load. Test all four directions in the matrix.
+- **Log noise reduction** — `INDEX LOAD`, `FLUSH_BEFORE`, `PENDING_READ`, `MARK_SYNCED`, `listeners=3` — demote to `trace!` for cleaner signal.
 
 ### Blocked
 - (none currently)
@@ -78,30 +78,9 @@ Same-browser CRDT sync via BroadcastChannel invalidation + shared OPFS, with det
 
 | Phase | Area | Change |
 |-------|------|--------|
-| 1 | `initialize()` | Added `[4.5/9] register returned cursor={}` after register() completes |
-| 1 | `initialize()` gen check | Added `cursor=` to `[5/9]` log; `[5.5/9] cursor after gen check= (subscribe was with after=)` |
-| 1 | `initialize()` gen OK path | Added `[sync_state] generation OK gen=` when no mismatch |
-| 1 | `initialize()` cursor reset log | Changed to include `(was {cursor_before})` |
-| 1 | Download worker | Added `t=` to `started` and `iter=N wake=Y` logs |
-| 2 | `Coordinator` trait | Added `async fn disconnect()` default method (returns Ok(())) |
-| 2 | `WasmWsCoordinator` | Implements `disconnect()` — closes WS, clears handlers, bumps conn_gen to kill old readers |
-| 2 | `initialize()` reconnect | After generation mismatch: `coordinator.disconnect()` + `register(..., cursor=0)` with `[6/9]` and `[6.5/9]` logs |
-| 2 | `ReplicaInfo` | Extracted once at top of `initialize()` to reuse across both register() calls |
-| 3 | `process_push_mutation()` | Upgraded stale-push skip from `debug!` to `warn!` with "should not happen after Phase 2 fix" |
-| 4 | `useQuery.ts` | Swapped order: `client.subscribe()` before `fetchInitial()` |
-| 4 | `useVaultSyncOne.ts` | Swapped order: `client.subscribe()` before `fetchInitial()` |
-| 10 | `WasmVaultSyncClient` | Added `cross_tab_channel: Option<BroadcastChannel>` and `tab_id: String` fields |
-| 10 | `WasmVaultSyncClient::new()` | Initializes `cross_tab_channel` and `tab_id` |
-| 10 | `WasmVaultSyncClient::new_with_coordinator()` | Same initialization |
-| 10 | `notify_cross_tab()` | Posts `{doc_id, record_id, tab_id}` to persistent BC after insert/update/delete |
-| 10 | `index.ts` `VaultSyncClient` | Added `tabId` field, constructor stores `replicaId` as `tabId` |
-| 10 | `index.ts` `setupBroadcastChannel()` | Added self-filter: `if (val.tab_id && val.tab_id === this.tabId) return` |
-| 11 | `config.rs` | Added `CoordinatorMode { Online, Offline }` enum |
-| 11 | `VaultSyncConfig` | Added `coordinator_mode: CoordinatorMode` field |
-| 11 | `client.rs` `initialize()` | Guards register/gen-check behind `coordinator_mode == Online` |
-| 11 | `WasmVaultSyncClient::new()` | Sets `coordinator_mode = Offline` |
-| 11 | `types.ts` | Added `mode?: 'online' | 'offline'` to `VaultSyncConfig` |
-| 11 | `index.ts` `VaultSyncClient.create()` | Routes based on `mode` — offline skips WS entirely |
+| 12 | `sync/state.rs` | Added `SyncState::new(namespace, generation_id)` constructor — makes invalid (empty gen) construction impossible through the typed API |
+| 12 | `client.rs` | `read_sync_state` log expanded: `cursor={} gen={} backend={} namespace={} took {} ms` — complete diagnostic on startup |
+| 12 | `download.rs` | All 3 `read_sync_state=None` fallback paths now call `fallback_generation_id()` + emit `warn!` log with namespace/caller context; prevents gen wipe that caused stale-gen reconnect loop on every page load |
 
 ### Completed Phases
 
@@ -118,11 +97,21 @@ Same-browser CRDT sync via BroadcastChannel invalidation + shared OPFS, with det
 | 9 | **Clock skew removed from pull/push** — pull path (`process_batch`) and push path (`process_push_mutation`) no longer reject coordinator-validated mutations; P2P path retains strict check | ✅ Done |
 | 10 | **BC notification for same-browser sync** — persistent `cross_tab_channel` on `WasmVaultSyncClient`; `notify_cross_tab()` posts `{doc_id, record_id, tab_id}` after every write; JS-side self-filtering via `tab_id` comparison | ✅ Done |
 | 11 | **CoordinatorMode enum** — `CoordinatorMode { Online, Offline }` in `VaultSyncConfig`; deterministic offline init skips register, gen check, WS entirely; JS SDK exposes `mode: 'online' | 'offline'` | ✅ Done |
+| 12 | **Generation fallback hardening** — `SyncState::new()` constructor; all 3 `read_sync_state=None` paths in `download.rs` preserve coordinator gen; `read_sync_state` log includes `gen=`/`backend=`/`namespace=` | ✅ Done |
 | | **WASM build** | ✅ `wasm-pack build --target web` succeeded, pkg at `crates/vaultsync-wasm/pkg/` |
 
 ### Generation ID Instability
 
-The root cause of WHY the local gen changes from `61162831...` to `148bd163...` between page refreshes is still unknown. The gen check runs at [5/9] before BC setup, so BroadcastChannel is not the culprit. Action: search every call to `write_sync_state()` / `save_sync_state()` and trace who writes `generation_id` to storage. This is a separate investigation from the subscribe timing fix.
+The root cause was the 3 `read_sync_state=None` fallback paths in `download.rs` that constructed `SyncState { generation_id: String::new(), .. }` — if `read_sync_state` ever returned `None` (even once, due to an ordering race or OPFS visibility delay), the subsequent `write_sync_state` would persist `generation_id=""`. Next page load would read `gen=""` → mismatch with server gen → reconnect loop.
+
+Fix: all 3 fallback paths now call `self.fallback_generation_id().await` (which reads `coordinator.generation_id()`) instead of hardcoding `String::new()`. Additionally, a `warn!` log fires on every `None` case to detect if the race still occurs. The `SyncState` struct now has a `SyncState::new(namespace, generation_id)` constructor to prevent invalid construction in future code.
+
+The 3 hardened paths:
+1. `process_batch` pull (line ~196) — `caller=process_batch`
+2. `try_fetch_snapshot` (line ~390) — `caller=try_fetch_snapshot`
+3. `process_push_mutation` (line ~518) — `caller=process_push_mutation`
+
+If `[download_queue] read_sync_state=None` logs never appear, the theory was wrong and the race doesn't exist. If they do appear occasionally, the fix prevents data loss while more investigation is needed.
 
 ### Expected Log Flow After All Fixes
 
@@ -176,6 +165,8 @@ After reconnect, server pushes from seq 0 and all historical pushes arrive with 
 - **BC payload is an invalidation bus, not a data channel.** Only `{doc_id, record_id, tab_id}` — no document data, no CRDT ops, no encryption concerns.
 
 ## Relevant Files
+- `crates/vaultsync-core/src/sync/state.rs` — `SyncState` with `generation_id` and `SyncState::new()` constructor
+- `crates/vaultsync-core/src/sync/download.rs` — 3 fallback paths with `fallback_generation_id()` + warning logs
 - `crates/vaultsync-core/src/transport/traits.rs` — `Transport` trait, `InboundMutation`, `TransportSource`, `TransportError`
 - `crates/vaultsync-core/src/transport/mod.rs` — Core transport module re-export
 - `crates/vaultsync-wasm/src/transport/broadcast_channel.rs` — `BroadcastChannelTransport` impl

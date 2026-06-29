@@ -195,16 +195,18 @@ impl DownloadQueue {
                     // Persist cursor to storage FIRST
                     let mut state = match self.storage.read_sync_state(&self.namespace).await? {
                         Some(s) => s,
-                        None => crate::sync::state::SyncState {
-                            namespace: self.namespace.clone(),
-                            replica_id: "".to_string(),
-                            last_synced_sequence: new_seq,
-                            connection_status: crate::sync::state::ConnectionStatus::Connected,
-                            leader_status: Some(true),
-                            last_connected_at: None,
-                            last_sync_at: None,
-                            schema_version: 0,
-                            generation_id: String::new(),
+                        None => {
+                            tracing::warn!(
+                                "[download_queue] read_sync_state=None namespace={} caller=process_batch cursor_before={}",
+                                self.namespace,
+                                after,
+                            );
+                            let mut s = crate::sync::state::SyncState::new(
+                                self.namespace.clone(),
+                                self.fallback_generation_id().await,
+                            );
+                            s.last_synced_sequence = new_seq;
+                            s
                         },
                     };
                     state.last_synced_sequence = new_seq;
@@ -330,6 +332,13 @@ impl DownloadQueue {
         );
     }
 
+    /// Get the coordinator's generation_id for fallback SyncState construction.
+    /// Returns empty string if the coordinator doesn't support generation tracking.
+    async fn fallback_generation_id(&self) -> String {
+        let server_gen = self.coordinator.generation_id().await;
+        if server_gen.is_empty() { String::new() } else { server_gen }
+    }
+
     /// Try to fetch and apply a snapshot when the cursor is far behind.
     ///
     /// Returns `true` if a snapshot was applied and cursor advanced.
@@ -382,16 +391,18 @@ impl DownloadQueue {
                 // Advance cursor past the snapshot sequence
                 let mut state = match self.storage.read_sync_state(&self.namespace).await? {
                     Some(s) => s,
-                    None => crate::sync::state::SyncState {
-                        namespace: self.namespace.clone(),
-                        replica_id: "".to_string(),
-                        last_synced_sequence: snapshot.sequence,
-                        connection_status: crate::sync::state::ConnectionStatus::Connected,
-                        leader_status: Some(true),
-                        last_connected_at: None,
-                        last_sync_at: None,
-                        schema_version: 0,
-                        generation_id: String::new(),
+                    None => {
+                        tracing::warn!(
+                            "[download_queue] read_sync_state=None namespace={} caller=try_fetch_snapshot cursor_before={}",
+                            self.namespace,
+                            after,
+                        );
+                        let mut s = crate::sync::state::SyncState::new(
+                            self.namespace.clone(),
+                            self.fallback_generation_id().await,
+                        );
+                        s.last_synced_sequence = snapshot.sequence;
+                        s
                     },
                 };
                 state.last_synced_sequence = snapshot.sequence;
@@ -509,16 +520,18 @@ impl DownloadQueue {
         let new_seq = m.sequence;
         let mut state = match self.storage.read_sync_state(&self.namespace).await? {
             Some(s) => s,
-            None => crate::sync::state::SyncState {
-                namespace: self.namespace.clone(),
-                replica_id: "".to_string(),
-                last_synced_sequence: new_seq,
-                connection_status: crate::sync::state::ConnectionStatus::Connected,
-                leader_status: Some(true),
-                last_connected_at: None,
-                last_sync_at: None,
-                schema_version: 0,
-                generation_id: String::new(),
+            None => {
+                tracing::warn!(
+                    "[download_queue] read_sync_state=None namespace={} caller=process_push_mutation cursor_before={}",
+                    self.namespace,
+                    cursor_before,
+                );
+                let mut s = crate::sync::state::SyncState::new(
+                    self.namespace.clone(),
+                    self.fallback_generation_id().await,
+                );
+                s.last_synced_sequence = new_seq;
+                s
             },
         };
         let now_ms = crate::time_utils::system_time_now_ms();

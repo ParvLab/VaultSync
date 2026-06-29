@@ -169,8 +169,14 @@ impl WasmVaultSyncClient {
             let _ = js_sys::Reflect::set(&msg, &"record_id".into(), &record_id.into());
             let _ = js_sys::Reflect::set(&msg, &"tab_id".into(), &self.tab_id.clone().into());
             if let Ok(json) = js_sys::JSON::stringify(&msg) {
+                console_debug!(
+                    "[BC send] tab_id={} doc_id={} record_id={} payload={}",
+                    self.tab_id, doc_id, record_id, json,
+                );
                 let _ = bc.post_message(&json);
             }
+        } else {
+            console_debug!("[BC send] skipped (no channel) tab_id={} doc_id={} record_id={}", self.tab_id, doc_id, record_id);
         }
     }
 
@@ -243,8 +249,21 @@ impl WasmVaultSyncClient {
     }
 
     pub async fn fire_subscription(&self, doc_id: &str, record_id: &str) -> Result<(), JsValue> {
-        if let Ok(Some(state)) = self.client.get(doc_id, record_id).await {
-            self.client.fire_local_subscription(doc_id, record_id, &state);
+        match self.client.get(doc_id, record_id).await {
+            Ok(Some(state)) => {
+                let keys: Vec<String> = state.keys().cloned().collect();
+                console_debug!(
+                    "[BC fire_subscription] doc={} record={} fields={} keys={:?}",
+                    doc_id, record_id, state.len(), keys,
+                );
+                self.client.fire_local_subscription(doc_id, record_id, &state);
+            }
+            Ok(None) => {
+                console_debug!("[BC fire_subscription] doc={} record={} not_found=true", doc_id, record_id);
+            }
+            Err(e) => {
+                console_debug!("[BC fire_subscription] doc={} record={} error={:?}", doc_id, record_id, e);
+            }
         }
         Ok(())
     }

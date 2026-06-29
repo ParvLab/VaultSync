@@ -50,26 +50,38 @@ export class VaultSyncClient {
     console.log(`[JS BC] Setting up BroadcastChannel: ${channelName}`);
     this.channel = new BroadcastChannel(channelName);
     this.channel.onmessage = (e) => {
-      console.log(`[JS BC] Received message on channel ${channelName}:`, e.data);
+      const raw = typeof e.data === 'string' ? e.data : JSON.stringify(e.data);
       if (typeof e.data === 'string') {
         try {
           const val = JSON.parse(e.data);
           if (val && typeof val.doc_id === 'string' && typeof val.record_id === 'string') {
-            if (val.tab_id && val.tab_id === this.tabId) {
+            const sender = val.tab_id || '(missing)';
+            const receiver = this.tabId || '(missing)';
+            const ignored = !!(val.tab_id && val.tab_id === this.tabId);
+            console.log(
+              `[JS BC] recv sender=${sender} receiver=${receiver} namespace=${namespace} ignored=${ignored} doc=${val.doc_id} record=${val.record_id}`
+            );
+            if (ignored) {
               return; // skip own notification
             }
             setTimeout(async () => {
               try {
-                console.log(`[JS BC] Firing subscription for doc_id=${val.doc_id}, record_id=${val.record_id}`);
+                console.log(
+                  `[JS BC] fire sender=${sender} receiver=${receiver} doc=${val.doc_id} record=${val.record_id}`
+                );
                 await this.inner.fire_subscription(val.doc_id, val.record_id);
               } catch (err) {
                 console.error("[JS BC] Failed to fire subscription in WASM: ", err);
               }
             }, 0);
+          } else {
+            console.warn(`[JS BC] recv invalid payload on ${channelName}:`, raw);
           }
         } catch (err) {
           console.error("[JS BC] Failed to parse message:", err);
         }
+      } else {
+        console.warn(`[JS BC] recv non-string data on ${channelName}:`, raw);
       }
     };
   }

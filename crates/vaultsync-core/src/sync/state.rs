@@ -28,6 +28,22 @@ impl Default for ConnectionStatus {
     }
 }
 
+impl SyncState {
+    pub fn new(namespace: String, generation_id: String) -> Self {
+        Self {
+            namespace,
+            replica_id: String::new(),
+            last_synced_sequence: 0,
+            connection_status: ConnectionStatus::Connected,
+            leader_status: Some(true),
+            last_connected_at: None,
+            last_sync_at: None,
+            schema_version: 0,
+            generation_id,
+        }
+    }
+}
+
 impl FromStr for ConnectionStatus {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {

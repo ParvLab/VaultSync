@@ -290,9 +290,16 @@ impl VaultSyncClient {
         tracing::info!("[client.new] read_sync_state start");
         let last_sequence = match storage.read_sync_state(&config.namespace).await? {
             Some(state) => {
+                #[cfg(target_arch = "wasm32")]
+                let backend = "opfs";
+                #[cfg(not(target_arch = "wasm32"))]
+                let backend = "sqlite";
                 tracing::info!(
-                    "[client.new] read_sync_state cursor={} took {} ms",
+                    "[client.new] read_sync_state cursor={} gen={} backend={} namespace={} took {} ms",
                     state.last_synced_sequence,
+                    state.generation_id,
+                    backend,
+                    config.namespace,
                     crate::time_utils::system_time_now_ms() - _t
                 );
                 state.last_synced_sequence
@@ -485,32 +492,80 @@ impl VaultSyncClient {
             });
         }
 
-        // ── Upload worker (event-driven) ──────────────────────────────────
+        // ── Upload worker (event-driven with offline backoff) ─────────────
         let uq = upload_queue.clone();
         let mut upload_rx = upload_events_rx;
         let pc_tx = pending_count_tx;
         let pc_cache = pending_cache.clone();
         crate::time_utils::spawn(async move {
+            let mut offline = false;
+            let mut backoff_ms: u64 = 0;
             loop {
-                match upload_rx.next().await {
-                    Some(_) => {
-                        loop {
-                            match uq.process_batch().await {
-                                Ok(0) => break,
-                                Ok(_) => continue,
-                                Err(e) => {
-                                    tracing::warn!("[upload_worker] batch failed: {:?}", e);
-                                    break;
+                // Wait for a notification. While offline, skip the channel
+                // and wait for the backoff timer directly.
+                if offline {
+                    if backoff_ms > 0 {
+                        crate::time_utils::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                    // Drain any stale notifications that piled up while we slept
+                    while let Ok(()) = upload_rx.try_recv() {}
+                } else {
+                    match upload_rx.next().await {
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+
+                // Process all pending batches
+                loop {
+                    match uq.process_batch().await {
+                        Ok(0) => {
+                            // Either no pending entries OR coordinator unavailable.
+                            // Distinguish by checking pending count.
+                            if let Ok(count) = uq.pending_count().await {
+                                if count > 0 && !offline {
+                                    tracing::warn!(
+                                        "[upload_worker] coordinator not available ({} pending), entering offline mode",
+                                        count
+                                    );
+                                    offline = true;
+                                    backoff_ms = 1000;
+                                } else if count > 0 {
+                                    // Still offline after retry; increase backoff
+                                    backoff_ms = std::cmp::min(backoff_ms * 2, 30000);
+                                    tracing::debug!(
+                                        "[upload_worker] still offline, backoff={}ms",
+                                        backoff_ms,
+                                    );
+                                } else if count == 0 && offline {
+                                    // All pending cleared — return to online
+                                    tracing::info!("[upload_worker] all pending cleared, returning online");
+                                    offline = false;
+                                    backoff_ms = 0;
                                 }
                             }
+                            break;
                         }
-                        // After processing (or exhausting) a batch, update cache and notify
-                        if let Ok(count) = uq.pending_count().await {
-                            pc_cache.store(count, std::sync::atomic::Ordering::Relaxed);
-                            let _ = pc_tx.unbounded_send(count);
+                        Ok(_) => {
+                            // Successfully pushed — reset offline state
+                            if offline {
+                                tracing::info!("[upload_worker] coordinator reconnected, returning online");
+                            }
+                            offline = false;
+                            backoff_ms = 0;
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!("[upload_worker] batch failed: {:?}", e);
+                            break;
                         }
                     }
-                    None => break,
+                }
+
+                // Update pending count cache
+                if let Ok(count) = uq.pending_count().await {
+                    pc_cache.store(count, std::sync::atomic::Ordering::Relaxed);
+                    let _ = pc_tx.unbounded_send(count);
                 }
             }
         });
