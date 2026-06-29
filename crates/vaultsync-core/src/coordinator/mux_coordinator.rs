@@ -928,7 +928,12 @@ impl Coordinator for NamespacedCoordinator {
         .await
     }
 
-    async fn register(&self, _namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        _namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             MuxCoordinator::add_namespace(

@@ -126,8 +126,13 @@ impl Coordinator for FailoverCoordinator {
         try_coord!(self, subscribe(namespace, from_sequence))
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
-        try_coord!(self, register(namespace, info.clone()))
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
+        try_coord!(self, register(namespace, info.clone(), last_sequence))
     }
 
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError> {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useVaultSyncClient } from './context.js';
+import { useVaultSyncClient } from './useVaultSyncClient.js';
 import type { RecordFields } from '@vaultsync/web';
 
 export interface UseQueryOptions {
@@ -18,11 +18,13 @@ export function useQuery(docId: string, options?: UseQueryOptions) {
     async function fetchInitial() {
       try {
         const records = await client.find(docId);
+        console.log(`[React useQuery] fetchInitial for ${docId}: found ${records.length} records`);
         if (active) {
           setData(records);
           setLoading(false);
         }
       } catch (err) {
+        console.error(`[React useQuery] fetchInitial error for ${docId}:`, err);
         if (active) {
           setError(err as Error);
           setLoading(false);
@@ -30,13 +32,15 @@ export function useQuery(docId: string, options?: UseQueryOptions) {
       }
     }
 
-    fetchInitial();
-
-    // Subscribe to real-time changes on docId
-    const unsubscribe = client.subscribe(docId, async () => {
+    // Register subscription FIRST so no subscription fires are missed during fetchInitial's async window
+    let notifySeq = 0;
+    const unsubscribe = client.subscribe(docId, async (recordId: string | undefined) => {
+      const seq = ++notifySeq;
+      console.log(`[notify] seq=${seq} doc=${docId} phase=react_callback t=${Date.now()}`);
       if (!active) return;
       try {
         const records = await client.find(docId);
+        console.log(`[notify] seq=${seq} doc=${docId} phase=react_setData records=${records.length} t=${Date.now()}`);
         if (active) {
           setData(records);
         }
@@ -44,6 +48,8 @@ export function useQuery(docId: string, options?: UseQueryOptions) {
         console.error('Failed to refresh query data on mutation notification:', err);
       }
     });
+
+    fetchInitial();
 
     return () => {
       active = false;

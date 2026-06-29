@@ -1,6 +1,6 @@
 use crate::crdt::document::CRDTDocument;
 use crate::error::VaultSyncError;
-use crate::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+use crate::oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus};
 use crate::storage::traits::Storage;
 use std::sync::Arc;
 
@@ -36,21 +36,23 @@ impl CrashRecovery {
                         let encrypted_blob =
                             encryptor.encrypt_symmetric(&entry.yrs_update, &self.namespace)?;
                         let epoch = entry.timestamp;
-                        let oplog_entry = OplogEntry {
-                            id: entry.id.clone(),
-                            replica_id: "recovered-replica".to_string(),
-                            namespace: self.namespace.clone(),
-                            mutation_type: MutationType::CrdtUpdate,
-                            doc_id: doc_id.clone(),
-                            record_id: record_id.clone(),
-                            yrs_update: entry.yrs_update.clone(),
-                            encrypted_blob: Some(encrypted_blob),
-                            timestamp: epoch,
-                            sequence: None,
-                            sync_status: SyncStatus::Pending,
-                            synced_at: None,
-                            created_at: epoch,
-                        };
+                        let oplog_entry = OplogEntry::new(
+                            entry.id.clone(),
+                            "recovered-replica".to_string(),
+                            self.namespace.clone(),
+                            MutationType::CrdtUpdate,
+                            doc_id.clone(),
+                            record_id.clone(),
+                            entry.yrs_update.clone(),
+                            Some(encrypted_blob),
+                            epoch,
+                            None,
+                            SyncStatus::Pending,
+                            None,
+                            epoch,
+                            MutationOrigin::CrashRecovery,
+                            "",
+                        );
 
                         match self
                             .storage

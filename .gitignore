@@ -30,3 +30,8 @@ lcov.info
 # Fuzz artifacts
 artifacts/
 corpus/
+
+# Local database artifacts
+vaultsync_coordinator.db
+vaultsync_coordinator.db-shm
+vaultsync_coordinator.db-wal

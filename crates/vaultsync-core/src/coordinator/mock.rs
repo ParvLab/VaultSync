@@ -64,7 +64,12 @@ impl Coordinator for MockCoordinator {
         Ok(Box::new(MockSubscription { rx: Some(rx) }))
     }
 
-    async fn register(&self, _namespace: &str, _info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        _namespace: &str,
+        _info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         Ok(())
     }
 

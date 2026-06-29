@@ -1,16 +1,20 @@
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = console, js_name = log)]
     fn console_log_str(s: &str);
 }
 
+#[cfg(target_arch = "wasm32")]
 struct ConsoleSubscriber;
 
+#[cfg(target_arch = "wasm32")]
 impl tracing::Subscriber for ConsoleSubscriber {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.level() <= &tracing::Level::INFO
     }
 
     fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -50,16 +54,36 @@ impl tracing::Subscriber for ConsoleSubscriber {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
+pub const BUILD_ID: &str = concat!(env!("VAULTSYNC_BUILD_DATE"), "-", env!("VAULTSYNC_GIT_HASH"));
+
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
     let _ = tracing::subscriber::set_global_default(ConsoleSubscriber);
+    tracing::warn!("================================================");
+    tracing::warn!("VaultSync WASM BUILD: {} instrumentation=v4", BUILD_ID);
+    tracing::warn!("================================================");
 }
 
+#[cfg(target_arch = "wasm32")]
 pub mod client;
+#[cfg(target_arch = "wasm32")]
 pub mod e2ee;
+#[cfg(target_arch = "wasm32")]
 pub mod indexeddb;
+#[cfg(target_arch = "wasm32")]
 pub mod ipc;
+#[cfg(target_arch = "wasm32")]
+pub mod mutation_store;
+#[cfg(target_arch = "wasm32")]
+pub mod presence;
+#[cfg(target_arch = "wasm32")]
 pub mod storage;
+#[cfg(target_arch = "wasm32")]
 pub mod transport;
+#[cfg(target_arch = "wasm32")]
 pub mod ws_coordinator;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn placeholder() {} // no-op: crate is only built by wasm-pack for wasm32

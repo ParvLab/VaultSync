@@ -49,6 +49,7 @@ async fn test_mutation_gossip_roundtrip() {
         encrypted_blob: vec![42, 43, 44],
         timestamp: 123456789,
         key_version: 1,
+        replica_id: "test-replica".to_string(),
     };
 
     // Broadcast mutation
@@ -113,6 +114,7 @@ async fn test_namespace_isolation() {
         encrypted_blob: vec![1],
         timestamp: 12345,
         key_version: 1,
+        replica_id: "test-replica".to_string(),
     };
 
     // Broadcast from Node 1 (ns-1)
@@ -188,6 +190,7 @@ async fn test_hybrid_p2p_and_coordinator_convergence() {
         encrypted_blob: mutation.encrypted_blob.clone(),
         timestamp: mutation.timestamp,
         key_version: mutation.key_version,
+        replica_id: mutation.replica_id.clone(),
     };
     handle_a.broadcast_mutation(pending).await.unwrap();
 

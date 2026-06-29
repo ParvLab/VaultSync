@@ -82,14 +82,26 @@ impl Coordinator for PostgresCoordinator {
                 &(m.key_version as i64),
             ];
 
-            let row = tx.query_one(
+            // Try INSERT with ON CONFLICT DO NOTHING — if row already exists, RETURNING
+            // yields no row and we fall back to SELECTing the existing sequence.
+            let rows = tx.query(
                 "INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (id) DO NOTHING
                  RETURNING sequence",
                 params,
             ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
-            let seq: i64 = row.get(0);
+            let seq: i64 = if let Some(row) = rows.first() {
+                row.get(0)
+            } else {
+                let lookup_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&m.id];
+                tx.query_one(
+                    "SELECT sequence FROM mutations WHERE id = $1",
+                    lookup_params,
+                ).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
+                .get(0)
+            };
             seqs.push(seq as u64);
         }
 
@@ -119,7 +131,7 @@ impl Coordinator for PostgresCoordinator {
             &[&namespace, &after_i64, &limit_i64];
 
         let rows = client_guard.query(
-            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
+            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
              FROM mutations
              WHERE namespace = $1 AND sequence > $2
              ORDER BY sequence ASC
@@ -141,6 +153,7 @@ impl Coordinator for PostgresCoordinator {
                 encrypted_blob: row.get(5),
                 timestamp: ts as u64,
                 key_version: kv as u64,
+                replica_id: row.get(8),
             });
         }
         Ok(res)
@@ -168,7 +181,7 @@ impl Coordinator for PostgresCoordinator {
                 let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
                     &[&namespace_str, &last_sent_i64, &pull_limit_i64];
                 let rows_res = client_guard.query(
-                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
+                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
                      FROM mutations
                      WHERE namespace = $1 AND sequence > $2
                      ORDER BY sequence ASC
@@ -196,6 +209,7 @@ impl Coordinator for PostgresCoordinator {
                                 encrypted_blob: row.get(5),
                                 timestamp: ts as u64,
                                 key_version: kv as u64,
+                                replica_id: row.get(8),
                             };
                             last_sent = last_sent.max(pm.sequence);
                             if tx_mpsc.send(pm).await.is_err() {
@@ -211,16 +225,18 @@ impl Coordinator for PostgresCoordinator {
             }
 
             // 2. Poll/listen for new notifications
-            while let Ok(notif_ns) = rx_broadcast.recv().await {
-                if notif_ns == namespace_str {
-                    loop {
-                        let client_guard = client.lock().await;
+            loop {
+                match rx_broadcast.recv().await {
+                    Ok(notif_ns) => {
+                        if notif_ns == namespace_str {
+                            loop {
+                                let client_guard = client.lock().await;
                         let last_sent_i64 = last_sent as i64;
                         let pull_limit_i64 = pull_limit as i64;
                         let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
                             &[&namespace_str, &last_sent_i64, &pull_limit_i64];
                         let rows_res = client_guard.query(
-                            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
+                            "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
                              FROM mutations
                              WHERE namespace = $1 AND sequence > $2
                              ORDER BY sequence ASC
@@ -248,6 +264,7 @@ impl Coordinator for PostgresCoordinator {
                                         encrypted_blob: row.get(5),
                                         timestamp: ts as u64,
                                         key_version: kv as u64,
+                                        replica_id: row.get(8),
                                     };
                                     last_sent = last_sent.max(pm.sequence);
                                     if tx_mpsc.send(pm).await.is_err() {
@@ -257,9 +274,23 @@ impl Coordinator for PostgresCoordinator {
                                 if rows.len() < pull_limit {
                                     break;
                                 }
+                                    }
+                                    Err(_) => break,
+                                }
                             }
-                            Err(_) => break,
                         }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            "Postgres subscription lagged by {} notifications ns={}",
+                            n,
+                            namespace_str
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::info!("Postgres subscription broadcast channel closed ns={}", namespace_str);
+                        break;
                     }
                 }
             }
@@ -268,7 +299,12 @@ impl Coordinator for PostgresCoordinator {
         Ok(Box::new(PostgresSubscription { rx: rx_mpsc }))
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         let mut client_guard = self.client.lock().await;
         let namespace_str = namespace.to_string();
         let now = std::time::SystemTime::now()

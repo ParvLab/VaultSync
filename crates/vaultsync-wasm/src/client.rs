@@ -4,32 +4,67 @@ use std::sync::Arc;
 use vaultsync_core::coordinator::memory::InMemoryCoordinator;
 use vaultsync_core::crdt::types::CrdtValue;
 use vaultsync_core::e2ee::keyring::KeyRing;
+use vaultsync_core::storage::traits::StorageConfig;
 use vaultsync_core::VaultSyncClient;
 use vaultsync_core::VaultSyncConfig;
 use wasm_bindgen::prelude::*;
-
 use wasm_bindgen::JsCast;
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = log)]
+    fn console_log_str(s: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = debug)]
+    fn console_debug_str(s: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = warn)]
+    fn console_warn_str(s: &str);
+}
+
+macro_rules! console_log {
+    ($($t:tt)*) => (console_log_str(&format!($($t)*)));
+}
+
+macro_rules! console_debug {
+    ($($t:tt)*) => (console_debug_str(&format!($($t)*)));
+}
+
+macro_rules! console_warn {
+    ($($t:tt)*) => (console_warn_str(&format!($($t)*)));
+}
 
 #[wasm_bindgen]
 pub struct WasmVaultSyncClient {
     client: Arc<VaultSyncClient>,
+    presence: Option<crate::presence::PresenceManager>,
+    cross_tab_channel: Option<web_sys::BroadcastChannel>,
+    tab_id: String,
 }
 
 #[wasm_bindgen]
 impl WasmVaultSyncClient {
-    pub async fn new(namespace: &str, replica_id: &str) -> Result<WasmVaultSyncClient, JsValue> {
+    pub async fn new(
+        namespace: &str,
+        replica_id: &str,
+        db_name: Option<String>,
+        storage_backend: Option<String>,
+    ) -> Result<WasmVaultSyncClient, JsValue> {
         let mut config = VaultSyncConfig::default();
         config.namespace = namespace.to_string();
         config.replica_id = replica_id.to_string();
+        config.coordinator_mode = vaultsync_core::CoordinatorMode::Offline;
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
 
-        let db_name = format!("{}_db", namespace);
+        let final_db_name = db_name.unwrap_or_else(|| format!("{}_db", namespace));
         let storage = Arc::new(
-            BrowserStorage::new(&db_name)
+            BrowserStorage::new(&final_db_name, storage_backend.as_deref())
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?,
         );
+
+        config.storage = match &*storage {
+            BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
+        };
 
         let coordinator = Arc::new(InMemoryCoordinator::new());
         let keyring = Arc::new(KeyRing::generate());
@@ -40,49 +75,15 @@ impl WasmVaultSyncClient {
                 .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
         );
 
-        // Setup BroadcastChannel for cross-tab sync
         let channel_name = format!("vaultsync-ipc-{}", namespace);
-        let channel = web_sys::BroadcastChannel::new(&channel_name).map_err(|e| {
-            JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e))
-        })?;
+        let cross_tab_channel = web_sys::BroadcastChannel::new(&channel_name).ok();
 
-        let client_clone = client.clone();
-        let onmessage =
-            wasm_bindgen::closure::Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
-                if let Some(msg_str) = e.data().as_string() {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg_str) {
-                        if let (Some(doc_id), Some(record_id)) = (
-                            val.get("doc_id").and_then(|v| v.as_str()),
-                            val.get("record_id").and_then(|v| v.as_str()),
-                        ) {
-                            let doc_id = doc_id.to_string();
-                            let record_id = record_id.to_string();
-                            let client = client_clone.clone();
-                            wasm_bindgen_futures::spawn_local(async move {
-                                if let Ok(Some(state)) = client.get(&doc_id, &record_id).await {
-                                    client.fire_local_subscription(&doc_id, &record_id, &state);
-                                }
-                            });
-                        }
-                    }
-                }
-            })
-                as Box<dyn FnMut(web_sys::MessageEvent)>);
-
-        channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-        onmessage.forget();
-
-        let channel_send = channel.clone();
-        client.set_change_listener(Arc::new(move |doc_id, record_id| {
-            let msg = serde_json::json!({
-                "doc_id": doc_id,
-                "record_id": record_id,
-            })
-            .to_string();
-            let _ = channel_send.post_message(&JsValue::from_str(&msg));
-        }));
-
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            presence: None,
+            cross_tab_channel,
+            tab_id: replica_id.to_string(),
+        })
     }
 
     pub async fn new_with_coordinator(
@@ -90,75 +91,93 @@ impl WasmVaultSyncClient {
         replica_id: &str,
         coordinator_url: &str,
         auth_token: Option<String>,
+        db_name: Option<String>,
+        storage_backend: Option<String>,
     ) -> Result<WasmVaultSyncClient, JsValue> {
+        let _t0 = js_sys::Date::now();
+        let t = || -> f64 { js_sys::Date::now() - _t0 };
+        console_log!("[1/9] creating browser storage");
         let mut config = VaultSyncConfig::default();
         config.namespace = namespace.to_string();
         config.replica_id = replica_id.to_string();
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
 
-        let db_name = format!("{}_db", namespace);
+        let final_db_name = db_name.unwrap_or_else(|| format!("{}_db", namespace));
         let storage = Arc::new(
-            BrowserStorage::new(&db_name)
+            BrowserStorage::new(&final_db_name, storage_backend.as_deref())
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?,
         );
 
+        config.storage = match &*storage {
+            BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
+        };
+
+        console_debug!("[timing] storage ready t={:.0}ms", t());
+        console_log!("[2/9] creating ws coordinator");
         let coordinator = Arc::new(crate::ws_coordinator::WasmWsCoordinator::new(
             coordinator_url,
             auth_token,
         ));
+        // Clone the Arc BEFORE coercing to dyn Coordinator, so we keep a concrete reference
+        let coordinator_for_client: Arc<dyn vaultsync_core::coordinator::traits::Coordinator> =
+            coordinator.clone();
         let keyring = Arc::new(KeyRing::generate());
 
+        console_log!("[3/9] creating sync client");
         let client = Arc::new(
-            VaultSyncClient::new_with_storage(config, coordinator, keyring, storage)
+            VaultSyncClient::new_with_storage_skip_init(config, coordinator_for_client, keyring, storage)
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
         );
+        console_debug!("[timing] client built t={:.0}ms", t());
 
-        // Setup BroadcastChannel for cross-tab sync
-        let channel_name = format!("vaultsync-ipc-{}", namespace);
-        let channel = web_sys::BroadcastChannel::new(&channel_name).map_err(|e| {
-            JsValue::from_str(&format!("Failed to create BroadcastChannel: {:?}", e))
+        // Wire WS mutation push → download/upload notifications BEFORE initialize (no race)
+        coordinator.set_download_notify(client.events.download_notify.clone());
+        coordinator.set_upload_notify(client.events.upload_notify.clone());
+
+        // Now start WS connection (background processor starts here, sender already set)
+        console_debug!("[timing] calling initialize t={:.0}ms", t());
+        client.initialize().await.map_err(|e| {
+            JsValue::from_str(&format!("Initialize failed: {:?}", e))
         })?;
+        console_debug!("[timing] initialize done t={:.0}ms", t());
 
-        let client_clone = client.clone();
-        let onmessage =
-            wasm_bindgen::closure::Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
-                if let Some(msg_str) = e.data().as_string() {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg_str) {
-                        if let (Some(doc_id), Some(record_id)) = (
-                            val.get("doc_id").and_then(|v| v.as_str()),
-                            val.get("record_id").and_then(|v| v.as_str()),
-                        ) {
-                            let doc_id = doc_id.to_string();
-                            let record_id = record_id.to_string();
-                            let client = client_clone.clone();
-                            wasm_bindgen_futures::spawn_local(async move {
-                                if let Ok(Some(state)) = client.get(&doc_id, &record_id).await {
-                                    client.fire_local_subscription(&doc_id, &record_id, &state);
-                                }
-                            });
-                        }
-                    }
-                }
-            })
-                as Box<dyn FnMut(web_sys::MessageEvent)>);
+        // Bootstrap: same event-driven path as WS push notifications
+        client.events.notify_download(None);
 
-        channel.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-        onmessage.forget();
+        // Create presence manager for cross-tab awareness
+        let presence = crate::presence::PresenceManager::new(namespace, replica_id).ok();
 
-        let channel_send = channel.clone();
-        client.set_change_listener(Arc::new(move |doc_id, record_id| {
-            let msg = serde_json::json!({
-                "doc_id": doc_id,
-                "record_id": record_id,
-            })
-            .to_string();
-            let _ = channel_send.post_message(&JsValue::from_str(&msg));
-        }));
+        console_log!("[9/9] client ready");
+        let channel_name = format!("vaultsync-ipc-{}", namespace);
+        let cross_tab_channel = web_sys::BroadcastChannel::new(&channel_name).ok();
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            presence,
+            cross_tab_channel,
+            tab_id: replica_id.to_string(),
+        })
+    }
+
+    fn notify_cross_tab(&self, doc_id: &str, record_id: &str) {
+        if let Some(ref bc) = self.cross_tab_channel {
+            let msg = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&msg, &"doc_id".into(), &doc_id.into());
+            let _ = js_sys::Reflect::set(&msg, &"record_id".into(), &record_id.into());
+            let _ = js_sys::Reflect::set(&msg, &"tab_id".into(), &self.tab_id.clone().into());
+            if let Ok(json) = js_sys::JSON::stringify(&msg) {
+                console_debug!(
+                    "[BC send] tab_id={} doc_id={} record_id={} payload={}",
+                    self.tab_id, doc_id, record_id, json,
+                );
+                let _ = bc.post_message(&json);
+            }
+        } else {
+            console_debug!("[BC send] skipped (no channel) tab_id={} doc_id={} record_id={}", self.tab_id, doc_id, record_id);
+        }
     }
 
     pub async fn insert(&self, doc_id: &str, record_id: &str, json: &str) -> Result<(), JsValue> {
@@ -167,6 +186,7 @@ impl WasmVaultSyncClient {
             .insert(doc_id, record_id, fields)
             .await
             .map_err(|e| JsValue::from_str(&format!("Insert failed: {:?}", e)))?;
+        self.notify_cross_tab(doc_id, record_id);
         Ok(())
     }
 
@@ -176,6 +196,7 @@ impl WasmVaultSyncClient {
             .update(doc_id, record_id, fields)
             .await
             .map_err(|e| JsValue::from_str(&format!("Update failed: {:?}", e)))?;
+        self.notify_cross_tab(doc_id, record_id);
         Ok(())
     }
 
@@ -184,6 +205,7 @@ impl WasmVaultSyncClient {
             .delete(doc_id, record_id)
             .await
             .map_err(|e| JsValue::from_str(&format!("Delete failed: {:?}", e)))?;
+        self.notify_cross_tab(doc_id, record_id);
         Ok(())
     }
 
@@ -226,7 +248,28 @@ impl WasmVaultSyncClient {
         Ok(())
     }
 
+    pub async fn fire_subscription(&self, doc_id: &str, record_id: &str) -> Result<(), JsValue> {
+        match self.client.get(doc_id, record_id).await {
+            Ok(Some(state)) => {
+                let keys: Vec<String> = state.keys().cloned().collect();
+                console_debug!(
+                    "[BC fire_subscription] doc={} record={} fields={} keys={:?}",
+                    doc_id, record_id, state.len(), keys,
+                );
+                self.client.fire_local_subscription(doc_id, record_id, &state);
+            }
+            Ok(None) => {
+                console_debug!("[BC fire_subscription] doc={} record={} not_found=true", doc_id, record_id);
+            }
+            Err(e) => {
+                console_debug!("[BC fire_subscription] doc={} record={} error={:?}", doc_id, record_id, e);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn find(&self, doc_id: &str) -> Result<js_sys::Array, JsValue> {
+        console_debug!("[timing] find call doc={} t={:.0}ms", doc_id, js_sys::Date::now());
         let records = self
             .client
             .find(doc_id, None)
@@ -271,6 +314,8 @@ impl WasmVaultSyncClient {
         let connected =
             state.connection_status != vaultsync_core::sync::state::ConnectionStatus::Disconnected;
 
+        let metrics = self.client.metrics.snapshot();
+
         let mut map = serde_json::Map::new();
         map.insert("connected".to_string(), serde_json::Value::Bool(connected));
         map.insert(
@@ -281,6 +326,22 @@ impl WasmVaultSyncClient {
             "lastSyncedSequence".to_string(),
             serde_json::Value::Number(serde_json::Number::from(state.last_synced_sequence)),
         );
+        map.insert(
+            "optimisticWrites".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(metrics.optimistic_writes)),
+        );
+        map.insert(
+            "pushMutationsReceived".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(metrics.push_mutations_received)),
+        );
+        map.insert(
+            "snapshotsApplied".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(metrics.snapshots_applied)),
+        );
+        map.insert(
+            "activePeers".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(metrics.active_peers)),
+        );
 
         let json_str = serde_json::to_string(&serde_json::Value::Object(map))
             .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))?;
@@ -288,10 +349,19 @@ impl WasmVaultSyncClient {
     }
 
     pub fn subscribe(&self, doc_id: &str, callback: js_sys::Function) -> WasmSubscriptionHandle {
-        let send_cb = SendFunction(callback);
+        console_debug!("[timing] subscribe call doc={} t={:.0}ms", doc_id, js_sys::Date::now());
+        static NOTIFY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let send_cb = SendFunction(JsValue::from(callback));
         let handle = self.client.subscribe(
             doc_id,
             Box::new(move |_doc_id, record_id, fields| {
+                let notify_seq = NOTIFY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                console_log!(
+                    "[notify] seq={} record={} phase=wasm_callback t={:.0}ms",
+                    notify_seq,
+                    record_id,
+                    js_sys::Date::now()
+                );
                 let mut map = serde_json::Map::new();
                 for (k, v) in fields {
                     let json_val = match v {
@@ -307,9 +377,22 @@ impl WasmVaultSyncClient {
                     map.insert(k.clone(), json_val);
                 }
                 if let Ok(json_str) = serde_json::to_string(&serde_json::Value::Object(map)) {
-                    let record_id_js = JsValue::from_str(record_id);
-                    let json_js = JsValue::from_str(&json_str);
-                    let _ = send_cb.0.call2(&JsValue::NULL, &record_id_js, &json_js);
+                    let record_id_owned = record_id.to_string();
+                    let cb_clone = send_cb.0.clone();
+                    let seq = notify_seq;
+                    wasm_bindgen_futures::spawn_local(async move {
+                        console_log!(
+                            "[notify] seq={} record={} phase=spawn_local t={:.0}ms",
+                            seq,
+                            record_id_owned,
+                            js_sys::Date::now()
+                        );
+                        let func: js_sys::Function = cb_clone.unchecked_into();
+                        let record_id_js = JsValue::from_str(&record_id_owned);
+                        let json_js = JsValue::from_str(&json_str);
+                        let seq_js = JsValue::from_f64(seq as f64);
+                        let _ = func.call3(&JsValue::NULL, &record_id_js, &json_js, &seq_js);
+                    });
                 }
             }),
         );
@@ -371,6 +454,19 @@ impl WasmVaultSyncClient {
     pub fn is_leader(&self) -> bool {
         self.client.leader_election.is_leader()
     }
+
+    /// Returns a clone of the PresenceManager if available.
+    #[wasm_bindgen]
+    pub fn presence(&self) -> Option<crate::presence::PresenceManager> {
+        self.presence.clone()
+    }
+
+    /// Returns a JSON snapshot of all metrics counters.
+    #[wasm_bindgen(js_name = metricsSnapshot)]
+    pub fn metrics_snapshot(&self) -> String {
+        let snapshot = self.client.metrics.snapshot();
+        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
+    }
 }
 
 #[wasm_bindgen]
@@ -391,7 +487,7 @@ impl WasmSubscriptionHandle {
     }
 }
 
-struct SendFunction(js_sys::Function);
+struct SendFunction(JsValue);
 
 unsafe impl Send for SendFunction {}
 unsafe impl Sync for SendFunction {}

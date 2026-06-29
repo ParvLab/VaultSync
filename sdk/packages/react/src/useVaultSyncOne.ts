@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useVaultSyncClient } from './context.js';
+import { useVaultSyncClient } from './useVaultSyncClient.js';
 import type { RecordFields } from '@vaultsync/web';
 
 export function useVaultSyncOne(docId: string, recordId: string) {
@@ -26,13 +26,16 @@ export function useVaultSyncOne(docId: string, recordId: string) {
       }
     }
 
-    fetchInitial();
-
-    const unsubscribe = client.subscribe(docId, async (changedRecordId) => {
+    // Register subscription FIRST so we don't miss fires from reconciler during startup
+    let notifySeq = 0;
+    const unsubscribe = client.subscribe(docId, async (changedRecordId: string) => {
+      const seq = ++notifySeq;
+      console.log(`[notify] seq=${seq} doc=${docId} phase=react_callback_one t=${Date.now()}`);
       if (!active) return;
       if (changedRecordId === recordId) {
         try {
           const record = await client.get(docId, recordId);
+          console.log(`[notify] seq=${seq} doc=${docId} record=${recordId} phase=react_setData_one t=${Date.now()}`);
           if (active) {
             setData(record);
           }
@@ -41,6 +44,8 @@ export function useVaultSyncOne(docId: string, recordId: string) {
         }
       }
     });
+
+    fetchInitial();
 
     return () => {
       active = false;

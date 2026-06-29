@@ -69,11 +69,16 @@ impl Coordinator for ChaosCoordinator {
         self.inner.subscribe(namespace, from_sequence).await
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         if self.partitioned.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
-        self.inner.register(namespace, info).await
+        self.inner.register(namespace, info, _last_sequence).await
     }
 
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError> {
@@ -495,11 +500,16 @@ impl Coordinator for PanickingCoordinator {
         }
         self.inner.subscribe(namespace, from_sequence).await
     }
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         if self.should_fail.load(Ordering::SeqCst) {
             return Err(CoordinatorError::NotAvailable);
         }
-        self.inner.register(namespace, info).await
+        self.inner.register(namespace, info, _last_sequence).await
     }
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError> {
         if self.should_fail.load(Ordering::SeqCst) {

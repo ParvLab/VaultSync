@@ -3,7 +3,7 @@ use vaultsync_core::crdt::document::CRDTDocument;
 use vaultsync_core::crdt::types::CrdtValue;
 use vaultsync_core::ipc::crash_recovery::CrashRecovery;
 use vaultsync_core::ipc::leader_election::LeaderElection;
-use vaultsync_core::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+use vaultsync_core::oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus};
 use vaultsync_core::storage::memory::InMemoryStorage;
 use vaultsync_core::storage::traits::{Storage, StorageConfig};
 use vaultsync_core::sync::compaction::{CompactionConfig, CompactionEngine};
@@ -69,6 +69,8 @@ async fn test_crash_recovery_requeues_stale_pending() {
         sync_status: SyncStatus::Failed,
         synced_at: None,
         created_at: now - 100_000,
+        origin: MutationOrigin::Unknown,
+        origin_context: String::new(),
     };
     storage.append_oplog(&stale_entry).await.unwrap();
 
@@ -87,6 +89,8 @@ async fn test_crash_recovery_requeues_stale_pending() {
         sync_status: SyncStatus::Failed,
         synced_at: None,
         created_at: now - 10_000,
+        origin: MutationOrigin::Unknown,
+        origin_context: String::new(),
     };
     storage.append_oplog(&fresh_entry).await.unwrap();
 
@@ -127,6 +131,8 @@ async fn test_compaction_removes_synced_entries() {
         sync_status: SyncStatus::Synced,
         synced_at: Some(now_secs - 10 * 86400),
         created_at: (now_secs - 10 * 86400) * 1000,
+        origin: MutationOrigin::Unknown,
+        origin_context: String::new(),
     };
     storage.append_oplog(&stale_entry).await.unwrap();
 
@@ -145,6 +151,8 @@ async fn test_compaction_removes_synced_entries() {
         sync_status: SyncStatus::Synced,
         synced_at: Some(now_secs - 2 * 86400),
         created_at: (now_secs - 2 * 86400) * 1000,
+        origin: MutationOrigin::Unknown,
+        origin_context: String::new(),
     };
     storage.append_oplog(&fresh_entry).await.unwrap();
 
@@ -189,6 +197,8 @@ async fn test_compaction_removes_tombstoned_docs() {
         sync_status: SyncStatus::Synced,
         synced_at: Some((now_ms - 2 * 86400_000) / 1000),
         created_at: now_ms - 2 * 86400_000,
+        origin: MutationOrigin::Unknown,
+        origin_context: String::new(),
     };
     storage.append_oplog(&delete_entry).await.unwrap();
 

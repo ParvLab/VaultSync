@@ -89,7 +89,10 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
                                 schema_version: add_payload.schema_version,
                             };
 
-                            let reg_result = state.coordinator.register(&ns, replica_info).await;
+                            let reg_result = state
+                                .coordinator
+                                .register(&ns, replica_info, add_payload.last_sequence)
+                                .await;
 
                             let mut ack = NamespaceAckPayload {
                                 namespace: ns.clone(),
@@ -255,6 +258,7 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
                     }
                     MSG_SUBSCRIBE => {
                         if let Ok(sub) = serde_json::from_slice::<SubscribePayload>(payload) {
+                            info!("[ws_mux] subscribe namespace={} after={}", sub.namespace, sub.after);
                             let ns = sub.namespace.clone();
                             if let Some(cancel) = active_subs.remove(&ns) {
                                 let _ = cancel.send(());

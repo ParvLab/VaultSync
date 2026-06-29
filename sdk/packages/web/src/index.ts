@@ -1,5 +1,6 @@
 import init, { WasmVaultSyncClient } from '../wasm/vaultsync_wasm.js';
-import type { VaultSyncConfig, RecordFields, SyncStatus, SubscriptionCallback, UnsubscribeFn } from './types.js';
+import type { VaultSyncConfig, RecordFields, SyncStatus, MetricsSnapshot, SubscriptionCallback, UnsubscribeFn } from './types.js';
+import type { PresenceManager } from '../wasm/vaultsync_wasm.js';
 import { KeyManager } from './keys.js';
 import { createDbProxy, DbProxy, Collection } from './db.js';
 import { defineSchema, FieldDef, SchemaDefinition } from './schema.js';
@@ -12,14 +13,22 @@ export { SyncStatusObservable } from './sync.js';
 export { PostgresCoordinator } from './coordinator/postgres.js';
 export { RedisCoordinator } from './coordinator/redis.js';
 export { CustomCoordinator } from './coordinator/custom.js';
+export type { MetricsSnapshot } from './types.js';
+
+const instancePromises = new Map<string, Promise<VaultSyncClient>>();
 
 export class VaultSyncClient {
   private inner: any;
   private _keys?: KeyManager;
   private _db?: any;
+  private channel?: BroadcastChannel;
+  private namespace: string;
+  private tabId: string;
 
-  private constructor(inner: any) {
+  private constructor(inner: any, namespace: string, replicaId: string) {
     this.inner = inner;
+    this.namespace = namespace;
+    this.tabId = replicaId;
   }
 
   get db(): DbProxy & Record<string, Collection<any>> {
@@ -36,23 +45,85 @@ export class VaultSyncClient {
     return this._keys;
   }
 
-  static async create(config: VaultSyncConfig): Promise<VaultSyncClient> {
-    // Initialize the WebAssembly module
-    await init();
+  private setupBroadcastChannel(namespace: string) {
+    const channelName = `vaultsync-ipc-${namespace}`;
+    console.log(`[JS BC] Setting up BroadcastChannel: ${channelName}`);
+    this.channel = new BroadcastChannel(channelName);
+    this.channel.onmessage = (e) => {
+      const raw = typeof e.data === 'string' ? e.data : JSON.stringify(e.data);
+      if (typeof e.data === 'string') {
+        try {
+          const val = JSON.parse(e.data);
+          if (val && typeof val.doc_id === 'string' && typeof val.record_id === 'string') {
+            const sender = val.tab_id || '(missing)';
+            const receiver = this.tabId || '(missing)';
+            const ignored = !!(val.tab_id && val.tab_id === this.tabId);
+            console.log(
+              `[JS BC] recv sender=${sender} receiver=${receiver} namespace=${namespace} ignored=${ignored} doc=${val.doc_id} record=${val.record_id}`
+            );
+            if (ignored) {
+              return; // skip own notification
+            }
+            setTimeout(async () => {
+              try {
+                console.log(
+                  `[JS BC] fire sender=${sender} receiver=${receiver} doc=${val.doc_id} record=${val.record_id}`
+                );
+                await this.inner.fire_subscription(val.doc_id, val.record_id);
+              } catch (err) {
+                console.error("[JS BC] Failed to fire subscription in WASM: ", err);
+              }
+            }, 0);
+          } else {
+            console.warn(`[JS BC] recv invalid payload on ${channelName}:`, raw);
+          }
+        } catch (err) {
+          console.error("[JS BC] Failed to parse message:", err);
+        }
+      } else {
+        console.warn(`[JS BC] recv non-string data on ${channelName}:`, raw);
+      }
+    };
+  }
 
-    let inner: any;
-    if (config.coordinatorUrl) {
-      inner = await WasmVaultSyncClient.new_with_coordinator(
-        config.namespace,
-        config.replicaId,
-        config.coordinatorUrl,
-        config.authToken || null
-      );
-    } else {
-      inner = await WasmVaultSyncClient.new(config.namespace, config.replicaId);
+  static create(config: VaultSyncConfig): Promise<VaultSyncClient> {
+    const key = config.namespace;
+    const existing = instancePromises.get(key);
+    if (existing) {
+      console.log(`[VaultSync] Reusing existing client for namespace=${key}`);
+      return existing;
     }
 
-    return new VaultSyncClient(inner);
+    const promise = (async () => {
+      await init();
+
+      const mode = config.mode || (config.coordinatorUrl ? 'online' : 'offline');
+      let inner: any;
+      if (mode === 'online' && config.coordinatorUrl) {
+        inner = await WasmVaultSyncClient.new_with_coordinator(
+          config.namespace,
+          config.replicaId,
+          config.coordinatorUrl,
+          config.authToken || null,
+          config.dbName || null,
+          config.storageBackend || null
+        );
+      } else {
+        inner = await WasmVaultSyncClient.new(
+          config.namespace,
+          config.replicaId,
+          config.dbName || null,
+          config.storageBackend || null
+        );
+      }
+
+      const client = new VaultSyncClient(inner, config.namespace, config.replicaId);
+      client.setupBroadcastChannel(config.namespace);
+      return client;
+    })();
+
+    instancePromises.set(key, promise);
+    return promise;
   }
 
   async insert(docId: string, recordId: string, fields: RecordFields): Promise<void> {
@@ -87,9 +158,25 @@ export class VaultSyncClient {
     return JSON.parse(statusStr);
   }
 
+  /** Returns a snapshot of all metrics counters. */
+  async metrics(): Promise<MetricsSnapshot> {
+    const jsonStr = await this.inner.metricsSnapshot();
+    return JSON.parse(jsonStr);
+  }
+
+  /** Returns the PresenceManager for observing cross-tab peers, or null. */
+  presence(): PresenceManager | null {
+    return this.inner.presence();
+  }
+
   subscribe(docId: string, callback: SubscriptionCallback): UnsubscribeFn {
-    const wasmCallback = (recordId: string, jsonStr: string) => {
-      callback(recordId, JSON.parse(jsonStr));
+    const wasmCallback = (recordId: string, jsonStr: string, notifySeq?: number) => {
+      const t0 = Date.now();
+      console.log('[notify] seq=' + (notifySeq ?? '?') + ' record=' + recordId + ' phase=js_callback t=' + t0);
+      queueMicrotask(() => {
+        console.log('[notify] seq=' + (notifySeq ?? '?') + ' record=' + recordId + ' phase=microtask_exec t=' + Date.now() + ' (elapsed=' + (Date.now() - t0) + 'ms)');
+        callback(recordId, JSON.parse(jsonStr));
+      });
     };
     const handle = this.inner.subscribe(docId, wasmCallback);
     return () => {
@@ -102,6 +189,11 @@ export class VaultSyncClient {
   }
 
   async shutdown(): Promise<void> {
+    if (this.channel) {
+      this.channel.close();
+      this.channel = undefined;
+    }
+    instancePromises.delete(this.namespace);
     await this.inner.shutdown();
   }
 }

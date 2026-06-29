@@ -92,7 +92,12 @@ impl Coordinator for PeerCoordinator {
         ))
     }
 
-    async fn register(&self, _namespace: &str, _info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        _namespace: &str,
+        _info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         Err(CoordinatorError::NotSupported(
             "WebRTC P2P transport is only supported in WASM (browser) targets. \
              For server-to-server P2P, use vaultsync-transport-libp2p instead."
@@ -196,7 +201,7 @@ impl PeerCoordinator {
                     }
                 }
             }
-        }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+        }) as Box<dyn Fn(web_sys::MessageEvent)>);
         dc.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         onmessage.forget();
 
@@ -211,7 +216,7 @@ impl PeerCoordinator {
         drop(guard);
 
         let promise_offer = pc.create_offer();
-        let offer = wasm_bindgen_futures::JsFuture::from(promise_offer)
+        let offer = vaultsync_core::time_utils::SendJsFuture::from(promise_offer)
             .await
             .map_err(|e| format!("Failed to create offer: {:?}", e))?;
 
@@ -223,7 +228,7 @@ impl PeerCoordinator {
         sdp_init.sdp(&offer_sdp.sdp());
 
         let promise_local = pc.set_local_description(&sdp_init);
-        wasm_bindgen_futures::JsFuture::from(promise_local)
+        vaultsync_core::time_utils::SendJsFuture::from(promise_local)
             .await
             .map_err(|e| format!("Failed to set local description: {:?}", e))?;
 
@@ -262,12 +267,12 @@ impl PeerCoordinator {
             sdp.sdp(data);
 
             let promise = pc.set_remote_description(&sdp);
-            wasm_bindgen_futures::JsFuture::from(promise)
+            vaultsync_core::time_utils::SendJsFuture::from(promise)
                 .await
                 .map_err(|e| format!("Failed to set remote description: {:?}", e))?;
 
             let promise_ans = pc.create_answer();
-            let ans = wasm_bindgen_futures::JsFuture::from(promise_ans)
+            let ans = vaultsync_core::time_utils::SendJsFuture::from(promise_ans)
                 .await
                 .map_err(|e| format!("Failed to create answer: {:?}", e))?;
 
@@ -279,7 +284,7 @@ impl PeerCoordinator {
             sdp_init.sdp(&ans_sdp.sdp());
 
             let promise_local = pc.set_local_description(&sdp_init);
-            wasm_bindgen_futures::JsFuture::from(promise_local)
+            vaultsync_core::time_utils::SendJsFuture::from(promise_local)
                 .await
                 .map_err(|e| format!("Failed to set local description: {:?}", e))?;
 
@@ -290,7 +295,7 @@ impl PeerCoordinator {
             let mut sdp = web_sys::RtcSessionDescriptionInit::new(web_sys::RtcSdpType::Answer);
             sdp.sdp(data);
             let promise = pc.set_remote_description(&sdp);
-            wasm_bindgen_futures::JsFuture::from(promise)
+            vaultsync_core::time_utils::SendJsFuture::from(promise)
                 .await
                 .map_err(|e| format!("Failed to set remote description: {:?}", e))?;
         } else if signal_type == "candidate" {
@@ -299,7 +304,7 @@ impl PeerCoordinator {
             let candidate = web_sys::RtcIceCandidate::new(&candidate_init)
                 .map_err(|e| format!("Failed to create ICE candidate: {:?}", e))?;
             let promise = pc.add_ice_candidate_with_opt_rtc_ice_candidate(Some(&candidate));
-            wasm_bindgen_futures::JsFuture::from(promise)
+            vaultsync_core::time_utils::SendJsFuture::from(promise)
                 .await
                 .map_err(|e| format!("Failed to add ICE candidate: {:?}", e))?;
         }
@@ -334,7 +339,7 @@ impl PeerCoordinator {
                     });
                 }
             })
-                as Box<dyn FnMut(web_sys::RtcPeerConnectionIceEvent)>);
+                as Box<dyn Fn(web_sys::RtcPeerConnectionIceEvent)>);
 
         pc.set_onicecandidate(Some(onicecandidate.as_ref().unchecked_ref()));
         onicecandidate.forget();
@@ -355,12 +360,12 @@ impl PeerCoordinator {
                         }
                     }
                 }
-            }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+            }) as Box<dyn Fn(web_sys::MessageEvent)>);
 
             dc.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
             onmessage.forget();
         })
-            as Box<dyn FnMut(web_sys::RtcDataChannelEvent)>);
+            as Box<dyn Fn(web_sys::RtcDataChannelEvent)>);
 
         pc.set_ondatachannel(Some(ondatachannel.as_ref().unchecked_ref()));
         ondatachannel.forget();
@@ -411,6 +416,7 @@ impl Coordinator for PeerCoordinator {
                             encrypted_blob: m.encrypted_blob.clone(),
                             timestamp: m.timestamp,
                             key_version: m.key_version,
+                            replica_id: m.replica_id.clone(),
                         };
                         if let Ok(s) = serde_json::from_str::<serde_json::Value>(
                             &serde_json::to_string(&pm).unwrap(),
@@ -443,7 +449,12 @@ impl Coordinator for PeerCoordinator {
         Ok(Box::new(WasmWebRtcSubscription { rx }))
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         let mut inner = self.inner.lock().await;
         inner.replica_id = info.replica_id;
         inner.namespace = namespace.to_string();

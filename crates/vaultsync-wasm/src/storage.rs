@@ -1,35 +1,17 @@
 use async_trait::async_trait;
-use js_sys::{Promise, Uint8Array};
+use js_sys::Uint8Array;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Mutex;
-use std::task::{Context, Poll};
 use vaultsync_core::oplog::entry::{OplogEntry, SyncStatus};
 use vaultsync_core::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use vaultsync_core::sync::state::SyncState;
 use vaultsync_core::VaultSyncError;
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
 use web_sys::*;
 
-struct SendJsFuture<T = JsValue>(JsFuture<T>);
-
-unsafe impl<T> Send for SendJsFuture<T> {}
-
-impl<T> Future for SendJsFuture<T> {
-    type Output = Result<T, JsValue>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        unsafe { self.map_unchecked_mut(|s| &mut s.0) }.poll(cx)
-    }
-}
-
-impl<T: wasm_bindgen::convert::FromWasmAbi + 'static> From<Promise<T>> for SendJsFuture<T> {
-    fn from(p: Promise<T>) -> Self {
-        Self(JsFuture::from(p))
-    }
-}
+use vaultsync_core::time_utils::SendJsFuture;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OpfsIndex {
@@ -75,25 +57,40 @@ impl OpfsInner {
 }
 
 impl OpfsStorage {
-    pub async fn new() -> Result<Self, VaultSyncError> {
+    pub async fn new(db_name: &str) -> Result<Self, VaultSyncError> {
         let window =
             web_sys::window().ok_or_else(|| VaultSyncError::Storage("no window".into()))?;
         let navigator = window.navigator();
         let storage: StorageManager = navigator.storage();
 
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] get_directory start"));
         let root_val = SendJsFuture::from(storage.get_directory())
             .await
             .map_err(|e| VaultSyncError::Storage(format!("get_directory failed: {:?}", e)))?;
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] get_directory done"));
 
         let root_handle: FileSystemDirectoryHandle = root_val.clone().into();
-        Self::ensure_dir(&root_handle, "_system").await?;
-        Self::ensure_dir(&root_handle, "docs").await?;
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!("[opfs] ensure_dir '{}' start", db_name)));
+        let db_dir = Self::ensure_dir(&root_handle, db_name).await?;
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!("[opfs] ensure_dir '{}' done", db_name)));
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] ensure_dir '_system' start"));
+        Self::ensure_dir(&db_dir, "_system").await?;
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] ensure_dir '_system' done"));
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] ensure_dir 'docs' start"));
+        Self::ensure_dir(&db_dir, "docs").await?;
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] ensure_dir 'docs' done"));
 
-        let index = Self::load_index(&root_handle).await?;
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] load_index start"));
+        let index = Self::load_index(&db_dir).await?;
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[opfs] load_index done: {} sync_states, {} oplog entries",
+            index.sync_states.len(),
+            index.oplog.len()
+        )));
 
         Ok(Self {
             inner: Mutex::new(OpfsInner {
-                root: root_val,
+                root: JsValue::from(db_dir),
                 index,
             }),
             tx_lock: futures::lock::Mutex::new(()),
@@ -131,14 +128,7 @@ impl OpfsStorage {
     }
 
     async fn sleep(ms: u64) {
-        let mut cb = |resolve: js_sys::Function, _reject: js_sys::Function| {
-            if let Some(window) = web_sys::window() {
-                let _ = window
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms as i32);
-            }
-        };
-        let p = js_sys::Promise::new(&mut cb);
-        let _ = SendJsFuture::from(p).await;
+        vaultsync_core::time_utils::sleep(std::time::Duration::from_millis(ms)).await;
     }
 
     async fn write_doc_file(
@@ -167,8 +157,10 @@ impl OpfsStorage {
                 })?;
                 let writable: FileSystemWritableFileStream = writable_val.into();
 
+                let js_array = js_sys::Uint8Array::new_with_length(data.len() as u32);
+                js_array.copy_from(data);
                 let write_promise = writable
-                    .write_with_u8_array(data)
+                    .write_with_buffer_source(&js_array)
                     .map_err(|e| VaultSyncError::Storage(format!("write error: {:?}", e)))?;
                 SendJsFuture::from(write_promise)
                     .await
@@ -291,6 +283,38 @@ impl OpfsStorage {
         }
     }
 
+    /// Snapshot the index state for diagnostic logging.
+    fn index_state(label: &str, index: &OpfsIndex) {
+        let pending: Vec<&str> = index
+            .oplog
+            .iter()
+            .filter(|e| e.sync_status.is_uploadable())
+            .map(|e| e.id.as_str())
+            .collect();
+        let synced: Vec<&str> = index
+            .oplog
+            .iter()
+            .filter(|e| matches!(e.sync_status, SyncStatus::Synced))
+            .map(|e| e.id.as_str())
+            .collect();
+        let mut hasher = DefaultHasher::new();
+        index.oplog.len().hash(&mut hasher);
+        pending.len().hash(&mut hasher);
+        for id in &pending {
+            id.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[INDEX] {} hash={:#x} oplog={} pending={} synced={} pending_ids={:?}",
+            label,
+            hash,
+            index.oplog.len(),
+            pending.len(),
+            synced.len(),
+            pending,
+        )));
+    }
+
     async fn load_index(root: &FileSystemDirectoryHandle) -> Result<OpfsIndex, VaultSyncError> {
         let opts = FileSystemGetFileOptions::new();
         opts.set_create(false);
@@ -299,6 +323,9 @@ impl OpfsStorage {
         let mut attempts = 0;
         let max_attempts = 15;
         loop {
+            if attempts > 0 {
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!("[opfs] load_index retry attempt {}", attempts)));
+            }
             let res = async {
                 let file_val =
                     match SendJsFuture::from(dir.get_file_handle_with_options("index.json", &opts))
@@ -311,6 +338,7 @@ impl OpfsStorage {
                                 .and_then(|v| v.as_string())
                                 .map_or(false, |s| s == "NotFoundError");
                             if is_not_found {
+                                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] load_index default empty (no index.json)"));
                                 return Ok(OpfsIndex::default());
                             } else {
                                 return Err(VaultSyncError::Storage(format!(
@@ -345,7 +373,10 @@ impl OpfsStorage {
             .await;
 
             match res {
-                Ok(index) => return Ok(index),
+                Ok(index) => {
+                    Self::index_state("LOAD", &index);
+                    return Ok(index);
+                }
                 Err(e) => {
                     attempts += 1;
                     if attempts >= max_attempts {
@@ -362,6 +393,7 @@ impl OpfsStorage {
         root: &FileSystemDirectoryHandle,
         index: &OpfsIndex,
     ) -> Result<(), VaultSyncError> {
+        Self::index_state("FLUSH_BEFORE", index);
         let json = serde_json::to_vec(index)
             .map_err(|e| VaultSyncError::Storage(format!("json: {:?}", e)))?;
         let sys_dir = Self::get_dir(root, &["_system"]).await?;
@@ -382,8 +414,10 @@ impl OpfsStorage {
                     .await
                     .map_err(|e| VaultSyncError::Storage(format!("create_writable: {:?}", e)))?;
                 let writable: FileSystemWritableFileStream = writable_val.into();
+                let js_array = js_sys::Uint8Array::new_with_length(json.len() as u32);
+                js_array.copy_from(&json);
                 let write_promise = writable
-                    .write_with_u8_array(&json)
+                    .write_with_buffer_source(&js_array)
                     .map_err(|e| VaultSyncError::Storage(format!("write: {:?}", e)))?;
                 SendJsFuture::from(write_promise)
                     .await
@@ -410,7 +444,16 @@ impl OpfsStorage {
         }
     }
 
-    async fn get_fresh_index(
+    fn get_cached_index(&self) -> OpfsIndex {
+        self.inner.lock().unwrap().index.clone()
+    }
+
+    fn get_cached_root_and_index(&self) -> (FileSystemDirectoryHandle, OpfsIndex) {
+        let inner = self.inner.lock().unwrap();
+        (inner.root_handle(), inner.index.clone())
+    }
+
+    async fn load_index_from_disk(
         &self,
     ) -> Result<(FileSystemDirectoryHandle, OpfsIndex), VaultSyncError> {
         let root = {
@@ -430,8 +473,12 @@ impl Storage for OpfsStorage {
         record_id: &str,
         bytes: &[u8],
     ) -> Result<(), VaultSyncError> {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[storage] apply mutation doc_id={} record_id={}",
+            doc_id, record_id
+        )));
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
         Self::write_doc_file(&root, doc_id, record_id, bytes).await?;
         let listing = index.doc_listing.entry(doc_id.to_string()).or_default();
         if !listing.contains(&record_id.to_string()) {
@@ -440,6 +487,10 @@ impl Storage for OpfsStorage {
         Self::flush_index(&root, &index).await?;
         let mut inner = self.inner.lock().unwrap();
         inner.index = index;
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[storage] mutation doc_id={} committed",
+            doc_id
+        )));
         Ok(())
     }
 
@@ -457,7 +508,7 @@ impl Storage for OpfsStorage {
 
     async fn delete_document(&self, doc_id: &str, record_id: &str) -> Result<(), VaultSyncError> {
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
         Self::delete_doc_file(&root, doc_id, record_id).await?;
         if let Some(listing) = index.doc_listing.get_mut(doc_id) {
             listing.retain(|r| r != record_id);
@@ -476,7 +527,7 @@ impl Storage for OpfsStorage {
         entry: &OplogEntry,
     ) -> Result<(), VaultSyncError> {
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
         Self::write_doc_file(&root, doc_id, record_id, bytes).await?;
         let listing = index.doc_listing.entry(doc_id.to_string()).or_default();
         if !listing.contains(&record_id.to_string()) {
@@ -496,7 +547,7 @@ impl Storage for OpfsStorage {
         entry: &OplogEntry,
     ) -> Result<(), VaultSyncError> {
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
         Self::delete_doc_file(&root, doc_id, record_id).await?;
         if let Some(listing) = index.doc_listing.get_mut(doc_id) {
             listing.retain(|r| r != record_id);
@@ -509,8 +560,7 @@ impl Storage for OpfsStorage {
     }
 
     async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (root, index) = self.get_fresh_index().await?;
+        let (root, index) = self.get_cached_root_and_index();
         let record_ids = index.doc_listing.get(doc_id).cloned().unwrap_or_default();
         let mut results = Vec::new();
         for rid in &record_ids {
@@ -523,7 +573,7 @@ impl Storage for OpfsStorage {
 
     async fn append_oplog(&self, entry: &OplogEntry) -> Result<(), VaultSyncError> {
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
         index.oplog.push(entry.clone());
         Self::flush_index(&root, &index).await?;
         let mut inner = self.inner.lock().unwrap();
@@ -537,33 +587,73 @@ impl Storage for OpfsStorage {
         limit: usize,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
         let _guard = self.tx_lock.lock().await;
-        let (_, index) = self.get_fresh_index().await?;
+        let (_, index) = self.load_index_from_disk().await?;
         let results: Vec<OplogEntry> = index
             .oplog
             .iter()
-            .filter(|e| e.namespace == namespace && matches!(e.sync_status, SyncStatus::Pending))
+            .filter(|e| e.namespace == namespace && e.sync_status.is_uploadable())
             .take(limit)
             .cloned()
             .collect();
+        let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[PENDING_READ] ns={} count={} ids={:?}",
+            namespace,
+            results.len(),
+            ids,
+        )));
         Ok(results)
     }
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), VaultSyncError> {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[MARK_SYNCED] id={} seq={}",
+            id, sequence,
+        )));
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
+        let before_ids: Vec<String> = index
+            .oplog
+            .iter()
+            .filter(|e| e.sync_status.is_uploadable())
+            .map(|e| e.id.clone())
+            .collect();
         if let Some(entry) = index.oplog.iter_mut().find(|e| e.id == id) {
+            let old_status = format!("{:?}", entry.sync_status);
             entry.sync_status = SyncStatus::Synced;
             entry.sequence = Some(sequence);
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[MARK_SYNCED] found id={} old_status={} origin={:?} ctx={}",
+                id, old_status, entry.origin, entry.origin_context,
+            )));
+        } else {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[MARK_SYNCED] NOT FOUND id={} in oplog (oplog_len={})",
+                id,
+                index.oplog.len(),
+            )));
         }
         Self::flush_index(&root, &index).await?;
         let mut inner = self.inner.lock().unwrap();
         inner.index = index;
+        let after_ids: Vec<String> = inner
+            .index
+            .oplog
+            .iter()
+            .filter(|e| e.sync_status.is_uploadable())
+            .map(|e| e.id.clone())
+            .collect();
+        drop(inner);
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[MARK_SYNCED] done id={} pending_before={:?} pending_after={:?}",
+            id, before_ids, after_ids,
+        )));
         Ok(())
     }
 
     async fn mark_failed(&self, id: &str, _error: &str) -> Result<(), VaultSyncError> {
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
         if let Some(entry) = index.oplog.iter_mut().find(|e| e.id == id) {
             entry.sync_status = SyncStatus::Failed;
         }
@@ -578,8 +668,7 @@ impl Storage for OpfsStorage {
         namespace: &str,
         seq: u64,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (_, index) = self.get_fresh_index().await?;
+        let index = self.get_cached_index();
         let results: Vec<OplogEntry> = index
             .oplog
             .iter()
@@ -590,14 +679,16 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_sync_state(&self, namespace: &str) -> Result<Option<SyncState>, VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (_, index) = self.get_fresh_index().await?;
-        Ok(index.sync_states.get(namespace).cloned())
+        Ok(self.get_cached_index().sync_states.get(namespace).cloned())
     }
 
     async fn write_sync_state(&self, state: &SyncState) -> Result<(), VaultSyncError> {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[storage.write_sync_state] ns={} cursor={} gen={}",
+            state.namespace, state.last_synced_sequence, state.generation_id
+        )));
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
         index
             .sync_states
             .insert(state.namespace.clone(), state.clone());
@@ -608,14 +699,12 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_schema(&self, doc_id: &str) -> Result<Option<SchemaMeta>, VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (_, index) = self.get_fresh_index().await?;
-        Ok(index.schemas.get(doc_id).cloned())
+        Ok(self.get_cached_index().schemas.get(doc_id).cloned())
     }
 
     async fn write_schema(&self, meta: &SchemaMeta) -> Result<(), VaultSyncError> {
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
         index.schemas.insert(meta.doc_id.clone(), meta.clone());
         Self::flush_index(&root, &index).await?;
         let mut inner = self.inner.lock().unwrap();
@@ -624,14 +713,12 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (_, index) = self.get_fresh_index().await?;
-        Ok(index.migrations.clone())
+        Ok(self.get_cached_index().migrations.clone())
     }
 
     async fn write_migration(&self, record: &MigrationRecord) -> Result<(), VaultSyncError> {
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
         let pos = index
             .migrations
             .iter()
@@ -648,8 +735,7 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_keys(&self, namespace: &str) -> Result<Vec<KeyRecord>, VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (_, index) = self.get_fresh_index().await?;
+        let index = self.get_cached_index();
         let results: Vec<KeyRecord> = index
             .keys
             .iter()
@@ -661,7 +747,7 @@ impl Storage for OpfsStorage {
 
     async fn write_key(&self, key: &KeyRecord) -> Result<(), VaultSyncError> {
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
         let pos = index
             .keys
             .iter()
@@ -741,7 +827,7 @@ impl Storage for OpfsStorage {
         cutoff_ms: u64,
     ) -> Result<usize, VaultSyncError> {
         let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.get_fresh_index().await?;
+        let (root, mut index) = self.load_index_from_disk().await?;
         let before = index.oplog.len();
         index.oplog.retain(|entry| {
             !(entry.namespace == namespace
@@ -767,19 +853,48 @@ pub enum BrowserStorage {
 }
 
 impl BrowserStorage {
-    pub async fn new(db_name: &str) -> Result<Self, VaultSyncError> {
-        match OpfsStorage::new().await {
-            Ok(opfs) => {
-                tracing::info!("Using OPFS storage backend");
+    pub async fn new(db_name: &str, backend: Option<&str>) -> Result<Self, VaultSyncError> {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[Rust] BrowserStorage::new: db_name={}, requested_backend={:?}",
+            db_name, backend
+        )));
+
+        match backend {
+            Some("opfs") => {
+                let opfs = OpfsStorage::new(db_name).await?;
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                    "[Rust] Using forced OPFS storage backend"
+                ));
                 Ok(Self::Opfs(opfs))
             }
-            Err(e) => {
-                tracing::warn!(
-                    "OPFS storage not available, falling back to IndexedDB: {:?}",
-                    e
-                );
+            Some("indexeddb") => {
                 let idb = IndexedDbStorage::new(db_name).await?;
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                    "[Rust] Using forced IndexedDB storage backend"
+                ));
                 Ok(Self::Idb(idb))
+            }
+            _ => {
+                // OPFS is the preferred default: it is faster, quota-exempt, and
+                // not shared across browser profiles (avoids key-mismatch issues).
+                // Fall back to IndexedDB only when OPFS is unavailable (e.g. non-secure
+                // context or older browsers).
+                match OpfsStorage::new(db_name).await {
+                    Ok(opfs) => {
+                        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                            "[Rust] Using default OPFS storage backend",
+                        ));
+                        Ok(Self::Opfs(opfs))
+                    }
+                    Err(e) => {
+                        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                            "[Rust] OPFS unavailable, falling back to IndexedDB: {:?}",
+                            e
+                        )));
+                        let idb = IndexedDbStorage::new(db_name).await?;
+                        Ok(Self::Idb(idb))
+                    }
+                }
             }
         }
     }

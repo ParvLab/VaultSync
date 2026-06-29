@@ -634,7 +634,12 @@ impl Coordinator for HttpCoordinator {
         Ok(Box::new(HttpSubscription { rx }))
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         self.schema_version
             .store(info.schema_version, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(target_arch = "wasm32"))]
@@ -646,7 +651,7 @@ impl Coordinator for HttpCoordinator {
                     namespace: namespace.to_string(),
                     public_key: info.public_key.clone(),
                     schema_version: info.schema_version,
-                    last_sequence: 0,
+                    last_sequence,
                     key_version: 1,
                 };
                 if let Ok(frame) = encode_frame(MSG_REGISTER, &reg) {

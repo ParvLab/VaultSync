@@ -252,7 +252,7 @@ mod oplog_cleanup {
     use std::time::Duration;
     use vaultsync_core::{
         oplog::cleanup::OplogCleanup,
-        oplog::entry::{MutationType, OplogEntry, SyncStatus},
+        oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus},
         storage::memory::InMemoryStorage,
         storage::traits::Storage,
     };
@@ -277,6 +277,8 @@ mod oplog_cleanup {
             sync_status: SyncStatus::Synced,
             synced_at: Some(0),
             created_at: 0, // epoch
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
         };
         storage.append_oplog(&old_entry).await.unwrap();
 
@@ -311,6 +313,8 @@ mod oplog_cleanup {
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: 0,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
         };
         storage.append_oplog(&old_pending).await.unwrap();
 
@@ -345,6 +349,8 @@ mod oplog_cleanup {
                 sync_status: SyncStatus::Synced,
                 synced_at: Some(0),
                 created_at: 0,
+                origin: MutationOrigin::Unknown,
+                origin_context: String::new(),
             };
             storage.append_oplog(&e).await.unwrap();
         }
@@ -363,6 +369,8 @@ mod oplog_cleanup {
                 sync_status: SyncStatus::Pending,
                 synced_at: None,
                 created_at: 0,
+                origin: MutationOrigin::Unknown,
+                origin_context: String::new(),
             };
             storage.append_oplog(&e).await.unwrap();
         }
@@ -381,6 +389,8 @@ mod oplog_cleanup {
                 sync_status: SyncStatus::Synced,
                 synced_at: Some(u64::MAX),
                 created_at: u64::MAX, // future
+                origin: MutationOrigin::Unknown,
+                origin_context: String::new(),
             };
             storage.append_oplog(&e).await.unwrap();
         }

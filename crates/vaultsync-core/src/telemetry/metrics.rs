@@ -10,6 +10,11 @@ pub struct MetricsSnapshot {
     pub pending_mutations: u64,
     pub replica_count: u64,
     pub doc_count: u64,
+    pub push_mutations_received: u64,
+    pub snapshots_applied: u64,
+    pub optimistic_writes: u64,
+    pub hlc_logical_wraps: u64,
+    pub active_peers: u64,
 }
 
 #[cfg(feature = "telemetry")]
@@ -30,6 +35,11 @@ pub struct VaultSyncMetrics {
     pub download_lag_ms: HistogramVec,
     pub encryption_time_us: HistogramVec,
     pub crdt_merge_time_us: HistogramVec,
+    pub push_mutations_received: IntCounterVec,
+    pub snapshots_applied: IntCounterVec,
+    pub optimistic_writes: IntCounterVec,
+    pub hlc_logical_wraps: IntCounterVec,
+    pub active_peers: IntGaugeVec,
 }
 
 #[cfg(feature = "telemetry")]
@@ -131,6 +141,27 @@ impl VaultSyncMetrics {
         )
         .unwrap();
 
+        let push_mutations_received = IntCounterVec::new(
+            Opts::new("vaultsync_push_mutations_received", "Push mutations received via subscription"),
+            &[],
+        ).unwrap();
+        let snapshots_applied = IntCounterVec::new(
+            Opts::new("vaultsync_snapshots_applied", "Snapshots applied during catch-up"),
+            &[],
+        ).unwrap();
+        let optimistic_writes = IntCounterVec::new(
+            Opts::new("vaultsync_optimistic_writes", "Optimistic writes applied locally"),
+            &[],
+        ).unwrap();
+        let hlc_logical_wraps = IntCounterVec::new(
+            Opts::new("vaultsync_hlc_logical_wraps", "HLC logical counter wraps"),
+            &[],
+        ).unwrap();
+        let active_peers = IntGaugeVec::new(
+            Opts::new("vaultsync_active_peers", "Number of active peer tabs"),
+            &[],
+        ).unwrap();
+
         let _ = registry.register(Box::new(mutations_total.clone()));
         let _ = registry.register(Box::new(mutations_failed.clone()));
         let _ = registry.register(Box::new(conflicts_total.clone()));
@@ -144,6 +175,11 @@ impl VaultSyncMetrics {
         let _ = registry.register(Box::new(download_lag_ms.clone()));
         let _ = registry.register(Box::new(encryption_time_us.clone()));
         let _ = registry.register(Box::new(crdt_merge_time_us.clone()));
+        let _ = registry.register(Box::new(push_mutations_received.clone()));
+        let _ = registry.register(Box::new(snapshots_applied.clone()));
+        let _ = registry.register(Box::new(optimistic_writes.clone()));
+        let _ = registry.register(Box::new(hlc_logical_wraps.clone()));
+        let _ = registry.register(Box::new(active_peers.clone()));
 
         Self {
             mutations_total,
@@ -159,6 +195,11 @@ impl VaultSyncMetrics {
             download_lag_ms,
             encryption_time_us,
             crdt_merge_time_us,
+            push_mutations_received,
+            snapshots_applied,
+            optimistic_writes,
+            hlc_logical_wraps,
+            active_peers,
         }
     }
 
@@ -254,6 +295,26 @@ impl VaultSyncMetrics {
         // No-op or we can increment key rotation counters if registry exists.
     }
 
+    pub fn record_push_received(&self) {
+        self.push_mutations_received.with_label_values(&[]).inc();
+    }
+
+    pub fn record_snapshot_applied(&self) {
+        self.snapshots_applied.with_label_values(&[]).inc();
+    }
+
+    pub fn record_optimistic_write(&self) {
+        self.optimistic_writes.with_label_values(&[]).inc();
+    }
+
+    pub fn record_hlc_wrap(&self) {
+        self.hlc_logical_wraps.with_label_values(&[]).inc();
+    }
+
+    pub fn set_active_peers(&self, count: u64) {
+        self.active_peers.with_label_values(&[]).set(count as i64);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             mutations_uploaded: self
@@ -275,6 +336,11 @@ impl VaultSyncMetrics {
             pending_mutations: self.mutations_pending.with_label_values(&["default"]).get() as u64,
             replica_count: self.replica_count.with_label_values(&["default"]).get() as u64,
             doc_count: 0,
+            push_mutations_received: self.push_mutations_received.with_label_values(&[]).get(),
+            snapshots_applied: self.snapshots_applied.with_label_values(&[]).get(),
+            optimistic_writes: self.optimistic_writes.with_label_values(&[]).get(),
+            hlc_logical_wraps: self.hlc_logical_wraps.with_label_values(&[]).get(),
+            active_peers: self.active_peers.with_label_values(&[]).get() as u64,
         }
     }
 }
@@ -305,6 +371,11 @@ pub struct VaultSyncMetrics {
     pub mutations_downloaded: AtomicU64,
     pub sync_errors: AtomicU64,
     pub last_sync_lag_ms: AtomicU64,
+    pub push_mutations_received: AtomicU64,
+    pub snapshots_applied: AtomicU64,
+    pub optimistic_writes: AtomicU64,
+    pub hlc_logical_wraps: AtomicU64,
+    pub active_peers: AtomicU64,
 }
 
 #[cfg(not(feature = "telemetry"))]
@@ -315,6 +386,11 @@ impl VaultSyncMetrics {
             mutations_downloaded: AtomicU64::new(0),
             sync_errors: AtomicU64::new(0),
             last_sync_lag_ms: AtomicU64::new(0),
+            push_mutations_received: AtomicU64::new(0),
+            snapshots_applied: AtomicU64::new(0),
+            optimistic_writes: AtomicU64::new(0),
+            hlc_logical_wraps: AtomicU64::new(0),
+            active_peers: AtomicU64::new(0),
         }
     }
 
@@ -350,6 +426,31 @@ impl VaultSyncMetrics {
     pub fn record_crdt_merge_time(&self, _doc_id: &str, _us: f64) {}
     pub fn record_key_rotation(&self, _namespace: &str) {}
 
+    /// Record a push mutation received from subscription / WS.
+    pub fn record_push_received(&self) {
+        self.push_mutations_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a snapshot applied during catch-up.
+    pub fn record_snapshot_applied(&self) {
+        self.snapshots_applied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an optimistic write (local apply before server ack).
+    pub fn record_optimistic_write(&self) {
+        self.optimistic_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record HLC logical counter wrap (rare — clock stalled).
+    pub fn record_hlc_wrap(&self) {
+        self.hlc_logical_wraps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set number of active peer tabs.
+    pub fn set_active_peers(&self, count: u64) {
+        self.active_peers.store(count, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             mutations_uploaded: self.mutations_uploaded.load(Ordering::Relaxed),
@@ -359,6 +460,11 @@ impl VaultSyncMetrics {
             pending_mutations: 0,
             replica_count: 0,
             doc_count: 0,
+            push_mutations_received: self.push_mutations_received.load(Ordering::Relaxed),
+            snapshots_applied: self.snapshots_applied.load(Ordering::Relaxed),
+            optimistic_writes: self.optimistic_writes.load(Ordering::Relaxed),
+            hlc_logical_wraps: self.hlc_logical_wraps.load(Ordering::Relaxed),
+            active_peers: self.active_peers.load(Ordering::Relaxed),
         }
     }
 }

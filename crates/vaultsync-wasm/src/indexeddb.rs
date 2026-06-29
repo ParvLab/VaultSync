@@ -1,33 +1,100 @@
 use async_trait::async_trait;
-use js_sys::{Promise, Uint8Array};
+use js_sys::Uint8Array;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use vaultsync_core::oplog::entry::OplogEntry;
 use vaultsync_core::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use vaultsync_core::sync::state::SyncState;
 use vaultsync_core::VaultSyncError;
 use wasm_bindgen::{prelude::*, JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
 use web_sys::*;
 
-struct SendJsFuture<T = JsValue>(JsFuture<T>);
+struct IdbRequestFutureCleanup {
+    req: IdbRequest,
+    _closures: (Closure<dyn Fn(Event)>, Closure<dyn Fn(Event)>),
+}
 
-unsafe impl<T> Send for SendJsFuture<T> {}
+unsafe impl Send for IdbRequestFutureCleanup {}
+unsafe impl Sync for IdbRequestFutureCleanup {}
 
-impl<T> Future for SendJsFuture<T> {
-    type Output = Result<T, JsValue>;
+pub struct IdbRequestFuture {
+    rx: futures::channel::oneshot::Receiver<Result<JsValue, JsValue>>,
+    _cleanup: Arc<Mutex<Option<IdbRequestFutureCleanup>>>,
+}
+
+unsafe impl Send for IdbRequestFuture {}
+unsafe impl Sync for IdbRequestFuture {}
+
+impl Future for IdbRequestFuture {
+    type Output = Result<JsValue, JsValue>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        unsafe { self.map_unchecked_mut(|s| &mut s.0) }.poll(cx)
+        let mut rx = unsafe { self.map_unchecked_mut(|s| &mut s.rx) };
+        match Pin::new(&mut *rx).poll(cx) {
+            Poll::Ready(Ok(res)) => Poll::Ready(res),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(JsValue::from_str("IdbRequestFuture cancelled"))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
-impl<T: wasm_bindgen::convert::FromWasmAbi + 'static> From<Promise<T>> for SendJsFuture<T> {
-    fn from(p: Promise<T>) -> Self {
-        Self(JsFuture::from(p))
+impl Drop for IdbRequestFuture {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self._cleanup.lock() {
+            if let Some(cleanup) = guard.take() {
+                cleanup.req.set_onsuccess(None);
+                cleanup.req.set_onerror(None);
+                drop(cleanup);
+            }
+        }
+    }
+}
+
+struct OpenDbFutureCleanup {
+    req: IdbOpenDbRequest,
+    _closures: (
+        Closure<dyn Fn(Event)>,
+        Closure<dyn Fn(Event)>,
+        Closure<dyn Fn(Event)>,
+    ),
+}
+
+unsafe impl Send for OpenDbFutureCleanup {}
+unsafe impl Sync for OpenDbFutureCleanup {}
+
+pub struct OpenDbFuture {
+    rx: futures::channel::oneshot::Receiver<Result<JsValue, JsValue>>,
+    _cleanup: Arc<Mutex<Option<OpenDbFutureCleanup>>>,
+}
+
+unsafe impl Send for OpenDbFuture {}
+unsafe impl Sync for OpenDbFuture {}
+
+impl Future for OpenDbFuture {
+    type Output = Result<JsValue, JsValue>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut rx = unsafe { self.map_unchecked_mut(|s| &mut s.rx) };
+        match Pin::new(&mut *rx).poll(cx) {
+            Poll::Ready(Ok(res)) => Poll::Ready(res),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(JsValue::from_str("OpenDbFuture cancelled"))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for OpenDbFuture {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self._cleanup.lock() {
+            if let Some(cleanup) = guard.take() {
+                cleanup.req.set_onupgradeneeded(None);
+                cleanup.req.set_onsuccess(None);
+                cleanup.req.set_onerror(None);
+                drop(cleanup);
+            }
+        }
     }
 }
 
@@ -60,36 +127,46 @@ impl Default for IdbIndex {
 pub struct IndexedDbStorage {
     db: IdbDatabase,
     index: Mutex<IdbIndex>,
+    tx_lock: futures::lock::Mutex<()>,
 }
 
 unsafe impl Send for IndexedDbStorage {}
 unsafe impl Sync for IndexedDbStorage {}
 
-fn request_to_future(req: &IdbRequest) -> SendJsFuture {
-    let promise = Promise::new(&mut |resolve, reject| {
-        let onsuccess = Closure::wrap(Box::new(move |event: Event| {
-            let target = event.target().unwrap();
-            let req = target.dyn_into::<IdbRequest>().unwrap();
-            let result = req.result().unwrap_or(JsValue::NULL);
-            resolve.call1(&JsValue::UNDEFINED, &result).unwrap();
-        }) as Box<dyn FnMut(Event)>);
+fn request_to_future(req: &IdbRequest) -> IdbRequestFuture {
+    let (tx, rx) = futures::channel::oneshot::channel::<Result<JsValue, JsValue>>();
+    let shared_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(tx)));
 
-        let onerror = Closure::wrap(Box::new(move |_event: Event| {
-            reject
-                .call1(
-                    &JsValue::UNDEFINED,
-                    &JsValue::from_str("IndexedDB request failed"),
-                )
-                .unwrap();
-        }) as Box<dyn FnMut(Event)>);
+    let tx_success = shared_tx.clone();
+    let onsuccess = Closure::wrap(Box::new(move |event: Event| {
+        let target = event.target().unwrap();
+        let req = target.dyn_into::<IdbRequest>().unwrap();
+        let result = req.result().unwrap_or(JsValue::NULL);
+        if let Some(tx) = tx_success.borrow_mut().take() {
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = tx.send(Ok(result));
+            });
+        }
+    }) as Box<dyn Fn(Event)>);
 
-        req.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
-        req.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+    let tx_error = shared_tx.clone();
+    let onerror = Closure::wrap(Box::new(move |_event: Event| {
+        if let Some(tx) = tx_error.borrow_mut().take() {
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = tx.send(Err(JsValue::from_str("IndexedDB request failed")));
+            });
+        }
+    }) as Box<dyn Fn(Event)>);
 
-        onsuccess.forget();
-        onerror.forget();
-    });
-    SendJsFuture::from(promise)
+    req.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
+    req.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+
+    let cleanup = Arc::new(Mutex::new(Some(IdbRequestFutureCleanup {
+        req: req.clone(),
+        _closures: (onsuccess, onerror),
+    })));
+
+    IdbRequestFuture { rx, _cleanup: cleanup }
 }
 
 impl IndexedDbStorage {
@@ -104,44 +181,51 @@ impl IndexedDbStorage {
             .open_with_u32(db_name, 1)
             .map_err(|e| VaultSyncError::Storage(format!("open db request failed: {:?}", e)))?;
 
-        let promise = Promise::new(&mut |resolve, reject| {
-            let onupgradeneeded = Closure::wrap(Box::new(move |event: Event| {
-                let target = event.target().unwrap();
-                let req = target.dyn_into::<IdbOpenDbRequest>().unwrap();
-                let db: IdbDatabase = req.result().unwrap().into();
+        let (tx, rx) = futures::channel::oneshot::channel::<Result<JsValue, JsValue>>();
+        let shared_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(tx)));
 
-                db.create_object_store("documents").unwrap();
-                db.create_object_store("system").unwrap();
-            }) as Box<dyn FnMut(Event)>);
+        let onupgradeneeded = Closure::wrap(Box::new(move |event: Event| {
+            let target = event.target().unwrap();
+            let req = target.dyn_into::<IdbOpenDbRequest>().unwrap();
+            let db: IdbDatabase = req.result().unwrap().into();
 
-            let onsuccess = Closure::wrap(Box::new(move |event: Event| {
-                let target = event.target().unwrap();
-                let req = target.dyn_into::<IdbOpenDbRequest>().unwrap();
-                let db = req.result().unwrap();
-                resolve.call1(&JsValue::UNDEFINED, &db).unwrap();
-            }) as Box<dyn FnMut(Event)>);
+            db.create_object_store("documents").unwrap();
+            db.create_object_store("system").unwrap();
+        }) as Box<dyn Fn(Event)>);
 
-            let onerror = Closure::wrap(Box::new(move |_event: Event| {
-                reject
-                    .call1(
-                        &JsValue::UNDEFINED,
-                        &JsValue::from_str("IndexedDB open failed"),
-                    )
-                    .unwrap();
-            }) as Box<dyn FnMut(Event)>);
+        let tx_success = shared_tx.clone();
+        let onsuccess = Closure::wrap(Box::new(move |event: Event| {
+            let target = event.target().unwrap();
+            let req = target.dyn_into::<IdbOpenDbRequest>().unwrap();
+            let db = req.result().unwrap();
+            if let Some(tx) = tx_success.borrow_mut().take() {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = tx.send(Ok(db));
+                });
+            }
+        }) as Box<dyn Fn(Event)>);
 
-            req.set_onupgradeneeded(Some(onupgradeneeded.as_ref().unchecked_ref()));
-            req.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
-            req.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        let tx_error = shared_tx.clone();
+        let onerror = Closure::wrap(Box::new(move |_event: Event| {
+            if let Some(tx) = tx_error.borrow_mut().take() {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = tx.send(Err(JsValue::from_str("IndexedDB open failed")));
+                });
+            }
+        }) as Box<dyn Fn(Event)>);
 
-            onupgradeneeded.forget();
-            onsuccess.forget();
-            onerror.forget();
-        });
+        req.set_onupgradeneeded(Some(onupgradeneeded.as_ref().unchecked_ref()));
+        req.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
+        req.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 
-        let db_val = SendJsFuture::from(promise)
+        let cleanup = Arc::new(Mutex::new(Some(OpenDbFutureCleanup {
+            req: req.clone(),
+            _closures: (onupgradeneeded, onsuccess, onerror),
+        })));
+
+        let db_val = OpenDbFuture { rx, _cleanup: cleanup }
             .await
-            .map_err(|e| VaultSyncError::Storage(format!("open_db promise failed: {:?}", e)))?;
+            .map_err(|e| VaultSyncError::Storage(format!("open_db failed: {:?}", e)))?;
         let db: IdbDatabase = db_val.into();
 
         // Load index from system store
@@ -150,6 +234,7 @@ impl IndexedDbStorage {
         Ok(Self {
             db,
             index: Mutex::new(index),
+            tx_lock: futures::lock::Mutex::new(()),
         })
     }
 
@@ -219,6 +304,7 @@ impl Storage for IndexedDbStorage {
         record_id: &str,
         bytes: &[u8],
     ) -> Result<(), VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let tx = self
             .db
             .transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
@@ -282,6 +368,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn delete_document(&self, doc_id: &str, record_id: &str) -> Result<(), VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let tx = self
             .db
             .transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
@@ -311,6 +398,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let index = self.get_fresh_index().await?;
         let listing = index.doc_listing.get(doc_id).cloned().unwrap_or_default();
 
@@ -330,6 +418,7 @@ impl Storage for IndexedDbStorage {
         bytes: &[u8],
         entry: &OplogEntry,
     ) -> Result<(), VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let tx = self
             .db
             .transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
@@ -367,6 +456,7 @@ impl Storage for IndexedDbStorage {
         record_id: &str,
         entry: &OplogEntry,
     ) -> Result<(), VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let tx = self
             .db
             .transaction_with_str_and_mode("documents", IdbTransactionMode::Readwrite)
@@ -397,6 +487,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn append_oplog(&self, entry: &OplogEntry) -> Result<(), VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let mut index = self.get_fresh_index().await?;
         index.oplog.push(entry.clone());
         self.flush_index(&index).await?;
@@ -409,35 +500,75 @@ impl Storage for IndexedDbStorage {
         namespace: &str,
         limit: usize,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let index = self.get_fresh_index().await?;
         let pending: Vec<OplogEntry> = index
             .oplog
             .iter()
             .filter(|e| {
                 e.namespace == namespace
-                    && matches!(
-                        e.sync_status,
-                        vaultsync_core::oplog::entry::SyncStatus::Pending
-                    )
+                    && e.sync_status.is_uploadable()
             })
             .take(limit)
             .cloned()
             .collect();
+        let ids: Vec<&str> = pending.iter().map(|e| e.id.as_str()).collect();
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[PENDING_READ:IDB] ns={} count={} ids={:?}",
+            namespace,
+            pending.len(),
+            ids,
+        )));
         Ok(pending)
     }
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), VaultSyncError> {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[MARK_SYNCED:IDB] id={} seq={}",
+            id, sequence,
+        )));
+        let _guard = self.tx_lock.lock().await;
         let mut index = self.get_fresh_index().await?;
+        let before_ids: Vec<String> = index
+            .oplog
+            .iter()
+            .filter(|e| e.sync_status.is_uploadable())
+            .map(|e| e.id.clone())
+            .collect();
         if let Some(entry) = index.oplog.iter_mut().find(|e| e.id == id) {
+            let old_status = format!("{:?}", entry.sync_status);
             entry.sync_status = vaultsync_core::oplog::entry::SyncStatus::Synced;
             entry.sequence = Some(sequence);
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[MARK_SYNCED:IDB] found id={} old_status={} origin={:?} ctx={}",
+                id, old_status, entry.origin, entry.origin_context,
+            )));
+        } else {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[MARK_SYNCED:IDB] NOT FOUND id={} in oplog (oplog_len={})",
+                id,
+                index.oplog.len(),
+            )));
         }
         self.flush_index(&index).await?;
-        *self.index.lock().unwrap() = index;
+        let mut guard = self.index.lock().unwrap();
+        *guard = index;
+        let after_ids: Vec<String> = guard
+            .oplog
+            .iter()
+            .filter(|e| e.sync_status.is_uploadable())
+            .map(|e| e.id.clone())
+            .collect();
+        drop(guard);
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[MARK_SYNCED:IDB] done id={} pending_before={:?} pending_after={:?}",
+            id, before_ids, after_ids,
+        )));
         Ok(())
     }
 
     async fn mark_failed(&self, id: &str, _error: &str) -> Result<(), VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let mut index = self.get_fresh_index().await?;
         if let Some(entry) = index.oplog.iter_mut().find(|e| e.id == id) {
             entry.sync_status = vaultsync_core::oplog::entry::SyncStatus::Failed;
@@ -452,6 +583,7 @@ impl Storage for IndexedDbStorage {
         namespace: &str,
         seq: u64,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let index = self.get_fresh_index().await?;
         let entries: Vec<OplogEntry> = index
             .oplog
@@ -463,11 +595,17 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn read_sync_state(&self, namespace: &str) -> Result<Option<SyncState>, VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let index = self.get_fresh_index().await?;
         Ok(index.sync_states.get(namespace).cloned())
     }
 
     async fn write_sync_state(&self, state: &SyncState) -> Result<(), VaultSyncError> {
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[IDB.write_sync_state] ns={} cursor={} gen={}",
+            state.namespace, state.last_synced_sequence, state.generation_id
+        )));
+        let _guard = self.tx_lock.lock().await;
         let mut index = self.get_fresh_index().await?;
         index
             .sync_states
@@ -478,11 +616,13 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn read_schema(&self, doc_id: &str) -> Result<Option<SchemaMeta>, VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let index = self.get_fresh_index().await?;
         Ok(index.schemas.get(doc_id).cloned())
     }
 
     async fn write_schema(&self, meta: &SchemaMeta) -> Result<(), VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let mut index = self.get_fresh_index().await?;
         index.schemas.insert(meta.doc_id.clone(), meta.clone());
         self.flush_index(&index).await?;
@@ -491,11 +631,13 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let index = self.get_fresh_index().await?;
         Ok(index.migrations.clone())
     }
 
     async fn write_migration(&self, record: &MigrationRecord) -> Result<(), VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let mut index = self.get_fresh_index().await?;
         let pos = index
             .migrations
@@ -512,6 +654,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn read_keys(&self, namespace: &str) -> Result<Vec<KeyRecord>, VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let index = self.get_fresh_index().await?;
         let results: Vec<KeyRecord> = index
             .keys
@@ -523,6 +666,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn write_key(&self, key: &KeyRecord) -> Result<(), VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let mut index = self.get_fresh_index().await?;
         let pos = index
             .keys
@@ -601,6 +745,7 @@ impl Storage for IndexedDbStorage {
         namespace: &str,
         cutoff_ms: u64,
     ) -> Result<usize, VaultSyncError> {
+        let _guard = self.tx_lock.lock().await;
         let mut index = self.get_fresh_index().await?;
         let before = index.oplog.len();
         index.oplog.retain(|entry| {

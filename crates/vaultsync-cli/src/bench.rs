@@ -79,7 +79,7 @@ pub fn run(args: BenchArgs) {
         "oplog_append" => {
             // In-memory oplog append benchmark
             let rt = tokio::runtime::Runtime::new().unwrap();
-            use vaultsync_core::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+            use vaultsync_core::oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus};
             use vaultsync_core::storage::memory::InMemoryStorage;
             use vaultsync_core::storage::traits::Storage;
             let storage = InMemoryStorage::new();
@@ -100,6 +100,8 @@ pub fn run(args: BenchArgs) {
                         sync_status: SyncStatus::Pending,
                         synced_at: None,
                         created_at: 1000,
+                        origin: MutationOrigin::Unknown,
+                        origin_context: String::new(),
                     };
                     rt.block_on(async {
                         let _ = storage.append_oplog(&entry).await;
@@ -113,7 +115,7 @@ pub fn run(args: BenchArgs) {
         }
         "subscription_fire" => {
             use vaultsync_core::subscription::engine::SubscriptionEngine;
-            let engine = SubscriptionEngine::new();
+            let mut engine = SubscriptionEngine::new();
             let r = run_bench(
                 || {
                     engine.fire("todos", "record:1", &std::collections::HashMap::new());

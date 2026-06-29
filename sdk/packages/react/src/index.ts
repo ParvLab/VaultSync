@@ -1,4 +1,4 @@
-export { VaultSyncProvider, useVaultSyncClient } from './context.js';
+export { VaultSyncProvider } from './context.js';
 export type { VaultSyncProviderProps } from './context.js';
 export { useQuery } from './useQuery.js';
 export type { UseQueryOptions } from './useQuery.js';

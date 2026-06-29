@@ -2,7 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
 use vaultsync_core::crdt::document::CRDTDocument;
 use vaultsync_core::crdt::types::CrdtValue;
-use vaultsync_core::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+use vaultsync_core::oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus};
 use vaultsync_core::storage::memory::InMemoryStorage;
 use vaultsync_core::subscription::engine::SubscriptionEngine;
 use vaultsync_core::sync::reconciler::Reconciler;
@@ -38,12 +38,14 @@ fn bench_reconciler_apply_update(c: &mut Criterion) {
                     sync_status: SyncStatus::Synced,
                     synced_at: None,
                     created_at: 1000,
+                    origin: MutationOrigin::Unknown,
+                    origin_context: String::new(),
                 };
                 (reconciler, entry)
             },
             |(reconciler, entry)| {
                 rt.block_on(async {
-                    reconciler.apply_remote_update(&entry).await.unwrap();
+                    reconciler.apply_remote_update("bench", &entry).await.unwrap();
                     black_box(())
                 });
             },

@@ -6,7 +6,7 @@ use crate::crdt::document::CRDTDocument;
 use crate::crdt::types::CrdtValue;
 use crate::e2ee::keyring::{E2eeDecryptor, E2eeEncryptor, KeyRing};
 use crate::error::VaultSyncError;
-use crate::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+use crate::oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus};
 use crate::oplog::log::OpLog;
 use crate::schema::migration::MigrationDefinition;
 use crate::schema::registry::{DocumentSchema, SchemaRegistry};
@@ -21,8 +21,12 @@ use crate::sync::reconciler::Reconciler;
 use crate::sync::state::SyncState;
 use crate::sync::upload::UploadQueue;
 use crate::telemetry::tracing::VaultSyncTelemetry;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
+use yrs::updates::decoder::Decode;
+use yrs::Update;
+use sha2::{Digest, Sha256};
 
 pub type Callback = Box<dyn Fn(&str, &str, &HashMap<String, CrdtValue>) + Send>;
 
@@ -51,6 +55,12 @@ pub struct VaultSyncClient {
     pub leader_election: Arc<crate::ipc::leader_election::LeaderElection>,
     pub schema_version: u64,
     pub shared_memory: Arc<crate::ipc::shared_memory::SharedMemory>,
+    pub events: crate::sync::events::SyncEvents,
+    initialized: std::sync::atomic::AtomicBool,
+    clock: crate::clock::HybridLogicalClock,
+    pending_count_cache: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(target_arch = "wasm32")]
+    pending_count_rx: std::sync::Mutex<Option<futures::channel::mpsc::UnboundedReceiver<usize>>>,
 }
 
 impl VaultSyncClient {
@@ -175,18 +185,27 @@ impl VaultSyncClient {
         .await
     }
 
-    pub async fn new_with_storage_and_migrations(
+    /// Internal builder: shared implementation for all constructors.
+    /// When `auto_initialize` is true, calls `initialize()` after spawning workers.
+    /// When false, the caller must call `initialize()` and trigger startup catch-up.
+    async fn build_client(
         config: VaultSyncConfig,
         coordinator: Arc<dyn Coordinator>,
         keyring: Arc<KeyRing>,
         storage: Arc<dyn Storage>,
         migrations: Vec<Arc<crate::schema::migration::MigrationDefinition>>,
+        auto_initialize: bool,
     ) -> Result<Self, VaultSyncError> {
+        let _t = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] migration start");
         let runner = crate::schema::migration::MigrationRunner::new(storage.clone(), migrations);
         runner.validate_applied().await?;
         runner.run_pending().await?;
         let schema_version = runner.current_version().await;
+        tracing::info!("[client.new] migration done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
+        let _t = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] keys start");
         let mut stored_keys = storage.read_keys(&config.namespace).await?;
         if stored_keys.is_empty() {
             // Introduce a small random delay and re-read, to handle concurrent initialization races
@@ -252,19 +271,47 @@ impl VaultSyncClient {
             }
         }
 
+        tracing::info!("[client.new] keys done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        let _t = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] e2ee+subs+reconciler start");
         let encryptor = Arc::new(E2eeEncryptor::new(keyring.clone()));
         let decryptor = Arc::new(E2eeDecryptor::new(keyring.clone()));
 
         let subscriptions = Arc::new(std::sync::Mutex::new(SubscriptionEngine::new()));
         let reconciler = Arc::new(Reconciler::new(storage.clone(), subscriptions.clone()));
+        tracing::info!("[client.new] e2ee+subs+reconciler done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
+        let _t = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] oplog init start");
         let oplog = Arc::new(OpLog::new(storage.clone(), &config.namespace));
+        tracing::info!("[client.new] oplog init done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
+        let _t = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] read_sync_state start");
         let last_sequence = match storage.read_sync_state(&config.namespace).await? {
-            Some(state) => state.last_synced_sequence,
-            None => 0,
+            Some(state) => {
+                #[cfg(target_arch = "wasm32")]
+                let backend = "opfs";
+                #[cfg(not(target_arch = "wasm32"))]
+                let backend = "sqlite";
+                tracing::info!(
+                    "[client.new] read_sync_state cursor={} gen={} backend={} namespace={} took {} ms",
+                    state.last_synced_sequence,
+                    state.generation_id,
+                    backend,
+                    config.namespace,
+                    crate::time_utils::system_time_now_ms() - _t
+                );
+                state.last_synced_sequence
+            }
+            None => {
+                tracing::info!("[client.new] read_sync_state no state took {} ms", crate::time_utils::system_time_now_ms() - _t);
+                0
+            }
         };
 
+        let _t = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] queue init start");
         let metrics = Arc::new(crate::telemetry::metrics::VaultSyncMetrics::new());
         let debug_api = Arc::new(crate::telemetry::debug::DebugApi::new(
             storage.clone(),
@@ -289,7 +336,9 @@ impl VaultSyncClient {
             decryptor.clone(),
             metrics.clone(),
             config.max_clock_skew,
+            config.replica_id.clone(),
         ));
+        tracing::info!("[client.new] queue init done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let schema = Arc::new(std::sync::Mutex::new(SchemaRegistry::new()));
         let _telemetry = Arc::new(VaultSyncTelemetry::new());
@@ -301,6 +350,8 @@ impl VaultSyncClient {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
         // Perform crash recovery on startup before starting the sync loop
+        let _t = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] crash_recovery start");
         let crash_recovery = crate::ipc::crash_recovery::CrashRecovery::new(
             storage.clone(),
             config.namespace.clone(),
@@ -308,11 +359,15 @@ impl VaultSyncClient {
         if let Err(e) = crash_recovery.recover(keyring.clone()).await {
             tracing::error!(error = %e, "Crash recovery failed during startup");
         }
+        tracing::info!("[client.new] crash_recovery done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
+        let _t = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] leader_election start");
         let leader_election = Arc::new(crate::ipc::leader_election::LeaderElection::new(
             &config.namespace,
             &config.storage,
         ));
+        tracing::info!("[client.new] leader_election done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         #[cfg(not(target_arch = "wasm32"))]
         let mut p2p_handle = None;
@@ -342,6 +397,7 @@ impl VaultSyncClient {
                                 encrypted_blob: m.encrypted_blob,
                                 timestamp: m.timestamp,
                                 key_version: m.key_version,
+                                replica_id: m.replica_id,
                             };
                             if let Err(e) = dq.process_p2p_mutation(core_mutation).await {
                                 tracing::error!(error = %e, "Failed to process P2P mutation");
@@ -355,12 +411,26 @@ impl VaultSyncClient {
             }
         }
 
+        let _t = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] shared_memory start");
         let shared_memory = Arc::new(
             crate::ipc::shared_memory::SharedMemory::create_with_namespace(
                 &config.namespace,
                 64 * 1024,
             )?,
         );
+        tracing::info!("[client.new] shared_memory done {} ms", crate::time_utils::system_time_now_ms() - _t);
+
+        let _t = crate::time_utils::system_time_now_ms();
+        #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
+        let (events, upload_event_rx, download_event_rx, pending_count_rx) =
+            crate::sync::events::SyncEvents::new();
+
+        // Clone before moving into Self (used by download worker below)
+        let coord_for_dl = coordinator.clone();
+        let ns_for_dl = config.namespace.clone();
+        let pending_count_tx = events.pending_count.clone();
+        let pending_cache = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let client = Self {
             config,
@@ -387,14 +457,23 @@ impl VaultSyncClient {
             leader_election: leader_election.clone(),
             schema_version,
             shared_memory,
+            events,
+            initialized: std::sync::atomic::AtomicBool::new(false),
+            clock: crate::clock::HybridLogicalClock::new(),
+            pending_count_cache: pending_cache.clone(),
+            #[cfg(target_arch = "wasm32")]
+            pending_count_rx: std::sync::Mutex::new(Some(pending_count_rx)),
         };
+        tracing::info!("[client.new] construction done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
-        let leader_election_clone = leader_election.clone();
-        let upload_queue_clone = upload_queue.clone();
-        let download_queue_clone = download_queue.clone();
-        let sync_interval = client.config.sync_interval;
+        // Initialize pending count cache from storage
+        let initial_pending = upload_queue.pending_count().await.unwrap_or(0);
+        pending_cache.store(initial_pending, std::sync::atomic::Ordering::Relaxed);
+
         let namespace_clone = client.config.namespace.clone();
         let storage_clone = client.storage.clone();
+        let upload_events_rx = upload_event_rx;
+        let download_events_rx = download_event_rx;
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -413,135 +492,186 @@ impl VaultSyncClient {
             });
         }
 
-        let keyring_clone = keyring.clone();
-
+        // ── Upload worker (event-driven with offline backoff) ─────────────
+        let uq = upload_queue.clone();
+        let mut upload_rx = upload_events_rx;
+        let pc_tx = pending_count_tx;
+        let pc_cache = pending_cache.clone();
         crate::time_utils::spawn(async move {
-            let mut is_leader = match leader_election_clone.try_acquire() {
-                Ok(status) => status,
-                Err(e) => {
-                    tracing::error!(error = %e, "Leader election try_acquire failed during startup");
-                    false
+            let mut offline = false;
+            let mut backoff_ms: u64 = 0;
+            loop {
+                // Wait for a notification. While offline, skip the channel
+                // and wait for the backoff timer directly.
+                if offline {
+                    if backoff_ms > 0 {
+                        crate::time_utils::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                    // Drain any stale notifications that piled up while we slept
+                    while let Ok(()) = upload_rx.try_recv() {}
+                } else {
+                    match upload_rx.next().await {
+                        Some(_) => {}
+                        None => break,
+                    }
                 }
-            };
 
-            if let Ok(Some(mut state)) = storage_clone.read_sync_state(&namespace_clone).await {
-                state.leader_status = Some(is_leader);
-                let _ = storage_clone.write_sync_state(&state).await;
-            }
-
-            let compaction_engine = crate::sync::compaction::CompactionEngine::new(
-                storage_clone.clone(),
-                crate::sync::compaction::CompactionConfig::default(),
-            );
-            let mut sync_cycles = 0;
-
-            #[cfg(target_arch = "wasm32")]
-            {
+                // Process all pending batches
                 loop {
-                    if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                        leader_election_clone.release();
+                    match uq.process_batch().await {
+                        Ok(0) => {
+                            // Either no pending entries OR coordinator unavailable.
+                            // Distinguish by checking pending count.
+                            if let Ok(count) = uq.pending_count().await {
+                                if count > 0 && !offline {
+                                    tracing::warn!(
+                                        "[upload_worker] coordinator not available ({} pending), entering offline mode",
+                                        count
+                                    );
+                                    offline = true;
+                                    backoff_ms = 1000;
+                                } else if count > 0 {
+                                    // Still offline after retry; increase backoff
+                                    backoff_ms = std::cmp::min(backoff_ms * 2, 30000);
+                                    tracing::debug!(
+                                        "[upload_worker] still offline, backoff={}ms",
+                                        backoff_ms,
+                                    );
+                                } else if count == 0 && offline {
+                                    // All pending cleared — return to online
+                                    tracing::info!("[upload_worker] all pending cleared, returning online");
+                                    offline = false;
+                                    backoff_ms = 0;
+                                }
+                            }
+                            break;
+                        }
+                        Ok(_) => {
+                            // Successfully pushed — reset offline state
+                            if offline {
+                                tracing::info!("[upload_worker] coordinator reconnected, returning online");
+                            }
+                            offline = false;
+                            backoff_ms = 0;
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!("[upload_worker] batch failed: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Update pending count cache
+                if let Ok(count) = uq.pending_count().await {
+                    pc_cache.store(count, std::sync::atomic::Ordering::Relaxed);
+                    let _ = pc_tx.unbounded_send(count);
+                }
+            }
+        });
+
+        // ── Download worker (push-driven) ─────────────────────────────────
+        let dq = download_queue.clone();
+        let mut download_rx = download_events_rx;
+        let _coord = coord_for_dl;
+        let _ns = ns_for_dl;
+        let initial_seq = download_queue.last_sequence();
+        crate::time_utils::spawn(async move {
+            tracing::debug!("[download_worker] started cursor={} t={}", initial_seq, crate::time_utils::system_time_now_ms());
+
+            loop {
+                let mut needs_backfill = true;
+
+                match download_rx.next().await {
+                    None => {
+                        tracing::debug!("[download_worker] channel closed, exiting");
                         break;
                     }
-
-                    if !is_leader {
-                        is_leader = match leader_election_clone.try_acquire() {
-                            Ok(status) => status,
-                            Err(_) => false,
-                        };
-                        if let Ok(Some(mut state)) =
-                            storage_clone.read_sync_state(&namespace_clone).await
-                        {
-                            state.leader_status = Some(is_leader);
-                            let _ = storage_clone.write_sync_state(&state).await;
+                    Some(Some(m)) => {
+                        // Push mutation arrived from coordinator
+                        tracing::info!(
+                            "[download_worker] push seq={} id={}",
+                            m.sequence,
+                            m.id
+                        );
+                        match dq.process_push_mutation(m).await {
+                            Ok(outcome) => {
+                                tracing::debug!(
+                                    "[download_worker] push outcome={:?}",
+                                    outcome
+                                );
+                                needs_backfill = outcome == crate::sync::download::PushOutcome::GapDetected;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[download_worker] process_push_mutation error: {:?}",
+                                    e
+                                );
+                            }
                         }
                     }
-
-                    if is_leader {
-                        if let Err(e) = upload_queue_clone.process_batch().await {
-                            tracing::error!("Upload queue batch failed: {:?}", e);
-                        }
-                        if let Err(e) = download_queue_clone.process_batch().await {
-                            tracing::error!("Download queue batch failed: {:?}", e);
-                        }
-
-                        sync_cycles += 1;
-                        if sync_cycles % 100 == 0 {
-                            let _ = compaction_engine.run_compaction(&namespace_clone).await;
-                        }
-                        if sync_cycles >= 1000 {
-                            sync_cycles = 0;
-                            let _ = compaction_engine
-                                .run_snapshot_compaction(&namespace_clone)
-                                .await;
-                        }
+                    Some(None) => {
+                        // Bootstrap or wakeup: drain process_batch
                     }
-
-                    crate::time_utils::sleep(sync_interval).await;
                 }
-            }
 
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let mut interval = tokio::time::interval_at(
-                    tokio::time::Instant::now() + sync_interval,
-                    sync_interval,
-                );
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            if !is_leader {
-                                let promoted = match leader_election_clone.try_acquire() {
-                                    Ok(status) => status,
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "Leader election try_acquire failed");
-                                        false
-                                    }
-                                };
-                                if promoted {
-                                    is_leader = true;
-                                    let crash_recovery = crate::ipc::crash_recovery::CrashRecovery::new(storage_clone.clone(), namespace_clone.clone());
-                                    if let Err(e) = crash_recovery.recover(keyring_clone.clone()).await {
-                                        tracing::error!(error = %e, "Crash recovery failed on leader promotion");
-                                    }
-                                }
-                                if let Ok(Some(mut state)) = storage_clone.read_sync_state(&namespace_clone).await {
-                                    state.leader_status = Some(is_leader);
-                                    let _ = storage_clone.write_sync_state(&state).await;
-                                }
+                if needs_backfill {
+                    loop {
+                        match dq.process_batch().await {
+                            Ok(0) => {
+                                tracing::debug!("[download_worker] process_batch -> 0");
+                                break;
                             }
-
-                            if is_leader {
-                                if let Err(e) = upload_queue_clone.process_batch().await {
-                                    tracing::error!("Upload queue batch failed: {:?}", e);
-                                }
-                                if let Err(e) = download_queue_clone.process_batch().await {
-                                    tracing::error!("Download queue batch failed: {:?}", e);
-                                }
-
-                                sync_cycles += 1;
-                                if sync_cycles % 100 == 0 {
-                                    if let Err(e) = compaction_engine.run_compaction(&namespace_clone).await {
-                                        tracing::error!(error = %e, "Compaction failed");
-                                    }
-                                }
-                                if sync_cycles >= 1000 {
-                                    sync_cycles = 0;
-                                    if let Err(e) = compaction_engine.run_snapshot_compaction(&namespace_clone).await {
-                                        tracing::error!(error = %e, "Snapshot compaction failed");
-                                    }
-                                }
+                            Ok(count) => {
+                                tracing::info!(
+                                    "[download_worker] process_batch -> {}",
+                                    count
+                                );
                             }
-                        }
-                        _ = shutdown_rx.changed() => {
-                            leader_election_clone.release();
-                            break;
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[download_worker] process_batch error {:?}",
+                                    e
+                                );
+                                break;
+                            }
                         }
                     }
                 }
             }
         });
 
-        client.initialize().await?;
+        // ── Leader election + compaction timer ────────────────────────────
+        let le = leader_election.clone();
+        let ns = namespace_clone.clone();
+        let comp_storage = storage_clone.clone();
+        crate::time_utils::spawn(async move {
+            let compaction_engine = crate::sync::compaction::CompactionEngine::new(
+                comp_storage,
+                crate::sync::compaction::CompactionConfig::default(),
+            );
+            let mut last_compaction = crate::time_utils::PlatformInstant::now();
+            let mut last_snapshot = crate::time_utils::PlatformInstant::now();
+
+            loop {
+                crate::time_utils::sleep(std::time::Duration::from_secs(5)).await;
+                if !le.try_acquire().unwrap_or(false) {
+                    continue;
+                }
+                if last_compaction.elapsed() >= std::time::Duration::from_secs(600) {
+                    let _ = compaction_engine.run_compaction(&ns).await;
+                    last_compaction = crate::time_utils::PlatformInstant::now();
+                }
+                if last_snapshot.elapsed() >= std::time::Duration::from_secs(3600) {
+                    let _ = compaction_engine.run_snapshot_compaction(&ns).await;
+                    last_snapshot = crate::time_utils::PlatformInstant::now();
+                }
+            }
+        });
+
+        if auto_initialize {
+            client.initialize().await?;
+        }
 
         #[cfg(feature = "telemetry")]
         if let Some(port) = client.config.debug_port {
@@ -562,20 +692,123 @@ impl VaultSyncClient {
         Ok(client)
     }
 
+    pub async fn new_with_storage_and_migrations(
+        config: VaultSyncConfig,
+        coordinator: Arc<dyn Coordinator>,
+        keyring: Arc<KeyRing>,
+        storage: Arc<dyn Storage>,
+        migrations: Vec<Arc<crate::schema::migration::MigrationDefinition>>,
+    ) -> Result<Self, VaultSyncError> {
+        Self::build_client(config, coordinator, keyring, storage, migrations, true).await
+    }
+
+    /// Like `new_with_storage`, but does NOT call `initialize()` internally.
+    /// The caller MUST call `initialize()` before using the client.
+    /// Use this when you need to wire event channels (e.g., download notification)
+    /// before the WebSocket background processor starts.
+    pub async fn new_with_storage_skip_init(
+        config: VaultSyncConfig,
+        coordinator: Arc<dyn Coordinator>,
+        keyring: Arc<KeyRing>,
+        storage: Arc<dyn Storage>,
+    ) -> Result<Self, VaultSyncError> {
+        Self::build_client(
+            config,
+            coordinator,
+            keyring,
+            storage,
+            crate::schema::migration::get_global_migrations(),
+            false,
+        )
+        .await
+    }
+
     pub async fn initialize(&self) -> Result<(), VaultSyncError> {
-        tracing::info!(namespace = %self.config.namespace, "VaultSync client initializing");
-        self.coordinator
-            .register(
-                &self.config.namespace,
-                ReplicaInfo {
-                    replica_id: self.config.replica_id.clone(),
-                    namespace: self.config.namespace.clone(),
-                    public_key: self.keyring.active_key().public_key.to_vec(),
-                    schema_version: self.schema_version,
-                },
-            )
-            .await
-            .map_err(|e| VaultSyncError::Coordinator(format!("register failed: {e:?}")))?;
+        if self.initialized.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        tracing::info!(namespace = %self.config.namespace, mode = ?self.config.coordinator_mode, "VaultSync client initializing");
+
+        if self.config.coordinator_mode == crate::config::CoordinatorMode::Offline {
+            tracing::info!("Coordinator mode: offline, skipping register/generation check");
+            return Ok(());
+        }
+
+        let replica_info = ReplicaInfo {
+            replica_id: self.config.replica_id.clone(),
+            namespace: self.config.namespace.clone(),
+            public_key: self.keyring.active_key().public_key.to_vec(),
+            schema_version: self.schema_version,
+        };
+
+        let cursor = self.download_queue.last_sequence();
+        tracing::info!("[4/9] coordinator register cursor={}", cursor);
+        let registered = self.coordinator
+            .register(&self.config.namespace, replica_info.clone(), cursor)
+            .await;
+
+        match registered {
+            Err(e) => {
+                tracing::warn!("Coordinator unavailable, continuing offline: {:?}", e);
+            }
+            Ok(()) => {
+                let cursor_before = self.download_queue.last_sequence();
+                tracing::info!("[4.5/9] register returned cursor={}", cursor_before);
+
+                // Check generation ID — reset cursor if server restarted
+                let server_gen = self.coordinator.generation_id().await;
+                if !server_gen.is_empty() {
+                    tracing::info!("[5/9] generation check server_gen={} cursor={}", server_gen, cursor_before);
+                    if let Some(mut state) = self.storage.read_sync_state(&self.config.namespace).await? {
+                        if state.generation_id != server_gen {
+                            let cursor_was = cursor_before;
+                            state.generation_id = server_gen.clone();
+                            state.last_synced_sequence = 0;
+                            let now_ms = crate::time_utils::system_time_now_ms();
+                            state.last_sync_at = Some(now_ms);
+                            self.storage.write_sync_state(&state).await?;
+                            tracing::info!(
+                                "[client] write_sync_state cursor={} gen={} (from client init generation mismatch)",
+                                state.last_synced_sequence,
+                                state.generation_id
+                            );
+                            self.download_queue.reset_cursor(0);
+                            let cursor_after = self.download_queue.last_sequence();
+                            tracing::info!(
+                                "[sync_state] generation mismatch: local={} server={} -> resetting cursor (was {})",
+                                state.generation_id,
+                                server_gen,
+                                cursor_was
+                            );
+                            tracing::info!(
+                                "[5.5/9] cursor after gen check={} (subscribe was with after={})",
+                                cursor_after,
+                                cursor_was
+                            );
+
+                            // Phase 2: reconnect with cursor=0 so subscribe uses the right value
+                            tracing::info!("[6/9] generation changed, reconnecting with cursor=0");
+                            let _ = self.coordinator.disconnect().await;
+                            let new_cursor = self.download_queue.last_sequence(); // should be 0
+                            match self.coordinator
+                                .register(&self.config.namespace, replica_info, new_cursor)
+                                .await
+                            {
+                                Ok(()) => {
+                                    tracing::info!("[6.5/9] re-register complete cursor={}", new_cursor);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Re-register failed after gen reset: {:?}", e);
+                                }
+                            }
+                        } else {
+                            tracing::info!("[sync_state] generation OK gen={}", server_gen);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -606,39 +839,59 @@ impl VaultSyncClient {
         self.metrics
             .record_mutation_attempt(&self.config.namespace, "attempt");
 
+        let mutation_id = uuid::Uuid::new_v4().to_string();
         let mut doc = CRDTDocument::new(doc_id, record_id, 0);
-        for (field, value) in &fields {
-            doc.set_field(field, value.clone());
+        let update_bytes = doc.capture_incremental_update(|doc| {
+            for (field, value) in &fields {
+                doc.set_field(field, value.clone());
+            }
+        });
+
+        // ── Phase 1 diagnostic: state vector + hash of outgoing yrs_update ──
+        let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
+        if let Ok(decoded) = Update::decode_v1(&update_bytes) {
+            let sv = decoded.state_vector();
+            let entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
+            tracing::info!(
+                "[client.insert] id={} yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
+                mutation_id, doc_id, record_id, content_hash, entries, update_bytes.len(),
+            );
         }
-        let update_bytes = doc.to_snapshot();
+
         if update_bytes.len() > self.config.max_document_size {
             return Err(VaultSyncError::DocumentTooLarge(
                 update_bytes.len(),
                 self.config.max_document_size,
             ));
         }
-        let snapshot = update_bytes.clone();
+        let snapshot = doc.to_snapshot();
 
         let encrypted_blob = self
             .encryptor
             .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-        let epoch = crate::time_utils::system_time_now_ms();
-        let entry = OplogEntry {
-            id: uuid::Uuid::new_v4().to_string(),
-            replica_id: self.config.replica_id.clone(),
-            namespace: self.config.namespace.clone(),
-            mutation_type: MutationType::CrdtInsert,
-            doc_id: doc_id.to_string(),
-            record_id: record_id.to_string(),
-            yrs_update: update_bytes,
-            encrypted_blob: Some(encrypted_blob),
-            timestamp: epoch,
-            sequence: None,
-            sync_status: SyncStatus::Pending,
-            synced_at: None,
-            created_at: epoch,
-        };
+        let hlc = self.clock.now();
+        if self.clock.did_logical_wrap() {
+            self.metrics.record_hlc_wrap();
+            self.clock.clear_logical_wrap();
+        }
+        let entry = OplogEntry::new(
+            mutation_id,
+            self.config.replica_id.clone(),
+            self.config.namespace.clone(),
+            MutationType::CrdtInsert,
+            doc_id.to_string(),
+            record_id.to_string(),
+            update_bytes,
+            Some(encrypted_blob),
+            hlc.wall,
+            None,
+            SyncStatus::Optimistic,
+            None,
+            hlc.wall,
+            MutationOrigin::Insert,
+            "",
+        );
 
         let append_span = tracing::info_span!(
             "oplog.append",
@@ -657,6 +910,10 @@ impl VaultSyncClient {
                 let _ = self.shared_memory.write_entry(&entry.id, &entry.yrs_update);
                 let key_version = self.keyring.active_key().version;
                 self.broadcast_p2p(&entry, key_version).await;
+                self.events.notify_upload();
+                self.pending_count_cache.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .record_optimistic_write();
                 self.metrics
                     .record_mutation_attempt(&self.config.namespace, "success");
                 let pending = self.pending_uploads().await.unwrap_or(0);
@@ -712,38 +969,58 @@ impl VaultSyncClient {
             Some(bytes) => CRDTDocument::from_snapshot(&bytes)?,
             None => CRDTDocument::new(doc_id, record_id, 0),
         };
-        for (field, value) in &fields {
-            doc.set_field(field, value.clone());
+        let mutation_id = uuid::Uuid::new_v4().to_string();
+        let update_bytes = doc.capture_incremental_update(|doc| {
+            for (field, value) in &fields {
+                doc.set_field(field, value.clone());
+            }
+        });
+
+        // ── Phase 1 diagnostic: state vector + hash of outgoing yrs_update ──
+        let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
+        if let Ok(decoded) = Update::decode_v1(&update_bytes) {
+            let sv = decoded.state_vector();
+            let entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
+            tracing::info!(
+                "[client.update] id={} yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
+                mutation_id, doc_id, record_id, content_hash, entries, update_bytes.len(),
+            );
         }
-        let update_bytes = doc.to_snapshot();
+
         if update_bytes.len() > self.config.max_document_size {
             return Err(VaultSyncError::DocumentTooLarge(
                 update_bytes.len(),
                 self.config.max_document_size,
             ));
         }
-        let snapshot = update_bytes.clone();
+        let snapshot = doc.to_snapshot();
 
         let encrypted_blob = self
             .encryptor
             .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-        let epoch = crate::time_utils::system_time_now_ms();
-        let entry = OplogEntry {
-            id: uuid::Uuid::new_v4().to_string(),
-            replica_id: self.config.replica_id.clone(),
-            namespace: self.config.namespace.clone(),
-            mutation_type: MutationType::CrdtUpdate,
-            doc_id: doc_id.to_string(),
-            record_id: record_id.to_string(),
-            yrs_update: update_bytes,
-            encrypted_blob: Some(encrypted_blob),
-            timestamp: epoch,
-            sequence: None,
-            sync_status: SyncStatus::Pending,
-            synced_at: None,
-            created_at: epoch,
-        };
+        let hlc = self.clock.now();
+        if self.clock.did_logical_wrap() {
+            self.metrics.record_hlc_wrap();
+            self.clock.clear_logical_wrap();
+        }
+        let entry = OplogEntry::new(
+            mutation_id,
+            self.config.replica_id.clone(),
+            self.config.namespace.clone(),
+            MutationType::CrdtUpdate,
+            doc_id.to_string(),
+            record_id.to_string(),
+            update_bytes,
+            Some(encrypted_blob),
+            hlc.wall,
+            None,
+            SyncStatus::Optimistic,
+            None,
+            hlc.wall,
+            MutationOrigin::Update,
+            "",
+        );
 
         let append_span = tracing::info_span!(
             "oplog.append",
@@ -762,6 +1039,10 @@ impl VaultSyncClient {
                 let _ = self.shared_memory.write_entry(&entry.id, &entry.yrs_update);
                 let key_version = self.keyring.active_key().version;
                 self.broadcast_p2p(&entry, key_version).await;
+                self.events.notify_upload();
+                self.pending_count_cache.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .record_optimistic_write();
                 self.metrics
                     .record_mutation_attempt(&self.config.namespace, "success");
                 let pending = self.pending_uploads().await.unwrap_or(0);
@@ -810,30 +1091,48 @@ impl VaultSyncClient {
         let existing = self.storage.get_document(doc_id, record_id).await?;
         if let Some(bytes) = existing {
             let mut doc = CRDTDocument::from_snapshot(&bytes)?;
-            doc.set_field("_deleted", CrdtValue::Boolean(true));
-            let update_bytes = doc.to_snapshot();
-            let snapshot = update_bytes.clone();
+            let mutation_id = uuid::Uuid::new_v4().to_string();
+            let update_bytes = doc.set_field("_deleted", CrdtValue::Boolean(true));
+
+            // ── Phase 1 diagnostic: state vector + hash of outgoing yrs_update ──
+            let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
+            if let Ok(decoded) = Update::decode_v1(&update_bytes) {
+                let sv = decoded.state_vector();
+                let entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
+                tracing::info!(
+                    "[client.delete] id={} yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
+                    mutation_id, doc_id, record_id, content_hash, entries, update_bytes.len(),
+                );
+            }
+
+            let snapshot = doc.to_snapshot();
 
             let encrypted_blob = self
                 .encryptor
                 .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-            let epoch = crate::time_utils::system_time_now_ms();
-            let entry = OplogEntry {
-                id: uuid::Uuid::new_v4().to_string(),
-                replica_id: self.config.replica_id.clone(),
-                namespace: self.config.namespace.clone(),
-                mutation_type: MutationType::CrdtDelete,
-                doc_id: doc_id.to_string(),
-                record_id: record_id.to_string(),
-                yrs_update: update_bytes,
-                encrypted_blob: Some(encrypted_blob),
-                timestamp: epoch,
-                sequence: None,
-                sync_status: SyncStatus::Pending,
-                synced_at: None,
-                created_at: epoch,
-            };
+            let hlc = self.clock.now();
+            if self.clock.did_logical_wrap() {
+                self.metrics.record_hlc_wrap();
+                self.clock.clear_logical_wrap();
+            }
+            let entry = OplogEntry::new(
+                mutation_id,
+                self.config.replica_id.clone(),
+                self.config.namespace.clone(),
+                MutationType::CrdtDelete,
+                doc_id.to_string(),
+                record_id.to_string(),
+                update_bytes,
+                Some(encrypted_blob),
+                hlc.wall,
+                None,
+                SyncStatus::Optimistic,
+                None,
+                hlc.wall,
+                MutationOrigin::Delete,
+                "",
+            );
 
             let append_span = tracing::info_span!(
                 "oplog.append",
@@ -848,23 +1147,27 @@ impl VaultSyncClient {
             drop(append_guard);
 
             match res {
-                Ok(_) => {
-                    let _ = self.shared_memory.write_entry(&entry.id, &entry.yrs_update);
-                    let key_version = self.keyring.active_key().version;
-                    self.broadcast_p2p(&entry, key_version).await;
+            Ok(_) => {
+                let _ = self.shared_memory.write_entry(&entry.id, &entry.yrs_update);
+                let key_version = self.keyring.active_key().version;
+                self.broadcast_p2p(&entry, key_version).await;
+                self.events.notify_upload();
+                self.pending_count_cache.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .record_optimistic_write();
+                self.metrics
+                    .record_mutation_attempt(&self.config.namespace, "success");
+                let pending = self.pending_uploads().await.unwrap_or(0);
+                self.metrics
+                    .set_mutations_pending(&self.config.namespace, pending as i64);
+                if let Ok(entries) = self
+                    .storage
+                    .read_pending_oplog(&self.config.namespace, 10000)
+                    .await
+                {
                     self.metrics
-                        .record_mutation_attempt(&self.config.namespace, "success");
-                    let pending = self.pending_uploads().await.unwrap_or(0);
-                    self.metrics
-                        .set_mutations_pending(&self.config.namespace, pending as i64);
-                    if let Ok(entries) = self
-                        .storage
-                        .read_pending_oplog(&self.config.namespace, 10000)
-                        .await
-                    {
-                        self.metrics
-                            .set_oplog_size(&self.config.namespace, entries.len() as i64);
-                    }
+                        .set_oplog_size(&self.config.namespace, entries.len() as i64);
+                }
 
                     // Fire reactive subscriptions locally
                     let state = doc.to_map();
@@ -984,12 +1287,24 @@ impl VaultSyncClient {
                 last_connected_at: None,
                 last_sync_at: None,
                 schema_version: 0,
+                generation_id: String::new(),
             })
         }
     }
 
+    /// Returns the cached pending upload count. Updated by the upload worker
+    /// after each batch and by write methods. Avoids OPFS reads on every call.
     pub async fn pending_uploads(&self) -> Result<usize, VaultSyncError> {
-        self.upload_queue.pending_count().await
+        Ok(self.pending_count_cache.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Take the pending-count receiver for event-driven status updates.
+    /// Only used by the WASM bridge to push changes to JS.
+    #[cfg(target_arch = "wasm32")]
+    pub fn take_pending_count_rx(
+        &self,
+    ) -> Option<futures::channel::mpsc::UnboundedReceiver<usize>> {
+        self.pending_count_rx.lock().unwrap().take()
     }
 
     pub async fn rotate_keys(&self) -> Result<(), VaultSyncError> {
@@ -1054,6 +1369,7 @@ impl VaultSyncClient {
                     public_key: new_pair.public_key.to_vec(),
                     schema_version: self.schema_version,
                 },
+                0,
             )
             .await
             .map_err(|e| VaultSyncError::Coordinator(format!("re-register failed: {e:?}")))?;
@@ -1149,6 +1465,7 @@ impl VaultSyncClient {
                             encrypted_blob: m.encrypted_blob,
                             timestamp: m.timestamp,
                             key_version: m.key_version,
+                            replica_id: m.replica_id,
                         };
                         if let Err(e) = dq.process_p2p_mutation(core_mutation).await {
                             tracing::error!(error = %e, "Failed to process P2P mutation");
@@ -1191,6 +1508,7 @@ impl VaultSyncClient {
                 encrypted_blob: entry.encrypted_blob.clone().unwrap_or_default(),
                 timestamp: entry.timestamp,
                 key_version,
+                replica_id: entry.replica_id.clone(),
             };
             let _ = p2p.broadcast_mutation(m).await;
         }

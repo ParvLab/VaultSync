@@ -56,6 +56,7 @@ fn parse_stream_entry(entry_val: &redis::Value, namespace: &str) -> Option<Pendi
     let mut encrypted_blob = None;
     let mut timestamp = None;
     let mut key_version = None;
+    let mut replica_id = None;
 
     for chunk in fields.chunks_exact(2) {
         let key = match &chunk[0] {
@@ -99,6 +100,11 @@ fn parse_stream_entry(entry_val: &redis::Value, namespace: &str) -> Option<Pendi
                     key_version = Some(*i as u64);
                 }
             }
+            "replica_id" => {
+                if let redis::Value::Data(d) = &chunk[1] {
+                    replica_id = Some(std::str::from_utf8(d).ok()?.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -112,6 +118,7 @@ fn parse_stream_entry(entry_val: &redis::Value, namespace: &str) -> Option<Pendi
         encrypted_blob: encrypted_blob?,
         timestamp: timestamp.unwrap_or(0),
         key_version: key_version.unwrap_or(1),
+        replica_id: replica_id.unwrap_or_default(),
     })
 }
 
@@ -202,7 +209,12 @@ impl Coordinator for RedisCoordinator {
         Ok(mutations)
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         let mut conn = self.conn.clone();
         let replicas_key = format!("vaultsync:{}:replicas", namespace);
         let schema_key = format!("vaultsync:{}:schema_version", namespace);

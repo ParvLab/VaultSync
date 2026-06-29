@@ -1,0 +1,10 @@
+name = "vaultsync-hub"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+COORDINATOR_URL = "http://localhost:9876"
+COORDINATOR_WS_URL = "ws://localhost:9876"
+# PASETO secret key (change in production)
+AUTH_SECRET = "super-secret-paseto-signing-key-for-local-dev-32-chars"
+DATABASE_URL = "postgresql://postgres:password@localhost:5432/vaultsync_hub"

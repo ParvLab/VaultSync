@@ -86,11 +86,13 @@ E:\vaultsync\
 │   │       │   └── observer.rs         # CRDT document change watcher
 │   │       ├── sync/
 │   │       │   ├── mod.rs
+│   │       │   ├── events.rs           # SyncEvents: channels for download notify, subscribe bridge
 │   │       │   ├── upload.rs           # UploadQueue: poll, batch, send, retry
-│   │       │   ├── download.rs         # DownloadQueue: poll, receive, decrypt, merge
+│   │       │   ├── download.rs         # DownloadQueue: poll, receive, decrypt, merge, push mutations, snapshots
 │   │       │   ├── retry.rs            # RetryEngine: backoff, jitter, max attempts
 │   │       │   ├── reconciler.rs       # Reconciliation: apply remote mutations
-│   │       │   └── state.rs            # SyncState: per-namespace tracking
+│   │       │   ├── state.rs            # SyncState: per-namespace tracking (includes generation_id)
+│   │       │   └── state_manager.rs    # SyncStateManager: centralized cursor + generation accessors
 │   │       ├── coordinator/
 │   │       │   ├── mod.rs
 │   │       │   ├── traits.rs           # Coordinator trait definition
@@ -121,7 +123,15 @@ E:\vaultsync\
 │   │       ├── storage.rs              # OPFS + IndexedDB storage via wasm
 │   │       ├── ipc.rs                  # BroadcastChannel + SharedArrayBuffer
 │   │       ├── e2ee.rs                 # WebCrypto E2EE bindings
-│   │       └── transport.rs            # WebSocket via web-sys
+│   │       ├── mutation_store.rs       # OPFS-backed MutationStore (push, pop_batch, ack, nack)
+│   │       ├── presence.rs             # PresenceManager (join/leave/heartbeat over BC)
+│   │       ├── ws_coordinator.rs       # WasmWsCoordinator: WebSocket coordinator impl
+│   │       └── transport/
+│   │           ├── mod.rs              # Transport module re-exports
+│   │           ├── traits.rs           # Transport trait, InboundMutation, TransportSource
+│   │           ├── broadcast_channel.rs# BroadcastChannelTransport (plaintext, same-origin)
+│   │           ├── ws_transport.rs     # WasmWsTransport (refactored from transport.rs)
+│   │           └── router.rs           # TransportRouter: merged, deduped, self-filtered stream
 │   │
 │   ├── vaultsync-coordinator-postgres/     # Postgres coordinator package
 │   │   ├── Cargo.toml
@@ -683,6 +693,7 @@ pub enum SyncStatus {
     Pending,
     Synced,
     Failed,
+    Optimistic,  // Local write before upload confirmation; promoted to Pending during startup scan
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -819,6 +830,8 @@ impl CrdtObserver {
 pub struct SyncState {
     pub namespace: String,
     pub replica_id: String,
+    #[serde(default)]
+    pub generation_id: String,  // Server/coordinator generation; triggers cursor reset on mismatch
     pub last_synced_sequence: u64,
     pub pending_upload_count: usize,
     pub connection_status: ConnectionStatus,
@@ -854,11 +867,16 @@ impl UploadQueue {
 
 **`download.rs`**:
 ```rust
+pub struct DownloadConfig {
+    pub snapshot_threshold: usize,  // Cursor lag threshold before auto-fetching snapshot (default 500)
+}
+
 pub struct DownloadQueue {
     coordinator: Arc<dyn Coordinator>,
     decryptor: Arc<E2eeDecryptor>,
     reconciler: Arc<Reconciler>,
     state: Arc<SyncState>,
+    config: DownloadConfig,
 }
 
 impl DownloadQueue {
@@ -866,10 +884,33 @@ impl DownloadQueue {
     pub async fn process_batch(&self) -> Result<DownloadResult>;
     pub async fn process_all(&self) -> Result<DownloadResult>;
 
+    // Push-primary: process a single mutation received via subscribe stream
+    pub async fn process_push_mutation(&self, mutation: PendingMutation) -> Result<()>;
+
+    // Snapshot catch-up: when cursor is behind by >snapshot_threshold, fetch a coordinator snapshot
+    pub async fn try_fetch_snapshot(&self, before_pull: bool) -> Result<Option<Vec<u8>>>;
+
     async fn fetch_batch(&self, after: u64) -> Result<Vec<PendingMutation>>;
     async fn decrypt_batch(&self, mutations: &[PendingMutation]) -> Result<Vec<Vec<u8>>>;
     async fn merge_batch(&self, updates: &[Vec<u8>]) -> Result<()>;
     async fn update_last_sequence(&self, seq: u64) -> Result<()>;
+}
+```
+
+**`events.rs`** — Channel-based event bus for sync lifecycle:
+```rust
+pub struct SyncEvents {
+    /// Unbounded channel used by subscribe() to notify the download worker
+    /// of incoming push mutations. Sends `Some(PendingMutation)` for remote
+    /// mutations and `None` as a wake-up signal (e.g., after reconnect).
+    pub download_notify: UnboundedSender<Option<PendingMutation>>,
+    pub shutdown: watch::Sender<bool>,
+    pub connection_changed: broadcast::Sender<ConnectionStatus>,
+}
+
+impl SyncEvents {
+    pub fn new() -> Self;
+    pub fn subscribe(&self) -> UnboundedReceiver<Option<PendingMutation>>;
 }
 ```
 
@@ -917,6 +958,40 @@ impl Reconciler {
 }
 ```
 
+#### Step 1.7a: Hybrid Logical Clock (`crates/vaultsync-core/src/clock.rs`)
+
+```rust
+/// Hybrid Logical Clock (HLC) for causal ordering of mutations.
+/// Combines a wall clock timestamp with a logical counter to handle
+/// concurrent events and clock skew.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HlcTimestamp {
+    pub wall: u64,    // Unix millis (monotonic, never decreases)
+    pub logical: u32, // Monotonic counter; wraps reset wall if exceeds MAX_LOGICAL
+}
+
+pub struct HybridLogicalClock {
+    inner: AtomicU64,        // Packed (wall << 32 | logical), CAS for lock-free updates
+    wrapped: AtomicBool,     // True if logical counter wrapped (metrics signal)
+}
+
+impl HybridLogicalClock {
+    pub fn new() -> Self;
+
+    /// Returns the current HLC timestamp.
+    /// CAS-loop: reads packed state, computes new wall=max(prev_wall, sys_clock),
+    /// increments logical if wall unchanged, resets logical if wall advanced.
+    /// Increments `wrapped` flag if logical exceeds MAX_LOGICAL.
+    pub fn now(&self) -> HlcTimestamp;
+
+    /// Incorporates a received timestamp to guarantee monotonicity.
+    /// Updates local clock to max(local, received) and increments logical.
+    pub fn update_with_received(&self, received: &HlcTimestamp);
+}
+```
+
+All client-side timestamps (insert, update, delete) use `clock.now().wall` instead of raw `SystemTime`. The HLC lives on `VaultSyncClient` and its `now().wall` field replaces all ad-hoc timestamp generation.
+
 #### Step 1.8: Coordinator Trait (`crates/vaultsync-core/src/coordinator/`)
 
 **`traits.rs`**:
@@ -930,6 +1005,13 @@ pub trait Coordinator: Send + Sync + Debug {
     async fn heartbeat(&self, namespace: &str, replica_id: &str) -> Result<(), CoordinatorError>;
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError>;
     async fn report_metrics(&self, metrics: CoordinatorMetrics) -> Result<(), CoordinatorError>;
+
+    /// Returns the server/coordinator generation ID. Default returns empty string
+    /// for coordinators that don't support generation tracking. A new generation
+    /// (e.g., UUID at server startup) signals clients to reset their cursor.
+    async fn generation_id(&self) -> String {
+        String::new()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1022,6 +1104,7 @@ pub struct VaultSyncClient {
     oplog: Arc<OpLog>,
     schema: Arc<SchemaRegistry>,
     subscriptions: Arc<SubscriptionEngine>,
+    clock: Arc<HybridLogicalClock>,  // HLC for causal timestamp ordering
     upload_queue: Arc<UploadQueue>,
     download_queue: Arc<DownloadQueue>,
     reconciller: Arc<Reconciler>,
@@ -1031,10 +1114,19 @@ pub struct VaultSyncClient {
 
 impl VaultSyncClient {
     pub async fn new(config: VaultSyncConfig) -> Result<Self>;
+
+    /// Initializes the client: loads sync state, spawns workers, performs
+    /// generation check. After `register()` is sent to the coordinator, reads
+    /// `coordinator.generation_id()` and compares with stored
+    /// `sync_state.generation_id`. If mismatch (server restart / new gen),
+    /// **eagerly resets cursor to 0** before spawning download worker.
+    /// This ensures all mutations are re-downloaded after coordinator restart.
     pub async fn initialize(&self) -> Result<()>;
     pub async fn shutdown(&self) -> Result<()>;
 
-    // CRUD
+    // CRUD — All local writes produce entries with SyncStatus::Optimistic
+    // (not Pending). The upload worker promotes Optimistic→Pending during
+    // its startup scan, ensuring crash-recovery re-queues unacknowledged writes.
     pub async fn insert(&self, doc_id: &str, record_id: &str, fields: HashMap<String, CrdtValue>) -> Result<()>;
     pub async fn update(&self, doc_id: &str, record_id: &str, fields: HashMap<String, CrdtValue>) -> Result<()>;
     pub async fn delete(&self, doc_id: &str, record_id: &str) -> Result<()>;
@@ -1085,10 +1177,13 @@ Compile `vaultsync-core` to WASM for browser use. Implement OPFS and IndexedDB s
 | **P2.1** WASM storage trait | `crates/vaultsync-wasm/src/storage.rs` | Implement Storage trait for OPFS (via `send_sync`) and IndexedDB (via web-sys). OPFS: open SQLite via WASM in Web Worker, use synchronous access. IndexedDB: store Yrs snapshots as IDB records |
 | **P2.2** WASM IPC | `crates/vaultsync-wasm/src/ipc.rs` | Wraps `BroadcastChannel` for cross-tab messaging, `navigator.locks` for leader election fallback |
 | **P2.3** WASM E2EE | `crates/vaultsync-wasm/src/e2ee.rs` | Maps `Encrypt`/`Decrypt` to WebCrypto `subtle.encrypt`/`subtle.decrypt` (X25519 not natively available in all browsers — fallback to WASM-compiled libsodium) |
-| **P2.4** WASM transport | `crates/vaultsync-wasm/src/transport.rs` | WebSocket via `web_sys::WebSocket`. HTTP/SSE fallback for coordinators that don't support WS |
+| **P2.4** WASM transport | `crates/vaultsync-wasm/src/transport/` | Restructured into `transport/` directory: `mod.rs`, `traits.rs` (Transport trait, InboundMutation, TransportSource), `broadcast_channel.rs` (BC transport — plaintext, same-origin), `ws_transport.rs` (WasmWsTransport via web_sys::WebSocket, refactored old transport.rs), `router.rs` (TransportRouter — merged incoming stream + channel-based dedup + self-filter) |
 | **P2.5** WASM client bindings | `crates/vaultsync-wasm/src/client.rs` | #[wasm_bindgen] annotated wrapper: exposes `VaultSyncClient` methods to JS |
 | **P2.6** TypeScript types | `packages/web/src/` | Manual TypeScript type definitions that match the WASM exported API |
 | **P2.7** Storage detection | `packages/web/src/vaultsync.ts` | `VaultSync.detectStorage()`: try OPFS first, fallback to IndexedDB |
+| **P2.8** MutationStore (Phase E) | `crates/vaultsync-wasm/src/mutation_store.rs` | OPFS-backed `MutationStore` with `push()`, `pop_batch()`, `ack()`, `nack()`, `pending_count()`. Registered in WASM crate for crash-recovery optimistic write scanning |
+| **P2.9** Presence (Phase G) | `crates/vaultsync-wasm/src/presence.rs` | `PresenceManager` with join/leave/heartbeat over BroadcastChannel. `beforeunload` hook. `#[wasm_bindgen]` export with `peer_count()`, `active_peers_json()`. Peer tracking via dedicated BC listeners |
+| **P2.10** WsCoordinator | `crates/vaultsync-wasm/src/ws_coordinator.rs` | `WasmWsCoordinator` — WebSocket coordinator impl. `generation_id()` parses RegisterAck payload. Subscription + push notify via mpsc channels |
 
 ### WASM Build Configuration
 
@@ -1396,7 +1491,7 @@ Build the TypeScript SDKs that wrap the WASM/Native Rust core and provide idioma
   ├── useVaultSyncOne (single record subscription)
   ├── useVaultSyncMutations (insert, update, delete)
   ├── useVaultSyncSync (sync status hook)
-  └── SyncIndicator (pre-built component)
+  └── SyncIndicator (pre-built component with optional `showPeers` prop and expanded sync status display)
 ```
 
 ### Web SDK Core (`packages/web/src/vaultsync.ts`)
@@ -1450,6 +1545,8 @@ export class VaultSync {
   get sync(): SyncStatus { /* returns sync status observable */ }
   get keys(): KeyManager { /* returns E2EE key manager */ }
   get leader(): LeaderStatus { /* returns leader status */ }
+  get metrics(): MetricsSnapshot { /* returns current metrics: push_mutations_received, snapshots_applied, optimistic_writes, hlc_logical_wraps, active_peers */ }
+  get presence(): PresenceHandle { /* returns PresenceManager methods: peerCount, activePeers, join, leave */ }
 
   async shutdown(): Promise<void> { await this.client.shutdown() }
 }
@@ -1573,6 +1670,8 @@ export function useVaultSyncSync() {
     connected: false,
     pendingUploads: 0,
     lastSyncAt: null,
+    generationId: "",
+    activePeers: 0,
   })
 
   useEffect(() => {
@@ -1639,7 +1738,8 @@ Implement the full test suite defined in `vaultsync-testing-spec.md`. This phase
 | **P6.11** Fuzz targets | Fuzz | `crates/vaultsync-fuzz/fuzz_targets/` | 6 cargo-fuzz targets |
 | **P6.12** E2E (Playwright) | E2E | `packages/web/__tests__/e2e/` | Cross-tab sync, leader crash, offline→online in browser |
 | **P6.13** TS SDK unit tests | Unit | `packages/*/__tests__/` | Jest tests for TypeScript wrappers |
-| **P6.14** Coverage enforcement | CI | `.github/workflows/coverage.yml` | tarpaulin + threshold checks |
+| **P6.14** Phase integration tests | Integration | `crates/vaultsync-core/tests/phase_integration.rs` | 11 test scenarios covering Phases B–G: push mutation flow (B), HLC monotonicity (C), snapshot catch-up (D), optimistic→synced transition (F), presence join/leave detection (G), push+snapshot combined, optimistic crash-recovery, metrics recording, sync status transitions, concurrent push+snapshot, presence heartbeat expiry |
+| **P6.15** Coverage enforcement | CI | `.github/workflows/coverage.yml` | tarpaulin + threshold checks |
 
 ### Test Run Commands
 
@@ -1795,7 +1895,7 @@ pub async fn insert(&self, doc_id: &str, record_id: &str, fields: HashMap<String
         self.oplog.append(OplogEntry {
             yrs_update,
             encrypted_blob: Some(encrypted),
-            sync_status: SyncStatus::Pending,
+            sync_status: SyncStatus::Optimistic,
             // ...
         }).await?;
         drop(oplog_span);
@@ -1849,12 +1949,17 @@ pub struct VaultSyncMetrics {
     pub mutations_total: Counter,     // labels: status, namespace
     pub mutations_failed: Counter,    // labels: reason, namespace
     pub conflicts_total: Counter,
+    pub push_mutations_received: Counter, // Incremented in DownloadQueue::process_push_mutation
+    pub snapshots_applied: Counter,       // Incremented in DownloadQueue::try_fetch_snapshot
+    pub optimistic_writes: Counter,       // Incremented on each SyncStatus::Optimistic write
+    pub hlc_logical_wraps: Counter,       // Incremented when HLC logical counter wraps (clock.rs)
 
     // Gauges
     pub mutations_pending: Gauge,     // labels: namespace
     pub connection_status: Gauge,     // labels: namespace (1=connected, 0=disconnected)
     pub leader_status: Gauge,         // 1=leader, 0=reader
     pub oplog_size: Gauge,            // labels: namespace
+    pub active_peers: Gauge,          // Set by PresenceManager on join/leave events
 
     // Histograms
     pub sync_lag_ms: Histogram,       // labels: namespace

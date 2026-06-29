@@ -1,6 +1,6 @@
 use super::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use crate::error::VaultSyncError;
-use crate::oplog::entry::OplogEntry;
+use crate::oplog::entry::{MutationOrigin, OplogEntry};
 use crate::sync::state::SyncState;
 use async_trait::async_trait;
 use rusqlite::params;
@@ -64,7 +64,8 @@ impl SQLiteStorage {
                 leader_status TEXT,
                 last_connected_at INTEGER,
                 last_sync_at INTEGER,
-                schema_version INTEGER NOT NULL DEFAULT 0
+                schema_version INTEGER NOT NULL DEFAULT 0,
+                generation_id TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS schemas (
                 doc_id TEXT PRIMARY KEY,
@@ -281,7 +282,7 @@ impl Storage for SQLiteStorage {
             let conn = conn.lock().unwrap();
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, replica_id, mutation_type, doc_id, record_id, yrs_update, encrypted_blob, timestamp, sequence, sync_status, synced_at, created_at
-                 FROM oplog WHERE namespace = ?1 AND sync_status = 'Pending' ORDER BY created_at ASC LIMIT ?2"
+                 FROM oplog WHERE namespace = ?1 AND sync_status IN ('Pending', 'Optimistic') ORDER BY created_at ASC LIMIT ?2"
             )?;
             let rows = stmt.query_map(params![namespace, limit as i64], Self::map_oplog_entry)?;
             let mut results = Vec::new();
@@ -354,7 +355,7 @@ impl Storage for SQLiteStorage {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT namespace, replica_id, last_synced_sequence, connection_status, leader_status, last_connected_at, last_sync_at, schema_version
+                "SELECT namespace, replica_id, last_synced_sequence, connection_status, leader_status, last_connected_at, last_sync_at, schema_version, COALESCE(generation_id, '')
                  FROM sync_state WHERE namespace = ?1"
             )?;
             let mut rows = stmt.query(params![namespace])?;
@@ -370,6 +371,7 @@ impl Storage for SQLiteStorage {
                         last_connected_at: row.get(5)?,
                         last_sync_at: row.get(6)?,
                         schema_version: row.get::<_, i64>(7)? as u64,
+                        generation_id: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
                     }))
                 }
                 None => Ok(None),
@@ -385,13 +387,14 @@ impl Storage for SQLiteStorage {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             conn.execute(
-                "INSERT OR REPLACE INTO sync_state (namespace, replica_id, last_synced_sequence, connection_status, leader_status, last_connected_at, last_sync_at, schema_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT OR REPLACE INTO sync_state (namespace, replica_id, last_synced_sequence, connection_status, leader_status, last_connected_at, last_sync_at, schema_version, generation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     state.namespace, state.replica_id, state.last_synced_sequence as i64,
                     format!("{:?}", state.connection_status),
                     state.leader_status.map(|b| if b { "Leader" } else { "Reader" }),
                     state.last_connected_at, state.last_sync_at, state.schema_version as i64,
+                    state.generation_id,
                 ],
             )?;
             Ok(())
@@ -750,6 +753,8 @@ impl SQLiteStorage {
             sync_status,
             synced_at: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
             created_at: row.get::<_, i64>(12)? as u64,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
         })
     }
 }

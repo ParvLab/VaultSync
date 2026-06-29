@@ -19,7 +19,7 @@ pub async fn run_key_management_tests(coord: Arc<dyn Coordinator>, ns: &str) {
         schema_version: 0,
     };
     coord
-        .register(ns, rep)
+        .register(ns, rep, 0)
         .await
         .expect("register replica first");
 

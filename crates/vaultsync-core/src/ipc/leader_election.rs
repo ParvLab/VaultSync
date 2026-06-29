@@ -13,10 +13,10 @@ type LockHandle = std::fs::File;
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
-export function acquire_web_lock(lock_name, on_acquired, on_released) {
+export function acquire_web_lock(lock_name, lock_id, on_acquired, on_released) {
     let release_promise = new Promise((resolve) => {
         window._vaultsync_releases = window._vaultsync_releases || {};
-        window._vaultsync_releases[lock_name] = resolve;
+        window._vaultsync_releases[lock_id] = resolve;
     });
     navigator.locks.request(lock_name, async (lock) => {
         on_acquired();
@@ -26,27 +26,27 @@ export function acquire_web_lock(lock_name, on_acquired, on_released) {
         console.error("Web Lock acquisition failed", err);
     });
 }
-export function release_web_lock(lock_name) {
-    if (window._vaultsync_releases && window._vaultsync_releases[lock_name]) {
-        window._vaultsync_releases[lock_name]();
-        delete window._vaultsync_releases[lock_name];
+export function release_web_lock(lock_id) {
+    if (window._vaultsync_releases && window._vaultsync_releases[lock_id]) {
+        window._vaultsync_releases[lock_id]();
+        delete window._vaultsync_releases[lock_id];
     }
 }
 "#)]
 extern "C" {
     fn acquire_web_lock(
         lock_name: &str,
+        lock_id: &str,
         on_acquired: &js_sys::Function,
         on_released: &js_sys::Function,
     );
-    fn release_web_lock(lock_name: &str);
+    fn release_web_lock(lock_id: &str);
 }
 
 #[cfg(target_arch = "wasm32")]
 pub struct WasmLockState {
     name: String,
-    _acquired: wasm_bindgen::closure::Closure<dyn FnMut()>,
-    _released: wasm_bindgen::closure::Closure<dyn FnMut()>,
+    id: String,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -103,25 +103,33 @@ impl LeaderElection {
                 is_leader_clone.store(true, Ordering::SeqCst);
                 tracing::info!("[LeaderElection] Acquired lock for {}", name_clone);
             })
-                as Box<dyn FnMut()>);
+                as Box<dyn Fn()>);
 
             let name_clone2 = name.clone();
             let on_released = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
                 is_leader_clone2.store(false, Ordering::SeqCst);
                 tracing::info!("[LeaderElection] Released lock for {}", name_clone2);
             })
-                as Box<dyn FnMut()>);
+                as Box<dyn Fn()>);
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let id_clone = id.clone();
 
             acquire_web_lock(
                 &name,
+                &id,
                 on_acquired.as_ref().unchecked_ref(),
                 on_released.as_ref().unchecked_ref(),
             );
 
+            // Forget the closures so they are never dropped in Rust, keeping them alive
+            // for the asynchronous Web Lock callbacks.
+            on_acquired.forget();
+            on_released.forget();
+
             *handle_guard = Some(WasmLockState {
                 name,
-                _acquired: on_acquired,
-                _released: on_released,
+                id: id_clone,
             });
 
             Ok(false)
@@ -225,7 +233,7 @@ impl LeaderElection {
             }
             #[cfg(target_arch = "wasm32")]
             {
-                release_web_lock(&handle.name);
+                release_web_lock(&handle.id);
             }
             #[cfg(all(not(any(windows, unix)), not(target_arch = "wasm32")))]
             {

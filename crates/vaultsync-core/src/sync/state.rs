@@ -11,6 +11,8 @@ pub struct SyncState {
     pub last_connected_at: Option<u64>,
     pub last_sync_at: Option<u64>,
     pub schema_version: u64,
+    #[serde(default)]
+    pub generation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +25,22 @@ pub enum ConnectionStatus {
 impl Default for ConnectionStatus {
     fn default() -> Self {
         ConnectionStatus::Disconnected
+    }
+}
+
+impl SyncState {
+    pub fn new(namespace: String, generation_id: String) -> Self {
+        Self {
+            namespace,
+            replica_id: String::new(),
+            last_synced_sequence: 0,
+            connection_status: ConnectionStatus::Connected,
+            leader_status: Some(true),
+            last_connected_at: None,
+            last_sync_at: None,
+            schema_version: 0,
+            generation_id,
+        }
     }
 }
 

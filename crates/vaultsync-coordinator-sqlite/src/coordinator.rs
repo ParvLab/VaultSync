@@ -10,6 +10,7 @@ use vaultsync_core::coordinator::traits::*;
 pub struct SQLiteCoordinator {
     conn: Arc<Mutex<rusqlite::Connection>>,
     tx: broadcast::Sender<PendingMutation>,
+    db_path: String,
 }
 
 impl SQLiteCoordinator {
@@ -25,6 +26,7 @@ impl SQLiteCoordinator {
         Self {
             conn: Arc::new(Mutex::new(conn)),
             tx,
+            db_path: path.to_string(),
         }
     }
 }
@@ -36,9 +38,12 @@ impl Coordinator for SQLiteCoordinator {
         namespace: &str,
         mutations: Vec<EncryptedMutation>,
     ) -> Result<Vec<SequenceId>, CoordinatorError> {
+        let db_path = self.db_path.clone();
         let conn = self.conn.clone();
         let namespace_str = namespace.to_string();
         let tx_sender = self.tx.clone();
+
+        tracing::info!("[push] db={} ns={} count={}", db_path, namespace_str, mutations.len());
 
         let push_res = tokio::task::spawn_blocking(move || {
             let mut conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
@@ -47,13 +52,16 @@ impl Coordinator for SQLiteCoordinator {
             let mut seq_ids = Vec::new();
             let mut pending_to_broadcast = Vec::new();
             {
-                let mut stmt = tx.prepare(
-                    "INSERT INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version)
+                let mut insert = tx.prepare(
+                    "INSERT OR IGNORE INTO mutations (id, namespace, replica_id, doc_id, record_id, encrypted_blob, timestamp, key_version)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+                let mut lookup = tx.prepare(
+                    "SELECT sequence FROM mutations WHERE id = ?1"
                 ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
                 for m in mutations {
-                    stmt.execute(params![
+                    let inserted = insert.execute(params![
                         m.id,
                         namespace_str,
                         m.replica_id,
@@ -63,7 +71,12 @@ impl Coordinator for SQLiteCoordinator {
                         m.timestamp as i64,
                         m.key_version as i64
                     ]).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-                    let seq = tx.last_insert_rowid() as u64;
+                    let seq = if inserted > 0 {
+                        tx.last_insert_rowid() as u64
+                    } else {
+                        lookup.query_row(params![m.id], |row| row.get::<_, i64>(0))
+                            .map_err(|e| CoordinatorError::Internal(e.to_string()))? as u64
+                    };
                     seq_ids.push(seq);
                     pending_to_broadcast.push(PendingMutation {
                         id: m.id,
@@ -74,6 +87,7 @@ impl Coordinator for SQLiteCoordinator {
                         encrypted_blob: m.encrypted_blob,
                         timestamp: m.timestamp,
                         key_version: m.key_version,
+                        replica_id: m.replica_id,
                     });
                 }
             }
@@ -83,7 +97,19 @@ impl Coordinator for SQLiteCoordinator {
 
         let (seq_ids, pending_to_broadcast) = push_res;
         for pm in pending_to_broadcast {
-            let _ = tx_sender.send(pm);
+            let seq = pm.sequence;
+            match tx_sender.send(pm) {
+                Ok(receivers) => {
+                    if receivers == 0 {
+                        tracing::warn!("[push] broadcast to 0 receivers seq={}", seq);
+                    } else {
+                        tracing::debug!("[push] broadcasted seq={} to {} receivers", seq, receivers);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[push] broadcast channel closed seq={}", e.0.sequence);
+                }
+            }
         }
         Ok(seq_ids)
     }
@@ -94,13 +120,26 @@ impl Coordinator for SQLiteCoordinator {
         after: SequenceId,
         limit: usize,
     ) -> Result<Vec<PendingMutation>, CoordinatorError> {
+        let db_path = self.db_path.clone();
         let conn = self.conn.clone();
         let namespace_str = namespace.to_string();
 
         tokio::task::spawn_blocking(move || {
             let conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+
+            // Check max sequence for diagnostic
+            let max_seq: i64 = conn_guard.query_row(
+                "SELECT COALESCE(MAX(sequence),0) FROM mutations WHERE namespace=?",
+                params![namespace_str],
+                |r| r.get(0),
+            ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            tracing::info!("[pull] db={} ns={} after={} max_seq={}", db_path, namespace_str, after, max_seq);
+            if max_seq < after as i64 {
+                tracing::warn!("[pull] cursor past end: after={} max_seq={}", after, max_seq);
+            }
+
             let mut stmt = conn_guard.prepare(
-                "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
+                "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
                  FROM mutations
                  WHERE namespace = ?1 AND sequence > ?2
                  ORDER BY sequence ASC
@@ -117,12 +156,20 @@ impl Coordinator for SQLiteCoordinator {
                     encrypted_blob: row.get(5)?,
                     timestamp: row.get(6)?,
                     key_version: row.get(7)?,
+                    replica_id: row.get(8)?,
                 })
             }).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
 
             let mut res = Vec::new();
             for row in rows {
                 res.push(row.map_err(|e| CoordinatorError::Internal(e.to_string()))?);
+            }
+            tracing::info!("[pull] returned {} rows", res.len());
+            if let Some(first) = res.first() {
+                tracing::info!("[pull] first seq={}", first.sequence);
+            }
+            if let Some(last) = res.last() {
+                tracing::info!("[pull] last seq={}", last.sequence);
             }
             Ok(res)
         }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
@@ -140,13 +187,14 @@ impl Coordinator for SQLiteCoordinator {
 
         tokio::spawn(async move {
             let mut last_sent = from_sequence;
+            let ns_db = namespace_str.clone();
 
             // 1. Query existing mutations from DB that occurred after `from_sequence`
-            let ns_db = namespace_str.clone();
+            let db_conn = conn.clone();
             let db_res = tokio::task::spawn_blocking(move || {
-                let conn_guard = conn.lock().ok()?;
+                let conn_guard = db_conn.lock().ok()?;
                 let mut stmt = conn_guard.prepare(
-                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version
+                    "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
                      FROM mutations
                      WHERE namespace = ?1 AND sequence > ?2
                      ORDER BY sequence ASC"
@@ -161,6 +209,7 @@ impl Coordinator for SQLiteCoordinator {
                         encrypted_blob: row.get(5)?,
                         timestamp: row.get(6)?,
                         key_version: row.get(7)?,
+                        replica_id: row.get(8)?,
                     })
                 }).ok()?;
                 let mut res = Vec::new();
@@ -181,12 +230,75 @@ impl Coordinator for SQLiteCoordinator {
                 }
             }
 
-            // 2. Stream new mutations from the broadcast channel
-            while let Ok(m) = rx_broadcast.recv().await {
-                if m.namespace == namespace_str && m.sequence > last_sent {
-                    last_sent = m.sequence;
-                    if tx_mpsc.send(m).await.is_err() {
-                        return;
+            // 2. Stream new mutations from the broadcast channel.
+            //    Handle Lagged gracefully: re-query DB to catch missed mutations.
+            loop {
+                match rx_broadcast.recv().await {
+                    Ok(m) => {
+                        if m.namespace == namespace_str && m.sequence > last_sent {
+                            last_sent = m.sequence;
+                            if tx_mpsc.send(m).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            "subscription lagged by {} messages ns={} — re-querying DB",
+                            n,
+                            namespace_str
+                        );
+                        // Re-query DB from last_sent to recover missed mutations
+                        let catchup_conn = conn.clone();
+                        let catchup_ns = namespace_str.clone();
+                        let after = last_sent;
+                        let catchup = tokio::task::spawn_blocking(move || {
+                            let conn_guard = catchup_conn.lock().ok()?;
+                            let mut stmt = conn_guard.prepare(
+                                "SELECT id, namespace, sequence, doc_id, record_id, encrypted_blob, timestamp, key_version, replica_id
+                                 FROM mutations
+                                 WHERE namespace = ?1 AND sequence > ?2
+                                 ORDER BY sequence ASC"
+                            ).ok()?;
+                            let rows = stmt.query_map(params![catchup_ns, after], |row| {
+                                Ok(PendingMutation {
+                                    id: row.get(0)?,
+                                    namespace: row.get(1)?,
+                                    sequence: row.get(2)?,
+                                    doc_id: row.get(3)?,
+                                    record_id: row.get(4)?,
+                                    encrypted_blob: row.get(5)?,
+                                    timestamp: row.get(6)?,
+                                    key_version: row.get(7)?,
+                                    replica_id: row.get(8)?,
+                                })
+                            }).ok()?;
+                            let mut res = Vec::new();
+                            for r in rows {
+                                if let Ok(m) = r {
+                                    res.push(m);
+                                }
+                            }
+                            Some(res)
+                        }).await;
+                        if let Ok(Some(mutations)) = catchup {
+                            let caught = mutations.len();
+                            for m in mutations {
+                                last_sent = last_sent.max(m.sequence);
+                                if tx_mpsc.send(m).await.is_err() {
+                                    return;
+                                }
+                            }
+                            tracing::info!(
+                                "subscription DB catchup delivered {} mutations ns={}",
+                                caught,
+                                namespace_str
+                            );
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::info!("subscription broadcast channel closed ns={}", namespace_str);
+                        break;
                     }
                 }
             }
@@ -195,7 +307,12 @@ impl Coordinator for SQLiteCoordinator {
         Ok(Box::new(SqliteSubscription { rx: rx_mpsc }))
     }
 
-    async fn register(&self, namespace: &str, info: ReplicaInfo) -> Result<(), CoordinatorError> {
+    async fn register(
+        &self,
+        namespace: &str,
+        info: ReplicaInfo,
+        _last_sequence: SequenceId,
+    ) -> Result<(), CoordinatorError> {
         let conn = self.conn.clone();
         let namespace_str = namespace.to_string();
 

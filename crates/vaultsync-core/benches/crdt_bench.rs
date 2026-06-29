@@ -3,7 +3,7 @@ use std::sync::Arc;
 use vaultsync_core::crdt::document::CRDTDocument;
 use vaultsync_core::crdt::types::CrdtValue;
 use vaultsync_core::e2ee::keyring::{E2eeDecryptor, E2eeEncryptor, KeyRing};
-use vaultsync_core::oplog::entry::{MutationType, OplogEntry, SyncStatus};
+use vaultsync_core::oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus};
 use vaultsync_core::storage::sqlite::SQLiteStorage;
 use vaultsync_core::storage::traits::Storage;
 
@@ -114,6 +114,8 @@ fn bench_oplog_append(c: &mut Criterion) {
                             sync_status: SyncStatus::Pending,
                             synced_at: None,
                             created_at: 1000,
+                            origin: MutationOrigin::Unknown,
+                            origin_context: String::new(),
                         };
                         storage.append_oplog(&entry).await.unwrap();
                     }
@@ -155,6 +157,8 @@ fn bench_oplog_read_pending(c: &mut Criterion) {
                             sync_status: SyncStatus::Pending,
                             synced_at: None,
                             created_at: 1000,
+                            origin: MutationOrigin::Unknown,
+                            origin_context: String::new(),
                         };
                         storage.append_oplog(&entry).await.unwrap();
                     }

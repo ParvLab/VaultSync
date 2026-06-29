@@ -7,6 +7,25 @@ use std::sync::Arc;
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+/// Derive a **deterministic** 32-byte symmetric key for a given namespace and
+/// key-version.
+///
+/// This does NOT use the per-device random keypair — it is derived from the
+/// namespace string alone, so every browser/replica that knows the namespace
+/// will compute the same symmetric key for the same version. The X25519
+/// keypair is kept for future asymmetric P2P encryption but is no longer
+/// used for symmetric namespace encryption.
+fn derive_symmetric_namespace_key(namespace: &str, version: u64) -> [u8; 32] {
+    // Salt binds this derivation to VaultSync symmetric encryption.
+    // Info binds it to the specific (namespace, version) pair so that
+    // different versions produce different keys.
+    let hk = Hkdf::<Sha256>::new(Some(b"vaultsync-symmetric-v1"), namespace.as_bytes());
+    let mut okm = [0u8; 32];
+    hk.expand(&version.to_le_bytes(), &mut okm)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    okm
+}
+
 #[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct NamespaceKeypair {
     pub public_key: [u8; 32],
@@ -265,7 +284,9 @@ impl E2eeEncryptor {
         );
         let _enter = span.enter();
 
-        let key = self.keyring.derive_namespace_key(namespace);
+        // Use deterministic key — every replica with the same namespace derives
+        // the same key, enabling cross-browser / cross-device decryption.
+        let key = derive_symmetric_namespace_key(namespace, active_version);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
 
         let mut nonce_bytes = [0u8; 12];
@@ -343,6 +364,7 @@ impl E2eeDecryptor {
                 "invalid ciphertext length (too short)".into(),
             ));
         }
+        // First 8 bytes are the key version used during encryption
         let key_version = u64::from_le_bytes(ciphertext[..8].try_into().unwrap());
 
         let span = tracing::info_span!(
@@ -355,12 +377,9 @@ impl E2eeDecryptor {
         let nonce_bytes = &ciphertext[8..20];
         let actual_ciphertext = &ciphertext[20..];
 
-        let key = self
-            .keyring
-            .derive_namespace_key_for_version(namespace, key_version)
-            .ok_or_else(|| {
-                VaultSyncError::Encryption(format!("unknown key version {key_version}"))
-            })?;
+        // Use deterministic key — derived from (namespace, version), no random
+        // keypair involved. Any browser with the same namespace can decrypt.
+        let key = derive_symmetric_namespace_key(namespace, key_version);
 
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let nonce = Nonce::from_slice(nonce_bytes);

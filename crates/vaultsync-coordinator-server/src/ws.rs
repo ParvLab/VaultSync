@@ -226,7 +226,10 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         schema_version: reg_payload.schema_version,
     };
 
-    let reg_result = state.coordinator.register(&ns, replica_info).await;
+    let reg_result = state
+        .coordinator
+        .register(&ns, replica_info, reg_payload.last_sequence)
+        .await;
     let mut reg_ack = RegisterAckPayload {
         status: "ok".to_string(),
         coordinator_sequence: 0,
@@ -234,6 +237,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         snapshot_sequence: 0,
         snapshot_url: None,
         error: None,
+        generation_id: state.generation_id.clone(),
     };
 
     let mut available_snapshots = Vec::new();
@@ -336,17 +340,29 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                 match msg_type {
                     MSG_PUSH => {
                         if let Ok(push) = serde_json::from_slice::<PushPayload>(payload) {
+                            let req_id = push.request_id.clone();
+                            tracing::info!(
+                                "[ws] MSG_PUSH received count={} req={}",
+                                push.mutations.len(),
+                                req_id
+                            );
                             let res = state.coordinator.push(&ns, push.mutations).await;
                             let (sequences, error) = match res {
                                 Ok(seqs) => (seqs, None),
                                 Err(e) => (vec![], Some(format!("{:?}", e))),
                             };
+                            tracing::info!("[ws] MSG_PUSH stored, sending ACK req={}", req_id);
                             let ack = PushAckPayload {
                                 request_id: push.request_id,
-                                sequences,
+                                sequences: sequences.clone(),
                                 error,
                             };
                             if let Ok(frame) = encode_frame(MSG_PUSH_ACK, &ack) {
+                                tracing::info!(
+                                    "[ws] sending PUSH_ACK req={} sequences={:?}",
+                                    req_id,
+                                    sequences
+                                );
                                 let _ = tx.send(Message::Binary(frame)).await;
                             }
                         }
@@ -406,6 +422,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                     }
                     MSG_SUBSCRIBE => {
                         if let Ok(sub) = serde_json::from_slice::<SubscribePayload>(payload) {
+                            info!("[ws] subscribe namespace={} after={}", sub.namespace, sub.after);
                             if let Some(cancel) = active_sub_tx.take() {
                                 let _ = cancel.send(());
                             }
@@ -417,6 +434,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                             match stream_res {
                                 Ok(stream) => {
                                     let tx_clone = tx.clone();
+                                    let connected_replica_id = replica_id.clone();
                                     tokio::spawn(async move {
                                         let mut pinned_stream = std::pin::Pin::from(stream);
                                         loop {
@@ -427,6 +445,10 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                                                 next = pinned_stream.next() => {
                                                     match next {
                                                         Some(mutation) => {
+                                                            // Server-side filter: skip mutations from the connected replica
+                                                            if mutation.replica_id == connected_replica_id {
+                                                                continue;
+                                                            }
                                                             if let Ok(frame) = encode_frame(MSG_MUTATION_PUSH, &mutation) {
                                                                 if tx_clone.send(Message::Binary(frame)).await.is_err() {
                                                                     break;

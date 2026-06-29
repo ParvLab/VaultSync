@@ -87,6 +87,7 @@ async fn test_push_pull_flow() {
                 public_key: vec![1, 2, 3],
                 schema_version: 42,
             },
+            0,
         )
         .await
         .unwrap();

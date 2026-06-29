@@ -81,11 +81,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let generation_id = uuid::Uuid::new_v4().to_string();
+    tracing::info!("Server generation_id={}", generation_id);
+
     let state = AppState {
         coordinator,
         token_store,
         config: config.clone(),
         sessions: Default::default(),
+        generation_id,
     };
 
     // Build the Axum router

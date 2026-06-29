@@ -19,6 +19,7 @@ pub struct SubscriptionEngine {
     by_doc_id: HashMap<String, Vec<u64>>,
     next_handle: u64,
     global_listener: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+    fire_count: u64,
 }
 
 impl SubscriptionEngine {
@@ -28,6 +29,7 @@ impl SubscriptionEngine {
             by_doc_id: HashMap::new(),
             next_handle: 1,
             global_listener: None,
+            fire_count: 0,
         }
     }
 
@@ -73,7 +75,21 @@ impl SubscriptionEngine {
         Ok(())
     }
 
-    pub fn fire(&self, doc_id: &str, record_id: &str, state: &HashMap<String, CrdtValue>) {
+    pub fn listener_count(&self, doc_id: &str) -> usize {
+        self.by_doc_id.get(doc_id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    pub fn fire(&mut self, doc_id: &str, record_id: &str, state: &HashMap<String, CrdtValue>) {
+        self.fire_count += 1;
+        let seq = self.fire_count;
+        let listeners = self.listener_count(doc_id);
+        tracing::info!(
+            "[subscription] fire seq={} doc={} record={} listeners={}",
+            seq,
+            doc_id,
+            record_id,
+            listeners,
+        );
         if let Some(ref listener) = self.global_listener {
             listener(doc_id, record_id);
         }

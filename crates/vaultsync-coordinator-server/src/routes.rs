@@ -108,7 +108,7 @@ pub async fn register_replica(
 ) -> Result<StatusCode, StatusCode> {
     authorize_namespace(&state, &headers, &ns).await?;
 
-    state.coordinator.register(&ns, info).await.map_err(|e| {
+    state.coordinator.register(&ns, info, 0).await.map_err(|e| {
         tracing::error!("Failed to register replica: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;

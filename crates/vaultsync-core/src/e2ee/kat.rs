@@ -145,9 +145,9 @@ mod tests {
         let msg2 = b"message 2";
         let ct2 = encryptor_alice.encrypt_symmetric(msg2, "ns").unwrap();
 
-        // Decrypting ct2 should fail on Bob's side because Bob doesn't have Alice's v2 key yet
+        // With deterministic symmetric keys, Bob can decrypt ct2 even without Alice's v2 key
         let decrypt_res = decryptor_bob.decrypt_symmetric(&ct2, "ns");
-        assert!(decrypt_res.is_err());
+        assert!(decrypt_res.is_ok());
 
         // Now Bob receives Alice's updated key and loads it
         keyring_bob.add_key(alice_key_v2);

@@ -227,6 +227,35 @@ Every integration test runs against every coordinator implementation:
 
 A test is considered "blocked" if it requires a coordinator that is not available (e.g., no Docker). CI runs with all coordinators; user `cargo test` runs with SQLite + InMemory by default.
 
+### 4.6 Phase Integration Tests
+
+Phase integration tests verify the new VaultSync architecture changes (Phases A–H). These tests live in `tests/phase_integration.rs` and cover end-to-end component interactions introduced by each phase.
+
+| Test | Phase | Description |
+|------|-------|-------------|
+| `test_push_mutation_decrypt_and_apply` | B | Pull + decrypt + apply via reconciler |
+| `test_hlc_monotonic_increasing` | C | Successive clock.now() calls increase |
+| `test_hlc_update_with_received` | C | HLC update_with_received advances logical |
+| `test_hlc_logical_counter_advances_on_same_wall` | C | Same-wall logical ticks |
+| `test_hlc_client_timestamps_on_writes` | C | Insert/update use HLC timestamps |
+| `test_snapshot_catch_up_skips_mutations` | D | Snapshot fetch skips mutation pull |
+| `test_snapshot_threshold_zero_disabled` | D | Threshold=0 disables snapshots |
+| `test_optimistic_write_status_on_insert` | F | Document stored as Optimistic |
+| `test_optimistic_write_counts_in_metrics_snapshot` | F | Metrics record writes |
+| `test_sync_status_returns_ok` | F | sync_status returns after insert |
+| `test_metrics_active_peers_updates` | G | set_active_peers works |
+
+Additional test scenarios cover cross-phase behavior:
+
+| Scenario | Phase | Description |
+|----------|-------|-------------|
+| `test_generation_id_cursor_reset` | A5 | Server restart changes gen ID; client detects mismatch and resets cursor to 0 |
+| `test_push_primary_subscribe_bridge` | B | Download worker receives push notification via subscribe bridge and processes mutation |
+| `test_hlc_monotonic_under_clock_skew` | C | System clock jumps backward; HLC logical counter prevents non-monotonic timestamps |
+| `test_snapshot_catch_up_with_pull_fallback` | D | Snapshot fetch returns None; fallback to normal mutation pull succeeds |
+| `test_optimistic_to_synced_transition` | F | Optimistic write gets ack from server; transitions to Synced status |
+| `test_metrics_recording_in_download_queue` | H | DownloadQueue records push_mutations_received and snapshots_applied counters |
+
 ---
 
 ## 5. End-to-End (E2E) Testing Strategy
@@ -537,6 +566,10 @@ Described in Section 5.1. Key scenarios:
 | Leader's process is suspended (SIGSTOP) | Readers detect timeout, elect new leader; original leader resumes, detects it is no longer leader, becomes reader |
 | Network partition splits readers into two groups | No split-brain: only one group has the file lock (single writer to disk) |
 | 50 tabs simultaneously | All readers register, leader elected within 5 seconds, no crashes |
+| Peer joins mid-session | A new tab opens after sync is already active; presence detects join and adds to peer list |
+| Duplicate Join detection | Same peer sends Join twice (e.g. re-registration); presence deduplicates and updates heartbeat timestamp |
+| Leave vs timeout behavior | Peer sends graceful Leave → immediate removal; peer disappears without Leave → heartbeat timeout removes after threshold |
+| Presence heartbeat under high tab count | 100 tabs all sending heartbeats simultaneously; all heartbeats processed within timeout window |
 
 ---
 
@@ -570,6 +603,9 @@ All benchmarks use **Criterion.rs** with the following methodology:
 | `oplog_append_10000` | Append 10,000 mutations to oplog | < 100 ms | 20% |
 | `coordinator_push_100` | Push 100 mutations to Postgres coordinator | < 200 ms (network-bound) | 30% |
 | `coordinator_pull_1000` | Pull 1000 mutations from Postgres coordinator | < 500 ms (network-bound) | 30% |
+| `hlc_now` | Generate single HLC timestamp (now()) | < 100 ns | 15% |
+| `hlc_update_with_received` | Update HLC with received timestamp (update_with_received) | < 200 ns | 15% |
+| `presence_peer_management_1000` | Manage 1000 active peers (join/leave/heartbeat) | < 5 ms | 20% |
 
 ### 9.3 Performance Regression Workflow
 
@@ -1156,6 +1192,10 @@ TestScenario::new("three-way convergence")
 | **Coordinator Trait** | 90% | 85% | Core trait methods tested; per-backend impls in integration |
 | **Transport Layer** | 90% | 85% | WebSocket, HTTP, WebRTC paths |
 | **Observability** | 80% | 75% | Tracing and metrics are secondary; errors still logged |
+| **HLC Clock** (`clock.rs`) | 100% | 100% | HybridLogicalClock; any missed branch causes timestamp ordering violations |
+| **Presence Manager** (`presence.rs`) | 90% | 85% | Join/leave/heartbeat; timeout recovery is 100% |
+| **Mutation Store** (`mutation_store.rs`) | 90% | 85% | OPFS-backed queue; core push/pop/ack/nack paths are 100% |
+| **Metrics** (`telemetry/metrics.rs`) | 90% | 85% | Metrics recording and snapshot; all counter paths covered |
 | **SDK (TypeScript)** | 90% | 85% | Integration-tested via E2E; unit-tested with Jest |
 | **Total (Rust core)** | **94%** | **91%** | |
 | **Total (TypeScript SDK)** | **85%** | **80%** | |
@@ -1254,6 +1294,10 @@ TestScenario::new("three-way convergence")
 | F013 | Migration: checksum mismatch not detected | Misbehavior | Schema | Migration checksum test | `migration_checksum` |
 | F014 | Offline: pending ops lost on leader crash | Silent Data Loss | Multi-Tab | Leader crash recovery integration test | `multitab_leader_crash_pending_ops` |
 | F015 | Reconnect: ops re-uploaded after already synced | Duplicate | Sync | Offline→online integration test | `offline_reconnect_no_duplicates` |
+| F016 | Generation ID mismatch fails to reset cursor | Silent Data Loss | Sync | Server restart with new gen; client detects and resets cursor to 0 | `phase_integration::generation_id_cursor_reset` |
+| F017 | HLC wall clock regression | Silent Corruption | Clock | System clock jumps backward; logical counter prevents timestamp ordering violations | `phase_integration::hlc_monotonic_under_clock_skew` |
+| F018 | Presence heartbeat timeout not detected | Leak | Presence | Peer leaves without sending Leave; heartbeat timeout cleans up stale peer entry | `phase_integration::presence_heartbeat_timeout` |
+| F019 | Optimistic write lost on crash recovery | Silent Data Loss | Sync | Tab crashes before upload; startup recovery scans optimistic entries and re-queues | `phase_integration::optimistic_crash_recovery` |
 
 Each failure in the catalog has a corresponding test that verifies the failure cannot occur.
 

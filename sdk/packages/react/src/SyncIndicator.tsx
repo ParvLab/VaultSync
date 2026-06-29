@@ -4,9 +4,10 @@ import { useSyncStatus } from './useSyncStatus.js';
 interface SyncIndicatorProps {
   className?: string;
   showText?: boolean;
+  showPeers?: boolean;
 }
 
-export function SyncIndicator({ className = '', showText = true }: SyncIndicatorProps) {
+export function SyncIndicator({ className = '', showText = true, showPeers = false }: SyncIndicatorProps) {
   const status = useSyncStatus();
 
   let statusColor = '#ef4444'; // Red (offline)
@@ -20,6 +21,10 @@ export function SyncIndicator({ className = '', showText = true }: SyncIndicator
       statusColor = '#22c55e'; // Green (connected)
       statusText = 'Synced';
     }
+  }
+
+  if (showPeers && status.activePeers > 0) {
+    statusText += ` · ${status.activePeers} tab${status.activePeers !== 1 ? 's' : ''}`;
   }
 
   return (

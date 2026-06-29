@@ -9,7 +9,7 @@ pub async fn run_multi_namespace_tests(coord: Arc<dyn Coordinator>, ns_a: &str, 
         public_key: vec![1, 2],
         schema_version: 0,
     };
-    coord.register(ns_a, rep_a).await.expect("register in ns_a");
+    coord.register(ns_a, rep_a, 0).await.expect("register in ns_a");
 
     let list_b = coord
         .list_replicas(ns_b)
@@ -30,7 +30,7 @@ pub async fn run_multi_namespace_tests(coord: Arc<dyn Coordinator>, ns_a: &str, 
         public_key: vec![3, 4],
         schema_version: 5,
     };
-    coord.register(ns_b, rep_b).await.expect("register in ns_b");
+    coord.register(ns_b, rep_b, 0).await.expect("register in ns_b");
     // Memory and other coordinators update namespace schema version based on registration
     let sv_a = coord
         .schema_version(ns_a)

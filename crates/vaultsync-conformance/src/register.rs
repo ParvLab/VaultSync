@@ -17,13 +17,13 @@ pub async fn run_register_tests(coord: Arc<dyn Coordinator>, ns: &str) {
         schema_version: 0,
     };
     coord
-        .register(ns, rep1.clone())
+        .register(ns, rep1.clone(), 0)
         .await
         .expect("register rep-1");
 
     // 3. register_is_idempotent
     coord
-        .register(ns, rep1)
+        .register(ns, rep1, 0)
         .await
         .expect("register rep-1 again");
 
@@ -34,7 +34,7 @@ pub async fn run_register_tests(coord: Arc<dyn Coordinator>, ns: &str) {
         public_key: vec![4, 5, 6],
         schema_version: 0,
     };
-    coord.register(ns, rep2).await.expect("register rep-2");
+    coord.register(ns, rep2, 0).await.expect("register rep-2");
 
     // 5. heartbeat_succeeds
     coord.heartbeat(ns, "rep-1").await.expect("heartbeat rep-1");
