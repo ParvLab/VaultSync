@@ -19,6 +19,8 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
   // Ref to store latest inputs for the debounced save
   const titleRef = useRef(title);
   const bodyRef = useRef(body);
+  // Suppress auto-save during initial hydration or external merge
+  const isHydrating = useRef(false);
 
   useEffect(() => {
     titleRef.current = title;
@@ -33,20 +35,30 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
     if (note) {
       // If we switched notes, reset local state to matching values
       if (prevNoteIdRef.current !== noteId) {
+        isHydrating.current = true;
         setTitle((note.title as string) || '');
         setBody((note.body as string) || '');
         prevNoteIdRef.current = noteId;
         
         const timestamp = Number(note.updatedAt || Date.now());
         setLastSaved(new Date(timestamp).toLocaleTimeString());
+
+        requestAnimationFrame(() => { isHydrating.current = false; });
       } else {
         // If it's the same note but updated externally (e.g. from another tab),
         // and we aren't focused/editing them, merge the updates
+        let merged = false;
         if (document.activeElement?.id !== 'note-title-input' && titleRef.current !== note.title) {
           setTitle((note.title as string) || '');
+          merged = true;
         }
         if (document.activeElement?.id !== 'note-body-textarea' && bodyRef.current !== note.body) {
           setBody((note.body as string) || '');
+          merged = true;
+        }
+        if (merged) {
+          isHydrating.current = true;
+          requestAnimationFrame(() => { isHydrating.current = false; });
         }
         
         const timestamp = Number(note.updatedAt || Date.now());
@@ -57,8 +69,8 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
 
   // Debounced auto-save effect
   useEffect(() => {
-    // Skip auto-save on initial mount or load
-    if (loading || !note) return;
+    // Skip auto-save on initial mount or load, and during hydration/merge
+    if (loading || !note || isHydrating.current) return;
 
     // Check if anything actually changed
     const hasChanges = title !== (note.title as string || '') || body !== (note.body as string || '');

@@ -2,7 +2,7 @@ use crate::crdt::document::CRDTDocument;
 use crate::error::VaultSyncError;
 use crate::oplog::entry::OplogEntry;
 use crate::storage::traits::Storage;
-use crate::subscription::engine::SubscriptionEngine;
+use crate::subscription::engine::{FireSource, SubscriptionEngine};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -172,7 +172,7 @@ impl Reconciler {
             self.subscriptions
                 .lock()
                 .unwrap()
-                .fire(&entry.doc_id, &entry.record_id, &state);
+                .fire(FireSource::ReconcilerPush, &entry.doc_id, &entry.record_id, &state);
         }
         tracing::info!(
             "[reconciler] EXIT source={} changed={} id={}",
@@ -266,7 +266,7 @@ impl Reconciler {
             self.subscriptions
                 .lock()
                 .unwrap()
-                .fire(&entry.doc_id, &entry.record_id, &state);
+                .fire(FireSource::ReconcilerPush, &entry.doc_id, &entry.record_id, &state);
         }
         tracing::info!(
             "[reconciler] EXIT source={} encrypted changed={} id={}",
@@ -357,7 +357,7 @@ impl Reconciler {
                 "[subscription.enqueue] doc={} record={} listeners={}",
                 doc_id, record_id, subs.listener_count(doc_id),
             );
-            subs.fire(doc_id, record_id, state);
+            subs.fire(FireSource::ReconcilerPull, doc_id, record_id, state);
         }
         tracing::info!(
             "[subscription.batch] fired={}",

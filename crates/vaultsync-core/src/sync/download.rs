@@ -436,7 +436,7 @@ impl DownloadQueue {
         }
         if let Some(state) = self.storage.read_sync_state(&self.namespace).await? {
             if state.generation_id != server_gen {
-                tracing::warn!(
+                tracing::debug!(
                     "[download_queue] generation mismatch: local={} server={} (verify only, cursor NOT reset here)",
                     state.generation_id,
                     server_gen

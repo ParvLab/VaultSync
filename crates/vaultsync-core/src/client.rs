@@ -14,7 +14,7 @@ use crate::storage::memory::InMemoryStorage;
 #[cfg(feature = "storage-sqlite")]
 use crate::storage::sqlite::SQLiteStorage;
 use crate::storage::traits::{Storage, StorageConfig};
-use crate::subscription::engine::SubscriptionEngine;
+use crate::subscription::engine::{FireSource, SubscriptionEngine};
 use crate::subscription::filter::Filter;
 use crate::sync::download::DownloadQueue;
 use crate::sync::reconciler::Reconciler;
@@ -767,14 +767,14 @@ impl VaultSyncClient {
                             let now_ms = crate::time_utils::system_time_now_ms();
                             state.last_sync_at = Some(now_ms);
                             self.storage.write_sync_state(&state).await?;
-                            tracing::info!(
+                            tracing::debug!(
                                 "[client] write_sync_state cursor={} gen={} (from client init generation mismatch)",
                                 state.last_synced_sequence,
                                 state.generation_id
                             );
                             self.download_queue.reset_cursor(0);
                             let cursor_after = self.download_queue.last_sequence();
-                            tracing::info!(
+                            tracing::debug!(
                                 "[sync_state] generation mismatch: local={} server={} -> resetting cursor (was {})",
                                 state.generation_id,
                                 server_gen,
@@ -935,7 +935,7 @@ impl VaultSyncClient {
                 self.subscriptions
                     .lock()
                     .unwrap()
-                    .fire(doc_id, record_id, &state);
+                    .fire(FireSource::LocalWrite, doc_id, record_id, &state);
 
                 Ok(())
             }
@@ -1028,10 +1028,17 @@ impl VaultSyncClient {
             namespace = self.config.namespace.as_str()
         );
         let append_guard = append_span.enter();
+        let write_t0 = web_time::Instant::now();
         let res = self
             .storage
             .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
             .await;
+        let write_elapsed = write_t0.elapsed();
+        tracing::info!(
+            "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
+            entry.id, doc_id, record_id, write_elapsed.as_millis(),
+            if res.is_ok() { "ok" } else { "err" },
+        );
         drop(append_guard);
 
         match res {
@@ -1064,7 +1071,7 @@ impl VaultSyncClient {
                 self.subscriptions
                     .lock()
                     .unwrap()
-                    .fire(doc_id, record_id, &state);
+                    .fire(FireSource::LocalWrite, doc_id, record_id, &state);
 
                 Ok(())
             }
@@ -1117,7 +1124,7 @@ impl VaultSyncClient {
                 self.clock.clear_logical_wrap();
             }
             let entry = OplogEntry::new(
-                mutation_id,
+                mutation_id.clone(),
                 self.config.replica_id.clone(),
                 self.config.namespace.clone(),
                 MutationType::CrdtDelete,
@@ -1140,10 +1147,17 @@ impl VaultSyncClient {
                 namespace = self.config.namespace.as_str()
             );
             let append_guard = append_span.enter();
+            let write_t0 = web_time::Instant::now();
             let res = self
                 .storage
                 .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
                 .await;
+            let write_elapsed = write_t0.elapsed();
+            tracing::info!(
+                "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
+                mutation_id, doc_id, record_id, write_elapsed.as_millis(),
+                if res.is_ok() { "ok" } else { "err" },
+            );
             drop(append_guard);
 
             match res {
@@ -1176,7 +1190,7 @@ impl VaultSyncClient {
                     self.subscriptions
                         .lock()
                         .unwrap()
-                        .fire(doc_id, record_id, &state);
+                        .fire(FireSource::LocalWrite, doc_id, record_id, &state);
                 }
                 Err(e) => {
                     self.metrics

@@ -124,7 +124,7 @@ impl SyncStateManager {
             return Ok(false);
         }
 
-        tracing::info!(
+        tracing::debug!(
             "[sync_state] generation mismatch: local={} server={} -> resetting cursor",
             if local_gen.is_empty() { "<none>" } else { &local_gen },
             server_gen

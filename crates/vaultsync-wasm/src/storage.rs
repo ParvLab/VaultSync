@@ -304,7 +304,7 @@ impl OpfsStorage {
             id.hash(&mut hasher);
         }
         let hash = hasher.finish();
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+        web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
             "[INDEX] {} hash={:#x} oplog={} pending={} synced={} pending_ids={:?}",
             label,
             hash,
@@ -596,7 +596,7 @@ impl Storage for OpfsStorage {
             .cloned()
             .collect();
         let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+        web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
             "[PENDING_READ] ns={} count={} ids={:?}",
             namespace,
             results.len(),
@@ -606,7 +606,7 @@ impl Storage for OpfsStorage {
     }
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), VaultSyncError> {
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+        web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
             "[MARK_SYNCED] id={} seq={}",
             id, sequence,
         )));
@@ -622,12 +622,12 @@ impl Storage for OpfsStorage {
             let old_status = format!("{:?}", entry.sync_status);
             entry.sync_status = SyncStatus::Synced;
             entry.sequence = Some(sequence);
-            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
                 "[MARK_SYNCED] found id={} old_status={} origin={:?} ctx={}",
                 id, old_status, entry.origin, entry.origin_context,
             )));
         } else {
-            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
                 "[MARK_SYNCED] NOT FOUND id={} in oplog (oplog_len={})",
                 id,
                 index.oplog.len(),
@@ -644,7 +644,7 @@ impl Storage for OpfsStorage {
             .map(|e| e.id.clone())
             .collect();
         drop(inner);
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+        web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
             "[MARK_SYNCED] done id={} pending_before={:?} pending_after={:?}",
             id, before_ids, after_ids,
         )));
