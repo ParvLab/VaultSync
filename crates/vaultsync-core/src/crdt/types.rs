@@ -57,6 +57,23 @@ impl CrdtValue {
     pub fn is_null(&self) -> bool {
         matches!(self, CrdtValue::Null)
     }
+
+    pub fn to_truncated(&self, max_len: usize) -> String {
+        match self {
+            CrdtValue::String(s) => {
+                if s.len() > max_len {
+                    format!("{}... ({} chars)", &s[..max_len], s.len())
+                } else {
+                    format!("\"{}\"", s)
+                }
+            }
+            CrdtValue::Number(n) => format!("num({})", n),
+            CrdtValue::Boolean(b) => format!("bool({})", b),
+            CrdtValue::Array(arr) => format!("array[{}]", arr.len()),
+            CrdtValue::Map(map) => format!("map{{{}}}", map.len()),
+            CrdtValue::Null => "null".to_string(),
+        }
+    }
 }
 
 impl From<String> for CrdtValue {

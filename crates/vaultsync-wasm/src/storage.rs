@@ -394,6 +394,19 @@ impl OpfsStorage {
         index: &OpfsIndex,
     ) -> Result<(), VaultSyncError> {
         Self::index_state("FLUSH_BEFORE", index);
+        // ── Race detection: log all uploadable entries at flush time ──
+        let pending: Vec<&OplogEntry> = index.oplog.iter().filter(|e| e.sync_status.is_uploadable()).collect();
+        if !pending.is_empty() {
+            let ids: Vec<String> = pending.iter().map(|e| format!("{}={:?}", &e.id[..e.id.len().min(12)], e.sync_status)).collect();
+            let op_count: usize = index.doc_listing.values().map(|v| v.len()).sum();
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[opfs_flush] pending={} entries=[{}] docs={} version={}",
+                pending.len(),
+                ids.join(", "),
+                op_count,
+                index.version,
+            )));
+        }
         let json = serde_json::to_vec(index)
             .map_err(|e| VaultSyncError::Storage(format!("json: {:?}", e)))?;
         let sys_dir = Self::get_dir(root, &["_system"]).await?;

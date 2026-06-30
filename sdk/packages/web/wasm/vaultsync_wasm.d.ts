@@ -120,11 +120,11 @@ export interface InitOutput {
     readonly wasmipc_on_message: (a: number, b: any) => void;
     readonly wasmipc_receive: (a: number) => [number, number];
     readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
-    readonly init: () => void;
     readonly __wbg_presencemanager_free: (a: number, b: number) => void;
     readonly presencemanager_activePeers: (a: number) => [number, number];
     readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly presencemanager_peer_count: (a: number) => number;
+    readonly init: () => void;
     readonly wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h6742839cb717cdad: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h2dccc7bc52fbc5e7: (a: number, b: number, c: any) => void;

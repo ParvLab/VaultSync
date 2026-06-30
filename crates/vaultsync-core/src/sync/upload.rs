@@ -1,6 +1,7 @@
 use crate::coordinator::traits::{Coordinator, CoordinatorError, EncryptedMutation};
 use crate::error::VaultSyncError;
 use crate::oplog::log::OpLog;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::telemetry::metrics::VaultSyncMetrics;
@@ -43,8 +44,9 @@ impl UploadQueue {
 
     pub async fn process_batch(&self) -> Result<usize, VaultSyncError> {
         let raw_entries = self.oplog.read_pending(self.config.batch_size).await?;
-        tracing::info!("[upload_queue] read_pending found {} entries", raw_entries.len());
+        let raw_count = raw_entries.len();
         if raw_entries.is_empty() {
+            tracing::debug!("[upload_queue] BATCH_START read_pending=0 after_filter=0");
             return Ok(0);
         }
 
@@ -58,7 +60,24 @@ impl UploadQueue {
         };
 
         if entries.is_empty() {
+            tracing::debug!("[upload_queue] BATCH_START read_pending={} after_filter=0 (all throttled)", raw_count);
             return Ok(0);
+        }
+
+        tracing::info!(
+            "[upload_queue] BATCH_START read_pending={} after_filter={}",
+            raw_count,
+            entries.len(),
+        );
+
+        for e in &entries {
+            let yrs_sha256 = hex::encode(&Sha256::digest(&e.yrs_update)[..8]);
+            let doc_id = &e.doc_id;
+            let record_id = &e.record_id;
+            tracing::info!(
+                "[upload_queue] ENTRY id={} doc={} record={} yrs_update_len={} yrs_update_sha256={}",
+                e.id, doc_id, record_id, e.yrs_update.len(), yrs_sha256,
+            );
         }
 
         let mutations: Vec<EncryptedMutation> = entries
@@ -87,30 +106,48 @@ impl UploadQueue {
             })
             .collect();
 
-        let span = tracing::info_span!(
-            "transport.send",
-            batch_size = mutations.len(),
-            namespace = self.oplog.namespace()
-        );
-        let _enter = span.enter();
-
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         tracing::info!(
-            "[upload_queue] calling coordinator.push count={}",
-            mutations.len()
+            "[upload_queue] PUSH_SEND count={} ids=[{}]",
+            mutations.len(),
+            ids.join(","),
         );
+        let push_t0 = crate::time_utils::system_time_now_ms();
         let push_result = self
             .coordinator
             .push(&self.oplog.namespace(), mutations)
             .await;
-        tracing::info!("[upload_queue] push returned: {:?}", &push_result);
+        let push_elapsed = crate::time_utils::system_time_now_ms() - push_t0;
         match push_result
         {
             Ok(sequences) => {
-                tracing::info!("[upload_queue] push success seqs={:?}", sequences);
+                tracing::info!(
+                    "[upload_queue] PUSH_ACK sequences={:?} elapsed={}ms",
+                    sequences, push_elapsed,
+                );
                 self.metrics
                     .set_connection_status(&self.oplog.namespace(), true);
                 for (entry, seq) in entries.iter().zip(sequences.iter()) {
+                    tracing::debug!(
+                        "[upload_queue] MARK_SYNCED id={} seq={}",
+                        entry.id, *seq,
+                    );
                     self.oplog.mark_synced(&entry.id, *seq).await?;
+                }
+                // Verify: re-read pending count to confirm mark_synced persisted
+                match self.oplog.count_pending().await {
+                    Ok(remaining) => {
+                        tracing::info!(
+                            "[upload_queue] AFTER_MARK_SYNCED pending={} marked={}",
+                            remaining, entries.len(),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[upload_queue] AFTER_MARK_SYNCED error={:?}",
+                            e,
+                        );
+                    }
                 }
                 {
                     let mut engine = self.retry_engine.lock().unwrap();
@@ -119,9 +156,17 @@ impl UploadQueue {
                     }
                 }
                 self.metrics.record_upload(entries.len());
+                tracing::info!(
+                    "[upload_queue] BATCH_DONE success={}",
+                    entries.len(),
+                );
                 Ok(entries.len())
             }
             Err(CoordinatorError::NotAvailable) => {
+                tracing::warn!(
+                    "[upload_queue] PUSH_FAIL reason=NotAvailable elapsed={}ms",
+                    push_elapsed,
+                );
                 self.metrics
                     .set_connection_status(&self.oplog.namespace(), false);
                 self.metrics.record_sync_error();
@@ -143,6 +188,10 @@ impl UploadQueue {
                 Ok(0)
             }
             Err(e) => {
+                tracing::warn!(
+                    "[upload_queue] PUSH_FAIL reason={:?} elapsed={}ms",
+                    e, push_elapsed,
+                );
                 self.metrics
                     .set_connection_status(&self.oplog.namespace(), false);
                 self.metrics.record_sync_error();

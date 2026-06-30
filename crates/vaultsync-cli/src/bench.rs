@@ -118,7 +118,7 @@ pub fn run(args: BenchArgs) {
             let mut engine = SubscriptionEngine::new();
             let r = run_bench(
                 || {
-                    engine.fire("todos", "record:1", &std::collections::HashMap::new());
+                    engine.fire(vaultsync_core::subscription::engine::FireSource::LocalWrite, "todos", "record:1", &std::collections::HashMap::new());
                 },
                 duration,
                 iters,

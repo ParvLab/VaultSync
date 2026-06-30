@@ -7,7 +7,10 @@ use yrs::updates::decoder::Decode;
 use yrs::Update;
 use sha2::{Digest, Sha256};
 use crate::telemetry::metrics::VaultSyncMetrics;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 /// Result of processing a single push mutation.
 /// Used by the download worker to decide whether to backfill via pull.
@@ -50,6 +53,9 @@ pub struct DownloadQueue {
     metrics: Arc<VaultSyncMetrics>,
     max_clock_skew: std::time::Duration,
     self_replica_id: String,
+    replay_mode: AtomicBool,
+    replay_changed_docs: Mutex<HashSet<(String, String)>>,
+    stale_skip_count: AtomicU32,
 }
 
 impl DownloadQueue {
@@ -78,7 +84,48 @@ impl DownloadQueue {
             metrics,
             max_clock_skew,
             self_replica_id,
+            replay_mode: AtomicBool::new(false),
+            replay_changed_docs: Mutex::new(HashSet::new()),
+            stale_skip_count: AtomicU32::new(0),
         }
+    }
+
+    pub fn set_replay_mode(&self, active: bool) {
+        self.replay_mode.store(active, std::sync::atomic::Ordering::SeqCst);
+        self.reconciler.set_fire_suppressed(active);
+        if !active {
+            let mut changed = self.replay_changed_docs.lock().unwrap();
+            changed.clear();
+        }
+        tracing::info!(
+            "[download_queue] replay_mode={}",
+            active,
+        );
+    }
+
+    pub fn is_replay_mode(&self) -> bool {
+        self.replay_mode.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// After replay completes, fire one notification per changed document
+    /// to give React a single bulk re-render instead of N individual fires.
+    pub async fn flush_replay_notifications(&self) -> Result<(), VaultSyncError> {
+        let changed: Vec<(String, String)> = {
+            let guard = self.replay_changed_docs.lock().unwrap();
+            guard.iter().cloned().collect()
+        };
+        if changed.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            "[download_queue] flush_replay_notifications count={}",
+            changed.len(),
+        );
+        for (doc_id, record_id) in &changed {
+            self.reconciler.fire_doc(doc_id, record_id).await?;
+        }
+        self.replay_changed_docs.lock().unwrap().clear();
+        Ok(())
     }
 
     pub async fn process_batch(&self) -> Result<usize, VaultSyncError> {
@@ -151,14 +198,14 @@ impl DownloadQueue {
             .decryptor
             .decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
-        // ── Phase 2 diagnostic: state vector + hash of decrypted push payload ──
+        // ── Phase 3 diagnostic: hash of decrypted pull payload (correlate with [upload_queue] entry log) ──
         let content_hash = hex::encode(&Sha256::digest(&decrypted_bytes)[..8]);
         if let Ok(decoded) = Update::decode_v1(&decrypted_bytes) {
             let sv = decoded.state_vector();
-            let entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
+            let sv_entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
             tracing::info!(
-                "[download_queue] push_decrypted source=push seq={} sha256={} state_vector={:?} len={}",
-                m.sequence, content_hash, entries, decrypted_bytes.len(),
+                "[download_queue] pull_decrypted source=pull id={} seq={} sha256={} state_vector={:?} len={}",
+                m.id, m.sequence, content_hash, sv_entries, decrypted_bytes.len(),
             );
         }
 
@@ -187,6 +234,15 @@ impl DownloadQueue {
                         tracing::info_span!("crdt.merge_remote_batch", count = entries.len());
                     let _merge_guard = merge_remote_span.enter();
                     self.reconciler.apply_batch("pull", &entries).await?;
+                }
+
+                // ── Phase 4: end replay mode after first successful batch ──
+                if self.is_replay_mode() {
+                    tracing::info!(
+                        "[download_queue] replay batch complete, ending replay mode",
+                    );
+                    self.set_replay_mode(false);
+                    self.flush_replay_notifications().await?;
                 }
 
                 if let Some(last) = mutations.last() {
@@ -481,6 +537,17 @@ impl DownloadQueue {
             .decryptor
             .decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
+        // ── Phase 3 diagnostic: hash of decrypted push payload (correlate with [upload_queue] entry log) ──
+        let content_hash = hex::encode(&Sha256::digest(&decrypted_bytes)[..8]);
+        if let Ok(decoded) = Update::decode_v1(&decrypted_bytes) {
+            let sv = decoded.state_vector();
+            let sv_entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
+            tracing::debug!(
+                "[download_queue] push_decrypted source=push id={} seq={} sha256={} state_vector={:?} len={}",
+                m.id, m.sequence, content_hash, sv_entries, decrypted_bytes.len(),
+            );
+        }
+
         let entry = OplogEntry::new(
             m.id.clone(),
             "".to_string(),
@@ -501,19 +568,22 @@ impl DownloadQueue {
 
         // ── Cursor gate: skip if already processed (seq <= last_sequence) ──
         let cursor_before = self.last_sequence.load(std::sync::atomic::Ordering::SeqCst);
-        tracing::info!(
+        tracing::trace!(
             "[download_queue] push seq={} cursor={} stale={} id={}",
             m.sequence, cursor_before, m.sequence <= cursor_before, m.id,
         );
         if m.sequence <= cursor_before {
-            tracing::debug!(
-                "[download_queue] cursor gate: skip stale push seq={} (cursor={})",
-                m.sequence, cursor_before,
-            );
+            self.stale_skip_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(PushOutcome::Stale);
         }
 
         self.reconciler.apply_remote_update("push", &entry).await?;
+        if self.replay_mode.load(std::sync::atomic::Ordering::SeqCst) {
+            self.replay_changed_docs
+                .lock()
+                .unwrap()
+                .insert((m.doc_id.clone(), m.record_id.clone()));
+        }
         self.metrics.record_push_received();
 
         // Advance cursor to the pushed mutation's sequence (monotonic: never go backwards)
@@ -552,6 +622,15 @@ impl DownloadQueue {
             new_seq,
             m.id
         );
+
+        // Aggregated log: report how many stale pushes were skipped since last valid push
+        let skipped = self.stale_skip_count.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if skipped > 0 {
+            tracing::debug!(
+                "[download_queue] replay: suppressed {} stale pushes (cursor {} -> {})",
+                skipped, cursor_before, new_seq,
+            );
+        }
 
         let outcome = if new_seq == cursor_before.wrapping_add(1) {
             PushOutcome::Contiguous

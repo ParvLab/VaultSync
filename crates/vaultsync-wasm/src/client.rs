@@ -55,7 +55,7 @@ impl WasmVaultSyncClient {
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
 
-        let final_db_name = db_name.unwrap_or_else(|| format!("{}_db", namespace));
+        let final_db_name = db_name.unwrap_or_else(|| format!("{}_{}_db", namespace, replica_id));
         let storage = Arc::new(
             BrowserStorage::new(&final_db_name, storage_backend.as_deref())
                 .await
@@ -116,7 +116,7 @@ impl WasmVaultSyncClient {
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
 
-        let final_db_name = db_name.unwrap_or_else(|| format!("{}_db", namespace));
+        let final_db_name = db_name.unwrap_or_else(|| format!("{}_{}_db", namespace, replica_id));
         let storage = Arc::new(
             BrowserStorage::new(&final_db_name, storage_backend.as_deref())
                 .await
@@ -247,10 +247,14 @@ impl WasmVaultSyncClient {
         let result = match verb {
             "insert" => {
                 let fields = json_to_fields(json)?;
+                let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
+                console_log!("[BC] LEADER_INSERT_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
                 self.client.insert(doc_id, record_id, fields).await
             }
             "update" => {
                 let fields = json_to_fields(json)?;
+                let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
+                console_log!("[BC] LEADER_UPDATE_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
                 self.client.update(doc_id, record_id, fields).await
             }
             "delete" => self.client.delete(doc_id, record_id).await,
@@ -283,7 +287,7 @@ impl WasmVaultSyncClient {
             self.broadcast_invalidation(doc_id, record_id);
             Ok(())
         } else {
-            console_debug!("[Follower insert] sending command doc={} record={}", doc_id, record_id);
+            console_log!("[BC] FOLLOW_INSERT_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
             self.send_command("insert", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
                 self.client.fire_local_subscription(doc_id, record_id, &fields);
@@ -302,7 +306,7 @@ impl WasmVaultSyncClient {
             self.broadcast_invalidation(doc_id, record_id);
             Ok(())
         } else {
-            console_debug!("[Follower update] sending command doc={} record={}", doc_id, record_id);
+            console_log!("[BC] FOLLOW_UPDATE_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
             self.send_command("update", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
                 self.client.fire_local_subscription(doc_id, record_id, &fields);
