@@ -55,7 +55,7 @@ impl WasmVaultSyncClient {
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
 
-        let final_db_name = db_name.unwrap_or_else(|| format!("{}_{}_db", namespace, replica_id));
+        let final_db_name = db_name.unwrap_or_else(|| format!("{}_db", namespace));
         let storage = Arc::new(
             BrowserStorage::new(&final_db_name, storage_backend.as_deref())
                 .await
@@ -116,7 +116,7 @@ impl WasmVaultSyncClient {
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
 
-        let final_db_name = db_name.unwrap_or_else(|| format!("{}_{}_db", namespace, replica_id));
+        let final_db_name = db_name.unwrap_or_else(|| format!("{}_db", namespace));
         let storage = Arc::new(
             BrowserStorage::new(&final_db_name, storage_backend.as_deref())
                 .await

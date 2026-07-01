@@ -37,7 +37,6 @@ function MainLayout() {
       await mutations.insert(id, {
         title: '',
         body: '',
-        updatedAt: Date.now(),
       });
       setActiveNoteId(id);
     } catch (err) {

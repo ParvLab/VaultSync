@@ -280,6 +280,8 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
             bytes: snap.bytes,
             checksum: snap.checksum,
             namespace: ns.clone(),
+            schema_version: snap.schema_version,
+            created_at: snap.created_at,
         };
         if let Ok(snap_frame) = encode_frame(MSG_SNAPSHOT, &snap_payload) {
             if tx.send(Message::Binary(snap_frame)).await.is_err() {

@@ -526,6 +526,8 @@ impl DurableObject for NamespaceDurableObject {
                         bytes: snap.bytes,
                         checksum: snap.checksum,
                         namespace: add_payload.namespace.clone(),
+                        schema_version: snap.schema_version,
+                        created_at: snap.created_at,
                     };
                     if let Ok(snap_frame) = vaultsync_core::coordinator::ws_proto::encode_frame(
                         vaultsync_core::coordinator::ws_proto::MSG_SNAPSHOT,
@@ -655,6 +657,8 @@ impl DurableObject for NamespaceDurableObject {
                         bytes: snap.bytes,
                         checksum: snap.checksum,
                         namespace: attachment.namespace.clone(),
+                        schema_version: snap.schema_version,
+                        created_at: snap.created_at,
                     };
                     if let Ok(snap_frame) = vaultsync_core::coordinator::ws_proto::encode_frame(
                         vaultsync_core::coordinator::ws_proto::MSG_SNAPSHOT,

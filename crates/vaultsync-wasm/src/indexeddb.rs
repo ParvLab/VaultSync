@@ -692,18 +692,50 @@ impl Storage for IndexedDbStorage {
 
     async fn delete_synced_oplog_older_than(
         &self,
-        _namespace: &str,
-        _older_than_secs: u64,
+        namespace: &str,
+        older_than_secs: u64,
     ) -> Result<usize, VaultSyncError> {
-        Ok(0)
+        let ns = namespace.to_string();
+        let cutoff = (js_sys::Date::now() as u64)
+            .saturating_sub(older_than_secs * 1000);
+        let _guard = self.tx_lock.lock().await;
+        let mut index = self.get_fresh_index().await?;
+        let before = index.oplog.len();
+        index.oplog.retain(|entry| {
+            !(entry.namespace == ns
+                && entry.sync_status == vaultsync_core::oplog::entry::SyncStatus::Synced
+                && entry.created_at < cutoff)
+        });
+        let removed = before - index.oplog.len();
+        if removed > 0 {
+            self.flush_index(&index).await?;
+            *self.index.lock().unwrap() = index;
+        }
+        Ok(removed)
     }
 
     async fn list_tombstoned_documents(
         &self,
-        _namespace: &str,
-        _older_than_secs: u64,
+        namespace: &str,
+        older_than_secs: u64,
     ) -> Result<Vec<(String, String)>, VaultSyncError> {
-        Ok(Vec::new())
+        let ns = namespace.to_string();
+        let _guard = self.tx_lock.lock().await;
+        let index = self.get_fresh_index().await?;
+        let now_ms = js_sys::Date::now() as u64;
+        let threshold = now_ms.saturating_sub(older_than_secs * 1000);
+        let results: Vec<(String, String)> = index
+            .oplog
+            .iter()
+            .filter(|e| {
+                e.namespace == ns
+                    && e.mutation_type == vaultsync_core::oplog::entry::MutationType::CrdtDelete
+                    && e.sync_status == vaultsync_core::oplog::entry::SyncStatus::Synced
+                    && e.created_at < threshold
+            })
+            .map(|e| (e.doc_id.clone(), e.record_id.clone()))
+            .collect();
+        Ok(results)
     }
 
     async fn update_oplog_encrypted_blob(
@@ -716,28 +748,71 @@ impl Storage for IndexedDbStorage {
 
     async fn list_active_documents(
         &self,
-        _namespace: &str,
+        namespace: &str,
     ) -> Result<Vec<(String, String)>, VaultSyncError> {
-        Ok(Vec::new())
+        let ns = namespace.to_string();
+        let _guard = self.tx_lock.lock().await;
+        let index = self.get_fresh_index().await?;
+        let mut seen = std::collections::HashSet::new();
+        for entry in &index.oplog {
+            if entry.namespace == ns && !seen.contains(&(entry.doc_id.clone(), entry.record_id.clone())) {
+                seen.insert((entry.doc_id.clone(), entry.record_id.clone()));
+            }
+        }
+        Ok(seen.into_iter().collect())
     }
 
     async fn read_synced_oplog_for_document(
         &self,
-        _namespace: &str,
-        _doc_id: &str,
-        _record_id: &str,
+        namespace: &str,
+        doc_id: &str,
+        record_id: &str,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
-        Ok(Vec::new())
+        let ns = namespace.to_string();
+        let did = doc_id.to_string();
+        let rid = record_id.to_string();
+        let _guard = self.tx_lock.lock().await;
+        let index = self.get_fresh_index().await?;
+        let results: Vec<OplogEntry> = index
+            .oplog
+            .iter()
+            .filter(|e| {
+                e.namespace == ns
+                    && e.doc_id == did
+                    && e.record_id == rid
+                    && e.sync_status == vaultsync_core::oplog::entry::SyncStatus::Synced
+            })
+            .cloned()
+            .collect();
+        Ok(results)
     }
 
     async fn delete_synced_oplog_before_timestamp(
         &self,
-        _namespace: &str,
-        _doc_id: &str,
-        _record_id: &str,
-        _timestamp: u64,
+        namespace: &str,
+        doc_id: &str,
+        record_id: &str,
+        timestamp: u64,
     ) -> Result<usize, VaultSyncError> {
-        Ok(0)
+        let ns = namespace.to_string();
+        let did = doc_id.to_string();
+        let rid = record_id.to_string();
+        let _guard = self.tx_lock.lock().await;
+        let mut index = self.get_fresh_index().await?;
+        let before = index.oplog.len();
+        index.oplog.retain(|entry| {
+            !(entry.namespace == ns
+                && entry.doc_id == did
+                && entry.record_id == rid
+                && entry.sync_status == vaultsync_core::oplog::entry::SyncStatus::Synced
+                && entry.created_at < timestamp)
+        });
+        let removed = before - index.oplog.len();
+        if removed > 0 {
+            self.flush_index(&index).await?;
+            *self.index.lock().unwrap() = index;
+        }
+        Ok(removed)
     }
 
     async fn delete_synced_before(

@@ -1,4 +1,5 @@
 use crate::coordinator::traits::{Coordinator, CoordinatorError};
+use crate::crdt::snapshot::Snapshot;
 use crate::e2ee::keyring::E2eeDecryptor;
 use crate::error::VaultSyncError;
 use crate::oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus};
@@ -142,8 +143,8 @@ impl DownloadQueue {
         let after = self.last_sequence.load(std::sync::atomic::Ordering::SeqCst);
         tracing::trace!("[download_queue] pulling after={}", after);
 
-        // If cursor is far behind, try snapshot-first catch-up
-        if self.config.snapshot_threshold > 0 && after > 0 {
+        // Try snapshot-first catch-up (works even with cursor=0 for replay)
+        if self.config.snapshot_threshold > 0 {
             match self.try_fetch_snapshot().await {
                 Ok(true) => {
                     let new_after = self.last_sequence.load(std::sync::atomic::Ordering::SeqCst);
@@ -409,77 +410,98 @@ impl DownloadQueue {
             Err(_) => return Ok(false),
         };
 
-        // Find the snapshot with the highest sequence > cursor
-        let best = snapshots
+        // Collect all snapshots with sequence > cursor
+        let applicable: Vec<Snapshot> = snapshots
             .into_iter()
             .filter(|s| s.sequence > after)
-            .max_by_key(|s| s.sequence);
+            .collect();
 
-        match best {
-            Some(snapshot) => {
-                tracing::info!(
-                    "[download_queue] applying snapshot doc={} record={} seq={}",
-                    snapshot.doc_id,
-                    snapshot.record_id,
-                    snapshot.sequence
-                );
-
-                let entry = OplogEntry::new(
-                    format!("snap-{}", snapshot.sequence),
-                    String::new(),
-                    self.namespace.clone(),
-                    MutationType::CrdtUpdate,
-                    snapshot.doc_id.clone(),
-                    snapshot.record_id.clone(),
-                    snapshot.bytes.clone(),
-                    None,
-                    snapshot.created_at,
-                    Some(snapshot.sequence),
-                    SyncStatus::Synced,
-                    None,
-                    snapshot.created_at,
-                    MutationOrigin::Snapshot,
-                    "",
-                );
-                self.reconciler.apply_remote_update("snapshot", &entry).await?;
-                self.metrics.record_snapshot_applied();
-
-                // Advance cursor past the snapshot sequence
-                let mut state = match self.storage.read_sync_state(&self.namespace).await? {
-                    Some(s) => s,
-                    None => {
-                        tracing::warn!(
-                            "[download_queue] read_sync_state=None namespace={} caller=try_fetch_snapshot cursor_before={}",
-                            self.namespace,
-                            after,
-                        );
-                        let mut s = crate::sync::state::SyncState::new(
-                            self.namespace.clone(),
-                            self.fallback_generation_id().await,
-                        );
-                        s.last_synced_sequence = snapshot.sequence;
-                        s
-                    },
-                };
-                state.last_synced_sequence = snapshot.sequence;
-                let now_ms = crate::time_utils::system_time_now_ms();
-                state.last_sync_at = Some(now_ms);
-                self.storage.write_sync_state(&state).await?;
-                tracing::debug!(
-                    "[download_queue] write_sync_state cursor={} gen={} (from snapshot)",
-                    state.last_synced_sequence,
-                    state.generation_id
-                );
-                let old = self.last_sequence.swap(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
-                tracing::trace!(
-                    "[download_queue] cursor advanced via snapshot {} -> {}",
-                    old,
-                    snapshot.sequence
-                );
-                Ok(true)
-            }
-            None => Ok(false),
+        if applicable.is_empty() {
+            return Ok(false);
         }
+
+        // Deduplicate: keep the latest snapshot per (doc_id, record_id)
+        let mut latest: std::collections::HashMap<(String, String), Snapshot> =
+            std::collections::HashMap::new();
+        for s in applicable {
+            let key = (s.doc_id.clone(), s.record_id.clone());
+            match latest.get(&key) {
+                Some(existing) if s.sequence > existing.sequence => {
+                    latest.insert(key, s);
+                }
+                None => {
+                    latest.insert(key, s);
+                }
+                _ => {}
+            }
+        }
+        let mut to_apply: Vec<Snapshot> = latest.into_values().collect();
+        // Apply in ascending sequence order for correctness
+        to_apply.sort_by_key(|s| s.sequence);
+        let max_seq = to_apply.last().map(|s| s.sequence).unwrap_or(0);
+
+        for snapshot in &to_apply {
+            tracing::info!(
+                "[download_queue] applying snapshot doc={} record={} seq={}",
+                snapshot.doc_id,
+                snapshot.record_id,
+                snapshot.sequence
+            );
+
+            let entry = OplogEntry::new(
+                format!("snap-{}", snapshot.sequence),
+                String::new(),
+                self.namespace.clone(),
+                MutationType::CrdtUpdate,
+                snapshot.doc_id.clone(),
+                snapshot.record_id.clone(),
+                snapshot.bytes.clone(),
+                None,
+                snapshot.created_at,
+                Some(snapshot.sequence),
+                SyncStatus::Synced,
+                None,
+                snapshot.created_at,
+                MutationOrigin::Snapshot,
+                "",
+            );
+            self.reconciler.apply_remote_update("snapshot", &entry).await?;
+            self.metrics.record_snapshot_applied();
+        }
+
+        // Advance cursor past the max snapshot sequence
+        let mut state = match self.storage.read_sync_state(&self.namespace).await? {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    "[download_queue] read_sync_state=None namespace={} caller=try_fetch_snapshot cursor_before={}",
+                    self.namespace,
+                    after,
+                );
+                let mut s = crate::sync::state::SyncState::new(
+                    self.namespace.clone(),
+                    self.fallback_generation_id().await,
+                );
+                s.last_synced_sequence = max_seq;
+                s
+            },
+        };
+        state.last_synced_sequence = max_seq;
+        let now_ms = crate::time_utils::system_time_now_ms();
+        state.last_sync_at = Some(now_ms);
+        self.storage.write_sync_state(&state).await?;
+        tracing::debug!(
+            "[download_queue] write_sync_state cursor={} gen={} (from snapshot catch-up)",
+            state.last_synced_sequence,
+            state.generation_id
+        );
+        let old = self.last_sequence.swap(max_seq, std::sync::atomic::Ordering::SeqCst);
+        tracing::trace!(
+            "[download_queue] cursor advanced via snapshot {} -> {}",
+            old,
+            max_seq
+        );
+        Ok(true)
     }
 
     /// Verify server generation matches local state. If mismatch is detected, log

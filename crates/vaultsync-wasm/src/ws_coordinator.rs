@@ -10,6 +10,7 @@ use vaultsync_core::coordinator::traits::{
     Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId,
 };
 use vaultsync_core::coordinator::ws_proto::*;
+use vaultsync_core::crdt::snapshot::Snapshot;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{BinaryType, WebSocket};
@@ -63,6 +64,8 @@ struct WasmWsCoordinatorInner {
     upload_notify: Mutex<Option<mpsc::UnboundedSender<()>>>,
     generation_id: Mutex<String>,
     conn_gen: AtomicU64,
+    /// Snapshots received from server pushes (MSG_SNAPSHOT) during REGISTER or later.
+    received_snapshots: Mutex<Vec<Snapshot>>,
 }
 
 impl std::fmt::Debug for WasmWsCoordinatorInner {
@@ -97,6 +100,7 @@ impl WasmWsCoordinator {
                 upload_notify: Mutex::new(None),
                 generation_id: Mutex::new(String::new()),
                 conn_gen: AtomicU64::new(0),
+                received_snapshots: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -358,6 +362,38 @@ impl WasmWsCoordinator {
 
         console_log!("[WasmWs] register successful!");
 
+        // 3.5 Drain MSG_SNAPSHOT frames pushed by server after REGISTER_ACK
+        console_log!("[WasmWs] draining snapshots after register");
+        loop {
+            let timeout = vaultsync_core::time_utils::sleep(
+                std::time::Duration::from_millis(300),
+            );
+            futures::pin_mut!(timeout);
+            match futures::future::select(msg_rx.next(), timeout).await {
+                Either::Left((Some(bin), _)) => {
+                    if let Ok((mt, pl)) = decode_frame(&bin) {
+                        if mt == MSG_SNAPSHOT {
+                            if let Ok(sp) = serde_json::from_slice::<SnapshotPayload>(pl) {
+                                console_log!("[WasmWs] drained snapshot doc={} seq={}", sp.doc_id, sp.sequence);
+                                let snapshot = Snapshot {
+                                    doc_id: sp.doc_id,
+                                    record_id: sp.record_id,
+                                    schema_version: sp.schema_version,
+                                    sequence: sp.sequence,
+                                    created_at: sp.created_at,
+                                    bytes: sp.bytes,
+                                    checksum: sp.checksum,
+                                };
+                                self.inner.received_snapshots.lock().unwrap().push(snapshot);
+                            }
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        console_log!("[WasmWs] snapshot drain complete");
+
         // 4. Perform SUBSCRIBE
         console_log!("[8/9] subscribe after={}", after);
         let sub = SubscribePayload {
@@ -419,6 +455,20 @@ impl WasmWsCoordinator {
                                     )
                                     .await;
                             }
+                        }
+                    } else if msg_type == MSG_SNAPSHOT {
+                        if let Ok(sp) = serde_json::from_slice::<SnapshotPayload>(payload) {
+                            let snapshot = Snapshot {
+                                doc_id: sp.doc_id,
+                                record_id: sp.record_id,
+                                schema_version: sp.schema_version,
+                                sequence: sp.sequence,
+                                created_at: sp.created_at,
+                                bytes: sp.bytes,
+                                checksum: sp.checksum,
+                            };
+                            inner_clone.received_snapshots.lock().unwrap().push(snapshot);
+                            console_debug!("[reader] cached snapshot seq={}", sp.sequence);
                         }
                     } else if matches!(msg_type, MSG_HEARTBEAT | MSG_HEARTBEAT_ACK | MSG_ERROR) {
                         // System messages — no response routing needed
@@ -864,6 +914,43 @@ impl Coordinator for WasmWsCoordinator {
         Ok(0)
     }
 
+    async fn list_snapshots(
+        &self,
+        _namespace: &str,
+    ) -> Result<Vec<Snapshot>, CoordinatorError> {
+        let snaps = self.inner.received_snapshots.lock().unwrap().clone();
+        console_debug!("[WasmWs] list_snapshots returning {} snapshots", snaps.len());
+        Ok(snaps)
+    }
+
+    async fn store_snapshot(
+        &self,
+        _namespace: &str,
+        snapshot: &Snapshot,
+    ) -> Result<(), CoordinatorError> {
+        let payload = SnapshotPayload {
+            doc_id: snapshot.doc_id.clone(),
+            record_id: snapshot.record_id.clone(),
+            sequence: snapshot.sequence,
+            bytes: snapshot.bytes.clone(),
+            checksum: snapshot.checksum,
+            namespace: _namespace.to_string(),
+            schema_version: snapshot.schema_version,
+            created_at: snapshot.created_at,
+        };
+        let frame = encode_frame(MSG_SNAPSHOT, &payload)
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        let state = self.inner.connection.lock().unwrap();
+        if let Some(ref ws) = state.ws {
+            if ws.ready_state() == 1 {
+                ws.send_with_u8_array(&frame)
+                    .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+                console_log!("[WasmWs] stored snapshot doc={} seq={}", snapshot.doc_id, snapshot.sequence);
+            }
+        }
+        Ok(())
+    }
+
     async fn disconnect(&self) -> Result<(), CoordinatorError> {
         console_log!("[WasmWs] disconnect requested");
         let mut state = self.inner.connection.lock().unwrap();
@@ -877,6 +964,8 @@ impl Coordinator for WasmWsCoordinator {
         state.connecting = false;
         state.waiters.clear();
         drop(state);
+        // Clear cached snapshots to avoid stale data on reconnect
+        self.inner.received_snapshots.lock().unwrap().clear();
         // Bump conn_gen to invalidate background readers from the old connection
         self.inner.conn_gen.fetch_add(1, Ordering::SeqCst);
         console_log!("[WasmWs] disconnect complete");

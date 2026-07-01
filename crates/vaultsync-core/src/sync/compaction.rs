@@ -1,3 +1,4 @@
+use crate::crdt::snapshot::Snapshot;
 use crate::error::VaultSyncError;
 use crate::storage::traits::Storage;
 use std::sync::Arc;
@@ -12,9 +13,9 @@ pub struct CompactionConfig {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            max_synced_age_secs: 7 * 24 * 60 * 60, // 7 days
-            tombstone_grace_secs: 24 * 60 * 60,    // 24 hours
-            snapshot_entry_threshold: 500,
+            max_synced_age_secs: 24 * 60 * 60,     // 24 hours
+            tombstone_grace_secs: 4 * 60 * 60,     // 4 hours
+            snapshot_entry_threshold: 100,
         }
     }
 }
@@ -60,7 +61,7 @@ impl CompactionEngine {
             }
         }
 
-        let snapshot_stats = self.run_snapshot_compaction(namespace).await?;
+        let (snapshot_stats, _snapshots) = self.run_snapshot_compaction(namespace).await?;
 
         Ok(CompactionStats {
             oplog_removed: age_oplog_removed + snapshot_stats.oplog_removed,
@@ -72,10 +73,11 @@ impl CompactionEngine {
     pub async fn run_snapshot_compaction(
         &self,
         namespace: &str,
-    ) -> Result<CompactionStats, VaultSyncError> {
+    ) -> Result<(CompactionStats, Vec<Snapshot>), VaultSyncError> {
         let active_docs = self.storage.list_active_documents(namespace).await?;
         let mut oplog_removed = 0;
         let mut snapshots_collapsed = 0;
+        let mut created_snapshots = Vec::new();
 
         for (doc_id, record_id) in active_docs {
             let synced_entries = self
@@ -107,16 +109,40 @@ impl CompactionEngine {
                                 .await?;
                             oplog_removed += deleted_count;
                             snapshots_collapsed += 1;
+
+                            // Build snapshot for coordinator upload
+                            let max_sequence = synced_entries
+                                .iter()
+                                .filter_map(|e| e.sequence)
+                                .max()
+                                .unwrap_or(0);
+                            let checksum = {
+                                let mut hasher = crc32fast::Hasher::new();
+                                hasher.update(&fresh_snapshot);
+                                hasher.finalize()
+                            };
+                            created_snapshots.push(Snapshot {
+                                doc_id: doc_id.clone(),
+                                record_id: record_id.clone(),
+                                schema_version: doc.schema_version,
+                                sequence: max_sequence,
+                                created_at: max_timestamp,
+                                bytes: fresh_snapshot,
+                                checksum,
+                            });
                         }
                     }
                 }
             }
         }
 
-        Ok(CompactionStats {
-            oplog_removed,
-            docs_removed: 0,
-            snapshots_collapsed,
-        })
+        Ok((
+            CompactionStats {
+                oplog_removed,
+                docs_removed: 0,
+                snapshots_collapsed,
+            },
+            created_snapshots,
+        ))
     }
 }

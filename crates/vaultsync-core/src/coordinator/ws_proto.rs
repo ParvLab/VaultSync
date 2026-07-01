@@ -215,6 +215,10 @@ pub struct SnapshotPayload {
     pub checksum: u32,
     #[serde(default)]
     pub namespace: String,
+    #[serde(default)]
+    pub schema_version: u64,
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

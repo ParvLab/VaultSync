@@ -18,7 +18,7 @@ web-sys = { version = "0.3", features = [
     "FileSystemFileHandle", "FileSystemWritableFileStream",
     "FileSystemGetFileOptions", "FileSystemGetDirectoryOptions",
     "FileSystemCreateWritableOptions", "FileSystemRemoveOptions",
-    "Blob", "File", "WritableStream",
+    "Blob", "File", "WritableStream", "Lock", "LockManager",
     "IdbDatabase", "IdbTransaction", "IdbObjectStore",
     "IdbFactory", "IdbRequest", "IdbOpenDbRequest",
     "IdbTransactionMode", "IdbVersionChangeEvent",

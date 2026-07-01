@@ -107,13 +107,11 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
     setIsSaving(true);
     const timer = setTimeout(async () => {
       try {
-        const updatedAt = Date.now();
         await mutations.update(noteId, {
           title: title.trim(),
           body,
-          updatedAt,
         });
-        setLastSaved(new Date(updatedAt).toLocaleTimeString());
+        setLastSaved(new Date().toLocaleTimeString());
       } catch (err) {
         console.error('Auto-save failed:', err);
       } finally {

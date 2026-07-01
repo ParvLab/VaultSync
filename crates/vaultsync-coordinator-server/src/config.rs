@@ -34,6 +34,14 @@ pub struct ServerConfig {
 
     #[arg(long, env = "VAULTSYNC_ADMIN_TOKEN")]
     pub admin_token: Option<String>,
+
+    /// Namespace to auto-compact (empty = disabled). Requires auto_compact_interval_minutes > 0.
+    #[arg(long, default_value = "", env = "VAULTSYNC_AUTO_COMPACT_NS")]
+    pub auto_compact_ns: String,
+
+    /// How often to auto-compact, in minutes (0 = disabled).
+    #[arg(long, default_value_t = 0, env = "VAULTSYNC_AUTO_COMPACT_INTERVAL")]
+    pub auto_compact_interval_minutes: u64,
 }
 
 impl ServerConfig {

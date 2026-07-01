@@ -1,42 +1,52 @@
 # Anchored Summary
 
 ## Goal
-- Complete bidirectional sync fix: eliminate notification loop caused by stale-focus guard, then stabilize with stress testing
+- Eliminate oplog bloat and notification loop: filter `updatedAt` from CRDT writes, autoset on content change only, implement WASM storage compaction
 
 ## Constraints & Preferences
 - WASM build target (`wasm-pack build --target web`)
 - TypeScript SDK build via `npm run build` in `sdk/`
 - All Rust crates must compile (`cargo check --workspace`)
-- Instrumentation logs must clearly identify each pipeline stage with unique prefixes
+- Compaction methods must use `js_sys::Date::now()` for timestamps (not `crate::time_utils`)
 
 ## Progress
 ### Done
-- **Bug A — Per-tab OPFS storage path fix**: Changed `crates/vaultsync-wasm/src/client.rs` lines 58 and 119 from `format!("{}_db", namespace)` to `format!("{}_{}_db", namespace, replica_id)`. Each tab now has its own `index.json`. Cross-tab OPFS lost-update race eliminated.
-- **Bug B — Focus guard notification loop**: Identified and fixed the root cause of one-way replication in `sdk/examples/notes/src/components/NoteEditor.tsx`. The `document.activeElement` focus guard at line 60 blocked external merges when the textarea merely had focus (even with no active typing), causing the follower to auto-save stale state back to the leader via BC commands, creating an infinite loop.
-- **Fix applied**: Replaced binary `document.activeElement` check with edit-timestamp cooldown. Added `lastEditRef.current` tracking per field (`{ title: number, body: number }`) and `FOCUS_COOLDOWN_MS = 2000`. A field is "actively editing" only if it has focus AND the user typed within 2 seconds. Stale focus does not block merge. Added `[FocusGuard] console.warn` logs.
-- **BC command instrumentation**: Added `[BC] FOLLOW_INSERT_BEGIN` / `[BC] FOLLOW_UPDATE_BEGIN` logs on the follower side (payload_len + first 500 chars of payload) and `[BC] LEADER_INSERT_BEGIN` / `[BC] LEADER_UPDATE_BEGIN` logs on the leader side (field_count, keys, payload_len + first 300 chars of payload)
-- **Build verification**: All Rust crates pass `cargo check --workspace`, WASM binary builds, all 5 SDK packages build clean
-- **Phase 4 — Replay batching**: Aggregates stale push skips into single `debug!` line with `swap(0)` counter
-- **Phase 5 — Upload worker instrumentation**: WAKE/OFFLINE/RECONNECTED/BATCH markers with stage prefixes
-- **vaultsync-cli fix**: Added missing `FireSource::LocalWrite` argument
-- **vaultsync-napi fix**: `*const` raw pointers → `usize` for `#[napi]` Send bound
-- **Bidirectional sync confirmed**: Both leader→follower and follower→leader work reliably. Logs show clean `PUSH_SEND → PUSH_ACK → AFTER_MARK_SYNCED pending=0 → BATCH_DONE` on every upload. Reconciler fires `subscription.fire` once per mutation. Document content is identical on both tabs across multiple alternating edits.
+- **`updatedAt` metadata normalization**: `VaultSyncClient::filter_meta_fields()` strips `updatedAt`/`updated_at` from user-provided fields before CRDT apply in both `insert()` and `update()`. Engine auto-sets `updatedAt` to HLC wall clock only when content fields actually change. No-op saves (no content change) skip mutation entirely (`[client.update] SKIP no-op mutation`).
+- **OPFS compaction implemented**: 5 methods (`delete_synced_oplog_older_than`, `list_tombstoned_documents`, `list_active_documents`, `read_synced_oplog_for_document`, `delete_synced_oplog_before_timestamp`) fully implemented for both `OpfsStorage` and `IndexedDbStorage` backends.
+- **Aggressive compaction defaults**: Changed from 7-day/500-entry to 24h age cutoff, 4h tombstone grace, 100-entry snapshot threshold (`CompactionConfig` defaults).
+- **Compaction runs on all tabs**: Age-based cleanup runs every 5 min on ALL tabs (not just leader). Snapshot compaction stays leader-only (runs every 15 min).
+- **Notes example updated**: Removed `updatedAt` from `App.tsx:insert()` and `NoteEditor.tsx:auto-save` — engine handles it automatically.
+- **Build verification**: `cargo check --workspace` (0 new warnings), `wasm-pack build --target web` (0 errors), `npm run build` (all 5 SDK packages + notes Vite bundle).
 
 ### In Progress
-- **Stress test suite**: 6 scenarios to run before removing instrumentation: (1) 3 tabs simultaneous edits, (2) leader closes while follower editing (leader election), (3) offline → edit → reconnect, (4) refresh one tab during continuous edits, (5) create/delete multiple notes concurrently, (6) 15-minute soak with continuous alternating edits.
+- (none — all three hardening items addressed)
 
 ### Blocked
 - (none)
 
 ## Key Decisions
-- **Focus guard was the root cause of one-way replication**: The `NoteEditor.tsx` `document.activeElement` check at line 60 prevented the follower from merging external edits when its textarea had focus (even stale, no-active-typing focus). This caused the auto-save to fire with stale local state, sending a BC command to the leader that overwrote the correct data with stale data. The subsequent push then re-triggered the cycle.
-- **Edit-timestamp cooldown replaces binary focus check**: Instead of checking `document.activeElement?.id !== 'note-body-textarea'`, the fix checks if the field has focus AND the user has typed within `FOCUS_COOLDOWN_MS` (2 seconds). This protects active editing while allowing external merges when the focus is stale.
-- **The fix is a circuit breaker, not a semantic version guard**: The fix uses string equality (via `lastEditRef` timestamps + content hashing) rather than CRDT document revision IDs. A more robust solution would track `lastAppliedRemoteRevision` to prevent re-saving data that arrived from remote.
+- **`updatedAt` filtered at core client level, not just SDK**: Applications that include `updatedAt` in mutations are automatically handled. No app-level changes needed beyond removing the redundant field. The engine uses HLC wall clock (not user-provided value) to prevent mutation uniqueness when content is identical.
+- **Compaction uses `js_sys::Date::now()` in WASM**: The `crate::time_utils::system_time_now_ms()` is not available in the WASM crate (it's in vaultsync-core only). `js_sys::Date::now()` returns the same wall-clock milliseconds.
+- **Age-based compaction safe on all tabs**: Each tab independently cleans up its own oplog by removing Synced entries past the cutoff. No cross-tab race because `index_transaction`/`tx_lock` serializes writes; concurrent deletions of different entries are idempotent.
+- **Snapshot compaction stays leader-only**: Re-writing document snapshots + bulk-deleting synced oplog entries is not idempotent if two tabs run it simultaneously. Leader-only avoids cross-tab races.
 
 ## Next Steps
-1. **Stress test**: Run 3+ tab multi-scenario stress test suite before removing instrumentation
-2. **Demote instrumentation logs**: Move `[opfs_flush]`, `[BC fire_subscription]`, `[FocusGuard]`, upload pipeline markers from `info!`/`console.warn` to `trace!`/`console.debug` after stress tests pass
-3. **Tag release**: Once stable, tag a release and update AGENTS.md with final status
+1. **Stress testing**: Run multi-tab scenarios to verify oplog stays bounded and notification loop eliminated
+2. **Logging cleanup (after stress tests pass)**: Demote ~200 log lines to `trace!`/`debug!`, install level-filtered WASM tracing subscriber
+3. **Tag release** once stable
+
+### Logging Cleanup Plan (Detailed)
+When ready to implement, the work splits into these phases:
+
+| Phase | Scope | Files | Est. Changes |
+|-------|-------|-------|-------------|
+| L1 | Add `LogLevel` to config + WASM tracing subscriber | `core/src/config.rs`, `wasm/src/lib.rs`, `sdk/web/src/types.ts` | 3 files |
+| L2 | Demote Rust core instrumentation (`reconciler.rs`, `download.rs` internals) | `core/src/sync/reconciler.rs`, `download.rs`, `state_manager.rs` | ~90 lines |
+| L3 | Demote WASM instrumentation (`client.rs`, `ws_coordinator.rs`, `storage.rs`) | `wasm/src/client.rs`, `ws_coordinator.rs`, `storage.rs` | ~60 lines |
+| L4 | Demote notify pipeline + JS SDK logging | `sdk/web/src/index.ts`, `sdk/react/src/useQuery.ts`, `useVaultSyncOne.ts`, `sdk/web/src/sync.ts`, `subscription.ts` | ~20 lines |
+| L5 | Upgrade operational events + demote FocusGuard | `upload.rs`, `client.rs` (core + wasm), `NoteEditor.tsx` | ~30 lines |
+| L6 | Clean up init progress `[1/9]–[9/9]` → condensed | `wasm/src/client.rs`, `ws_coordinator.rs` | ~15 lines |
+| L7 | Verify: `cargo check`, `wasm-pack build`, `npm run build`, smoke test | — | — |
 
 ## Critical Context
 - **Bug A (OPFS race) — FIXED**: Cross-tab OPFS race eliminated by per-tab storage paths. Upload pipeline health confirmed by consistent `PUSH_ACK sequences=[N]`, `AFTER_MARK_SYNCED pending=0`, `BATCH_DONE success=1`.

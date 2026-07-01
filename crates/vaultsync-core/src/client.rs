@@ -426,8 +426,9 @@ impl VaultSyncClient {
         let (events, upload_event_rx, download_event_rx, pending_count_rx) =
             crate::sync::events::SyncEvents::new();
 
-        // Clone before moving into Self (used by download worker below)
+        // Clone before moving into Self (used by download/compaction workers below)
         let coord_for_dl = coordinator.clone();
+        let coord_for_comp = coordinator.clone();
         let ns_for_dl = config.namespace.clone();
         let pending_count_tx = events.pending_count.clone();
         let pending_cache = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -657,6 +658,7 @@ impl VaultSyncClient {
         let le = leader_election.clone();
         let ns = namespace_clone.clone();
         let comp_storage = storage_clone.clone();
+        let comp_coord = coord_for_comp;
         crate::time_utils::spawn(async move {
             let compaction_engine = crate::sync::compaction::CompactionEngine::new(
                 comp_storage,
@@ -666,16 +668,36 @@ impl VaultSyncClient {
             let mut last_snapshot = crate::time_utils::PlatformInstant::now();
 
             loop {
-                crate::time_utils::sleep(std::time::Duration::from_secs(5)).await;
-                if !le.try_acquire().unwrap_or(false) {
-                    continue;
-                }
-                if last_compaction.elapsed() >= std::time::Duration::from_secs(600) {
+                crate::time_utils::sleep(std::time::Duration::from_secs(30)).await;
+                // Age-based compaction and tombstone cleanup run on ALL tabs
+                if last_compaction.elapsed() >= std::time::Duration::from_secs(300) {
                     let _ = compaction_engine.run_compaction(&ns).await;
                     last_compaction = crate::time_utils::PlatformInstant::now();
                 }
-                if last_snapshot.elapsed() >= std::time::Duration::from_secs(3600) {
-                    let _ = compaction_engine.run_snapshot_compaction(&ns).await;
+                // Snapshot compaction runs only on the leader (re-writes docs)
+                if le.try_acquire().unwrap_or(false)
+                    && last_snapshot.elapsed() >= std::time::Duration::from_secs(900)
+                {
+                    match compaction_engine.run_snapshot_compaction(&ns).await {
+                        Ok((_stats, snapshots)) => {
+                            for snap in &snapshots {
+                                if let Err(e) = comp_coord.store_snapshot(&ns, snap).await {
+                                    tracing::warn!(
+                                        "[compaction] failed to upload snapshot doc={} seq={}: {:?}",
+                                        snap.doc_id, snap.sequence, e
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "[compaction] uploaded snapshot doc={} seq={}",
+                                        snap.doc_id, snap.sequence
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("[compaction] snapshot run failed: {:?}", e);
+                        }
+                    }
                     last_snapshot = crate::time_utils::PlatformInstant::now();
                 }
             }
@@ -837,12 +859,21 @@ impl VaultSyncClient {
         Ok(())
     }
 
+    /// Filter out engine-managed metadata fields from user-provided field maps.
+    /// These fields are auto-set by the engine to prevent unnecessary CRDT mutations.
+    fn filter_meta_fields(fields: &mut HashMap<String, CrdtValue>) {
+        fields.remove("updatedAt");
+        fields.remove("updated_at");
+    }
+
     pub async fn insert(
         &self,
         doc_id: &str,
         record_id: &str,
-        fields: HashMap<String, CrdtValue>,
+        mut fields: HashMap<String, CrdtValue>,
     ) -> Result<(), VaultSyncError> {
+        Self::filter_meta_fields(&mut fields);
+
         let span = tracing::info_span!(
             "vaultsync.write",
             doc_id = doc_id,
@@ -856,6 +887,10 @@ impl VaultSyncClient {
 
         let mutation_id = uuid::Uuid::new_v4().to_string();
         let mut doc = CRDTDocument::new(doc_id, record_id, 0);
+
+        // Auto-set updatedAt to HLC wall clock — it reflects when content was created
+        let hlc = self.clock.now();
+        fields.insert("updatedAt".to_string(), CrdtValue::Number(hlc.wall as f64));
 
         let sv_before = doc.state_vector();
         let sv_before_entries: Vec<_> = sv_before.iter().map(|(c, cl)| (c, cl)).collect();
@@ -907,7 +942,6 @@ impl VaultSyncClient {
             .encryptor
             .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-        let hlc = self.clock.now();
         if self.clock.did_logical_wrap() {
             self.metrics.record_hlc_wrap();
             self.clock.clear_logical_wrap();
@@ -988,8 +1022,10 @@ impl VaultSyncClient {
         &self,
         doc_id: &str,
         record_id: &str,
-        fields: HashMap<String, CrdtValue>,
+        mut fields: HashMap<String, CrdtValue>,
     ) -> Result<(), VaultSyncError> {
+        Self::filter_meta_fields(&mut fields);
+
         let span = tracing::info_span!(
             "vaultsync.write",
             doc_id = doc_id,
@@ -1006,7 +1042,28 @@ impl VaultSyncClient {
             Some(bytes) => CRDTDocument::from_snapshot(&bytes)?,
             None => CRDTDocument::new(doc_id, record_id, 0),
         };
+
+        // ── Phase 0: skip no-op writes (no content field changed) ──
+        let content_changed = fields.iter().any(|(key, value)| {
+            doc.get_field(key).as_ref().map_or(true, |existing| existing != value)
+        });
+        if !content_changed {
+            tracing::info!(
+                "[client.update] SKIP no-op mutation doc={} record={} — content unchanged",
+                doc_id, record_id,
+            );
+            return Ok(());
+        }
+
         let mutation_id = uuid::Uuid::new_v4().to_string();
+
+        // Auto-set updatedAt to HLC wall clock (content changed, so timestamp advances)
+        let hlc = self.clock.now();
+        if self.clock.did_logical_wrap() {
+            self.metrics.record_hlc_wrap();
+            self.clock.clear_logical_wrap();
+        }
+        fields.insert("updatedAt".to_string(), CrdtValue::Number(hlc.wall as f64));
 
         // ── Phase 1: state vector + snapshot hash BEFORE mutation ──
         let sv_before = doc.state_vector();
@@ -1060,11 +1117,6 @@ impl VaultSyncClient {
             .encryptor
             .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-        let hlc = self.clock.now();
-        if self.clock.did_logical_wrap() {
-            self.metrics.record_hlc_wrap();
-            self.clock.clear_logical_wrap();
-        }
         let entry = OplogEntry::new(
             mutation_id,
             self.config.replica_id.clone(),

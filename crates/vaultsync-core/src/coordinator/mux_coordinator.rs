@@ -846,6 +846,8 @@ impl MuxCoordinator {
                     bytes: snapshot.bytes.clone(),
                     checksum: snapshot.checksum,
                     namespace: namespace.to_string(),
+                    schema_version: snapshot.schema_version,
+                    created_at: snapshot.created_at,
                 };
                 let frame = encode_frame(MSG_SNAPSHOT, &snap_payload)
                     .map_err(|e| CoordinatorError::Internal(e.to_string()))?;

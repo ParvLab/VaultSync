@@ -8,6 +8,35 @@ pub mod ws_mux;
 use state::AppState;
 
 pub fn build_router(state: AppState) -> axum::Router {
+    // Spawn background auto-compaction task if configured
+    if !state.config.auto_compact_ns.is_empty() && state.config.auto_compact_interval_minutes > 0 {
+        let ns = state.config.auto_compact_ns.clone();
+        let coord = state.coordinator.clone();
+        let interval_minutes = state.config.auto_compact_interval_minutes;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    interval_minutes * 60,
+                ))
+                .await;
+                match coord.compact_oplog(&ns).await {
+                    Ok(stats) => {
+                        tracing::info!(
+                            "[auto-compact] namespace={} removed={} snapshots={} docs={}",
+                            ns,
+                            stats.oplog_removed,
+                            stats.snapshots_collapsed,
+                            stats.docs_removed
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("[auto-compact] namespace={} failed: {:?}", ns, e);
+                    }
+                }
+            }
+        });
+    }
+
     axum::Router::new()
         .route("/health", axum::routing::get(routes::health_check))
         .route(
