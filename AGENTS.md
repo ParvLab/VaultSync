@@ -29,8 +29,11 @@
 - **Phase B — `history_preserved` protocol**: Added field to `RegisterAckPayload`/`NamespaceAckPayload`. Demo server sets `false` (in-memory), CF coordinator sets `true` (D1 persists). Added to `Coordinator` trait with default `false`. Stored in WASM coordinator (`AtomicBool`) and mux coordinator (`Arc<AtomicBool>`).
 - **Phase C — Smart recovery**: `client.rs` generation mismatch now checks `history_preserved` before resetting cursor. If `true`: keep cursor, just re-register with same cursor. If `false`: reset cursor to 0 (existing replay behavior).
 
-### In Progress
-- L6: Clean up init progress `[1/9]–[9/9]` → condensed
+### Done (cont.)
+- **Phase 2 — Workers start after recovery**: Download worker spawn moved from `build_client()` to after subscribe in `initialize()`. Receiver stored in `VaultSyncClient.download_worker_rx`, spawned via `start_download_worker()`. Stale init wakeups drained before entering main loop.
+- **Phase 3 — Bootstrap notify removed**: `client.events.notify_download(None)` removed from `wasm/src/client.rs:161`. No bootstrap pull needed — worker starts already synchronized after subscribe.
+- **Phase 4 — CF coordinator max_sequence**: Both RegisterAck and NamespaceAck queries now use `SELECT COALESCE(MAX(...), 0) FROM (SELECT MAX(sequence) FROM mutations UNION ALL SELECT MAX(sequence) FROM snapshots)`. Survives compaction (mutations deleted) correctly.
+- **L6 — Init progress condensed**: `[1/9]–[9/9]` numbering removed across 3 files. Replaced with clean `[Coordinator]`, `[Recovery]`, `[Subscribed]` tags. Construction timings demoted to `debug!`. Ready log includes total startup ms.
 
 ### Blocked
 - Log demotion (L2-L5) blocked until snapshot verification confirms replay is functional
@@ -47,9 +50,10 @@
 - **`InMemoryCoordinator` vs CF Coordinator persistence**: InMemoryCoordinator (demo server) uses `AtomicU64::new(1)` for seq counter and `HashMap` for all data — everything lost on restart. CF coordinator uses D1 `AUTOINCREMENT` for seq and D1 tables for all data — survives DO eviction. This distinction drove the `history_preserved` protocol addition.
 
 ## Next Steps
-1. **Verify snapshot restore with compaction**: Start server, POST /namespace/notes-demo/compact, restart coordinator, connect client. Confirm `[download_queue] snapshot restored: docs=N ...` and no full replay.
-2. **Log demotion (after verification)**: Demote ~130 log lines to `trace!`/`debug!` per the audience model below.
-3. **Tag release** once stable.
+1. **Verify production fetchInitial count** — Build production React app, confirm StrictMode double-invoke disappears.
+2. **Demote remaining instrumentation (L2-L5)** — After soak test confirms new lifecycle, ~130 lines to `trace!`/`debug!`.
+3. **8–12 hour soak test** — Overnight run with new lifecycle (worker spawn relocation).
+4. **Benchmark suite** — Startup time, snapshot restore, compaction, reconnect timing.
 
 ### Logging Architecture
 Log levels map to audience:
@@ -74,6 +78,12 @@ When ready, the remaining work splits into these phases:
 | L6 | Clean up init progress `[1/9]–[9/9]` → condensed | `wasm/src/client.rs`, `ws_coordinator.rs` | ~15 lines |
 | L7 | Verify: `cargo check`, `wasm-pack build`, `npm run build`, smoke test | — | — |
 
+### Done
+- **Phase 2 — Workers start after recovery**: Download worker spawn moved from `build_client()` to after subscribe in `initialize()`. Receiver stored in `VaultSyncClient.download_worker_rx`, spawned via `start_download_worker()`. Stale init wakeups drained before entering main loop.
+- **Phase 3 — Bootstrap notify removed**: `client.events.notify_download(None)` removed from `wasm/src/client.rs:161`. No bootstrap pull needed — worker starts already synchronized after subscribe.
+- **Phase 4 — CF coordinator max_sequence**: Both RegisterAck and NamespaceAck queries use `SELECT COALESCE(MAX(...), 0) FROM (SELECT MAX(sequence) FROM mutations UNION ALL SELECT MAX(sequence) FROM snapshots)`. Survives compaction correctly.
+- **L6 — Init progress condensed**: `[1/9]–[9/9]` numbering removed across 3 files. Replaced with clean `[Coordinator]`, `[Recovery]`, `[Subscribed]` tags. Construction timings demoted to `debug!`. Ready log includes total startup ms.
+
 ## Critical Context
 - **Bug A (OPFS race) — FIXED**: Cross-tab OPFS race eliminated by per-tab storage paths. Upload pipeline health confirmed by consistent `PUSH_ACK sequences=[N]`, `AFTER_MARK_SYNCED pending=0`, `BATCH_DONE success=1`.
 - **Bug B (Focus guard loop) — FIXED**: One-way replication caused by `document.activeElement` check blocking external merges on the follower tab. Fixed with edit-timestamp cooldown. Both directions now confirmed working.
@@ -89,10 +99,11 @@ When ready, the remaining work splits into these phases:
 - `crates/vaultsync-core/src/sync/reconciler.rs`: Reconciler ENTER/EXIT logs — confirmed working
 - `sdk/packages/react/src/useQuery.ts`, `useVaultSyncOne.ts`: React hooks with notification chain
 - `sdk/examples/notes/src/components/NoteEditor.tsx`: Focus guard fix with edit-timestamp cooldown
-- `crates/vaultsync-wasm/src/ws_coordinator.rs`: `effective_after` for SUBSCRIBE after snapshot drain; `history_preserved` storage + trait impl
-- `crates/vaultsync-core/src/client.rs`: Smart recovery — keep cursor on gen mismatch when `history_preserved=true`
-- `crates/vaultsync-core/src/coordinator/ws_proto.rs`: `history_preserved` in `RegisterAckPayload`/`NamespaceAckPayload`
-- `crates/vaultsync-core/src/coordinator/traits.rs`: `history_preserved()` trait method
-- `crates/vaultsync-core/src/coordinator/mux_coordinator.rs`: `history_preserved` stored in `MuxWsHandle` + exposed via `NamespacedCoordinator`
-- `crates/vaultsync-coordinator-cf/src/lib.rs`: `history_preserved: true` in register/namespace-ack
+- `crates/vaultsync-wasm/src/ws_coordinator.rs`: `effective_after` for SUBSCRIBE after snapshot drain; `history_preserved` storage + trait impl; `skip_subscribe` param for split handshake; `[N/9]` → `[VaultSync]` tags
+- `crates/vaultsync-wasm/src/client.rs`: Removed bootstrap `notify_download(None)`; `[1/9]`/`[9/9]` → clean `[VaultSync]` tags
+- `crates/vaultsync-core/src/client.rs`: Evidence-based gen mismatch handler; download worker spawn moved to `start_download_worker()` after subscribe; `[4/9]–[8/9]` → `[Coordinator]/[Recovery]/[Subscribed]` tags; `[client.new]` construction timings → `debug!`; removed `[client] synced` summary
+- `crates/vaultsync-core/src/coordinator/ws_proto.rs`: `max_sequence` in `RegisterAckPayload`/`NamespaceAckPayload`
+- `crates/vaultsync-core/src/coordinator/traits.rs`: `max_sequence()` trait method; `history_preserved()` trait method
+- `crates/vaultsync-core/src/coordinator/mux_coordinator.rs`: `max_sequence` in `MuxWsHandle`; `history_preserved` stored
+- `crates/vaultsync-coordinator-cf/src/lib.rs`: `max_sequence` uses `COALESCE(MAX(...), 0) FROM (SELECT MAX(sequence) FROM mutations UNION ALL SELECT MAX(sequence) FROM snapshots)` — survives compaction; `history_preserved: true`
 - `crates/vaultsync-coordinator-server/src/ws.rs`, `ws_mux.rs`: `history_preserved: false` in register/namespace-ack

@@ -111,12 +111,12 @@ impl WasmWsCoordinator {
 
     pub fn set_download_notify(&self, tx: mpsc::UnboundedSender<Option<PendingMutation>>) {
         *self.inner.download_notify.lock().unwrap() = Some(tx);
-        console_log!("[WasmWs] download_notify registered");
+        console_debug!("[WasmWs] download_notify registered");
     }
 
     pub fn set_upload_notify(&self, tx: mpsc::UnboundedSender<()>) {
         *self.inner.upload_notify.lock().unwrap() = Some(tx);
-        console_log!("[WasmWs] upload_notify registered");
+        console_debug!("[WasmWs] upload_notify registered");
     }
 
     async fn connect_and_handshake(
@@ -125,7 +125,17 @@ impl WasmWsCoordinator {
         after: SequenceId,
         info: Option<&ReplicaInfo>,
     ) -> Result<(), CoordinatorError> {
-        console_log!("[5/9] coordinator connect");
+        self.connect_and_handshake_impl(namespace, after, info, false).await
+    }
+
+    async fn connect_and_handshake_impl(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        info: Option<&ReplicaInfo>,
+        skip_subscribe: bool,
+    ) -> Result<(), CoordinatorError> {
+        console_debug!("[VaultSync] coordinator connect");
 
         // ── Single-flight guard: only one caller connects, others wait ──
         let wait_for_connection = {
@@ -154,11 +164,11 @@ impl WasmWsCoordinator {
 
         // Perform connection handshake
         let reconn_t0 = js_sys::Date::now();
-        let result = self.do_connect(namespace, after, info, generation).await;
+        let result = self.do_connect(namespace, after, info, generation, skip_subscribe).await;
         let reconn_elapsed = (js_sys::Date::now() - reconn_t0) as u64;
 
         // Notify waiters and finalize state
-        let had_ws = {
+        let _had_ws = {
             let mut state = self.inner.connection.lock().unwrap();
             let had = state.ws.is_some();
             state.connecting = false;
@@ -183,8 +193,8 @@ impl WasmWsCoordinator {
         // On successful reconnect, wake workers to resume syncing
         if result.is_ok() {
             console_log!(
-                "[reconnect] SUCCESS generation={} elapsed={}ms had_ws_before={} notifying_workers=true",
-                generation, reconn_elapsed, had_ws,
+                "[reconnect] SUCCESS generation={} elapsed={}ms",
+                generation, reconn_elapsed,
             );
             if let Some(ref notify) = *self.inner.upload_notify.lock().unwrap() {
                 let _ = notify.unbounded_send(());
@@ -203,13 +213,15 @@ impl WasmWsCoordinator {
     }
 
     /// Performs the actual WebSocket connection and handshake.
-    /// Returns the established WebSocket on success.
+    /// When `skip_subscribe` is true, SUBSCRIBE is not sent — the caller
+    /// must call `subscribe()` separately after the generation check.
     async fn do_connect(
         &self,
         namespace: &str,
         after: SequenceId,
         info: Option<&ReplicaInfo>,
         generation: u64,
+        skip_subscribe: bool,
     ) -> Result<(), CoordinatorError> {
         let ws_url = get_ws_url(&self.inner.url, namespace);
         console_debug!("[reconnect] state=Connecting url={}", ws_url);
@@ -278,7 +290,7 @@ impl WasmWsCoordinator {
 
         // 2. Perform AUTH
         console_debug!("[reconnect] state=Authenticating");
-        console_log!("[6/9] auth");
+        console_debug!("[VaultSync] auth");
         let token = self.inner.auth_token.clone().unwrap_or_default();
         let replica_id = info
             .map(|i| i.replica_id.clone())
@@ -318,10 +330,10 @@ impl WasmWsCoordinator {
             console_log!("[WasmWs] auth ack status is not ok: {:?}", auth_ack.error);
             return Err(CoordinatorError::AuthFailed);
         }
-        console_log!("[WasmWs] auth successful!");
+        console_debug!("[WasmWs] auth successful!");
 
         // 3. Perform REGISTER
-        console_log!("[7/9] register");
+        console_debug!("[VaultSync] register");
         let reg = RegisterPayload {
             replica_id: replica_id.clone(),
             namespace: namespace.to_string(),
@@ -367,7 +379,7 @@ impl WasmWsCoordinator {
             self.inner.max_sequence.store(ack.max_sequence, Ordering::SeqCst);
         }
 
-        console_log!("[WasmWs] register successful!");
+        console_debug!("[WasmWs] register successful!");
 
         // 3.5 Drain MSG_SNAPSHOT frames pushed by server after REGISTER_ACK
         console_log!("[WasmWs] draining snapshots after register");
@@ -409,17 +421,21 @@ impl WasmWsCoordinator {
             .unwrap_or(0);
         let effective_after = std::cmp::max(after, max_snap_seq);
 
-        // 4. Perform SUBSCRIBE
-        console_log!("[8/9] subscribe after={} (after={} max_snapshot={})", effective_after, after, max_snap_seq);
-        let sub = SubscribePayload {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            namespace: namespace.to_string(),
-            after: effective_after,
-        };
-        let sub_frame = encode_frame(MSG_SUBSCRIBE, &sub)
-            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        ws.send_with_u8_array(&sub_frame)
-            .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+        // 4. Perform SUBSCRIBE (skipped when caller will subscribe separately after gen check)
+        if !skip_subscribe {
+            console_debug!("[VaultSync] subscribe after={} (after={} max_snapshot={})", effective_after, after, max_snap_seq);
+            let sub = SubscribePayload {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                namespace: namespace.to_string(),
+                after: effective_after,
+            };
+            let sub_frame = encode_frame(MSG_SUBSCRIBE, &sub)
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            ws.send_with_u8_array(&sub_frame)
+                .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+        } else {
+            console_debug!("[VaultSync] subscribe deferred (will subscribe after gen check)");
+        }
 
         // Spawn background message processor with generation guard
         let inner_clone = self.inner.clone();
@@ -879,7 +895,7 @@ impl Coordinator for WasmWsCoordinator {
         };
 
         if !is_connected {
-            self.connect_and_handshake(namespace, last_sequence, Some(&info))
+            self.connect_and_handshake_impl(namespace, last_sequence, Some(&info), true)
                 .await?;
         } else {
             let reg = RegisterPayload {

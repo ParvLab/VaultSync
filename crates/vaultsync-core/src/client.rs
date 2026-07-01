@@ -1,7 +1,7 @@
 use crate::config::VaultSyncConfig;
 #[cfg(feature = "async-runtime")]
 use crate::coordinator::memory::InMemoryCoordinator;
-use crate::coordinator::traits::{Coordinator, ReplicaInfo};
+use crate::coordinator::traits::{Coordinator, PendingMutation, ReplicaInfo};
 use crate::crdt::document::CRDTDocument;
 use crate::crdt::types::CrdtValue;
 use crate::e2ee::keyring::{E2eeDecryptor, E2eeEncryptor, KeyRing};
@@ -61,6 +61,10 @@ pub struct VaultSyncClient {
     pending_count_cache: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(target_arch = "wasm32")]
     pending_count_rx: std::sync::Mutex<Option<futures::channel::mpsc::UnboundedReceiver<usize>>>,
+    /// Download channel receiver, held until `start_download_worker()` is called
+    /// after subscribe completes in `initialize()`.
+    download_worker_rx:
+        std::sync::Mutex<Option<futures::channel::mpsc::UnboundedReceiver<Option<PendingMutation>>>>,
 }
 
 impl VaultSyncClient {
@@ -197,15 +201,15 @@ impl VaultSyncClient {
         auto_initialize: bool,
     ) -> Result<Self, VaultSyncError> {
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::info!("[client.new] migration start");
+        tracing::debug!("[client.new] migration start");
         let runner = crate::schema::migration::MigrationRunner::new(storage.clone(), migrations);
         runner.validate_applied().await?;
         runner.run_pending().await?;
         let schema_version = runner.current_version().await;
-        tracing::info!("[client.new] migration done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::debug!("[client.new] migration done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::info!("[client.new] keys start");
+        tracing::debug!("[client.new] keys start");
         let mut stored_keys = storage.read_keys(&config.namespace).await?;
         if stored_keys.is_empty() {
             // Introduce a small random delay and re-read, to handle concurrent initialization races
@@ -271,23 +275,23 @@ impl VaultSyncClient {
             }
         }
 
-        tracing::info!("[client.new] keys done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::debug!("[client.new] keys done {} ms", crate::time_utils::system_time_now_ms() - _t);
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::info!("[client.new] e2ee+subs+reconciler start");
+        tracing::debug!("[client.new] e2ee+subs+reconciler start");
         let encryptor = Arc::new(E2eeEncryptor::new(keyring.clone()));
         let decryptor = Arc::new(E2eeDecryptor::new(keyring.clone()));
 
         let subscriptions = Arc::new(std::sync::Mutex::new(SubscriptionEngine::new()));
         let reconciler = Arc::new(Reconciler::new(storage.clone(), subscriptions.clone()));
-        tracing::info!("[client.new] e2ee+subs+reconciler done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::debug!("[client.new] e2ee+subs+reconciler done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::info!("[client.new] oplog init start");
+        tracing::debug!("[client.new] oplog init start");
         let oplog = Arc::new(OpLog::new(storage.clone(), &config.namespace));
-        tracing::info!("[client.new] oplog init done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::debug!("[client.new] oplog init done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::info!("[client.new] read_sync_state start");
+        tracing::debug!("[client.new] read_sync_state start");
         let last_sequence = match storage.read_sync_state(&config.namespace).await? {
             Some(state) => {
                 #[cfg(target_arch = "wasm32")]
@@ -305,13 +309,13 @@ impl VaultSyncClient {
                 state.last_synced_sequence
             }
             None => {
-                tracing::info!("[client.new] read_sync_state no state took {} ms", crate::time_utils::system_time_now_ms() - _t);
+                tracing::debug!("[client.new] read_sync_state no state took {} ms", crate::time_utils::system_time_now_ms() - _t);
                 0
             }
         };
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::info!("[client.new] queue init start");
+        tracing::debug!("[client.new] queue init start");
         let metrics = Arc::new(crate::telemetry::metrics::VaultSyncMetrics::new());
         let debug_api = Arc::new(crate::telemetry::debug::DebugApi::new(
             storage.clone(),
@@ -338,7 +342,7 @@ impl VaultSyncClient {
             config.max_clock_skew,
             config.replica_id.clone(),
         ));
-        tracing::info!("[client.new] queue init done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::debug!("[client.new] queue init done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let schema = Arc::new(std::sync::Mutex::new(SchemaRegistry::new()));
         let _telemetry = Arc::new(VaultSyncTelemetry::new());
@@ -351,7 +355,7 @@ impl VaultSyncClient {
 
         // Perform crash recovery on startup before starting the sync loop
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::info!("[client.new] crash_recovery start");
+        tracing::debug!("[client.new] crash_recovery start");
         let crash_recovery = crate::ipc::crash_recovery::CrashRecovery::new(
             storage.clone(),
             config.namespace.clone(),
@@ -359,15 +363,15 @@ impl VaultSyncClient {
         if let Err(e) = crash_recovery.recover(keyring.clone()).await {
             tracing::error!(error = %e, "Crash recovery failed during startup");
         }
-        tracing::info!("[client.new] crash_recovery done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::debug!("[client.new] crash_recovery done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::info!("[client.new] leader_election start");
+        tracing::debug!("[client.new] leader_election start");
         let leader_election = Arc::new(crate::ipc::leader_election::LeaderElection::new(
             &config.namespace,
             &config.storage,
         ));
-        tracing::info!("[client.new] leader_election done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::debug!("[client.new] leader_election done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         #[cfg(not(target_arch = "wasm32"))]
         let mut p2p_handle = None;
@@ -412,24 +416,22 @@ impl VaultSyncClient {
         }
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::info!("[client.new] shared_memory start");
+        tracing::debug!("[client.new] shared_memory start");
         let shared_memory = Arc::new(
             crate::ipc::shared_memory::SharedMemory::create_with_namespace(
                 &config.namespace,
                 64 * 1024,
             )?,
         );
-        tracing::info!("[client.new] shared_memory done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::debug!("[client.new] shared_memory done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let _t = crate::time_utils::system_time_now_ms();
         #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
         let (events, upload_event_rx, download_event_rx, pending_count_rx) =
             crate::sync::events::SyncEvents::new();
 
-        // Clone before moving into Self (used by download/compaction workers below)
-        let coord_for_dl = coordinator.clone();
+        // Clone before moving into Self (used by compaction worker below)
         let coord_for_comp = coordinator.clone();
-        let ns_for_dl = config.namespace.clone();
         let pending_count_tx = events.pending_count.clone();
         let pending_cache = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -464,8 +466,9 @@ impl VaultSyncClient {
             pending_count_cache: pending_cache.clone(),
             #[cfg(target_arch = "wasm32")]
             pending_count_rx: std::sync::Mutex::new(Some(pending_count_rx)),
+            download_worker_rx: std::sync::Mutex::new(Some(download_event_rx)),
         };
-        tracing::info!("[client.new] construction done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::debug!("[client.new] construction done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         // Initialize pending count cache from storage
         let initial_pending = upload_queue.pending_count().await.unwrap_or(0);
@@ -474,7 +477,6 @@ impl VaultSyncClient {
         let namespace_clone = client.config.namespace.clone();
         let storage_clone = client.storage.clone();
         let upload_events_rx = upload_event_rx;
-        let download_events_rx = download_event_rx;
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -579,80 +581,7 @@ impl VaultSyncClient {
             }
         });
 
-        // ── Download worker (push-driven) ─────────────────────────────────
-        let dq = download_queue.clone();
-        let mut download_rx = download_events_rx;
-        let _coord = coord_for_dl;
-        let _ns = ns_for_dl;
-        let initial_seq = download_queue.last_sequence();
-        crate::time_utils::spawn(async move {
-            tracing::debug!("[download_worker] started cursor={} t={}", initial_seq, crate::time_utils::system_time_now_ms());
-
-            loop {
-                let mut needs_backfill = true;
-
-                match download_rx.next().await {
-                    None => {
-                        tracing::debug!("[download_worker] channel closed, exiting");
-                        break;
-                    }
-                    Some(Some(m)) => {
-                        // Push mutation arrived from coordinator
-                        tracing::info!(
-                            "[download_worker] push seq={} id={}",
-                            m.sequence,
-                            m.id
-                        );
-                        match dq.process_push_mutation(m).await {
-                            Ok(outcome) => {
-                                tracing::debug!(
-                                    "[download_worker] push outcome={:?}",
-                                    outcome
-                                );
-                                needs_backfill = outcome == crate::sync::download::PushOutcome::GapDetected;
-                                // ── Phase 4: always backfill at least once during replay ──
-                                if !needs_backfill && dq.is_replay_mode() {
-                                    needs_backfill = true;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[download_worker] process_push_mutation error: {:?}",
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    Some(None) => {
-                        // Bootstrap or wakeup: drain process_batch
-                    }
-                }
-
-                if needs_backfill {
-                    loop {
-                        match dq.process_batch().await {
-                            Ok(0) => {
-                                tracing::debug!("[download_worker] process_batch -> 0");
-                                break;
-                            }
-                            Ok(count) => {
-                                tracing::info!(
-                                    "[download_worker] process_batch -> {}",
-                                    count
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[download_worker] process_batch error {:?}",
-                                    e
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        // ── Download worker (push-driven) — spawned in initialize() after subscribe ──
 
         // ── Leader election + compaction timer ────────────────────────────
         let le = leader_election.clone();
@@ -776,7 +705,7 @@ impl VaultSyncClient {
         };
 
         let cursor = self.download_queue.last_sequence();
-        tracing::info!("[4/9] coordinator register cursor={}", cursor);
+        tracing::info!("[Coordinator] register cursor={}", cursor);
         let registered = self.coordinator
             .register(&self.config.namespace, replica_info.clone(), cursor)
             .await;
@@ -787,12 +716,12 @@ impl VaultSyncClient {
             }
             Ok(()) => {
                 let cursor_before = self.download_queue.last_sequence();
-                tracing::info!("[4.5/9] register returned cursor={}", cursor_before);
+                tracing::info!("[Coordinator] register returned cursor={}", cursor_before);
 
                 // Check generation ID — reset cursor if server restarted
                 let server_gen = self.coordinator.generation_id().await;
                 if !server_gen.is_empty() {
-                    tracing::info!("[5/9] generation check server_gen={} cursor={}", server_gen, cursor_before);
+                    tracing::info!("[Recovery] server gen={} cursor={}", server_gen, cursor_before);
                     if let Some(mut state) = self.storage.read_sync_state(&self.config.namespace).await? {
                         if state.generation_id != server_gen {
                             let cursor_was = cursor_before;
@@ -804,7 +733,7 @@ impl VaultSyncClient {
                             // Preserve cursor in sync state (don't reset to 0)
                             self.storage.write_sync_state(&state).await?;
                             tracing::info!(
-                                "[5/9] gen mismatch: keeping cursor={} gen={} (will validate after re-register)",
+                                "[Recovery] gen mismatch: cursor={} gen={} (will validate)",
                                 cursor_was,
                                 state.generation_id
                             );
@@ -816,22 +745,22 @@ impl VaultSyncClient {
                                 .await
                             {
                                 Ok(()) => {
-                                    tracing::info!("[6/9] re-register complete cursor={}", cursor_was);
+                                    tracing::info!("[Recovery] re-registered cursor={}", cursor_was);
                                     // Evidence-based cursor validation
                                     let server_max = self.coordinator.max_sequence().await;
                                     if server_max == 0 {
                                         tracing::info!(
-                                            "[6.5/9] cursor validation unavailable (server_max=0), keeping cursor={}",
+                                            "[Recovery] cursor validation unavailable (server_max=0), keeping cursor={}",
                                             cursor_was
                                         );
                                     } else if server_max >= cursor_was {
                                         tracing::info!(
-                                            "[6.5/9] cursor valid: server_max={} >= cursor={}",
+                                            "[Recovery] cursor valid: server_max={} >= cursor={}",
                                             server_max, cursor_was
                                         );
                                     } else {
                                         tracing::info!(
-                                            "[6.5/9] cursor INVALID: server_max={} < cursor={} -> resetting to 0",
+                                            "[Recovery] cursor INVALID: server_max={} < cursor={} -> resetting to 0",
                                             server_max, cursor_was
                                         );
                                         state.last_synced_sequence = 0;
@@ -843,7 +772,7 @@ impl VaultSyncClient {
                                             .await
                                         {
                                             Ok(()) => {
-                                                tracing::info!("[7/9] re-register complete cursor=0 (full replay)");
+                                                tracing::info!("[Recovery] re-registered cursor=0 (full replay)");
                                             }
                                             Err(e) => {
                                                 tracing::warn!("Re-register failed at cursor=0: {:?}", e);
@@ -856,29 +785,23 @@ impl VaultSyncClient {
                                 }
                             }
                         } else {
-                            tracing::info!("[sync_state] generation OK gen={}", server_gen);
+                            tracing::info!("[Recovery] generation OK gen={}", server_gen);
                         }
                     }
                 }
             }
         }
 
-        // ── Sync state summary ──
-        let final_cursor = self.download_queue.last_sequence();
-        let server_gen = self.coordinator.generation_id().await;
-        let gen_ok = if let Some(state) = self.storage.read_sync_state(&self.config.namespace).await.ok().flatten() {
-            state.generation_id == server_gen || server_gen.is_empty()
+        // ── Subscribe for push notifications after recovery ──
+        let sub_cursor = self.download_queue.last_sequence();
+        if self.coordinator.subscribe(&self.config.namespace, sub_cursor).await.is_ok() {
+            tracing::info!("[Subscribed] after={}", sub_cursor);
         } else {
-            true
-        };
-        #[cfg(target_arch = "wasm32")]
-        let backend = "opfs";
-        #[cfg(not(target_arch = "wasm32"))]
-        let backend = "sqlite";
-        tracing::info!(
-            "[client] synced: cursor={} gen_match={} backend={} ns={}",
-            final_cursor, gen_ok, backend, self.config.namespace
-        );
+            tracing::warn!("[Subscribed] failed (pull-only mode)");
+        }
+
+        // ── Start download worker now that initialization is complete ──
+        self.start_download_worker();
 
         Ok(())
     }
@@ -891,6 +814,90 @@ impl VaultSyncClient {
         #[cfg(not(target_arch = "wasm32"))]
         let _ = self.shutdown_tx.send(true);
         Ok(())
+    }
+
+    /// Spawns the download worker thread/task.
+    /// Called once from `initialize()` after subscribe completes,
+    /// ensuring the worker never wakes before recovery is done.
+    fn start_download_worker(&self) {
+        let rx = self.download_worker_rx.lock().unwrap().take();
+        let Some(mut download_rx) = rx else {
+            tracing::warn!("[download_worker] already started or rx missing");
+            return;
+        };
+        let dq = self.download_queue.clone();
+        crate::time_utils::spawn(async move {
+            // Drain stale wakeups accumulated before subscribe
+            while let Ok(_) = download_rx.try_recv() {}
+
+            tracing::debug!(
+                "[download_worker] started cursor={}",
+                dq.last_sequence()
+            );
+
+            loop {
+                let mut needs_backfill = true;
+
+                match download_rx.next().await {
+                    None => {
+                        tracing::debug!("[download_worker] channel closed, exiting");
+                        break;
+                    }
+                    Some(Some(m)) => {
+                        tracing::info!(
+                            "[download_worker] push seq={} id={}",
+                            m.sequence,
+                            m.id
+                        );
+                        match dq.process_push_mutation(m).await {
+                            Ok(outcome) => {
+                                tracing::debug!(
+                                    "[download_worker] push outcome={:?}",
+                                    outcome
+                                );
+                                needs_backfill = outcome == crate::sync::download::PushOutcome::GapDetected;
+                                if !needs_backfill && dq.is_replay_mode() {
+                                    needs_backfill = true;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[download_worker] process_push_mutation error: {:?}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Some(None) => {
+                        // Bootstrap or wakeup: drain process_batch
+                    }
+                }
+
+                if needs_backfill {
+                    loop {
+                        match dq.process_batch().await {
+                            Ok(0) => {
+                                tracing::debug!("[download_worker] process_batch -> 0");
+                                break;
+                            }
+                            Ok(count) => {
+                                tracing::info!(
+                                    "[download_worker] process_batch -> {}",
+                                    count
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[download_worker] process_batch error {:?}",
+                                    e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Filter out engine-managed metadata fields from user-provided field maps.

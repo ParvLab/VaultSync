@@ -109,7 +109,7 @@ impl WasmVaultSyncClient {
     ) -> Result<WasmVaultSyncClient, JsValue> {
         let _t0 = js_sys::Date::now();
         let t = || -> f64 { js_sys::Date::now() - _t0 };
-        console_log!("[1/9] creating browser storage");
+        console_log!("[VaultSync] storage initializing");
         let mut config = VaultSyncConfig::default();
         config.namespace = namespace.to_string();
         config.replica_id = replica_id.to_string();
@@ -128,7 +128,7 @@ impl WasmVaultSyncClient {
         };
 
         console_debug!("[timing] storage ready t={:.0}ms", t());
-        console_log!("[2/9] creating ws coordinator");
+        console_debug!("[VaultSync] creating ws coordinator");
         let coordinator = Arc::new(crate::ws_coordinator::WasmWsCoordinator::new(
             coordinator_url,
             auth_token,
@@ -138,7 +138,7 @@ impl WasmVaultSyncClient {
             coordinator.clone();
         let keyring = Arc::new(KeyRing::generate());
 
-        console_log!("[3/9] creating sync client");
+        console_debug!("[VaultSync] creating sync client");
         let client = Arc::new(
             VaultSyncClient::new_with_storage_skip_init(config, coordinator_for_client, keyring, storage)
                 .await
@@ -157,13 +157,13 @@ impl WasmVaultSyncClient {
         })?;
         console_debug!("[timing] initialize done t={:.0}ms", t());
 
-        // Bootstrap: same event-driven path as WS push notifications
-        client.events.notify_download(None);
+        // NOTE: No bootstrap notify_download needed — download worker starts
+        // after subscribe completes in initialize(), already synchronized.
 
         // Create presence manager for cross-tab awareness
         let presence = crate::presence::PresenceManager::new(namespace, replica_id).ok();
 
-        console_log!("[9/9] client ready");
+        console_log!("[VaultSync] Ready ({:.0}ms)", t());
 
         // Settle leader election
         let _ = client.leader_election.try_acquire();

@@ -482,16 +482,22 @@ impl DurableObject for NamespaceDurableObject {
                 {
                     ack.coordinator_sequence = row.version as u64;
                 }
-                // Query max sequence for cursor validation
+                // Query max sequence for cursor validation.
+                // After compaction, mutations rows are deleted but snapshots
+                // retain the max sequence — query both and take the max.
                 if let Ok(Some(max_row)) = db
-                    .prepare("SELECT MAX(sequence) AS max_seq FROM mutations WHERE namespace = ?1")
+                    .prepare(
+                        "SELECT COALESCE(MAX(m.seq), 0) AS max_seq FROM (\
+                         SELECT MAX(sequence) AS seq FROM mutations WHERE namespace = ?1 \
+                         UNION ALL \
+                         SELECT MAX(sequence) AS seq FROM snapshots WHERE namespace = ?1 \
+                        ) m"
+                    )
                     .bind(&[add_payload.namespace.clone().into()])?
                     .first::<D1MaxSeqRow>(None)
                     .await
                 {
-                    if let Some(seq) = max_row.max_seq {
-                        ack.max_sequence = seq as u64;
-                    }
+                    ack.max_sequence = max_row.max_seq.unwrap_or(0) as u64;
                 }
 
                 let mut available_snapshots = Vec::new();
@@ -626,16 +632,22 @@ impl DurableObject for NamespaceDurableObject {
                 {
                     reg_ack.coordinator_sequence = row.version as u64;
                 }
-                // Query max sequence for cursor validation
+                // Query max sequence for cursor validation.
+                // After compaction, mutations rows are deleted but snapshots
+                // retain the max sequence — query both and take the max.
                 if let Ok(Some(max_row)) = db
-                    .prepare("SELECT MAX(sequence) AS max_seq FROM mutations WHERE namespace = ?1")
+                    .prepare(
+                        "SELECT COALESCE(MAX(m.seq), 0) AS max_seq FROM (\
+                         SELECT MAX(sequence) AS seq FROM mutations WHERE namespace = ?1 \
+                         UNION ALL \
+                         SELECT MAX(sequence) AS seq FROM snapshots WHERE namespace = ?1 \
+                        ) m"
+                    )
                     .bind(&[attachment.namespace.clone().into()])?
                     .first::<D1MaxSeqRow>(None)
                     .await
                 {
-                    if let Some(seq) = max_row.max_seq {
-                        reg_ack.max_sequence = seq as u64;
-                    }
+                    reg_ack.max_sequence = max_row.max_seq.unwrap_or(0) as u64;
                 }
 
                 let mut available_snapshots = Vec::new();
