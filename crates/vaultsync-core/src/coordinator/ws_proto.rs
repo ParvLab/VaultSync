@@ -60,6 +60,10 @@ pub struct RegisterAckPayload {
     pub error: Option<String>,
     #[serde(default)]
     pub generation_id: String,
+    #[serde(default)]
+    pub history_preserved: bool,
+    #[serde(default)]
+    pub max_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +127,10 @@ pub struct NamespaceAckPayload {
     pub snapshot_available: bool,
     pub snapshot_sequence: u64,
     pub error: Option<String>,
+    #[serde(default)]
+    pub history_preserved: bool,
+    #[serde(default)]
+    pub max_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

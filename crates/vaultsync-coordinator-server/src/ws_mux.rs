@@ -101,6 +101,8 @@ async fn handle_ws_mux_session(state: AppState, socket: WebSocket) {
                                 snapshot_available: false,
                                 snapshot_sequence: 0,
                                 error: None,
+                                history_preserved: false,
+                                max_sequence: state.coordinator.max_sequence().await,
                             };
 
                             let mut available_snapshots = Vec::new();

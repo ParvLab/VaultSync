@@ -9,6 +9,8 @@ use tracing::warn;
 
 #[cfg(not(target_arch = "wasm32"))]
 use futures::SinkExt;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
@@ -37,6 +39,8 @@ struct MuxWsHandle {
     snapshots: Arc<
         tokio::sync::Mutex<std::collections::HashMap<String, Vec<crate::crdt::snapshot::Snapshot>>>,
     >,
+    history_preserved: Arc<AtomicBool>,
+    max_sequence: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +122,8 @@ impl MuxCoordinator {
                 pending_schema_syncs: pending_schema_syncs.clone(),
                 namespace_txs: namespace_txs.clone(),
                 snapshots: snapshots.clone(),
+                history_preserved: Arc::new(AtomicBool::new(false)),
+                max_sequence: Arc::new(AtomicU64::new(0)),
             };
 
             // Heartbeat task
@@ -178,6 +184,8 @@ impl MuxCoordinator {
             let snapshots_clone = snapshots.clone();
 
             let self_weak = Arc::downgrade(&self_arc);
+            let hp = handle.history_preserved.clone();
+            let ms = handle.max_sequence.clone();
 
             crate::time_utils::spawn(async move {
                 use tokio_tungstenite::tungstenite::Message;
@@ -248,6 +256,10 @@ impl MuxCoordinator {
                                     if let Ok(ack) =
                                         serde_json::from_slice::<NamespaceAckPayload>(payload)
                                     {
+                                        if ack.history_preserved {
+                                            hp.store(true, Ordering::SeqCst);
+                                        }
+                                        ms.store(ack.max_sequence, Ordering::SeqCst);
                                         let mut reqs = pending_registers_clone.lock().await;
                                         if let Some(tx) = reqs.remove(&ack.namespace) {
                                             let _ = tx.send(ack);
@@ -478,6 +490,26 @@ impl MuxCoordinator {
             }
         }
         Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn history_preserved(&self) -> bool {
+        let handle_opt = self.ws_client.lock().await.clone();
+        if let Some(handle) = handle_opt {
+            handle.history_preserved.load(Ordering::SeqCst)
+        } else {
+            false
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn max_sequence(&self) -> u64 {
+        let handle_opt = self.ws_client.lock().await.clone();
+        if let Some(handle) = handle_opt {
+            handle.max_sequence.load(Ordering::SeqCst)
+        } else {
+            0
+        }
     }
 
     async fn push(
@@ -986,6 +1018,24 @@ impl Coordinator for NamespacedCoordinator {
         _namespace: &str,
     ) -> Result<Vec<crate::crdt::snapshot::Snapshot>, CoordinatorError> {
         self.mux.list_snapshots(&self.namespace).await
+    }
+
+    async fn history_preserved(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            return self.mux.history_preserved().await;
+        }
+        #[cfg(target_arch = "wasm32")]
+        false
+    }
+
+    async fn max_sequence(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            return self.mux.max_sequence().await;
+        }
+        #[cfg(target_arch = "wasm32")]
+        0
     }
 }
 

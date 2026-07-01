@@ -796,46 +796,63 @@ impl VaultSyncClient {
                     if let Some(mut state) = self.storage.read_sync_state(&self.config.namespace).await? {
                         if state.generation_id != server_gen {
                             let cursor_was = cursor_before;
+
+                            // Keep cursor on gen mismatch — only reset if server proves cursor invalid
                             state.generation_id = server_gen.clone();
-                            state.last_synced_sequence = 0;
                             let now_ms = crate::time_utils::system_time_now_ms();
                             state.last_sync_at = Some(now_ms);
+                            // Preserve cursor in sync state (don't reset to 0)
                             self.storage.write_sync_state(&state).await?;
-                            tracing::debug!(
-                                "[client] write_sync_state cursor={} gen={} (from client init generation mismatch)",
-                                state.last_synced_sequence,
+                            tracing::info!(
+                                "[5/9] gen mismatch: keeping cursor={} gen={} (will validate after re-register)",
+                                cursor_was,
                                 state.generation_id
                             );
-                            self.download_queue.reset_cursor(0);
-                            let cursor_after = self.download_queue.last_sequence();
-                            tracing::debug!(
-                                "[sync_state] generation mismatch: local={} server={} -> resetting cursor (was {})",
-                                state.generation_id,
-                                server_gen,
-                                cursor_was
-                            );
-                            tracing::info!(
-                                "[5.5/9] cursor after gen check={} (subscribe was with after={})",
-                                cursor_after,
-                                cursor_was
-                            );
 
-                            // ── Phase 4: enable replay batching to suppress notification storm ──
                             self.download_queue.set_replay_mode(true);
-
-                            // Phase 2: reconnect with cursor=0 so subscribe uses the right value
-                            tracing::info!("[6/9] generation changed, reconnecting with cursor=0");
                             let _ = self.coordinator.disconnect().await;
-                            let new_cursor = self.download_queue.last_sequence(); // should be 0
                             match self.coordinator
-                                .register(&self.config.namespace, replica_info, new_cursor)
+                                .register(&self.config.namespace, replica_info.clone(), cursor_was)
                                 .await
                             {
                                 Ok(()) => {
-                                    tracing::info!("[6.5/9] re-register complete cursor={}", new_cursor);
+                                    tracing::info!("[6/9] re-register complete cursor={}", cursor_was);
+                                    // Evidence-based cursor validation
+                                    let server_max = self.coordinator.max_sequence().await;
+                                    if server_max == 0 {
+                                        tracing::info!(
+                                            "[6.5/9] cursor validation unavailable (server_max=0), keeping cursor={}",
+                                            cursor_was
+                                        );
+                                    } else if server_max >= cursor_was {
+                                        tracing::info!(
+                                            "[6.5/9] cursor valid: server_max={} >= cursor={}",
+                                            server_max, cursor_was
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            "[6.5/9] cursor INVALID: server_max={} < cursor={} -> resetting to 0",
+                                            server_max, cursor_was
+                                        );
+                                        state.last_synced_sequence = 0;
+                                        self.storage.write_sync_state(&state).await?;
+                                        self.download_queue.reset_cursor(0);
+                                        let _ = self.coordinator.disconnect().await;
+                                        match self.coordinator
+                                            .register(&self.config.namespace, replica_info.clone(), 0)
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                tracing::info!("[7/9] re-register complete cursor=0 (full replay)");
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Re-register failed at cursor=0: {:?}", e);
+                                            }
+                                        }
+                                    }
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Re-register failed after gen reset: {:?}", e);
+                                    tracing::warn!("Re-register failed after gen change: {:?}", e);
                                 }
                             }
                         } else {
@@ -845,6 +862,23 @@ impl VaultSyncClient {
                 }
             }
         }
+
+        // ── Sync state summary ──
+        let final_cursor = self.download_queue.last_sequence();
+        let server_gen = self.coordinator.generation_id().await;
+        let gen_ok = if let Some(state) = self.storage.read_sync_state(&self.config.namespace).await.ok().flatten() {
+            state.generation_id == server_gen || server_gen.is_empty()
+        } else {
+            true
+        };
+        #[cfg(target_arch = "wasm32")]
+        let backend = "opfs";
+        #[cfg(not(target_arch = "wasm32"))]
+        let backend = "sqlite";
+        tracing::info!(
+            "[client] synced: cursor={} gen_match={} backend={} ns={}",
+            final_cursor, gen_ok, backend, self.config.namespace
+        );
 
         Ok(())
     }

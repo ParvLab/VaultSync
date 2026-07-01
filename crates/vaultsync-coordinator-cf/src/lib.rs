@@ -31,6 +31,11 @@ struct D1SchemaVersionRow {
     version: i64,
 }
 
+#[derive(Deserialize)]
+struct D1MaxSeqRow {
+    max_seq: Option<i64>,
+}
+
 fn server_generation_id() -> &'static str {
     static GEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     GEN.get_or_init(|| uuid::Uuid::new_v4().to_string())
@@ -466,6 +471,8 @@ impl DurableObject for NamespaceDurableObject {
                     snapshot_available: false,
                     snapshot_sequence: 0,
                     error: None,
+                    history_preserved: true,
+                    max_sequence: 0,
                 };
                 if let Ok(Some(row)) = db
                     .prepare("SELECT version FROM schema_versions WHERE namespace = ?1")
@@ -474,6 +481,17 @@ impl DurableObject for NamespaceDurableObject {
                     .await
                 {
                     ack.coordinator_sequence = row.version as u64;
+                }
+                // Query max sequence for cursor validation
+                if let Ok(Some(max_row)) = db
+                    .prepare("SELECT MAX(sequence) AS max_seq FROM mutations WHERE namespace = ?1")
+                    .bind(&[add_payload.namespace.clone().into()])?
+                    .first::<D1MaxSeqRow>(None)
+                    .await
+                {
+                    if let Some(seq) = max_row.max_seq {
+                        ack.max_sequence = seq as u64;
+                    }
                 }
 
                 let mut available_snapshots = Vec::new();
@@ -597,6 +615,8 @@ impl DurableObject for NamespaceDurableObject {
                     snapshot_url: None,
                     error: None,
                     generation_id: server_generation_id().to_string(),
+                    history_preserved: true,
+                    max_sequence: 0,
                 };
                 if let Ok(Some(row)) = db
                     .prepare("SELECT version FROM schema_versions WHERE namespace = ?1")
@@ -605,6 +625,17 @@ impl DurableObject for NamespaceDurableObject {
                     .await
                 {
                     reg_ack.coordinator_sequence = row.version as u64;
+                }
+                // Query max sequence for cursor validation
+                if let Ok(Some(max_row)) = db
+                    .prepare("SELECT MAX(sequence) AS max_seq FROM mutations WHERE namespace = ?1")
+                    .bind(&[attachment.namespace.clone().into()])?
+                    .first::<D1MaxSeqRow>(None)
+                    .await
+                {
+                    if let Some(seq) = max_row.max_seq {
+                        reg_ack.max_sequence = seq as u64;
+                    }
                 }
 
                 let mut available_snapshots = Vec::new();

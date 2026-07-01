@@ -85,6 +85,18 @@ pub trait Coordinator: Send + Sync + std::fmt::Debug {
     async fn generation_id(&self) -> String {
         String::new()
     }
+    /// Whether the coordinator's mutation history survives restarts (e.g., D1 backend).
+    /// When true, the client can keep its cursor on generation mismatch.
+    /// Default false (in-memory coordinators lose everything on restart).
+    async fn history_preserved(&self) -> bool {
+        false
+    }
+    /// Returns the server's current max oplog sequence, or 0 if unknown.
+    /// The client uses this to validate its cursor after a generation mismatch:
+    /// if `max_sequence < client_cursor`, the cursor is no longer valid.
+    async fn max_sequence(&self) -> u64 {
+        0
+    }
     async fn update_replica_key(
         &self,
         _namespace: &str,

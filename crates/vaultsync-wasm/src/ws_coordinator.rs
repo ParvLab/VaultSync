@@ -4,7 +4,7 @@ use futures::future::Either;
 use futures::FutureExt;
 use futures::{Stream, StreamExt};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use vaultsync_core::coordinator::traits::{
     Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId,
@@ -63,6 +63,8 @@ struct WasmWsCoordinatorInner {
     download_notify: Mutex<Option<mpsc::UnboundedSender<Option<PendingMutation>>>>,
     upload_notify: Mutex<Option<mpsc::UnboundedSender<()>>>,
     generation_id: Mutex<String>,
+    history_preserved: AtomicBool,
+    max_sequence: AtomicU64,
     conn_gen: AtomicU64,
     /// Snapshots received from server pushes (MSG_SNAPSHOT) during REGISTER or later.
     received_snapshots: Mutex<Vec<Snapshot>>,
@@ -99,6 +101,8 @@ impl WasmWsCoordinator {
                 download_notify: Mutex::new(None),
                 upload_notify: Mutex::new(None),
                 generation_id: Mutex::new(String::new()),
+                history_preserved: AtomicBool::new(false),
+                max_sequence: AtomicU64::new(0),
                 conn_gen: AtomicU64::new(0),
                 received_snapshots: Mutex::new(Vec::new()),
             }),
@@ -348,16 +352,19 @@ impl WasmWsCoordinator {
             )));
         }
 
-        // Extract generation_id from RegisterAck
+        // Extract generation_id, history_preserved, and max_sequence from RegisterAck
         if let Ok(ack) = serde_json::from_slice::<RegisterAckPayload>(payload) {
             if !ack.generation_id.is_empty() {
                 let mut gen = self.inner.generation_id.lock().unwrap();
                 *gen = ack.generation_id.clone();
                 console_log!(
-                    "[WasmWs] server generation_id={}",
-                    ack.generation_id
+                    "[WasmWs] server generation_id={} max_sequence={}",
+                    ack.generation_id,
+                    ack.max_sequence
                 );
             }
+            self.inner.history_preserved.store(ack.history_preserved, Ordering::SeqCst);
+            self.inner.max_sequence.store(ack.max_sequence, Ordering::SeqCst);
         }
 
         console_log!("[WasmWs] register successful!");
@@ -394,12 +401,20 @@ impl WasmWsCoordinator {
         }
         console_log!("[WasmWs] snapshot drain complete");
 
+        // Compute effective subscribe cursor: prefer max snapshot seq from drain over raw `after`
+        let max_snap_seq = self.inner.received_snapshots.lock().unwrap()
+            .iter()
+            .map(|s| s.sequence)
+            .max()
+            .unwrap_or(0);
+        let effective_after = std::cmp::max(after, max_snap_seq);
+
         // 4. Perform SUBSCRIBE
-        console_log!("[8/9] subscribe after={}", after);
+        console_log!("[8/9] subscribe after={} (after={} max_snapshot={})", effective_after, after, max_snap_seq);
         let sub = SubscribePayload {
             request_id: uuid::Uuid::new_v4().to_string(),
             namespace: namespace.to_string(),
-            after,
+            after: effective_after,
         };
         let sub_frame = encode_frame(MSG_SUBSCRIBE, &sub)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
@@ -974,6 +989,14 @@ impl Coordinator for WasmWsCoordinator {
 
     async fn generation_id(&self) -> String {
         self.inner.generation_id.lock().unwrap().clone()
+    }
+
+    async fn history_preserved(&self) -> bool {
+        self.inner.history_preserved.load(Ordering::SeqCst)
+    }
+
+    async fn max_sequence(&self) -> u64 {
+        self.inner.max_sequence.load(Ordering::SeqCst)
     }
 }
 

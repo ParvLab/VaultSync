@@ -15,6 +15,53 @@ impl Default for CoordinatorMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl Default for LogLevel {
+    fn default() -> Self {
+        Self::Info
+    }
+}
+
+impl LogLevel {
+    pub fn allows(&self, other: &LogLevel) -> bool {
+        self.priority() >= other.priority()
+    }
+
+    fn priority(&self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Error => 1,
+            Self::Warn => 2,
+            Self::Info => 3,
+            Self::Debug => 4,
+            Self::Trace => 5,
+        }
+    }
+}
+
+impl From<&str> for LogLevel {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "off" => Self::Off,
+            "error" => Self::Error,
+            "warn" => Self::Warn,
+            "info" => Self::Info,
+            "debug" => Self::Debug,
+            "trace" => Self::Trace,
+            _ => Self::Info,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VaultSyncConfig {
     pub namespace: String,
@@ -33,6 +80,7 @@ pub struct VaultSyncConfig {
     pub p2p_listen_addr: Option<String>,
     pub max_clock_skew: std::time::Duration,
     pub max_document_size: usize,
+    pub log_level: LogLevel,
 }
 
 impl Default for VaultSyncConfig {
@@ -54,6 +102,7 @@ impl Default for VaultSyncConfig {
             p2p_listen_addr: Some("/ip4/0.0.0.0/udp/0/quic-v1".to_string()),
             max_clock_skew: std::time::Duration::from_secs(24 * 3600), // 24 hours
             max_document_size: 100 * 1024 * 1024,                      // 100 MB
+            log_level: LogLevel::Info,
         }
     }
 }

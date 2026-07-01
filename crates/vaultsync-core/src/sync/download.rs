@@ -239,11 +239,18 @@ impl DownloadQueue {
 
                 // ── Phase 4: end replay mode after first successful batch ──
                 if self.is_replay_mode() {
-                    tracing::info!(
-                        "[download_queue] replay batch complete, ending replay mode",
+                    let mut replay_info = format!(
+                        "[download_queue] replay complete: mutations={}",
+                        entries.len(),
                     );
+                    if let Some(last) = mutations.last() {
+                        replay_info.push_str(&format!(" cursor=->{}", last.sequence));
+                    }
                     self.set_replay_mode(false);
+                    let changed_count = self.replay_changed_docs.lock().unwrap().len();
+                    replay_info.push_str(&format!(" changed={}", changed_count));
                     self.flush_replay_notifications().await?;
+                    tracing::info!("{}", replay_info);
                 }
 
                 if let Some(last) = mutations.last() {
@@ -439,9 +446,11 @@ impl DownloadQueue {
         // Apply in ascending sequence order for correctness
         to_apply.sort_by_key(|s| s.sequence);
         let max_seq = to_apply.last().map(|s| s.sequence).unwrap_or(0);
+        let snapshot_start = crate::time_utils::PlatformInstant::now();
+        let snapshot_count = to_apply.len();
 
         for snapshot in &to_apply {
-            tracing::info!(
+            tracing::debug!(
                 "[download_queue] applying snapshot doc={} record={} seq={}",
                 snapshot.doc_id,
                 snapshot.record_id,
@@ -468,6 +477,12 @@ impl DownloadQueue {
             self.reconciler.apply_remote_update("snapshot", &entry).await?;
             self.metrics.record_snapshot_applied();
         }
+
+        let snapshot_elapsed = snapshot_start.elapsed().as_millis();
+        tracing::info!(
+            "[download_queue] snapshot restored: docs={} cursor={}->{} restore_time={}ms",
+            snapshot_count, after, max_seq, snapshot_elapsed
+        );
 
         // Advance cursor past the max snapshot sequence
         let mut state = match self.storage.read_sync_state(&self.namespace).await? {

@@ -9,12 +9,32 @@ extern "C" {
 }
 
 #[cfg(target_arch = "wasm32")]
+use std::sync::atomic::{AtomicU8, Ordering};
+
+#[cfg(target_arch = "wasm32")]
+static LOG_LEVEL: AtomicU8 = AtomicU8::new(3); // 0=Off, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace
+
+#[cfg(target_arch = "wasm32")]
+pub fn set_log_level(level: u8) {
+    LOG_LEVEL.store(level.min(5), Ordering::SeqCst);
+}
+
+#[cfg(target_arch = "wasm32")]
 struct ConsoleSubscriber;
 
 #[cfg(target_arch = "wasm32")]
 impl tracing::Subscriber for ConsoleSubscriber {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.level() <= &tracing::Level::INFO
+        let level = LOG_LEVEL.load(Ordering::Relaxed);
+        if level == 0 { return false; }
+        let event_level = match *metadata.level() {
+            tracing::Level::ERROR => 1,
+            tracing::Level::WARN => 2,
+            tracing::Level::INFO => 3,
+            tracing::Level::DEBUG => 4,
+            tracing::Level::TRACE => 5,
+        };
+        event_level <= level
     }
 
     fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -55,6 +75,21 @@ impl tracing::Subscriber for ConsoleSubscriber {
 }
 
 pub const BUILD_ID: &str = concat!(env!("VAULTSYNC_BUILD_DATE"), "-", env!("VAULTSYNC_GIT_HASH"));
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn set_log_level_from_str(level: &str) {
+    let lvl = match level.to_lowercase().as_str() {
+        "off" => 0,
+        "error" => 1,
+        "warn" => 2,
+        "info" => 3,
+        "debug" => 4,
+        "trace" => 5,
+        _ => 3,
+    };
+    set_log_level(lvl);
+}
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]

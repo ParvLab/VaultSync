@@ -10,6 +10,9 @@ use tokio::sync::broadcast;
 #[derive(Debug)]
 pub struct InMemoryCoordinator {
     next_seq: std::sync::atomic::AtomicU64,
+    /// Monotonic counter tracking the highest sequence ever assigned.
+    /// Never decreases, survives compaction. Used for cursor validation.
+    highest_seq: std::sync::atomic::AtomicU64,
     ops: Arc<RwLock<BTreeMap<(String, u64), PendingMutation>>>,
     schema_versions: Arc<RwLock<std::collections::HashMap<String, u64>>>,
     replicas: Arc<RwLock<std::collections::HashMap<(String, String), ReplicaInfo>>>,
@@ -27,6 +30,7 @@ impl InMemoryCoordinator {
         let (tx, _) = broadcast::channel(4096);
         Self {
             next_seq: std::sync::atomic::AtomicU64::new(1),
+            highest_seq: std::sync::atomic::AtomicU64::new(0),
             ops: Arc::new(RwLock::new(BTreeMap::new())),
             schema_versions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             replicas: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -66,6 +70,7 @@ impl Coordinator for InMemoryCoordinator {
             let seq = self
                 .next_seq
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.highest_seq.store(seq, std::sync::atomic::Ordering::SeqCst);
             let pm = PendingMutation {
                 id: m.id,
                 namespace: namespace.to_string(),
@@ -260,6 +265,10 @@ impl Coordinator for InMemoryCoordinator {
             .filter(|((ns, _), _)| ns == namespace)
             .map(|(_, v)| v.clone())
             .collect())
+    }
+
+    async fn max_sequence(&self) -> u64 {
+        self.highest_seq.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn schema_version(&self, namespace: &str) -> Result<u64, CoordinatorError> {

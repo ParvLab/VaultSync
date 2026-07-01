@@ -238,6 +238,8 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         snapshot_url: None,
         error: None,
         generation_id: state.generation_id.clone(),
+        history_preserved: false,
+        max_sequence: state.coordinator.max_sequence().await,
     };
 
     let mut available_snapshots = Vec::new();
