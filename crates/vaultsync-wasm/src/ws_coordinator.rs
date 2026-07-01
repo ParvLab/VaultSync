@@ -223,6 +223,7 @@ impl WasmWsCoordinator {
         generation: u64,
         skip_subscribe: bool,
     ) -> Result<(), CoordinatorError> {
+        let dc_t0 = js_sys::Date::now();
         let ws_url = get_ws_url(&self.inner.url, namespace);
         console_debug!("[reconnect] state=Connecting url={}", ws_url);
         let ws = WebSocket::new(&ws_url).map_err(|e| {
@@ -235,7 +236,6 @@ impl WasmWsCoordinator {
             let (open_tx, open_rx) = oneshot::channel::<()>();
             let open_tx_cell = std::cell::RefCell::new(Some(open_tx));
             let open_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-                console_log!("[WasmWs] WebSocket opened!");
                 if let Some(tx) = open_tx_cell.borrow_mut().take() {
                     let _ = tx.send(());
                 }
@@ -248,7 +248,6 @@ impl WasmWsCoordinator {
             let close_tx_cell = std::cell::RefCell::new(Some(close_tx));
             let inner_close_clone = self.inner.clone();
             let close_callback = Closure::wrap(Box::new(move |e: web_sys::Event| {
-                console_log!("[WasmWs] WebSocket closed/failed: {:?}", e);
                 if let Some(tx) = close_tx_cell.borrow_mut().take() {
                     let _ = tx.send(());
                 }
@@ -262,10 +261,11 @@ impl WasmWsCoordinator {
 
         futures::select! {
             _ = open_rx.fuse() => {
-                console_log!("[WasmWs] open_rx resolved, connected!");
+                let ws_open_elapsed = (js_sys::Date::now() - dc_t0) as u64;
+                console_log!("[ws] ws_open elapsed={}ms", ws_open_elapsed);
             }
             _ = close_rx.fuse() => {
-                console_log!("[WasmWs] close_rx resolved, connection failed!");
+                console_log!("[WasmWs] WebSocket closed/failed!");
                 return Err(CoordinatorError::NotAvailable);
             }
         }
@@ -289,6 +289,7 @@ impl WasmWsCoordinator {
         };
 
         // 2. Perform AUTH
+        let auth_t0 = js_sys::Date::now();
         console_debug!("[reconnect] state=Authenticating");
         console_debug!("[VaultSync] auth");
         let token = self.inner.auth_token.clone().unwrap_or_default();
@@ -330,9 +331,11 @@ impl WasmWsCoordinator {
             console_warn!("[WasmWs] auth ack status is not ok: {:?}", auth_ack.error);
             return Err(CoordinatorError::AuthFailed);
         }
-        console_debug!("[WasmWs] auth successful!");
+        let auth_elapsed = (js_sys::Date::now() - auth_t0) as u64;
+        console_log!("[ws] auth elapsed={}ms", auth_elapsed);
 
         // 3. Perform REGISTER
+        let reg_t0 = js_sys::Date::now();
         console_debug!("[VaultSync] register");
         let reg = RegisterPayload {
             replica_id: replica_id.clone(),
@@ -379,9 +382,11 @@ impl WasmWsCoordinator {
             self.inner.max_sequence.store(ack.max_sequence, Ordering::SeqCst);
         }
 
-        console_debug!("[WasmWs] register successful!");
+        let reg_elapsed = (js_sys::Date::now() - reg_t0) as u64;
+        console_log!("[ws] register elapsed={}ms", reg_elapsed);
 
         // 3.5 Drain MSG_SNAPSHOT frames pushed by server after REGISTER_ACK
+        let snap_t0 = js_sys::Date::now();
         console_debug!("[WasmWs] draining snapshots after register");
         loop {
             let timeout = vaultsync_core::time_utils::sleep(
@@ -411,7 +416,8 @@ impl WasmWsCoordinator {
                 _ => break,
             }
         }
-        console_debug!("[WasmWs] snapshot drain complete");
+        let snap_elapsed = (js_sys::Date::now() - snap_t0) as u64;
+        console_log!("[ws] snapshot_drain elapsed={}ms", snap_elapsed);
 
         // Compute effective subscribe cursor: prefer max snapshot seq from drain over raw `after`
         let max_snap_seq = self.inner.received_snapshots.lock().unwrap()
@@ -422,6 +428,7 @@ impl WasmWsCoordinator {
         let effective_after = std::cmp::max(after, max_snap_seq);
 
         // 4. Perform SUBSCRIBE (skipped when caller will subscribe separately after gen check)
+        let sub_t0 = js_sys::Date::now();
         if !skip_subscribe {
             console_debug!("[VaultSync] subscribe after={} (after={} max_snapshot={})", effective_after, after, max_snap_seq);
             let sub = SubscribePayload {
@@ -433,6 +440,8 @@ impl WasmWsCoordinator {
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
             ws.send_with_u8_array(&sub_frame)
                 .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+            let sub_elapsed = (js_sys::Date::now() - sub_t0) as u64;
+            console_log!("[ws] subscribe_send elapsed={}ms", sub_elapsed);
         } else {
             console_debug!("[VaultSync] subscribe deferred (will subscribe after gen check)");
         }

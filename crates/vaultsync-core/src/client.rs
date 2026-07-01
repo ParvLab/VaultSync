@@ -687,6 +687,7 @@ impl VaultSyncClient {
     }
 
     pub async fn initialize(&self) -> Result<(), VaultSyncError> {
+        let init_t0 = crate::time_utils::PlatformInstant::now();
         if self.initialized.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
@@ -705,6 +706,7 @@ impl VaultSyncClient {
         };
 
         let cursor = self.download_queue.last_sequence();
+        let reg_t0 = crate::time_utils::PlatformInstant::now();
         tracing::info!("[Coordinator] register cursor={}", cursor);
         let registered = self.coordinator
             .register(&self.config.namespace, replica_info.clone(), cursor)
@@ -715,10 +717,12 @@ impl VaultSyncClient {
                 tracing::warn!("Coordinator unavailable, continuing offline: {:?}", e);
             }
             Ok(()) => {
+                let reg_elapsed = reg_t0.elapsed().as_millis();
                 let cursor_before = self.download_queue.last_sequence();
-                tracing::info!("[Coordinator] register returned cursor={}", cursor_before);
+                tracing::info!("[Coordinator] register returned cursor={} register={}ms", cursor_before, reg_elapsed);
 
                 // Check generation ID — reset cursor if server restarted
+                let gen_t0 = crate::time_utils::PlatformInstant::now();
                 let server_gen = self.coordinator.generation_id().await;
                 if !server_gen.is_empty() {
                     tracing::info!("[Recovery] server gen={} cursor={}", server_gen, cursor_before);
@@ -732,31 +736,38 @@ impl VaultSyncClient {
                             state.last_sync_at = Some(now_ms);
                             // Preserve cursor in sync state (don't reset to 0)
                             self.storage.write_sync_state(&state).await?;
+                            let gen_elapsed = gen_t0.elapsed().as_millis();
                             tracing::info!(
-                                "[Recovery] gen mismatch: cursor={} gen={} (will validate)",
+                                "[Recovery] gen mismatch: cursor={} gen={} gen_check={}ms (will validate)",
                                 cursor_was,
-                                state.generation_id
+                                state.generation_id,
+                                gen_elapsed,
                             );
 
                             self.download_queue.set_replay_mode(true);
+                            let reconnect_t0 = crate::time_utils::PlatformInstant::now();
                             let _ = self.coordinator.disconnect().await;
                             match self.coordinator
                                 .register(&self.config.namespace, replica_info.clone(), cursor_was)
                                 .await
                             {
                                 Ok(()) => {
-                                    tracing::info!("[Recovery] re-registered cursor={}", cursor_was);
+                                    let reconnect_elapsed = reconnect_t0.elapsed().as_millis();
+                                    tracing::info!("[Recovery] re-registered cursor={} reconnect={}ms", cursor_was, reconnect_elapsed);
                                     // Evidence-based cursor validation
+                                    let cursor_t0 = crate::time_utils::PlatformInstant::now();
                                     let server_max = self.coordinator.max_sequence().await;
                                     if server_max == 0 {
                                         tracing::info!(
-                                            "[Recovery] cursor validation unavailable (server_max=0), keeping cursor={}",
-                                            cursor_was
+                                            "[Recovery] cursor validation unavailable (server_max=0), keeping cursor={} cursor_check={}ms",
+                                            cursor_was,
+                                            cursor_t0.elapsed().as_millis(),
                                         );
                                     } else if server_max >= cursor_was {
                                         tracing::info!(
-                                            "[Recovery] cursor valid: server_max={} >= cursor={}",
-                                            server_max, cursor_was
+                                            "[Recovery] cursor valid: server_max={} >= cursor={} cursor_check={}ms",
+                                            server_max, cursor_was,
+                                            cursor_t0.elapsed().as_millis(),
                                         );
                                     } else {
                                         tracing::info!(
@@ -785,17 +796,22 @@ impl VaultSyncClient {
                                 }
                             }
                         } else {
-                            tracing::info!("[Recovery] generation OK gen={}", server_gen);
+                            let gen_elapsed = gen_t0.elapsed().as_millis();
+                            tracing::info!("[Recovery] generation OK gen={} gen_check={}ms", server_gen, gen_elapsed);
                         }
                     }
+                } else {
+                    tracing::debug!("[Recovery] server does not support generation tracking");
                 }
             }
         }
 
         // ── Subscribe for push notifications after recovery ──
         let sub_cursor = self.download_queue.last_sequence();
+        let sub_t0 = crate::time_utils::PlatformInstant::now();
         if self.coordinator.subscribe(&self.config.namespace, sub_cursor).await.is_ok() {
-            tracing::info!("[Subscribed] after={}", sub_cursor);
+            let sub_elapsed = sub_t0.elapsed().as_millis();
+            tracing::info!("[Subscribed] after={} subscribe={}ms", sub_cursor, sub_elapsed);
         } else {
             tracing::warn!("[Subscribed] failed (pull-only mode)");
         }
@@ -803,6 +819,8 @@ impl VaultSyncClient {
         // ── Start download worker now that initialization is complete ──
         self.start_download_worker();
 
+        let init_elapsed = init_t0.elapsed().as_millis();
+        tracing::info!("[Initialize] done total={}ms", init_elapsed);
         Ok(())
     }
 

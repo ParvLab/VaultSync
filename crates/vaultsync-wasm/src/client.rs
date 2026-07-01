@@ -109,7 +109,10 @@ impl WasmVaultSyncClient {
     ) -> Result<WasmVaultSyncClient, JsValue> {
         let _t0 = js_sys::Date::now();
         let t = || -> f64 { js_sys::Date::now() - _t0 };
-        console_log!("[VaultSync] storage initializing");
+        let phase_log = |name: &str| {
+            console_log!("[{:.0} ms] {}", t(), name);
+        };
+        phase_log("startup");
         let mut config = VaultSyncConfig::default();
         config.namespace = namespace.to_string();
         config.replica_id = replica_id.to_string();
@@ -127,8 +130,7 @@ impl WasmVaultSyncClient {
             BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
         };
 
-        console_debug!("[timing] storage ready t={:.0}ms", t());
-        console_debug!("[VaultSync] creating ws coordinator");
+        phase_log("storage ready");
         let coordinator = Arc::new(crate::ws_coordinator::WasmWsCoordinator::new(
             coordinator_url,
             auth_token,
@@ -138,45 +140,51 @@ impl WasmVaultSyncClient {
             coordinator.clone();
         let keyring = Arc::new(KeyRing::generate());
 
-        console_debug!("[VaultSync] creating sync client");
         let client = Arc::new(
             VaultSyncClient::new_with_storage_skip_init(config, coordinator_for_client, keyring, storage)
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
         );
-        console_debug!("[timing] client built t={:.0}ms", t());
+        phase_log("client built");
 
         // Wire WS mutation push → download/upload notifications BEFORE initialize (no race)
         coordinator.set_download_notify(client.events.download_notify.clone());
         coordinator.set_upload_notify(client.events.upload_notify.clone());
 
         // Now start WS connection (background processor starts here, sender already set)
-        console_debug!("[timing] calling initialize t={:.0}ms", t());
+        phase_log("initialize start");
         client.initialize().await.map_err(|e| {
             JsValue::from_str(&format!("Initialize failed: {:?}", e))
         })?;
-        console_debug!("[timing] initialize done t={:.0}ms", t());
+        phase_log("initialize done");
 
         // NOTE: No bootstrap notify_download needed — download worker starts
         // after subscribe completes in initialize(), already synchronized.
 
         // Create presence manager for cross-tab awareness
         let presence = crate::presence::PresenceManager::new(namespace, replica_id).ok();
+        phase_log("presence ready");
 
-        console_log!("[VaultSync] Ready ({:.0}ms)", t());
-
-        // Settle leader election
+        // Settle leader election (timed)
         let _ = client.leader_election.try_acquire();
+        let le_t0 = js_sys::Date::now();
+        let mut le_attempts = 0u32;
         for _ in 0..30 {
             if client.leader_election.is_leader() {
-                console_debug!("[LeaderElection] Leadership acquired for tab={}", replica_id);
+                le_attempts += 1;
                 break;
             }
+            le_attempts += 1;
             vaultsync_core::time_utils::sleep(std::time::Duration::from_millis(50)).await;
         }
-        if !client.leader_election.is_leader() {
-            console_debug!("[LeaderElection] Acting as follower for tab={}", replica_id);
+        let le_elapsed = (js_sys::Date::now() - le_t0) as u64;
+        if client.leader_election.is_leader() {
+            console_log!("[{:.0} ms] leader election acquired attempts={} elapsed={}ms", t(), le_attempts, le_elapsed);
+        } else {
+            console_debug!("[LeaderElection] Acting as follower for tab={} attempts={} elapsed={}ms", replica_id, le_attempts, le_elapsed);
         }
+
+        console_log!("[{:.0} ms] READY", t());
 
         let channel_name = format!("vaultsync-ipc-{}", namespace);
         let cross_tab_channel = web_sys::BroadcastChannel::new(&channel_name).ok();
