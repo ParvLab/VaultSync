@@ -55,7 +55,7 @@ impl WasmVaultSyncClient {
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
 
-        let final_db_name = db_name.unwrap_or_else(|| format!("{}_db", namespace));
+        let final_db_name = db_name.unwrap_or_else(|| format!("{}_{}_db", namespace, replica_id));
         let storage = Arc::new(
             BrowserStorage::new(&final_db_name, storage_backend.as_deref())
                 .await
@@ -74,6 +74,19 @@ impl WasmVaultSyncClient {
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
         );
+
+        // Settle leader election (Web Locks API - async, need to poll)
+        let _ = client.leader_election.try_acquire();
+        for _ in 0..30 {
+            if client.leader_election.is_leader() {
+                console_debug!("[LeaderElection] Leadership acquired for tab={}", replica_id);
+                break;
+            }
+            vaultsync_core::time_utils::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if !client.leader_election.is_leader() {
+            console_debug!("[LeaderElection] Acting as follower for tab={}", replica_id);
+        }
 
         let channel_name = format!("vaultsync-ipc-{}", namespace);
         let cross_tab_channel = web_sys::BroadcastChannel::new(&channel_name).ok();
@@ -103,7 +116,7 @@ impl WasmVaultSyncClient {
         config.sync_interval = std::time::Duration::from_millis(200);
         config.retry.initial_delay = std::time::Duration::from_millis(50);
 
-        let final_db_name = db_name.unwrap_or_else(|| format!("{}_db", namespace));
+        let final_db_name = db_name.unwrap_or_else(|| format!("{}_{}_db", namespace, replica_id));
         let storage = Arc::new(
             BrowserStorage::new(&final_db_name, storage_backend.as_deref())
                 .await
@@ -151,6 +164,20 @@ impl WasmVaultSyncClient {
         let presence = crate::presence::PresenceManager::new(namespace, replica_id).ok();
 
         console_log!("[9/9] client ready");
+
+        // Settle leader election
+        let _ = client.leader_election.try_acquire();
+        for _ in 0..30 {
+            if client.leader_election.is_leader() {
+                console_debug!("[LeaderElection] Leadership acquired for tab={}", replica_id);
+                break;
+            }
+            vaultsync_core::time_utils::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if !client.leader_election.is_leader() {
+            console_debug!("[LeaderElection] Acting as follower for tab={}", replica_id);
+        }
+
         let channel_name = format!("vaultsync-ipc-{}", namespace);
         let cross_tab_channel = web_sys::BroadcastChannel::new(&channel_name).ok();
 
@@ -162,51 +189,145 @@ impl WasmVaultSyncClient {
         })
     }
 
-    fn notify_cross_tab(&self, doc_id: &str, record_id: &str) {
+    fn broadcast_invalidation(&self, doc_id: &str, record_id: &str) {
         if let Some(ref bc) = self.cross_tab_channel {
             let msg = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&msg, &"type".into(), &"invalidate".into());
             let _ = js_sys::Reflect::set(&msg, &"doc_id".into(), &doc_id.into());
             let _ = js_sys::Reflect::set(&msg, &"record_id".into(), &record_id.into());
             let _ = js_sys::Reflect::set(&msg, &"tab_id".into(), &self.tab_id.clone().into());
             if let Ok(json) = js_sys::JSON::stringify(&msg) {
                 console_debug!(
-                    "[BC send] tab_id={} doc_id={} record_id={} payload={}",
+                    "[BC invalidate] tab_id={} doc_id={} record_id={} payload={}",
                     self.tab_id, doc_id, record_id, json,
                 );
                 let _ = bc.post_message(&json);
             }
         } else {
-            console_debug!("[BC send] skipped (no channel) tab_id={} doc_id={} record_id={}", self.tab_id, doc_id, record_id);
+            console_debug!("[BC invalidate] skipped (no channel) tab_id={} doc_id={} record_id={}", self.tab_id, doc_id, record_id);
+        }
+    }
+
+    fn send_command(&self, verb: &str, doc_id: &str, record_id: &str, json: &str) {
+        if let Some(ref bc) = self.cross_tab_channel {
+            let msg = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&msg, &"type".into(), &verb.into());
+            let _ = js_sys::Reflect::set(&msg, &"doc_id".into(), &doc_id.into());
+            let _ = js_sys::Reflect::set(&msg, &"record_id".into(), &record_id.into());
+            let _ = js_sys::Reflect::set(&msg, &"tab_id".into(), &self.tab_id.clone().into());
+            let _ = js_sys::Reflect::set(&msg, &"payload".into(), &json.into());
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let _ = js_sys::Reflect::set(&msg, &"request_id".into(), &request_id.clone().into());
+            if let Ok(json_str) = js_sys::JSON::stringify(&msg) {
+                console_debug!(
+                    "[BC command] verb={} tab_id={} doc_id={} record_id={} request_id={}",
+                    verb, self.tab_id, doc_id, record_id, request_id,
+                );
+                let _ = bc.post_message(&json_str);
+            }
+        } else {
+            console_debug!("[BC command] skipped (no channel) verb={} tab_id={} doc_id={} record_id={}", verb, self.tab_id, doc_id, record_id);
+        }
+    }
+
+    /// Leader processes a command from a follower: executes the mutation through the normal
+    /// VaultSyncClient pipeline, then broadcasts invalidation to all tabs.
+    pub async fn handle_command(
+        &self,
+        verb: &str,
+        doc_id: &str,
+        record_id: &str,
+        json: &str,
+    ) -> Result<(), JsValue> {
+        console_log!("[leader] handle_command verb={} doc={} record={} tab={}", verb, doc_id, record_id, self.tab_id);
+        let t0 = web_sys::window()
+            .and_then(|w| w.performance())
+            .map(|p| p.now())
+            .unwrap_or(0.0);
+        let result = match verb {
+            "insert" => {
+                let fields = json_to_fields(json)?;
+                let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
+                console_log!("[BC] LEADER_INSERT_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
+                self.client.insert(doc_id, record_id, fields).await
+            }
+            "update" => {
+                let fields = json_to_fields(json)?;
+                let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
+                console_log!("[BC] LEADER_UPDATE_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
+                self.client.update(doc_id, record_id, fields).await
+            }
+            "delete" => self.client.delete(doc_id, record_id).await,
+            _ => return Err(JsValue::from_str(&format!("Unknown command verb: {}", verb))),
+        };
+        let elapsed = web_sys::window()
+            .and_then(|w| w.performance())
+            .map(|p| p.now() - t0)
+            .unwrap_or(0.0);
+        match result {
+            Ok(()) => {
+                console_log!("[leader] command done verb={} doc={} record={} elapsed={:.1}ms", verb, doc_id, record_id, elapsed);
+                self.broadcast_invalidation(doc_id, record_id);
+                Ok(())
+            }
+            Err(e) => {
+                console_log!("[leader] command failed verb={} doc={} record={} elapsed={:.1}ms err={:?}", verb, doc_id, record_id, elapsed, e);
+                Err(JsValue::from_str(&format!("Command {} failed: {:?}", verb, e)))
+            }
         }
     }
 
     pub async fn insert(&self, doc_id: &str, record_id: &str, json: &str) -> Result<(), JsValue> {
-        let fields = json_to_fields(json)?;
-        self.client
-            .insert(doc_id, record_id, fields)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Insert failed: {:?}", e)))?;
-        self.notify_cross_tab(doc_id, record_id);
-        Ok(())
+        if self.client.leader_election.is_leader() {
+            let fields = json_to_fields(json)?;
+            self.client
+                .insert(doc_id, record_id, fields)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Insert failed: {:?}", e)))?;
+            self.broadcast_invalidation(doc_id, record_id);
+            Ok(())
+        } else {
+            console_log!("[BC] FOLLOW_INSERT_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
+            self.send_command("insert", doc_id, record_id, json);
+            if let Ok(fields) = json_to_fields(json) {
+                self.client.fire_local_subscription(doc_id, record_id, &fields);
+            }
+            Ok(())
+        }
     }
 
     pub async fn update(&self, doc_id: &str, record_id: &str, json: &str) -> Result<(), JsValue> {
-        let fields = json_to_fields(json)?;
-        self.client
-            .update(doc_id, record_id, fields)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Update failed: {:?}", e)))?;
-        self.notify_cross_tab(doc_id, record_id);
-        Ok(())
+        if self.client.leader_election.is_leader() {
+            let fields = json_to_fields(json)?;
+            self.client
+                .update(doc_id, record_id, fields)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Update failed: {:?}", e)))?;
+            self.broadcast_invalidation(doc_id, record_id);
+            Ok(())
+        } else {
+            console_log!("[BC] FOLLOW_UPDATE_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
+            self.send_command("update", doc_id, record_id, json);
+            if let Ok(fields) = json_to_fields(json) {
+                self.client.fire_local_subscription(doc_id, record_id, &fields);
+            }
+            Ok(())
+        }
     }
 
     pub async fn delete(&self, doc_id: &str, record_id: &str) -> Result<(), JsValue> {
-        self.client
-            .delete(doc_id, record_id)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Delete failed: {:?}", e)))?;
-        self.notify_cross_tab(doc_id, record_id);
-        Ok(())
+        if self.client.leader_election.is_leader() {
+            self.client
+                .delete(doc_id, record_id)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Delete failed: {:?}", e)))?;
+            self.broadcast_invalidation(doc_id, record_id);
+            Ok(())
+        } else {
+            console_debug!("[Follower delete] sending command doc={} record={}", doc_id, record_id);
+            self.send_command("delete", doc_id, record_id, "");
+            Ok(())
+        }
     }
 
     pub async fn get(&self, doc_id: &str, record_id: &str) -> Result<JsValue, JsValue> {

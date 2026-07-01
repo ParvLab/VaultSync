@@ -1,5 +1,6 @@
 use crate::crdt::types::CrdtValue;
 use crate::error::VaultSyncError;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use yrs::any::Any;
 use yrs::updates::decoder::Decode;
@@ -110,12 +111,30 @@ impl CRDTDocument {
     }
 
     pub fn set_field(&mut self, field: &str, value: CrdtValue) -> Vec<u8> {
-        let sv = self.state_vector();
         let mut txn = self.inner.transact_mut();
+        let sv = txn.state_vector();
         let any_val = crdt_value_to_any(&value);
         self.root.insert(&mut txn, field, any_val);
+        let delta = txn.encode_diff_v1(&sv);
         drop(txn);
-        self.inner.transact().encode_diff_v1(&sv)
+        let sv_entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
+        tracing::info!(
+            "[set_field] field={} value_truncated={} sv_before={:?} delta_len={} delta_sha256={}",
+            field,
+            value.to_truncated(80),
+            sv_entries,
+            delta.len(),
+            hex::encode(&Sha256::digest(&delta)[..8]),
+        );
+        if delta.is_empty() {
+            tracing::warn!(
+                "[set_field] EMPTY DELTA field={} value_truncated={} sv_before={:?}",
+                field,
+                value.to_truncated(80),
+                sv_entries,
+            );
+        }
+        delta
     }
 
     pub fn capture_incremental_update<F>(&mut self, f: F) -> Vec<u8>

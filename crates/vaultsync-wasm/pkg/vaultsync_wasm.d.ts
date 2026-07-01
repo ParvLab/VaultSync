@@ -52,6 +52,11 @@ export class WasmVaultSyncClient {
     find(doc_id: string): Promise<Array<any>>;
     fire_subscription(doc_id: string, record_id: string): Promise<void>;
     get(doc_id: string, record_id: string): Promise<any>;
+    /**
+     * Leader processes a command from a follower: executes the mutation through the normal
+     * VaultSyncClient pipeline, then broadcasts invalidation to all tabs.
+     */
+    handle_command(verb: string, doc_id: string, record_id: string, json: string): Promise<void>;
     insert(doc_id: string, record_id: string, json: string): Promise<void>;
     is_leader(): boolean;
     list_key_versions(): any;
@@ -88,7 +93,6 @@ export interface InitOutput {
     readonly __wbg_wasmvaultsyncclient_free: (a: number, b: number) => void;
     readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
-    readonly init: () => void;
     readonly wasmsubscriptionhandle_cancel: (a: number, b: number) => [number, number];
     readonly wasmvaultsyncclient_active_key_version: (a: number) => bigint;
     readonly wasmvaultsyncclient_define_schema: (a: number, b: number, c: number, d: number, e: number) => any;
@@ -96,6 +100,7 @@ export interface InitOutput {
     readonly wasmvaultsyncclient_find: (a: number, b: number, c: number) => any;
     readonly wasmvaultsyncclient_fire_subscription: (a: number, b: number, c: number, d: number, e: number) => any;
     readonly wasmvaultsyncclient_get: (a: number, b: number, c: number, d: number, e: number) => any;
+    readonly wasmvaultsyncclient_handle_command: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => any;
     readonly wasmvaultsyncclient_insert: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => any;
     readonly wasmvaultsyncclient_is_leader: (a: number) => number;
     readonly wasmvaultsyncclient_list_key_versions: (a: number) => [number, number, number];
@@ -119,16 +124,17 @@ export interface InitOutput {
     readonly presencemanager_activePeers: (a: number) => [number, number];
     readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly presencemanager_peer_count: (a: number) => number;
+    readonly init: () => void;
     readonly wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h6742839cb717cdad: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h2e344701028fdaf2: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hde300ef533c5520f: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h2e344701028fdaf2_3: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h9e7fb665684ebcac: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h9e7fb665684ebcac_5: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h9e7fb665684ebcac_6: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h719b5b51b5754f1f: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h7c8b54782b404fc3: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h2dccc7bc52fbc5e7: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hc470a37e1ced5300: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h2dccc7bc52fbc5e7_3: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1_5: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1_6: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h1ae5816e5fd698bd: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h0edffd97ea4639bb: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

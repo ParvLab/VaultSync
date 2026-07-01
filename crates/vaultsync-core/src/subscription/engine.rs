@@ -1,7 +1,27 @@
 use crate::crdt::types::CrdtValue;
 use crate::error::VaultSyncError;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FireSource {
+    LocalWrite,
+    ReconcilerPush,
+    ReconcilerPull,
+    ReconcilerSnapshot,
+}
+
+impl fmt::Display for FireSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FireSource::LocalWrite => write!(f, "LocalWrite"),
+            FireSource::ReconcilerPush => write!(f, "ReconcilerPush"),
+            FireSource::ReconcilerPull => write!(f, "ReconcilerPull"),
+            FireSource::ReconcilerSnapshot => write!(f, "ReconcilerSnapshot"),
+        }
+    }
+}
 
 pub type Callback = Box<dyn Fn(&str, &str, &HashMap<String, CrdtValue>) + Send>;
 
@@ -79,13 +99,14 @@ impl SubscriptionEngine {
         self.by_doc_id.get(doc_id).map(|v| v.len()).unwrap_or(0)
     }
 
-    pub fn fire(&mut self, doc_id: &str, record_id: &str, state: &HashMap<String, CrdtValue>) {
+    pub fn fire(&mut self, source: FireSource, doc_id: &str, record_id: &str, state: &HashMap<String, CrdtValue>) {
         self.fire_count += 1;
         let seq = self.fire_count;
         let listeners = self.listener_count(doc_id);
         tracing::info!(
-            "[subscription] fire seq={} doc={} record={} listeners={}",
+            "[subscription] fire seq={} source={} doc={} record={} listeners={}",
             seq,
+            source,
             doc_id,
             record_id,
             listeners,

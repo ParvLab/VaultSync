@@ -24,11 +24,20 @@ export class VaultSyncClient {
   private channel?: BroadcastChannel;
   private namespace: string;
   private tabId: string;
+  private commandQueue: Promise<void> = Promise.resolve();
+  private subscriptionCache = new Map<string, { unsub: () => void; callbacks: Set<SubscriptionCallback> }>();
 
   private constructor(inner: any, namespace: string, replicaId: string) {
     this.inner = inner;
     this.namespace = namespace;
     this.tabId = replicaId;
+  }
+
+  /** Serializes mutations (local + remote) so they run one-at-a-time on the leader. */
+  private enqueueMutation<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.commandQueue.then(fn, fn);
+    this.commandQueue = result.then(() => {}, () => {});
+    return result;
   }
 
   get db(): DbProxy & Record<string, Collection<any>> {
@@ -54,28 +63,53 @@ export class VaultSyncClient {
       if (typeof e.data === 'string') {
         try {
           const val = JSON.parse(e.data);
-          if (val && typeof val.doc_id === 'string' && typeof val.record_id === 'string') {
-            const sender = val.tab_id || '(missing)';
-            const receiver = this.tabId || '(missing)';
-            const ignored = !!(val.tab_id && val.tab_id === this.tabId);
-            console.log(
-              `[JS BC] recv sender=${sender} receiver=${receiver} namespace=${namespace} ignored=${ignored} doc=${val.doc_id} record=${val.record_id}`
-            );
-            if (ignored) {
-              return; // skip own notification
-            }
-            setTimeout(async () => {
-              try {
+          if (!val) {
+            return; // no message payload
+          }
+          if (!val.type) {
+            val.type = 'invalidate'; // backward compat: old WASM sent no type
+          }
+          const sender = val.tab_id || '(missing)';
+          const receiver = this.tabId || '(missing)';
+          const ignored = !!(val.tab_id && val.tab_id === this.tabId);
+
+          switch (val.type) {
+            case 'invalidate': {
+              if (val.doc_id && val.record_id) {
                 console.log(
-                  `[JS BC] fire sender=${sender} receiver=${receiver} doc=${val.doc_id} record=${val.record_id}`
+                  `[JS BC] recv sender=${sender} receiver=${receiver} namespace=${namespace} ignored=${ignored} type=invalidate doc=${val.doc_id} record=${val.record_id}`
                 );
-                await this.inner.fire_subscription(val.doc_id, val.record_id);
-              } catch (err) {
-                console.error("[JS BC] Failed to fire subscription in WASM: ", err);
+                if (ignored) break;
+                setTimeout(async () => {
+                  try {
+                    console.log(`[JS BC] fire sender=${sender} receiver=${receiver} doc=${val.doc_id} record=${val.record_id}`);
+                    await this.inner.fire_subscription(val.doc_id, val.record_id);
+                  } catch (err) {
+                    console.error("[JS BC] Failed to fire subscription: ", err);
+                  }
+                }, 0);
               }
-            }, 0);
-          } else {
-            console.warn(`[JS BC] recv invalid payload on ${channelName}:`, raw);
+              break;
+            }
+            case 'insert':
+            case 'update':
+            case 'delete': {
+              if (val.doc_id && val.record_id && !ignored && this.inner.is_leader()) {
+                console.log(
+                  `[JS BC] command sender=${sender} receiver=${receiver} type=${val.type} doc=${val.doc_id} record=${val.record_id}`
+                );
+                this.enqueueMutation(async () => {
+                  try {
+                    await this.inner.handle_command(val.type, val.doc_id, val.record_id, val.payload || '');
+                  } catch (err) {
+                    console.error(`[JS BC] Command ${val.type} failed: `, err);
+                  }
+                });
+              }
+              break;
+            }
+            default:
+              console.warn(`[JS BC] recv unknown type=${val.type} on ${channelName}:`, raw);
           }
         } catch (err) {
           console.error("[JS BC] Failed to parse message:", err);
@@ -127,14 +161,23 @@ export class VaultSyncClient {
   }
 
   async insert(docId: string, recordId: string, fields: RecordFields): Promise<void> {
+    if (this.inner.is_leader()) {
+      return this.enqueueMutation(() => this.inner.insert(docId, recordId, JSON.stringify(fields)));
+    }
     await this.inner.insert(docId, recordId, JSON.stringify(fields));
   }
 
   async update(docId: string, recordId: string, fields: RecordFields): Promise<void> {
+    if (this.inner.is_leader()) {
+      return this.enqueueMutation(() => this.inner.update(docId, recordId, JSON.stringify(fields)));
+    }
     await this.inner.update(docId, recordId, JSON.stringify(fields));
   }
 
   async delete(docId: string, recordId: string): Promise<void> {
+    if (this.inner.is_leader()) {
+      return this.enqueueMutation(() => this.inner.delete(docId, recordId));
+    }
     await this.inner.delete(docId, recordId);
   }
 
@@ -170,17 +213,35 @@ export class VaultSyncClient {
   }
 
   subscribe(docId: string, callback: SubscriptionCallback): UnsubscribeFn {
-    const wasmCallback = (recordId: string, jsonStr: string, notifySeq?: number) => {
-      const t0 = Date.now();
-      console.log('[notify] seq=' + (notifySeq ?? '?') + ' record=' + recordId + ' phase=js_callback t=' + t0);
-      queueMicrotask(() => {
-        console.log('[notify] seq=' + (notifySeq ?? '?') + ' record=' + recordId + ' phase=microtask_exec t=' + Date.now() + ' (elapsed=' + (Date.now() - t0) + 'ms)');
-        callback(recordId, JSON.parse(jsonStr));
-      });
-    };
-    const handle = this.inner.subscribe(docId, wasmCallback);
+    let entry = this.subscriptionCache.get(docId);
+    if (!entry) {
+      const jsCallbacks: Set<SubscriptionCallback> = new Set();
+      const wasmCallback = (recordId: string, jsonStr: string, notifySeq?: number) => {
+        const t0 = Date.now();
+        console.log('[notify] seq=' + (notifySeq ?? '?') + ' record=' + recordId + ' phase=js_callback t=' + t0);
+        const parsed = JSON.parse(jsonStr);
+        queueMicrotask(() => {
+          const elapsed = Date.now() - t0;
+          console.log('[notify] seq=' + (notifySeq ?? '?') + ' record=' + recordId + ' phase=microtask_exec t=' + Date.now() + ' (elapsed=' + elapsed + 'ms)');
+          for (const cb of jsCallbacks) {
+            cb(recordId, parsed);
+          }
+        });
+      };
+      const handle = this.inner.subscribe(docId, wasmCallback);
+      entry = {
+        unsub: () => this.inner.unsubscribe(handle),
+        callbacks: jsCallbacks,
+      };
+      this.subscriptionCache.set(docId, entry);
+    }
+    entry.callbacks.add(callback);
     return () => {
-      this.inner.unsubscribe(handle);
+      entry!.callbacks.delete(callback);
+      if (entry!.callbacks.size === 0) {
+        entry!.unsub();
+        this.subscriptionCache.delete(docId);
+      }
     };
   }
 

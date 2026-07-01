@@ -145,11 +145,14 @@ impl WasmWsCoordinator {
         let generation = self.inner.conn_gen.fetch_add(1, Ordering::SeqCst) + 1;
 
         // Perform connection handshake
+        let reconn_t0 = js_sys::Date::now();
         let result = self.do_connect(namespace, after, info, generation).await;
+        let reconn_elapsed = (js_sys::Date::now() - reconn_t0) as u64;
 
         // Notify waiters and finalize state
-        {
+        let had_ws = {
             let mut state = self.inner.connection.lock().unwrap();
+            let had = state.ws.is_some();
             state.connecting = false;
             if result.is_ok() {
                 state.generation = generation;
@@ -166,17 +169,26 @@ impl WasmWsCoordinator {
             for tx in state.waiters.drain(..) {
                 let _ = tx.send(result.clone());
             }
-        }
+            had
+        };
 
         // On successful reconnect, wake workers to resume syncing
         if result.is_ok() {
-            console_debug!("[reconnect] state=Connected");
+            console_log!(
+                "[reconnect] SUCCESS generation={} elapsed={}ms had_ws_before={} notifying_workers=true",
+                generation, reconn_elapsed, had_ws,
+            );
             if let Some(ref notify) = *self.inner.upload_notify.lock().unwrap() {
                 let _ = notify.unbounded_send(());
             }
             if let Some(ref notify) = *self.inner.download_notify.lock().unwrap() {
                 let _ = notify.unbounded_send(None);
             }
+        } else {
+            console_warn!(
+                "[reconnect] FAIL generation={} elapsed={}ms",
+                generation, reconn_elapsed,
+            );
         }
 
         result

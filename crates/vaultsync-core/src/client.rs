@@ -14,7 +14,7 @@ use crate::storage::memory::InMemoryStorage;
 #[cfg(feature = "storage-sqlite")]
 use crate::storage::sqlite::SQLiteStorage;
 use crate::storage::traits::{Storage, StorageConfig};
-use crate::subscription::engine::SubscriptionEngine;
+use crate::subscription::engine::{FireSource, SubscriptionEngine};
 use crate::subscription::filter::Filter;
 use crate::sync::download::DownloadQueue;
 use crate::sync::reconciler::Reconciler;
@@ -503,18 +503,26 @@ impl VaultSyncClient {
             loop {
                 // Wait for a notification. While offline, skip the channel
                 // and wait for the backoff timer directly.
+                let wake_source: &str;
                 if offline {
                     if backoff_ms > 0 {
                         crate::time_utils::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     }
+                    wake_source = "timer";
                     // Drain any stale notifications that piled up while we slept
                     while let Ok(()) = upload_rx.try_recv() {}
                 } else {
+                    wake_source = "notify";
                     match upload_rx.next().await {
                         Some(_) => {}
                         None => break,
                     }
                 }
+
+                tracing::debug!(
+                    "[upload_worker] WAKE source={} offline={} backoff={}ms pending_cache={}",
+                    wake_source, offline, backoff_ms, pc_cache.load(std::sync::atomic::Ordering::Relaxed),
+                );
 
                 // Process all pending batches
                 loop {
@@ -525,7 +533,7 @@ impl VaultSyncClient {
                             if let Ok(count) = uq.pending_count().await {
                                 if count > 0 && !offline {
                                     tracing::warn!(
-                                        "[upload_worker] coordinator not available ({} pending), entering offline mode",
+                                        "[upload_worker] OFFLINE_ENTER pending={} backoff=1s",
                                         count
                                     );
                                     offline = true;
@@ -534,29 +542,29 @@ impl VaultSyncClient {
                                     // Still offline after retry; increase backoff
                                     backoff_ms = std::cmp::min(backoff_ms * 2, 30000);
                                     tracing::debug!(
-                                        "[upload_worker] still offline, backoff={}ms",
-                                        backoff_ms,
+                                        "[upload_worker] OFFLINE_RETRY pending={} backoff={}ms",
+                                        count, backoff_ms,
                                     );
                                 } else if count == 0 && offline {
                                     // All pending cleared — return to online
-                                    tracing::info!("[upload_worker] all pending cleared, returning online");
+                                    tracing::info!("[upload_worker] ONLINE pending=0");
                                     offline = false;
                                     backoff_ms = 0;
                                 }
                             }
                             break;
                         }
-                        Ok(_) => {
+                        Ok(n) => {
                             // Successfully pushed — reset offline state
                             if offline {
-                                tracing::info!("[upload_worker] coordinator reconnected, returning online");
+                                tracing::info!("[upload_worker] RECONNECTED pushed={}", n);
                             }
                             offline = false;
                             backoff_ms = 0;
                             continue;
                         }
                         Err(e) => {
-                            tracing::warn!("[upload_worker] batch failed: {:?}", e);
+                            tracing::warn!("[upload_worker] BATCH_FAILED {:?}", e);
                             break;
                         }
                     }
@@ -601,6 +609,10 @@ impl VaultSyncClient {
                                     outcome
                                 );
                                 needs_backfill = outcome == crate::sync::download::PushOutcome::GapDetected;
+                                // ── Phase 4: always backfill at least once during replay ──
+                                if !needs_backfill && dq.is_replay_mode() {
+                                    needs_backfill = true;
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -767,14 +779,14 @@ impl VaultSyncClient {
                             let now_ms = crate::time_utils::system_time_now_ms();
                             state.last_sync_at = Some(now_ms);
                             self.storage.write_sync_state(&state).await?;
-                            tracing::info!(
+                            tracing::debug!(
                                 "[client] write_sync_state cursor={} gen={} (from client init generation mismatch)",
                                 state.last_synced_sequence,
                                 state.generation_id
                             );
                             self.download_queue.reset_cursor(0);
                             let cursor_after = self.download_queue.last_sequence();
-                            tracing::info!(
+                            tracing::debug!(
                                 "[sync_state] generation mismatch: local={} server={} -> resetting cursor (was {})",
                                 state.generation_id,
                                 server_gen,
@@ -785,6 +797,9 @@ impl VaultSyncClient {
                                 cursor_after,
                                 cursor_was
                             );
+
+                            // ── Phase 4: enable replay batching to suppress notification storm ──
+                            self.download_queue.set_replay_mode(true);
 
                             // Phase 2: reconnect with cursor=0 so subscribe uses the right value
                             tracing::info!("[6/9] generation changed, reconnecting with cursor=0");
@@ -841,20 +856,42 @@ impl VaultSyncClient {
 
         let mutation_id = uuid::Uuid::new_v4().to_string();
         let mut doc = CRDTDocument::new(doc_id, record_id, 0);
+
+        let sv_before = doc.state_vector();
+        let sv_before_entries: Vec<_> = sv_before.iter().map(|(c, cl)| (c, cl)).collect();
+        let snap_before = doc.to_snapshot();
+        let snap_hash_before = hex::encode(&Sha256::digest(&snap_before)[..8]);
+        let doc_ptr = &doc as *const CRDTDocument as usize;
+        let inner_doc_ptr = doc.inner_doc() as *const yrs::Doc as usize;
+
         let update_bytes = doc.capture_incremental_update(|doc| {
             for (field, value) in &fields {
                 doc.set_field(field, value.clone());
             }
         });
 
-        // ── Phase 1 diagnostic: state vector + hash of outgoing yrs_update ──
+        let sv_after = doc.state_vector();
+        let sv_after_entries: Vec<_> = sv_after.iter().map(|(c, cl)| (c, cl)).collect();
+        let snap_after = doc.to_snapshot();
+        let snap_hash_after = hex::encode(&Sha256::digest(&snap_after)[..8]);
+        let doc_advanced = sv_before != sv_after;
+
         let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
         if let Ok(decoded) = Update::decode_v1(&update_bytes) {
-            let sv = decoded.state_vector();
-            let entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
+            let update_sv = decoded.state_vector();
+            let update_sv_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
             tracing::info!(
-                "[client.insert] id={} yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
-                mutation_id, doc_id, record_id, content_hash, entries, update_bytes.len(),
+                "[client.insert] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={} snap_hash_after={} doc_advanced={}",
+                mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
+                doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
+                snap_hash_before, snap_hash_after, doc_advanced,
+            );
+        }
+
+        if !doc_advanced && !update_bytes.is_empty() {
+            tracing::warn!(
+                "[client.insert] MUTATION_DID_NOT_ADVANCE id={} doc={} record={} update_len={} sha256={} sv_before={:?}",
+                mutation_id, doc_id, record_id, update_bytes.len(), content_hash, sv_before_entries,
             );
         }
 
@@ -935,7 +972,7 @@ impl VaultSyncClient {
                 self.subscriptions
                     .lock()
                     .unwrap()
-                    .fire(doc_id, record_id, &state);
+                    .fire(FireSource::LocalWrite, doc_id, record_id, &state);
 
                 Ok(())
             }
@@ -970,20 +1007,44 @@ impl VaultSyncClient {
             None => CRDTDocument::new(doc_id, record_id, 0),
         };
         let mutation_id = uuid::Uuid::new_v4().to_string();
+
+        // ── Phase 1: state vector + snapshot hash BEFORE mutation ──
+        let sv_before = doc.state_vector();
+        let sv_before_entries: Vec<_> = sv_before.iter().map(|(c, cl)| (c, cl)).collect();
+        let snap_before = doc.to_snapshot();
+        let snap_hash_before = hex::encode(&Sha256::digest(&snap_before)[..8]);
+        let doc_ptr = &doc as *const CRDTDocument as usize;
+        let inner_doc_ptr = doc.inner_doc() as *const yrs::Doc as usize;
+
         let update_bytes = doc.capture_incremental_update(|doc| {
             for (field, value) in &fields {
                 doc.set_field(field, value.clone());
             }
         });
 
-        // ── Phase 1 diagnostic: state vector + hash of outgoing yrs_update ──
+        // ── Phase 1: state vector + snapshot hash AFTER mutation ──
+        let sv_after = doc.state_vector();
+        let sv_after_entries: Vec<_> = sv_after.iter().map(|(c, cl)| (c, cl)).collect();
+        let snap_after = doc.to_snapshot();
+        let snap_hash_after = hex::encode(&Sha256::digest(&snap_after)[..8]);
+        let doc_advanced = sv_before != sv_after;
+
         let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
         if let Ok(decoded) = Update::decode_v1(&update_bytes) {
-            let sv = decoded.state_vector();
-            let entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
+            let update_sv = decoded.state_vector();
+            let update_sv_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
             tracing::info!(
-                "[client.update] id={} yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
-                mutation_id, doc_id, record_id, content_hash, entries, update_bytes.len(),
+                "[client.update] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={} snap_hash_after={} doc_advanced={}",
+                mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
+                doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
+                snap_hash_before, snap_hash_after, doc_advanced,
+            );
+        }
+
+        if !doc_advanced && !update_bytes.is_empty() {
+            tracing::warn!(
+                "[client.update] MUTATION_DID_NOT_ADVANCE id={} doc={} record={} update_len={} sha256={} sv_before={:?}",
+                mutation_id, doc_id, record_id, update_bytes.len(), content_hash, sv_before_entries,
             );
         }
 
@@ -1028,10 +1089,17 @@ impl VaultSyncClient {
             namespace = self.config.namespace.as_str()
         );
         let append_guard = append_span.enter();
+        let write_t0 = web_time::Instant::now();
         let res = self
             .storage
             .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
             .await;
+        let write_elapsed = write_t0.elapsed();
+        tracing::info!(
+            "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
+            entry.id, doc_id, record_id, write_elapsed.as_millis(),
+            if res.is_ok() { "ok" } else { "err" },
+        );
         drop(append_guard);
 
         match res {
@@ -1064,7 +1132,7 @@ impl VaultSyncClient {
                 self.subscriptions
                     .lock()
                     .unwrap()
-                    .fire(doc_id, record_id, &state);
+                    .fire(FireSource::LocalWrite, doc_id, record_id, &state);
 
                 Ok(())
             }
@@ -1092,16 +1160,38 @@ impl VaultSyncClient {
         if let Some(bytes) = existing {
             let mut doc = CRDTDocument::from_snapshot(&bytes)?;
             let mutation_id = uuid::Uuid::new_v4().to_string();
+
+            let sv_before = doc.state_vector();
+            let sv_before_entries: Vec<_> = sv_before.iter().map(|(c, cl)| (c, cl)).collect();
+            let snap_before = doc.to_snapshot();
+            let snap_hash_before = hex::encode(&Sha256::digest(&snap_before)[..8]);
+            let doc_ptr = &doc as *const CRDTDocument as usize;
+            let inner_doc_ptr = doc.inner_doc() as *const yrs::Doc as usize;
+
             let update_bytes = doc.set_field("_deleted", CrdtValue::Boolean(true));
 
-            // ── Phase 1 diagnostic: state vector + hash of outgoing yrs_update ──
+            let sv_after = doc.state_vector();
+            let sv_after_entries: Vec<_> = sv_after.iter().map(|(c, cl)| (c, cl)).collect();
+            let snap_after = doc.to_snapshot();
+            let snap_hash_after = hex::encode(&Sha256::digest(&snap_after)[..8]);
+            let doc_advanced = sv_before != sv_after;
+
             let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
             if let Ok(decoded) = Update::decode_v1(&update_bytes) {
-                let sv = decoded.state_vector();
-                let entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
+                let update_sv = decoded.state_vector();
+                let update_sv_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
                 tracing::info!(
-                    "[client.delete] id={} yrs_update source=client doc={} record={} sha256={} state_vector={:?} len={}",
-                    mutation_id, doc_id, record_id, content_hash, entries, update_bytes.len(),
+                    "[client.delete] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={} snap_hash_after={} doc_advanced={}",
+                    mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
+                    doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
+                    snap_hash_before, snap_hash_after, doc_advanced,
+                );
+            }
+
+            if !doc_advanced && !update_bytes.is_empty() {
+                tracing::warn!(
+                    "[client.delete] MUTATION_DID_NOT_ADVANCE id={} doc={} record={} update_len={} sha256={} sv_before={:?}",
+                    mutation_id, doc_id, record_id, update_bytes.len(), content_hash, sv_before_entries,
                 );
             }
 
@@ -1117,7 +1207,7 @@ impl VaultSyncClient {
                 self.clock.clear_logical_wrap();
             }
             let entry = OplogEntry::new(
-                mutation_id,
+                mutation_id.clone(),
                 self.config.replica_id.clone(),
                 self.config.namespace.clone(),
                 MutationType::CrdtDelete,
@@ -1140,10 +1230,17 @@ impl VaultSyncClient {
                 namespace = self.config.namespace.as_str()
             );
             let append_guard = append_span.enter();
+            let write_t0 = web_time::Instant::now();
             let res = self
                 .storage
                 .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
                 .await;
+            let write_elapsed = write_t0.elapsed();
+            tracing::info!(
+                "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
+                mutation_id, doc_id, record_id, write_elapsed.as_millis(),
+                if res.is_ok() { "ok" } else { "err" },
+            );
             drop(append_guard);
 
             match res {
@@ -1176,7 +1273,7 @@ impl VaultSyncClient {
                     self.subscriptions
                         .lock()
                         .unwrap()
-                        .fire(doc_id, record_id, &state);
+                        .fire(FireSource::LocalWrite, doc_id, record_id, &state);
                 }
                 Err(e) => {
                     self.metrics
