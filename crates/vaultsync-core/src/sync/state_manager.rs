@@ -101,7 +101,7 @@ impl SyncStateManager {
         let old = self.cursor.swap(to, Ordering::SeqCst);
         let gen = self.generation_id.read().unwrap().clone();
         self.persist(to, &gen).await?;
-        tracing::info!(
+        tracing::warn!(
             "[sync_state] cursor reset {} -> {} (generation={})",
             old,
             to,

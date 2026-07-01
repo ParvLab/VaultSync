@@ -64,7 +64,7 @@ impl UploadQueue {
             return Ok(0);
         }
 
-        tracing::info!(
+        tracing::debug!(
             "[upload_queue] BATCH_START read_pending={} after_filter={}",
             raw_count,
             entries.len(),
@@ -74,7 +74,7 @@ impl UploadQueue {
             let yrs_sha256 = hex::encode(&Sha256::digest(&e.yrs_update)[..8]);
             let doc_id = &e.doc_id;
             let record_id = &e.record_id;
-            tracing::info!(
+            tracing::trace!(
                 "[upload_queue] ENTRY id={} doc={} record={} yrs_update_len={} yrs_update_sha256={}",
                 e.id, doc_id, record_id, e.yrs_update.len(), yrs_sha256,
             );
@@ -107,7 +107,7 @@ impl UploadQueue {
             .collect();
 
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
-        tracing::info!(
+        tracing::debug!(
             "[upload_queue] PUSH_SEND count={} ids=[{}]",
             mutations.len(),
             ids.join(","),
@@ -121,7 +121,7 @@ impl UploadQueue {
         match push_result
         {
             Ok(sequences) => {
-                tracing::info!(
+                tracing::debug!(
                     "[upload_queue] PUSH_ACK sequences={:?} elapsed={}ms",
                     sequences, push_elapsed,
                 );
@@ -137,7 +137,7 @@ impl UploadQueue {
                 // Verify: re-read pending count to confirm mark_synced persisted
                 match self.oplog.count_pending().await {
                     Ok(remaining) => {
-                        tracing::info!(
+                        tracing::debug!(
                             "[upload_queue] AFTER_MARK_SYNCED pending={} marked={}",
                             remaining, entries.len(),
                         );
@@ -156,7 +156,7 @@ impl UploadQueue {
                     }
                 }
                 self.metrics.record_upload(entries.len());
-                tracing::info!(
+                tracing::debug!(
                     "[upload_queue] BATCH_DONE success={}",
                     entries.len(),
                 );

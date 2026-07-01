@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use futures::channel::mpsc;
+use tracing::debug;
 use futures::Stream;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -49,7 +50,7 @@ impl BroadcastChannelTransport {
             listeners: Mutex::new(Vec::new()),
         };
 
-        log!("[BC] created channel={}", transport.channel_name);
+        debug!("[BC] created channel={}", transport.channel_name);
         Ok(transport)
     }
 

@@ -98,7 +98,7 @@ impl DownloadQueue {
             let mut changed = self.replay_changed_docs.lock().unwrap();
             changed.clear();
         }
-        tracing::info!(
+        tracing::debug!(
             "[download_queue] replay_mode={}",
             active,
         );
@@ -118,7 +118,7 @@ impl DownloadQueue {
         if changed.is_empty() {
             return Ok(());
         }
-        tracing::info!(
+        tracing::debug!(
             "[download_queue] flush_replay_notifications count={}",
             changed.len(),
         );
@@ -204,7 +204,7 @@ impl DownloadQueue {
         if let Ok(decoded) = Update::decode_v1(&decrypted_bytes) {
             let sv = decoded.state_vector();
             let sv_entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
-            tracing::info!(
+            tracing::trace!(
                 "[download_queue] pull_decrypted source=pull id={} seq={} sha256={} state_vector={:?} len={}",
                 m.id, m.sequence, content_hash, sv_entries, decrypted_bytes.len(),
             );
@@ -390,7 +390,7 @@ impl DownloadQueue {
 
     pub fn reset_cursor(&self, to: u64) {
         self.last_sequence.store(to, std::sync::atomic::Ordering::SeqCst);
-        tracing::info!(
+        tracing::warn!(
             "[download_queue] cursor reset to {}",
             to
         );

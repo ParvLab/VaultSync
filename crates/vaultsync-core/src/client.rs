@@ -956,7 +956,7 @@ impl VaultSyncClient {
         if let Ok(decoded) = Update::decode_v1(&update_bytes) {
             let update_sv = decoded.state_vector();
             let update_sv_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
-            tracing::info!(
+            tracing::trace!(
                 "[client.insert] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={} snap_hash_after={} doc_advanced={}",
                 mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
                 doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
@@ -1089,7 +1089,7 @@ impl VaultSyncClient {
             doc.get_field(key).as_ref().map_or(true, |existing| existing != value)
         });
         if !content_changed {
-            tracing::info!(
+            tracing::debug!(
                 "[client.update] SKIP no-op mutation doc={} record={} — content unchanged",
                 doc_id, record_id,
             );
@@ -1131,7 +1131,7 @@ impl VaultSyncClient {
         if let Ok(decoded) = Update::decode_v1(&update_bytes) {
             let update_sv = decoded.state_vector();
             let update_sv_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
-            tracing::info!(
+            tracing::trace!(
                 "[client.update] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={} snap_hash_after={} doc_advanced={}",
                 mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
                 doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
@@ -1188,7 +1188,7 @@ impl VaultSyncClient {
             .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
             .await;
         let write_elapsed = write_t0.elapsed();
-        tracing::info!(
+        tracing::debug!(
             "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
             entry.id, doc_id, record_id, write_elapsed.as_millis(),
             if res.is_ok() { "ok" } else { "err" },
@@ -1273,8 +1273,8 @@ impl VaultSyncClient {
             if let Ok(decoded) = Update::decode_v1(&update_bytes) {
                 let update_sv = decoded.state_vector();
                 let update_sv_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
-                tracing::info!(
-                    "[client.delete] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={} snap_hash_after={} doc_advanced={}",
+                    tracing::trace!(
+                        "[client.delete] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={} snap_hash_after={} doc_advanced={}",
                     mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
                     doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
                     snap_hash_before, snap_hash_after, doc_advanced,
@@ -1329,7 +1329,7 @@ impl VaultSyncClient {
                 .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
                 .await;
             let write_elapsed = write_t0.elapsed();
-            tracing::info!(
+            tracing::debug!(
                 "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
                 mutation_id, doc_id, record_id, write_elapsed.as_millis(),
                 if res.is_ok() { "ok" } else { "err" },

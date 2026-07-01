@@ -65,7 +65,7 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
           && Date.now() - lastEditRef.current.title < FOCUS_COOLDOWN_MS;
         if (!titleActive && titleRef.current !== note.title) {
           if (document.activeElement?.id === 'note-title-input') {
-            console.warn('[FocusGuard] title field has stale focus (no recent edit), allowing merge');
+            console.log('[FocusGuard] title field has stale focus (no recent edit), allowing merge');
           }
           setTitle((note.title as string) || '');
           merged = true;
@@ -75,7 +75,7 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
           && Date.now() - lastEditRef.current.body < FOCUS_COOLDOWN_MS;
         if (!bodyActive && bodyRef.current !== note.body) {
           if (document.activeElement?.id === 'note-body-textarea') {
-            console.warn('[FocusGuard] body field has stale focus (no recent edit), allowing merge');
+            console.log('[FocusGuard] body field has stale focus (no recent edit), allowing merge');
           }
           setBody((note.body as string) || '');
           merged = true;

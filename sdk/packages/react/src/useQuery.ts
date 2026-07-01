@@ -18,7 +18,7 @@ export function useQuery(docId: string, options?: UseQueryOptions) {
     async function fetchInitial() {
       try {
         const records = await client.find(docId);
-        console.log(`[React useQuery] fetchInitial for ${docId}: found ${records.length} records`);
+        console.debug(`[React useQuery] fetchInitial for ${docId}: found ${records.length} records`);
         if (active) {
           setData(records);
           setLoading(false);
@@ -36,11 +36,11 @@ export function useQuery(docId: string, options?: UseQueryOptions) {
     let notifySeq = 0;
     const unsubscribe = client.subscribe(docId, async (recordId: string | undefined) => {
       const seq = ++notifySeq;
-      console.log(`[notify] seq=${seq} doc=${docId} phase=react_callback t=${Date.now()}`);
+      console.debug(`[notify] seq=${seq} doc=${docId} phase=react_callback t=${Date.now()}`);
       if (!active) return;
       try {
         const records = await client.find(docId);
-        console.log(`[notify] seq=${seq} doc=${docId} phase=react_setData records=${records.length} t=${Date.now()}`);
+        console.debug(`[notify] seq=${seq} doc=${docId} phase=react_setData records=${records.length} t=${Date.now()}`);
         if (active) {
           setData(records);
         }

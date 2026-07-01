@@ -11,7 +11,7 @@
 - Compaction methods must use `js_sys::Date::now()` for timestamps (not `crate::time_utils`)
 
 ## Progress
-### Done
+### Done (L1-L6)
 - **Snapshot drain in WASM WS coordinator**: After REGISTER_ACK, drain MSG_SNAPSHOT frames from `msg_rx` with 300ms timeout and cache them in `received_snapshots`. Handle MSG_SNAPSHOT in background reader. Implemented `list_snapshots()` (returns cache) and `store_snapshot()` (sends MSG_SNAPSHOT frame).
 - **Snapshot pull at cursor=0**: Removed `after > 0` guard in `download.rs:146` so `try_fetch_snapshot()` runs during replay mode. Rewrote `try_fetch_snapshot()` to apply ALL snapshots (deduplicated by doc) and advance cursor to max seq.
 - **`SnapshotPayload` extended** with `schema_version` and `created_at` fields; all 7 constructors updated across `ws.rs`, `ws_mux.rs`, `mux_coordinator.rs`, `coordinator-cf/lib.rs` (2), and `ws_coordinator.rs`.
@@ -35,8 +35,12 @@
 - **Phase 4 — CF coordinator max_sequence**: Both RegisterAck and NamespaceAck queries now use `SELECT COALESCE(MAX(...), 0) FROM (SELECT MAX(sequence) FROM mutations UNION ALL SELECT MAX(sequence) FROM snapshots)`. Survives compaction (mutations deleted) correctly.
 - **L6 — Init progress condensed**: `[1/9]–[9/9]` numbering removed across 3 files. Replaced with clean `[Coordinator]`, `[Recovery]`, `[Subscribed]` tags. Construction timings demoted to `debug!`. Ready log includes total startup ms.
 
-### Blocked
-- Log demotion (L2-L5) blocked until snapshot verification confirms replay is functional
+### Done
+- **L4 — JS SDK log demotion**: BC setup log → `console.debug`; recv/fire → `console.debug`; reuse log → `console.debug`; `useQuery`/`useVaultSyncOne` notification → `console.debug`
+- **L5 — Upload pipeline demotion**: `BATCH_START`, `PUSH_SEND`, `PUSH_ACK`, `AFTER_MARK_SYNCED`, `BATCH_DONE` → `debug!`; `ENTRY` → `trace!` in `upload.rs`. Core client: `[client.insert]`/`[client.update]`/`[client.delete]` → `trace!`; `[pipeline] write_document_and_oplog` → `debug!`; `[client.update] SKIP` → `debug!` in `client.rs` (core). NoteEditor: `[FocusGuard]` → `console.log` from `console.warn`.
+- **L3 — WASM instrumentation demotion**: `ws_coordinator.rs` implementation details (snapshot drain, disconnect, register, generation) → `console_debug!`; auth failures, push/pull errors → `console_warn!`. `client.rs` BC leader/follower, command handler, notify timing → `console_debug!`/`console_warn!`.
+- **L2 — Rust core instrumentation demotion**: `reconciler.rs` — all ENTER/EXIT, doc_before/after, state vectors, snapshot_cmp, fire, apply_update → `trace!`/`debug!`; `[reconciler.fire]` → `debug!`; `[reconciler.batch]` → `debug!`. `download.rs` — `pull_decrypted` → `trace!`; `replay_mode`, `flush_replay_notifications` → `debug!`; `cursor reset` → `warn!`. `state_manager.rs` — `cursor reset` → `warn!`.
+- **L7 — Build verification**: `cargo check --workspace` ok; `wasm-pack build --target web` ok; `npm run build` (full SDK) ok.
 
 ## Key Decisions
 - **Full snapshot system over keeping cursor on gen mismatch**: Safer — server could have been fully wiped. Cursor reset + snapshot fallback is correct for all cases.
@@ -51,9 +55,9 @@
 
 ## Next Steps
 1. **Verify production fetchInitial count** — Build production React app, confirm StrictMode double-invoke disappears.
-2. **Demote remaining instrumentation (L2-L5)** — After soak test confirms new lifecycle, ~130 lines to `trace!`/`debug!`.
-3. **8–12 hour soak test** — Overnight run with new lifecycle (worker spawn relocation).
-4. **Benchmark suite** — Startup time, snapshot restore, compaction, reconnect timing.
+2. **8–12 hour soak test** — Overnight run with new lifecycle (worker spawn relocation).
+3. **Benchmark suite** — Startup time, snapshot restore, compaction, reconnect timing.
+4. **Add startup timing instrumentation** — Track total initialization breakdown (storage, coordinator, client, subscribe).
 
 ### Logging Architecture
 Log levels map to audience:
@@ -83,16 +87,21 @@ When ready, the remaining work splits into these phases:
 - **Phase 3 — Bootstrap notify removed**: `client.events.notify_download(None)` removed from `wasm/src/client.rs:161`. No bootstrap pull needed — worker starts already synchronized after subscribe.
 - **Phase 4 — CF coordinator max_sequence**: Both RegisterAck and NamespaceAck queries use `SELECT COALESCE(MAX(...), 0) FROM (SELECT MAX(sequence) FROM mutations UNION ALL SELECT MAX(sequence) FROM snapshots)`. Survives compaction correctly.
 - **L6 — Init progress condensed**: `[1/9]–[9/9]` numbering removed across 3 files. Replaced with clean `[Coordinator]`, `[Recovery]`, `[Subscribed]` tags. Construction timings demoted to `debug!`. Ready log includes total startup ms.
+- **L4 — JS SDK log demotion**: BC setup log → `console.debug`; recv/fire → `console.debug`; reuse log → `console.debug`; `useQuery`/`useVaultSyncOne` notification → `console.debug`
+- **L5 — Upload pipeline demotion**: `BATCH_START`, `PUSH_SEND`, `PUSH_ACK`, `AFTER_MARK_SYNCED`, `BATCH_DONE` → `debug!`; `ENTRY` → `trace!` in `upload.rs`. Core client: `[client.insert]`/`[client.update]`/`[client.delete]` → `trace!`; `[pipeline] write_document_and_oplog` → `debug!`; `[client.update] SKIP` → `debug!` in `client.rs` (core). NoteEditor: `[FocusGuard]` → `console.log` from `console.warn`.
+- **L3 — WASM instrumentation demotion**: `ws_coordinator.rs` implementation details (snapshot drain, disconnect, register, generation) → `console_debug!`; auth failures, push/pull errors → `console_warn!`. `client.rs` BC leader/follower, command handler, notify timing → `console_debug!`/`console_warn!`.
+- **L2 — Rust core instrumentation demotion**: `reconciler.rs` — all ENTER/EXIT, doc_before/after, state vectors, snapshot_cmp, fire, apply_update → `trace!`/`debug!`; `[reconciler.fire]` → `debug!`; `[reconciler.batch]` → `debug!`. `download.rs` — `pull_decrypted` → `trace!`; `replay_mode`, `flush_replay_notifications` → `debug!`; `cursor reset` → `warn!`. `state_manager.rs` — `cursor reset` → `warn!`.
+- **L7 — Build verification**: `cargo check --workspace` ok; `wasm-pack build --target web` ok; `npm run build` (full SDK) ok.
 
 ## Critical Context
 - **Bug A (OPFS race) — FIXED**: Cross-tab OPFS race eliminated by per-tab storage paths. Upload pipeline health confirmed by consistent `PUSH_ACK sequences=[N]`, `AFTER_MARK_SYNCED pending=0`, `BATCH_DONE success=1`.
 - **Bug B (Focus guard loop) — FIXED**: One-way replication caused by `document.activeElement` check blocking external merges on the follower tab. Fixed with edit-timestamp cooldown. Both directions now confirmed working.
 - **Bidirectional sync is stable**: Logs show clean single-pipeline flow: `upload → PUSH_SEND → PUSH_ACK → AFTER_MARK_SYNCED pending=0 → BATCH_DONE → reconciler → subscription.fire → React callback → setData`. No repeating notification cycles, no pending uploads.
 - **The focus guard was the biggest remaining bug after OPFS fix**: We traced the issue through Rust/WASM/OPFS/CRDT/BC/WebSockets/React/browser event loop, and the root cause was a single line in a React component that blocked external merge when the textarea had focus.
-- **Instrumentation should be kept until stress tests pass**, then cleaned up for release.
+- **Instrumentation cleanup (L2-L5) completed** — per-mutation reconciler internals at TRACE, pipeline operations at DEBUG, summary events at INFO, errors at WARN/ERROR.
 
 ## Relevant Files
-- `sdk/examples/notes/src/components/NoteEditor.tsx`: **Fix applied**. Replaced `document.activeElement` focus guard with edit-timestamp cooldown using `lastEditRef.current.title` / `lastEditRef.current.body` and `FOCUS_COOLDOWN_MS = 2000`. Added `[FocusGuard] console.warn` logs.
+- `sdk/examples/notes/src/components/NoteEditor.tsx`: **Fix applied**. Replaced `document.activeElement` focus guard with edit-timestamp cooldown using `lastEditRef.current.title` / `lastEditRef.current.body` and `FOCUS_COOLDOWN_MS = 2000`. Added `[FocusGuard] console.log` logs.
 - `crates/vaultsync-wasm/src/client.rs`: **Bug A fix** (per-tab OPFS paths). BC command instrumentation (follower `[BC] FOLLOW_INSERT_BEGIN`, leader `[BC] LEADER_INSERT_BEGIN`).
 - `crates/vaultsync-core/src/sync/upload.rs`: Upload pipeline instrumentation (BATCH_START, PUSH_SEND, PUSH_ACK, AFTER_MARK_SYNCED, BATCH_DONE) — all confirmed healthy
 - `crates/vaultsync-core/src/sync/download.rs`: Download worker wake path, cursor advancement

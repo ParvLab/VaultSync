@@ -239,7 +239,7 @@ impl WasmVaultSyncClient {
         record_id: &str,
         json: &str,
     ) -> Result<(), JsValue> {
-        console_log!("[leader] handle_command verb={} doc={} record={} tab={}", verb, doc_id, record_id, self.tab_id);
+        console_debug!("[leader] handle_command verb={} doc={} record={} tab={}", verb, doc_id, record_id, self.tab_id);
         let t0 = web_sys::window()
             .and_then(|w| w.performance())
             .map(|p| p.now())
@@ -248,13 +248,13 @@ impl WasmVaultSyncClient {
             "insert" => {
                 let fields = json_to_fields(json)?;
                 let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
-                console_log!("[BC] LEADER_INSERT_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
+                console_debug!("[BC] LEADER_INSERT_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
                 self.client.insert(doc_id, record_id, fields).await
             }
             "update" => {
                 let fields = json_to_fields(json)?;
                 let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
-                console_log!("[BC] LEADER_UPDATE_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
+                console_debug!("[BC] LEADER_UPDATE_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
                 self.client.update(doc_id, record_id, fields).await
             }
             "delete" => self.client.delete(doc_id, record_id).await,
@@ -266,12 +266,12 @@ impl WasmVaultSyncClient {
             .unwrap_or(0.0);
         match result {
             Ok(()) => {
-                console_log!("[leader] command done verb={} doc={} record={} elapsed={:.1}ms", verb, doc_id, record_id, elapsed);
+                console_debug!("[leader] command done verb={} doc={} record={} elapsed={:.1}ms", verb, doc_id, record_id, elapsed);
                 self.broadcast_invalidation(doc_id, record_id);
                 Ok(())
             }
             Err(e) => {
-                console_log!("[leader] command failed verb={} doc={} record={} elapsed={:.1}ms err={:?}", verb, doc_id, record_id, elapsed, e);
+                console_warn!("[leader] command failed verb={} doc={} record={} elapsed={:.1}ms err={:?}", verb, doc_id, record_id, elapsed, e);
                 Err(JsValue::from_str(&format!("Command {} failed: {:?}", verb, e)))
             }
         }
@@ -287,7 +287,7 @@ impl WasmVaultSyncClient {
             self.broadcast_invalidation(doc_id, record_id);
             Ok(())
         } else {
-            console_log!("[BC] FOLLOW_INSERT_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
+            console_debug!("[BC] FOLLOW_INSERT_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
             self.send_command("insert", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
                 self.client.fire_local_subscription(doc_id, record_id, &fields);
@@ -306,7 +306,7 @@ impl WasmVaultSyncClient {
             self.broadcast_invalidation(doc_id, record_id);
             Ok(())
         } else {
-            console_log!("[BC] FOLLOW_UPDATE_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
+            console_debug!("[BC] FOLLOW_UPDATE_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
             self.send_command("update", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
                 self.client.fire_local_subscription(doc_id, record_id, &fields);
@@ -477,7 +477,7 @@ impl WasmVaultSyncClient {
             doc_id,
             Box::new(move |_doc_id, record_id, fields| {
                 let notify_seq = NOTIFY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                console_log!(
+                console_debug!(
                     "[notify] seq={} record={} phase=wasm_callback t={:.0}ms",
                     notify_seq,
                     record_id,
@@ -502,7 +502,7 @@ impl WasmVaultSyncClient {
                     let cb_clone = send_cb.0.clone();
                     let seq = notify_seq;
                     wasm_bindgen_futures::spawn_local(async move {
-                        console_log!(
+                        console_debug!(
                             "[notify] seq={} record={} phase=spawn_local t={:.0}ms",
                             seq,
                             record_id_owned,

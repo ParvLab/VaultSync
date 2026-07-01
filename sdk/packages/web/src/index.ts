@@ -56,7 +56,7 @@ export class VaultSyncClient {
 
   private setupBroadcastChannel(namespace: string) {
     const channelName = `vaultsync-ipc-${namespace}`;
-    console.log(`[JS BC] Setting up BroadcastChannel: ${channelName}`);
+    console.debug(`[JS BC] Setting up BroadcastChannel: ${channelName}`);
     this.channel = new BroadcastChannel(channelName);
     this.channel.onmessage = (e) => {
       const raw = typeof e.data === 'string' ? e.data : JSON.stringify(e.data);
@@ -76,13 +76,13 @@ export class VaultSyncClient {
           switch (val.type) {
             case 'invalidate': {
               if (val.doc_id && val.record_id) {
-                console.log(
+                console.debug(
                   `[JS BC] recv sender=${sender} receiver=${receiver} namespace=${namespace} ignored=${ignored} type=invalidate doc=${val.doc_id} record=${val.record_id}`
                 );
                 if (ignored) break;
                 setTimeout(async () => {
                   try {
-                    console.log(`[JS BC] fire sender=${sender} receiver=${receiver} doc=${val.doc_id} record=${val.record_id}`);
+                    console.debug(`[JS BC] fire sender=${sender} receiver=${receiver} doc=${val.doc_id} record=${val.record_id}`);
                     await this.inner.fire_subscription(val.doc_id, val.record_id);
                   } catch (err) {
                     console.error("[JS BC] Failed to fire subscription: ", err);
@@ -95,7 +95,7 @@ export class VaultSyncClient {
             case 'update':
             case 'delete': {
               if (val.doc_id && val.record_id && !ignored && this.inner.is_leader()) {
-                console.log(
+                console.debug(
                   `[JS BC] command sender=${sender} receiver=${receiver} type=${val.type} doc=${val.doc_id} record=${val.record_id}`
                 );
                 this.enqueueMutation(async () => {
@@ -124,7 +124,7 @@ export class VaultSyncClient {
     const key = config.namespace;
     const existing = instancePromises.get(key);
     if (existing) {
-      console.log(`[VaultSync] Reusing existing client for namespace=${key}`);
+      console.debug(`[VaultSync] Reusing existing client for namespace=${key}`);
       return existing;
     }
 

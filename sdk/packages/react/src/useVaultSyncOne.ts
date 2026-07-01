@@ -30,12 +30,12 @@ export function useVaultSyncOne(docId: string, recordId: string) {
     let notifySeq = 0;
     const unsubscribe = client.subscribe(docId, async (changedRecordId: string) => {
       const seq = ++notifySeq;
-      console.log(`[notify] seq=${seq} doc=${docId} phase=react_callback_one t=${Date.now()}`);
+      console.debug(`[notify] seq=${seq} doc=${docId} phase=react_callback_one t=${Date.now()}`);
       if (!active) return;
       if (changedRecordId === recordId) {
         try {
           const record = await client.get(docId, recordId);
-          console.log(`[notify] seq=${seq} doc=${docId} record=${recordId} phase=react_setData_one t=${Date.now()}`);
+          console.debug(`[notify] seq=${seq} doc=${docId} record=${recordId} phase=react_setData_one t=${Date.now()}`);
           if (active) {
             setData(record);
           }
