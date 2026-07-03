@@ -85,20 +85,16 @@ export function encrypt(plaintext: Uint8Array, sender_sk: Uint8Array, recipient_
 
 export function init(): void;
 
+export function set_log_level_from_str(level: string): void;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
-    readonly init: () => void;
-    readonly __wbg_wasmipc_free: (a: number, b: number) => void;
     readonly __wbg_wasmsubscriptionhandle_free: (a: number, b: number) => void;
     readonly __wbg_wasmvaultsyncclient_free: (a: number, b: number) => void;
     readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
-    readonly wasmipc_new: (a: number, b: number) => [number, number, number];
-    readonly wasmipc_on_message: (a: number, b: any) => void;
-    readonly wasmipc_receive: (a: number) => [number, number];
-    readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
     readonly wasmsubscriptionhandle_cancel: (a: number, b: number) => [number, number];
     readonly wasmvaultsyncclient_active_key_version: (a: number) => bigint;
     readonly wasmvaultsyncclient_define_schema: (a: number, b: number, c: number, d: number, e: number) => any;
@@ -121,10 +117,17 @@ export interface InitOutput {
     readonly wasmvaultsyncclient_sync_status: (a: number) => any;
     readonly wasmvaultsyncclient_unsubscribe: (a: number, b: number) => [number, number];
     readonly wasmvaultsyncclient_update: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => any;
+    readonly __wbg_wasmipc_free: (a: number, b: number) => void;
+    readonly wasmipc_new: (a: number, b: number) => [number, number, number];
+    readonly wasmipc_on_message: (a: number, b: any) => void;
+    readonly wasmipc_receive: (a: number) => [number, number];
+    readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
     readonly __wbg_presencemanager_free: (a: number, b: number) => void;
+    readonly init: () => void;
     readonly presencemanager_activePeers: (a: number) => [number, number];
     readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly presencemanager_peer_count: (a: number) => number;
+    readonly set_log_level_from_str: (a: number, b: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h6742839cb717cdad: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__he2ce1522b1e9967f: (a: number, b: number, c: any) => any;
