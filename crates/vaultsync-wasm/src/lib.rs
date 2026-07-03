@@ -114,6 +114,10 @@ pub mod mutation_store;
 #[cfg(target_arch = "wasm32")]
 pub mod presence;
 #[cfg(target_arch = "wasm32")]
+pub mod migration;
+#[cfg(target_arch = "wasm32")]
+pub mod page_store;
+#[cfg(target_arch = "wasm32")]
 pub mod storage;
 #[cfg(target_arch = "wasm32")]
 pub mod transport;
