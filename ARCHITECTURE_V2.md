@@ -14,6 +14,17 @@ Synchronization is one subsystem. The center of the system is **local data manag
 
 ---
 
+## North Star
+
+A VaultSync application should feel exactly like an offline desktop application.
+
+- Network availability must never determine UI responsiveness.
+- Synchronization is asynchronous — the local database is always the source of truth for the user.
+- The coordinator is a replication service, not a query service.
+- Every feature is measured against this principle.
+
+---
+
 ## Replication Model
 
 VaultSync uses **permission-driven replication**, not query-driven caching.
@@ -124,7 +135,15 @@ Measurable targets that every implementation must meet:
                        │
           ┌─────────────────────────┐
           │     Query Planner       │
-          │   Working Set Manager   │
+          └─────────────────────────┘
+                       │
+            ─────────────────────────────
+            Logical Database
+            ─────────────────────────────
+                       │
+          ┌─────────────────────────┐
+          │  get / scan / query     │
+          │  transaction / watch    │
           └─────────────────────────┘
                        │
             ─────────────────────────────
@@ -146,13 +165,15 @@ Measurable targets that every implementation must meet:
 
 **Synchronization is not the center.** The center is local data management.
 
-The **Query Engine** asks "give me document X" — it doesn't know where X lives.
+The **Query Engine** asks "give me document X" — it doesn't know where X lives, or what storage tier it's in.
 
-The **Storage Manager** decides which tier X is in, whether to promote or evict it, when to compact, and what to prefetch. It is the central authority for all placement decisions.
+The **Logical Database** exposes a database-oriented API (`get`, `scan`, `query`, `transaction`, `watch`) and internally resolves through the Storage Manager tiers. The Query Engine never knows about storage tiers — it only knows about the Logical Database.
+
+The **Storage Manager** is the sole authority for all storage access. No subsystem — download worker, upload pipeline, reconciler, scheduler, memory manager — touches storage directly. All I/O goes through the Storage Manager, which enforces placement, eviction, compaction, and lifecycle policy.
 
 The **Storage Engine** is a thin adapter that translates page-level operations to the backend (OPFS file, SQLite row, IndexedDB record). It has no policy logic.
 
-**Workspace boundary:** The Storage Manager manages a single user's authorized scope. Everything in that scope exists on disk (at minimum at L3/cold). Nothing outside the scope exists locally. The Working Set Engine only manages **memory tiers** (L0–L2) within this already-replicated workspace — it never decides what should or shouldn't be on disk. That decision belongs to the replication model.
+**Workspace boundary:** The Storage Manager manages a single user's authorized scope. Everything in that scope exists on disk (at minimum at the Recoverable tier). Nothing outside the scope exists locally. The Logical Database and Memory Manager operate within this already-replicated workspace — they never decide what should or shouldn't be on disk. That decision belongs to the replication model.
 
 ---
 
@@ -176,11 +197,15 @@ The **Storage Engine** is a thin adapter that translates page-level operations t
 
 | Pillar | Description |
 |--------|-------------|
-| Storage Manager | Central authority for placement, compaction, eviction, lifecycle |
-| Storage Engine V2 | Page-oriented storage with independent stores, no global index |
-| Scheduler | Priority-driven background work + Maintenance Window self-optimization |
-| Working Set Engine | Scoring-based tier management with memory budget |
-| Query Planner | Cache-aware resolution: L0 → L1 → L2 → L3 → disk |
+| Storage Manager | Sole authority for all storage access. Enforces placement, lifecycle, and integrity policy |
+| Storage Engine V2 | Block-device page abstraction with independent stores, no global index |
+| Metadata Engine | Central catalog for permissions, schemas, indexes, namespace membership, and replication state |
+| Resource Manager | Single source of truth for CPU, battery, memory, disk, network, and idle state |
+| Memory Manager | Scoring-based memory budget across Resident / Recoverable / Archived tiers |
+| Scheduler | Central traffic controller — all async work submits through its priority queue. Self-optimizing Maintenance Window |
+| Query Planner | Cache-aware resolution within workspace: Resident → Recoverable → disk. Future: cost-based optimizer |
+| Replication Planner | Decides what should be replicated or removed based on permissions and policy |
+| Adaptive Replication | (Postponed) Timeliness hints for push priority within already-replicated scope |
 
 ### Generation 3 — Optimization
 
@@ -190,7 +215,7 @@ The **Storage Engine** is a thin adapter that translates page-level operations t
 |---------|-------------|
 | Intelligent Compaction | CPU/battery/disk/memory-aware compaction strategy selection |
 | Predictive Prefetch | Predict likely-needed data and fetch before requested |
-| Multi-Level Cache | L0 Active CRDT → L1 Working Set → L2 Snapshots → L3 Segments → Coordinator |
+| Multi-Level Cache | Resident CRDT → Recoverable cache → Disk pages → Archived segments → Coordinator |
 | Adaptive Compression | Rarely-changed data (invoices) → aggressive; frequently-changed (chat) → minimal |
 
 ### Generation 4 — Distributed Query Engine
@@ -215,41 +240,44 @@ Today, storage decisions are scattered: `upload.rs` decides when to mark entries
 
 #### Solution: Central Storage Manager
 
-The Storage Manager is the single point of control for all storage policy:
+The Storage Manager is the single point of control for all storage policy. Externally it exposes a single unified interface; internally it is modular:
 
 ```
-Storage Manager
+Storage Manager (facade)
     │
-    ├── Placement
-    │     └── Which tier does this document belong in?
-    │     └── Where should this new segment be written?
-    │     └── Should this data be promoted or demoted?
+    ├── Placement Engine
+    │     └── Which tier does this data belong in?
+    │     └── Where should new segments be written?
+    │     └── Should data be promoted or demoted?
     │
-    ├── Compaction
-    │     └── When should active journals be sealed?
-    │     └── When should small segments be merged?
-    │     └── When should segments covered by snapshots be deleted?
+    ├── Integrity Engine
+    │     └── Verify checksums on read
+    │     └── Detect crashes via partially-written files
+    │     └── Maintain minimal segment headers
     │
-    ├── Eviction
-    │     └── Which documents must leave the working set?
-    │     └── What must be persisted before eviction?
-    │     └── What can be discarded without persistence?
-    │
-    ├── Lifecycle
+    ├── Lifecycle Engine
     │     └── Active → Sealed (segment reaches size limit)
     │     └── Sealed → Deleted (covered by snapshot compaction)
-    │     └── Cold → Archived (not accessed in N days)
+    │     └── Recoverable → Archived (not accessed in N days)
     │     └── Archived → Deleted (explicit GC policy)
     │
-    └── Integrity
-          └── Verify checksums on read
-          └── Detect crashes via partially-written files
-          └── Maintain minimal segment manifests
+    ├── Segment Manager
+    │     └── Active journal sealing
+    │     └── Small segment merging
+    │     └── Compaction coordination
+    │
+    └── Page Allocator
+          └── allocate_page / read_page / write_page / free_page
+          └── Page-level operations, no file awareness
 ```
 
-All other subsystems — download worker, upload pipeline, reconciler, scheduler — talk to the Storage Manager. None of them write to storage directly.
+**No subsystem touches storage directly.** The download worker, upload pipeline, reconciler, scheduler, and memory manager all go through the Storage Manager. The Storage Manager is the sole authority for:
+- **Access control** — every read and write is gated through the manager
+- **Tier placement** — the manager decides which tier data belongs in based on access patterns and policy
+- **Lifecycle enforcement** — data transitions (active → sealed → deleted) are managed centrally
+- **Integrity verification** — checksums, crash recovery, and consistency are enforced in one place
 
-**Interface sketch:**
+**Interface sketch (intent-based, not policy-based):**
 ```rust
 trait StorageManager: Send + Sync {
     // Document access (transparent tier resolution)
@@ -265,11 +293,14 @@ trait StorageManager: Send + Sync {
     async fn seal_active_segments(&self) -> Result<CompactionStats>;
     async fn delete_compactable_segments(&self, before_seq: u64) -> Result<usize>;
 
-    // Tier hints (called by Working Set Engine)
-    async fn promote_to_hot(&self, ns: &str, doc_ids: &[&str]) -> Result<()>;
-    async fn demote_from_hot(&self, ns: &str, doc_ids: &[&str]) -> Result<()>;
+    // Intent-based tier hints (Storage Manager computes tiers internally)
+    async fn touch(&self, ns: &str, doc_id: &str) -> Result<()>;     // accessed, update recency
+    async fn pin(&self, ns: &str, doc_id: &str) -> Result<()>;       // keep resident
+    async fn release(&self, ns: &str, doc_id: &str) -> Result<()>;   // remove pin
 }
 ```
+
+Note the absence of tier-specific methods like `promote_to_hot` or `demote_to_cold`. Callers express **intent** (`touch`, `pin`, `release`); the Storage Manager computes the tier internally. This prevents policy from leaking outside the manager.
 
 ---
 
@@ -296,17 +327,26 @@ Every operation serializes/deserializes the entire dataset. Measured bottlenecks
 - `index_transaction`: 1108ms to re-serialize + write 896 entries
 - These grow linearly with dataset size — violates Invariant 1.
 
-#### Philosophy: Pages, Not Files
+#### Philosophy: Block Device Abstraction
 
-Storage engines don't think in terms of files. They think in terms of **pages** — fixed-size blocks that hold objects.
+The Storage Engine presents a **block device** interface to the Storage Manager — not files, not directories, not paths. The Storage Manager never sees filenames or directories. It only sees:
+
+```rust
+trait BlockDevice: Send + Sync {
+    async fn allocate_page(&self) -> Result<PageId>;
+    async fn read_page(&self, id: PageId) -> Result<Option<Vec<u8>>>;
+    async fn write_page(&self, id: PageId, data: &[u8]) -> Result<()>;
+    async fn free_page(&self, id: PageId) -> Result<()>;
+}
+```
 
 - A document may span multiple pages
 - Multiple small records may share a single page
-- The Storage Engine only knows about pages: read page N, write page N
-- The **page size** is fixed per backend (4KB for OPFS, 8KB for SQLite)
-- The **Storage Manager** decides page placement, compaction, and lifecycle
+- The **Storage Manager** decides page placement, compaction, and lifecycle via the block device interface
+- Each backend maps pages to its native storage: OPFS files, SQLite database pages, IndexedDB records, native disk blocks
+- The **page size** is defined by the backend (OPFS uses a configured page size, SQLite uses its own)
 
-The OPFS backend happens to store pages as individual files in a directory tree. The SQLite backend stores them as database pages. The abstraction hides this.
+This is how mature storage engines are designed: the higher layers think in abstract pages, the backend translates to concrete storage.
 
 **The document store does not know about oplogs. The mutation store does not know about documents.** Each is a separate page namespace managed independently.
 
@@ -411,7 +451,116 @@ If migration crashes mid-way, the original `index.json` is intact. Data is never
 
 ---
 
-### Pillar 3: Working Set Engine
+### Pillar 3: Metadata Engine
+
+#### Problem
+
+Today, metadata is scattered across the codebase: permissions live in the coordinator, schemas are embedded in the storage index, namespace membership is inferred from sync state, and there is no central catalog for what exists in the local database. As the platform grows to support ERP-scale data, metadata becomes as important as the data itself.
+
+#### Solution: Central Metadata Engine
+
+The Metadata Engine owns all metadata about the local database:
+
+```
+Metadata Engine
+    │
+    ├── Namespace Catalog
+    │     └── Which namespaces are replicated locally?
+    │     └── What is the sync state per namespace?
+    │     └── Replication scope (authorized documents)
+    │
+    ├── Permission Index
+    │     └── Namespace-level permissions (replicated from coordinator)
+    │     └── Document-level access control
+    │     └── Input to the Replication Planner
+    │
+    ├── Schema Registry
+    │     └── Versioned document schemas
+    │     └── Schema migration history
+    │     └── Schema-document mapping
+    │
+    ├── Index Definitions
+    │     └── Which fields are indexed?
+    │     └── Index metadata (type, cardinality, storage location)
+    │
+    ├── Generation IDs
+    │     └── Per-namespace generation tracking
+    │     └── Coordinator generation for recovery
+    │
+    └── Replication Catalog
+          └── What is being replicated and at what priority?
+          └── Snapshot metadata (timestamps, sequence ranges)
+          └── Segment index (seq → segment file mapping)
+```
+
+**Key properties:**
+- All metadata is stored in the page-oriented format (same as documents and mutations)
+- Only the metadata root page is loaded at startup (~one page read)
+- The Metadata Engine is read by the Storage Manager, Memory Manager, Scheduler, and Query Planner
+- It is written by the Replication Planner and Sync Coordinator
+
+The Metadata Engine is **not** a global index. It is a collection of independently paged indexes, each scoped to a specific metadata domain.
+
+---
+
+### Pillar 4: Resource Manager
+
+#### Problem
+
+Today, resource awareness is scattered: the Scheduler guesses CPU load, the Memory Manager guesses available RAM, the Maintenance Window guesses battery state. Each subsystem probes resources independently, leading to inconsistent decisions and duplicated logic.
+
+#### Solution: Central Resource Manager
+
+The Resource Manager is the single source of truth for system resource state:
+
+```
+Resource Manager
+    │
+    ├── CPU
+    │     └── Current utilization (idle / moderate / busy)
+    │     └── Core count and capacity
+    │
+    ├── Memory
+    │     └── Available RAM
+    │     └── Memory pressure level
+    │
+    ├── Battery
+    │     └── Charge level
+    │     └── Charging state (charging / discharging / full)
+    │
+    ├── Disk
+    │     └── Available space
+    │     └── I/O pressure
+    │
+    ├── Network
+    │     └── Connectivity (online / offline / metered / unmetered)
+    │     └── Bandwidth estimate
+    │
+    └── Idle
+          └── User activity state (active / idle / locked)
+          └── Idle duration
+```
+
+**Interface sketch:**
+```rust
+trait ResourceManager: Send + Sync {
+    fn current_state(&self) -> ResourceState;
+    fn can_schedule(&self, priority: Priority) -> bool;
+    fn is_maintenance_window(&self) -> bool;
+}
+```
+
+**Consumers:**
+- **Scheduler** — queries `can_schedule()` before dispatching background jobs
+- **Memory Manager** — queries memory pressure to adjust eviction aggressiveness
+- **Maintenance Window** — queries all resources to determine if maintenance is safe
+- **Replication Planner** — queries network state to decide prefetch timing
+
+The Resource Manager is lightweight and passive — it exposes state collected by the system rather than actively managing resources. Its value is in centralizing the resource model so that every subsystem asks the same source of truth.
+
+---
+
+### Pillar 5: Memory Manager
 
 #### Problem
 
@@ -419,9 +568,9 @@ Today, everything that's replicated is "loaded" in the sense that it's accessibl
 
 #### Scope
 
-The Working Set Engine manages **in-memory tiers only** — not disk residency. Everything in the user's authorized scope is already on disk (L3/cold at minimum) thanks to permission-driven replication. The working set answers: "what should be in memory right now?" not "what should exist locally?"
+The Memory Manager manages **in-memory tiers only** — not disk residency. Everything in the user's authorized scope is already on disk (Recoverable at minimum) thanks to permission-driven replication. The memory manager answers: "what should be in memory right now?" not "what should exist locally?"
 
-A document falling below the L3 threshold does not get deleted. It simply leaves the working set and remains on disk until re-accessed.
+A document falling below the Recoverable threshold does not get deleted. It simply leaves the working set and remains on disk until re-accessed.
 
 #### Solution: Scoring-Based Tier Management
 
@@ -446,15 +595,15 @@ fn compute_score(doc: &Document, ctx: &Context) -> f64 {
 }
 ```
 
-**Tiers are ranges on the score axis, not manual classifications:**
+**Tiers describe guarantees, not implementation labels:**
 
-| Score Range | Tier | Behavior |
-|-------------|------|----------|
-| >= 0.8 | L0 — Active | Currently editing, pinned, never evicted |
-| 0.5 – 0.8 | L1 — Hot | Full document in deserialized form, LRU within budget |
-| 0.2 – 0.5 | L2 — Warm | Resolvable from snapshot + recent segments, <50ms load |
-| 0.01 – 0.2 | L3 — Cold | On disk only (within replicated scope), <50ms load from disk |
-| < 0.01 | L4 — Archive | Compressed segments, never loaded unless explicitly requested. Data outside authorized scope is never stored locally. |
+| Guarantee | Tier | Behavior |
+|-----------|------|----------|
+| Resident | L0 — Active | Currently editing, pinned, never evicted. Full document in WASM Yrs document. |
+| Resident | L1 — Hot | Full document in deserialized form. LRU within memory budget. |
+| Recoverable | L2 — Warm | Resolvable from metadata + recent segments. <50ms load — stays on disk until accessed. |
+| Recoverable | L3 — Cold | On disk within replicated scope. <50ms load from disk. Accessible offline. |
+| Archived | L4 — Archived | Compressed segments. Never loaded unless explicitly requested. Data outside authorized scope is never stored locally. |
 
 #### Memory Budget (not soft tiers)
 
@@ -463,74 +612,113 @@ The engine operates on a fixed memory budget, not descriptive tiers:
 ```
 Memory Budget: 512 MB (configurable)
 
-  Active CRDTs (L0):  150 MB hard limit
-  Hot docs (L1):      100 MB LRU within budget
-  Warm docs (L2):     150 MB LRU within budget
-  Snapshot cache:      50 MB
-  Indexes:             30 MB
-  Scratch:             32 MB
+  Active CRDTs (Resident):  150 MB hard limit
+  Hot docs (Resident):      100 MB LRU within budget
+  Warm docs (Recoverable):  150 MB LRU within budget
+  Snapshot cache:            50 MB
+  Indexes:                   30 MB
+  Scratch:                   32 MB
 ```
 
 Rules:
-- **Promotion:** On access, doc immediately enters L1 (hot). If L1 is full, the lowest-scoring L1 doc is demoted to L2 (warm) to make room.
-- **Demotion:** Every 60 seconds, a background sweep recomputes scores. Docs that fell below the L0 threshold move to L1. L1 docs below threshold move to L2. L2 docs below threshold are evicted from memory (data stays on disk).
-- **Eviction:** Evicted L2 docs are not deleted — they simply leave the working set. The Storage Manager knows where their pages are and can reload them on next access.
-- **Pinning:** The developer can pin a document (e.g., "currently open invoice"), giving it a score multiplier of 100x. Pinned docs stay in L0 regardless of usage.
+- **Promotion:** On access, doc immediately enters Resident (L1). If Resident is full, the lowest-scoring Resident doc is demoted to Recoverable (L2) to make room.
+- **Demotion:** Every 60 seconds, a background sweep recomputes scores. Docs that fell below the Resident threshold move to Recoverable. Recoverable docs below threshold are evicted from memory (data stays on disk).
+- **Eviction:** Evicted Recoverable docs are not deleted — they simply leave the working set. The Storage Manager knows where their pages are and can reload them on next access.
+- **Pinning:** The developer can pin a document (e.g., "currently open invoice"), giving it a score multiplier of 100x. Pinned docs stay in Resident regardless of usage.
 
 **Key property:** The total memory used is always ≤ budget, regardless of total replicated data. A device with 10,000 replicated documents uses the same memory as one with 10 — only the disk footprint differs.
 
 ---
 
-### Pillar 4: Query Planner
+### Pillar 6: Scheduler (Traffic Controller)
 
 #### Problem
 
-Today `getDoc(docId)` always reads from OPFS (or cache). There's no query planning — no awareness of what's cached, what's materialized, what can be served from snapshots, or what needs the coordinator.
+Today everything is event-driven. Upload pipeline, compaction, cleanup, prefetch, and eviction are ad-hoc systems running independently. They compete with foreground operations unpredictably and have no central coordination.
 
-#### Scope
+#### Solution: Central Traffic Controller
 
-The Query Planner operates **within the user's authorized workspace**. Every document within scope is already on disk (L3/cold at minimum). The planner should never need a network fetch for data within the workspace — all resolution paths are local. Data outside the workspace is never stored locally and cannot be served regardless of connectivity.
-
-#### Solution: Cache-Aware Query Resolution
+The Scheduler becomes the operating system of VaultSync — it is the single point of execution for **all** asynchronous work. Nothing spawns itself. No subsystem creates its own timer, interval, or background task. Every unit of work goes through `Scheduler.submit()`:
 
 ```text
-getDocument("invoice-123")
-    │
-    ├── L0 cache hit?   → return immediately (0ms)
-    ├── L1 cache hit?   → return immediately (<1ms)
-    ├── L2 cache hit?   → materialize from snapshot + delta (<10ms)
-    ├── L3 cache hit?   → fetch from disk page (<50ms)
-    └── L4 miss?        → data is outside user's authorized scope → cannot be served
-                          (same behavior online and offline — expected)
+Upload Worker
+     │
+     └── submits job → Scheduler
+                          │
+Download Worker                 │
+     │                         │
+     └── submits job → Scheduler
+                          │
+Leader Election                 │
+     │                         │
+     └── submits job → Scheduler
+                          │
+Reconnect Timer                 │
+     │                         │
+     └── submits job → Scheduler
+                          │
+Snapshot                        │
+     │                         │
+     └── submits job → Scheduler
+                          │
+Compaction                      │
+     │                         │
+     └── submits job → Scheduler
+                          │
+Prefetch                        │
+     │                         │
+     └── submits job → Scheduler
+                          │
+Cleanup                         │
+     │                         │
+     └── submits job → Scheduler
+                          │
+                          ▼
+               ┌───────────────────┐
+               │ Resource Manager  │
+               │   current_state() │
+               └────────┬──────────┘
+                        │
+                        ▼
+                   Priority Queue
+                        │
+               ┌────────┴────────┐
+               │ Foreground(0-1) │
+               │ Background(2-5) │
+               └─────────────────┘
+                        │
+                        ▼
+                   Coordinator
+                   Storage Manager
+                   Metadata Engine
 ```
 
-Each level answers "do I have the data to resolve this document's state?" without loading unnecessary data. The query planner never scans the oplog to resolve a document.
+The Scheduler itself does not probe resources — it asks the [Resource Manager](#pillar-4-resource-manager):
 
-Note: L4 is not a network fallback. Within the workspace, L3 (disk) is the deepest tier. If the planner reaches L4, it means the document is outside the user's authorized scope — a permission issue, not a caching issue.
+```rust
+impl Scheduler {
+    async fn submit(&self, job: Job) {
+        if !self.resource_manager.can_schedule(job.priority()) {
+            self.deferred_queue.push_back(job);
+            return;
+        }
+        self.priority_queue.push(job);
+    }
 
-For queries (not single doc):
-
-```text
-getDocuments({ namespace, filter, sort, limit })
-    │
-    ├── Have index for this filter? → use index, load matched docs from working set
-    ├── Have snapshot for this namespace? → filter snapshot, apply deltas from warm docs
-    └── No local data? → data in namespace has not been replicated (check permissions)
+    async fn tick(&self) {
+        while let Some(job) = self.priority_queue.pop() {
+            if self.resource_manager.can_schedule(job.priority()) {
+                job.run().await;
+            } else {
+                self.deferred_queue.push_back(job);
+                break;  // yield until next tick
+            }
+        }
+    }
+}
 ```
 
-The query planner works with the Storage Manager to determine the fastest resolution path. It never deserializes more data than needed.
-
----
-
-### Pillar 5: Scheduler
-
-#### Problem
-
-Today everything is event-driven. Compaction, cleanup, prefetch, and eviction are ad-hoc timers scattered across the codebase. They compete with foreground operations unpredictably.
-
-#### Solution: Priority Queue + Nightly Self-Optimization
-
-**Priority Queue for real-time work:**
+**Priority Queue:**
 
 | Priority | Category | Description |
 |----------|----------|-------------|
@@ -542,47 +730,143 @@ Today everything is event-driven. Compaction, cleanup, prefetch, and eviction ar
 | 5 | Cleanup | GC, tombstone removal, idle-only |
 
 Implementation:
-- Single scheduler worker with priority queue
-- Foreground operations (priority 0–1) preempt background
-- Background operations (priority 2–5) yield on timer or backpressure
-- System resources (battery, CPU, memory) influence scheduling decisions
+- Single scheduler worker with priority queue + deferred queue
+- Foreground operations (priority 0–1) preempt background immediately
+- Background operations (priority 2–5) yield on backpressure or resource constraints via Resource Manager
+- The Resource Manager provides `current_state()` — the Scheduler never probes resources directly
 
-**Nightly Self-Optimization cycle:**
+**Maintenance Window (self-optimization):**
+
+When the device is idle, charging, on WiFi, and not under memory pressure, the Maintenance Window opens:
 
 ```
-Idle trigger (no user activity for N minutes)
-    │
-    ├── 1. Analyze workload
-    │       └── Which docs are hot at what times?
-    │       └── Which namespaces are active?
-    │       └── Update prediction model
-    │
-    ├── 2. Compact
-    │       └── Seal active segments that are ready
-    │       └── Merge small segments (below minimum fill ratio)
-    │       └── Delete segments fully covered by snapshots
-    │
-    ├── 3. Re-index
-    │       └── Refresh in-memory access scores
-    │       └── Rebuild query indexes if needed
-    │
-    ├── 4. Archive
-    │       └── Demote L3→L4 data to compressed storage
-    │       └── Compact archive segments
-    │
-    ├── 5. Predict
-    │       └── Compute next session's likely hot set
-    │       └── Prefetch if on unmetered connection / WiFi
-    │
-    └── 6. Report
-            └── Log health metrics, budget utilization, compaction stats
+Maintenance Window conditions:
+  ✓ No user activity for N minutes
+  ✓ Device charging (or battery > 50%)
+  ✓ On unmetered network
+  ✓ No memory pressure
+  ✓ No active sync in progress
+
+┌────────────────────────────────────────┐
+│          Maintenance Window            │
+│                                        │
+│  1. Analyze workload                   │
+│     → Which docs are hot?             │
+│     → Which namespaces are active?    │
+│     → Update prediction model         │
+│                                        │
+│  2. Compact                            │
+│     → Seal active segments            │
+│     → Merge small segments            │
+│     → Delete segments covered by      │
+│       snapshots                        │
+│                                        │
+│  3. Re-index                           │
+│     → Refresh access scores           │
+│     → Rebuild query indexes           │
+│                                        │
+│  4. Archive                            │
+│     → Demote cold data to compressed  │
+│     → Compact archive segments        │
+│                                        │
+│  5. Predict                            │
+│     → Compute next session's hot set  │
+│     → Prefetch if on WiFi             │
+│                                        │
+│  6. Report                             │
+│     → Log health metrics              │
+│     → Budget utilization              │
+│     → Compaction stats                │
+└────────────────────────────────────────┘
 ```
 
-**The developer never calls `compact()`, `vacuum()`, or `cleanup()`.** The engine maintains itself.
+**The developer never calls `compact()`, `vacuum()`, or `cleanup()`.** The engine maintains itself autonomously.
 
 ---
 
-### Pillar 6: Adaptive Replication (Postponed)
+### Pillar 7: Query Planner
+
+#### Problem
+
+Today `getDoc(docId)` always reads from OPFS (or cache). There's no query planning — no awareness of what's cached, what's materialized, what can be served from snapshots, or what needs the coordinator.
+
+#### Scope
+
+The Query Planner operates **within the user's authorized workspace**. Every document within scope is already on disk (Recoverable at minimum). The planner should never need a network fetch for data within the workspace — all resolution paths are local. Data outside the workspace is never stored locally and cannot be served regardless of connectivity.
+
+#### Solution: Cache-Aware Query Resolution
+
+```text
+getDocument("invoice-123")
+    │
+    ├── Resident cache hit?     → return immediately (0ms)
+    ├── Recoverable cache hit?  → materialize from metadata + delta (<10ms)
+    ├── Recoverable disk hit?   → fetch from disk page (<50ms)
+    └── Archived or missing?    → data is outside user's authorized scope → cannot be served
+                                  (same behavior online and offline — expected)
+```
+
+Each level answers "do I have the data to resolve this document's state?" without loading unnecessary data. The query planner never scans the oplog to resolve a document.
+
+Note: There is no network fallback in the query path. Within the workspace, disk is the deepest tier. If the planner cannot find a document, it means the document is outside the user's authorized scope — a permission issue, not a caching issue.
+
+For queries (not single doc):
+
+```text
+getDocuments({ namespace, filter, sort, limit })
+    │
+    ├── Have index for this filter? → use index, load matched docs from working set
+    ├── Have metadata snapshot for this namespace? → filter snapshot, apply deltas
+    └── No local data? → data in namespace has not been replicated (check permissions)
+```
+
+The query planner works with the Storage Manager to determine the fastest resolution path. It never deserializes more data than needed.
+
+**Future evolution:** As query complexity grows beyond single-doc lookups (filters, joins, aggregations), the Query Planner will evolve into a **Cost-Based Optimizer** — similar to SQLite's planner. It will estimate the cost of each resolution path (index scan vs. snapshot vs. disk) and choose the cheapest plan. Foundation: the Metadata Engine's index definitions and the Memory Manager's tier residency information.
+
+---
+
+### Pillar 8: Replication Planner
+
+#### Problem
+
+Today, replication decisions are scattered: the coordinator decides what to push, permissions decide what is allowed, and the download worker decides what to pull. There is no single authority for **what should be replicated** and **what should be removed** when circumstances change.
+
+#### Solution: Central Replication Planner
+
+The Replication Planner determines **what the local database should contain**. It is separate from the Coordinator — the Coordinator executes the plan, the Planner determines it.
+
+```
+Replication Planner
+    │
+    ├── On registration
+    │     └── Query coordinator for authorized scope
+    │     └── Compute initial replication set
+    │     └── Tell Storage Manager: replicate these namespaces
+    │
+    ├── On permission change
+    │     └── Receive permission update from coordinator
+    │     └── Compute delta: what should be added or removed
+    │     └── Tell Storage Manager: add these, remove these
+    │
+    ├── On namespace deletion
+    │     └── Receive deletion signal from coordinator
+    │     └── Decide: delete, archive, or keep encrypted
+    │     └── Tell Storage Manager: execute policy
+    │
+    └── On scope expansion
+          └── Compute new documents to replicate
+          └── Prioritize by urgency (active vs. background)
+          └── Tell Storage Manager: fetch new scope
+```
+
+**Key property:** The Replication Planner makes decisions based on permissions and policy. The Coordinator and Storage Manager execute those decisions. This separation ensures that replication policy is enforced in one place, not scattered across the sync protocol.
+
+The Replication Planner reads from the Metadata Engine (permission index, namespace catalog) and writes to it (replication catalog). It submits replication jobs to the Scheduler for execution.
+
+---
+
+### Pillar 9: Adaptive Replication (Postponed)
 
 #### Problem
 
@@ -594,9 +878,9 @@ Adaptive replication does **not** decide what to replicate. That decision is mad
 
 #### Why Postponed
 
-Adaptive replication requires coordinator intelligence — usage hints, tiered push policies, prefetch scheduling. This is a protocol-level change that depends on the Storage Manager, Working Set Engine, and Scheduler being in place first.
+Adaptive replication requires coordinator intelligence — usage hints, tiered push policies, prefetch scheduling. This is a protocol-level change that depends on the Storage Manager, Memory Manager, and Scheduler being in place first.
 
-The client-side hint computation depends on the working set engine knowing which docs are hot. The coordinator-side tiered push depends on the scheduler managing background work. Building adaptive replication before those foundations leads to ad-hoc design.
+The client-side hint computation depends on the memory manager knowing which docs are hot. The coordinator-side tiered push depends on the scheduler managing background work. Building adaptive replication before those foundations leads to ad-hoc design.
 
 #### Future Direction
 
@@ -619,17 +903,7 @@ Coordinator response:
 - Push mutations for `batched` docs in periodic batches
 - Track cursor for `passive` docs but only push on reconnection or explicit request
 
-The working set engine feeds `realtime` and `batched` hints from the access scoring model. If HR opens Payroll every morning, after a week the predictor promotes Payroll from `passive` → `batched` → `realtime` proactively.
-
----
-
-## Nightly Self-Optimization
-
-See the full cycle under [Pillar 5: Scheduler](#pillar-5-scheduler). This is called out separately because it is the feature that makes VaultSync genuinely different from every other sync engine.
-
-**The engine stays healthy without developer intervention.**
-
-No manual `compact()` calls. No `cleanup()` timers. No `vacuum()` scripts. The Scheduler observes workload patterns and runs maintenance during idle periods with appropriate priority.
+The memory manager feeds `realtime` and `batched` hints from the access scoring model. If HR opens Payroll every morning, after a week the predictor promotes Payroll from `passive` → `batched` → `realtime` proactively.
 
 ---
 
@@ -641,13 +915,16 @@ Storage is the foundation of Generation 2, but VaultSync as a data platform will
 |-----------|----------------|-------------|
 | **Indexing** | Document-level and field-level indexes for fast queries without full scans | Gen 3 |
 | **Query Execution** | A query planner that can optimize across cache, snapshot, and disk tiers | Gen 3 |
-| **Transactions** | Atomicity for multi-document write operations | Gen 3 |
+| **Transaction Manager** | Atomic multi-document commit (invoice + stock + ledger + audit log preserved together) | Gen 3 |
 | **Schema Evolution** | Versioned schemas with automatic migration | Gen 3 |
 | **Permissions** | Row-level and field-level access control — the input to the replication model | Gen 2 (design), Gen 3 (implementation) |
 | **Conflict Resolution** | Customizable policies per document type | Gen 3 |
 | **Observability** | Metrics, tracing, health diagnostics for production operation | Gen 2 (basic), Gen 3 (comprehensive) |
+| **Cost-Based Optimizer** | Evolve Query Planner from cache-aware resolution to SQLite-style cost-based execution planning | Gen 4 |
 
 **Permissions deserve early design attention** because they are the input to the replication model. The coordinator computes the user's authorized scope from permissions at registration time. The storage directory tree (`docs/{namespace}/{doc_id}/`) maps naturally to namespace-level permissions, but field-level and record-level permissions will need a more granular model.
+
+**Terminology evolution:** This document uses "document" as the unit of data, which reflects current CRDT-centric architecture. As VaultSync evolves to handle table-oriented ERP data (invoices, payroll, inventory), the terminology will shift toward **Entity** or **Collection**. The page-oriented storage model supports this shift naturally — an entity is just a page or set of pages with a defined schema. The Metadata Engine's schema registry and permission model are designed for this evolution.
 
 The page-oriented storage, Storage Manager abstraction, and tier architecture must not preclude any of these future subsystems.
 
@@ -681,42 +958,69 @@ The page-oriented storage, Storage Manager abstraction, and tier architecture mu
 - `core/src/storage/lifecycle.rs` — Segment lifecycle (active → sealed → deleted)
 - `wasm/src/storage_manager.rs` — WASM OPFS-backed StorageManager
 
-### Phase C — Scheduler (4-6 weeks)
+### Phase C — Metadata Engine (4-6 weeks)
 
-**Scope:** Priority queue for background work. Maintenance Window self-optimization cycle. Resource-aware scheduling.
+**Scope:** Central metadata catalog for permissions, schemas, indexes, namespace membership, generation IDs, and replication state.
 
 **New components:**
-- `core/src/scheduler/mod.rs` — Priority queue, worker pool
+- `core/src/metadata/mod.rs` — Metadata Engine implementations
+- `core/src/metadata/permissions.rs` — Permission index storage and queries
+- `core/src/metadata/schemas.rs` — Schema registry
+- `core/src/metadata/catalog.rs` — Namespace and replication catalog
+
+### Phase D — Scheduler + Resource Manager (6-8 weeks)
+
+**Scope:** Central traffic controller with priority queue. Resource Manager for CPU/battery/memory/network/idle state. Maintenance Window self-optimization cycle.
+
+**New components:**
+- `core/src/scheduler/mod.rs` — Priority queue, worker pool, job submission
+- `core/src/scheduler/resource.rs` — Resource Manager (CPU, battery, memory, network, idle)
 - `core/src/scheduler/optimizer.rs` — Maintenance Window self-optimization orchestrator
 - `core/src/scheduler/prefetch.rs` — Predictive prefetch job
 
-### Phase D — Working Set Engine (4-6 weeks)
+### Phase E — Memory Manager (4-6 weeks)
 
-**Scope:** Scoring algorithm, memory budget, LRU tiers, access tracking, pinning.
+**Scope:** Scoring algorithm, memory budget, Resident/Recoverable/Archived tier management, access tracking, pinning.
 
 **New components:**
-- `core/src/working_set/mod.rs` — Scoring, tier resolution, budget enforcement
-- `core/src/working_set/cache.rs` — In-memory document cache with LRU eviction
-- `core/src/working_set/tracker.rs` — Access frequency and recency tracking
+- `core/src/memory/mod.rs` — Scoring, tier resolution, budget enforcement
+- `core/src/memory/cache.rs` — In-memory document cache with LRU eviction
+- `core/src/memory/tracker.rs` — Access frequency and recency tracking
 
-### Phase E — Query Planner (4-6 weeks)
+### Phase F — Logical Database (4-6 weeks)
 
-**Scope:** Cache-aware query resolution. Tier-aware `getDocument`. Local indexes for filter patterns.
+**Scope:** Database-oriented API layer between Query Engine and Storage Manager. Exposes `get`, `scan`, `query`, `transaction`, `watch` — resolves through Storage Manager internally.
+
+**New components:**
+- `core/src/database/mod.rs` — Logical Database API
+- `core/src/database/resolver.rs` — Tier resolution (delegates to Storage Manager + Memory Manager)
+
+### Phase G — Query Planner (4-6 weeks)
+
+**Scope:** Cache-aware query resolution. Resident/Recoverable/disk-aware `getDocument`. Local indexes for filter patterns. Foundation for future cost-based optimizer.
 
 **New components:**
 - `core/src/query/planner.rs` — Query planner, tier resolver
 - `core/src/query/index.rs` — Local indexes for common filter patterns
 
-### Phase F — Adaptive Replication (6-8 weeks)
+### Phase H — Replication Planner (6-8 weeks)
 
-**Scope:** Protocol extensions for usage hints. Coordinated proactive push. Working-set-driven subscription updates.
+**Scope:** Replication decision engine. Handles registration, permission changes, scope expansion, and namespace deletion.
+
+**New components:**
+- `core/src/replication/planner.rs` — Replication decision engine
+- `core/src/replication/scope.rs` — Workspace scope computation
+
+### Phase I — Adaptive Replication (6-8 weeks)
+
+**Scope:** Protocol extensions for timeliness hints. Coordinated proactive push. Usage-driven subscription updates.
 
 **Protocol changes:**
-- Extend `SUBSCRIBE` with hot/warm/cold doc hints
+- Extend `SUBSCRIBE` with `realtime`/`batched`/`passive` doc hints
 - Extend coordinator to tier mutations by doc type
-- Client-side hint computation from working set engine
+- Client-side hint computation from the Memory Manager
 
-### Phase G — Performance (ongoing)
+### Phase J — Performance (ongoing)
 
 **Scope:** Postcard optimization. Adaptive compression. Multi-level cache tuning. Benchmark suite.
 

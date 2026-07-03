@@ -33,7 +33,8 @@ VaultSync is an embedded local-first synchronization and replication runtime wit
 - [Security Model](#-security-model)
 - [Real-World Use Cases](#-real-world-use-cases)
 - [VaultSync vs The World](#-vaultsync-vs-the-world)
-- [Repository Structure](#-repository-structure)
+- [Deployment Modes](#-deployment-modes)
+- [Anti-Patterns to Avoid](#-anti-patterns-to-avoid)
 - [Contributing](#-contributing)
 - [Production Checklist](#-production-checklist)
 
@@ -148,12 +149,28 @@ Open the same app in 3 browser tabs. Close the one that was writing. VaultSync a
 │  │   └────────────────────────┬───────────────────────────────┘  │  │
 │  │                            │                                  │  │
 │  │   ┌────────────────────────▼───────────────────────────────┐  │  │
-│  │   │  Storage Abstraction                                   │  │  │
-│  │   │  SQLite / OPFS / IndexedDB / RocksDB / In-Memory       │  │  │
+│  │   │  Query Engine + Logical Database                       │  │  │
+│  │   │  Query Planner (cache-aware tier resolution)           │  │  │
+│  │   │  get / scan / query / transaction / watch              │  │  │
 │  │   └────────────────────────┬───────────────────────────────┘  │  │
 │  │                            │                                  │  │
 │  │   ┌────────────────────────▼───────────────────────────────┐  │  │
-│  │   │  Transport Abstraction                                 │  │  │
+│  │   │  Storage Manager                                       │  │  │
+│  │   │  Placement / Compaction / Lifecycle / Page Allocator   │  │  │
+│  │   └────────────────────────┬───────────────────────────────┘  │  │
+│  │                            │                                  │  │
+│  │   ┌────────────────────────▼───────────────────────────────┐  │  │
+│  │   │  Block Device (page-oriented stores)                   │  │  │
+│  │   │  OPFS / IndexedDB / SQLite                             │  │  │
+│  │   └────────────────────────┬───────────────────────────────┘  │  │
+│  │                            │                                  │  │
+│  │   ┌────────────────────────▼───────────────────────────────┐  │  │
+│  │   │  Scheduler + Resource Manager                          │  │  │
+│  │   │  Async work  │  Priority queue  │  CPU/battery/memory  │  │  │
+│  │   └────────────────────────┬───────────────────────────────┘  │  │
+│  │                            │                                  │  │
+│  │   ┌────────────────────────▼───────────────────────────────┐  │  │
+│  │   │  Transport Layer                                       │  │  │
 │  │   │  BC (BroadcastChannel)  │  WS (WebSocket)  │  P2P (WebRTC)  │  │  │
 │  │   └────────────────────────────────────────────────────────┘  │  │
 │  └──────────────────────────────────────────────────────────────┘  │
@@ -170,11 +187,11 @@ Open the same app in 3 browser tabs. Close the one that was writing. VaultSync a
 
 ## 🏗️ Core Architecture
 
-VaultSync is built on three non-negotiable design principles:
+VaultSync's architecture centers on local data management, not sync. Synchronization is a background concern — every read and write hits local storage, never a remote server. The engine is organized into six integrated pillars:
 
-### 1. CRDT-Native From Day One
+### Pillar 1: CRDT-Native Document Model
 
-Concurrent writes **never conflict**. There is no V1 (last-write-wins) → V2 (field merge) → V3 (CRDT) upgrade path. Every operation from the first line of code is a Yrs CRDT mutation. All replicas converge deterministically regardless of write order.
+Concurrent writes **never conflict**. Every operation is a Yrs CRDT mutation from day one. All replicas converge deterministically regardless of write order.
 
 | CRDT Type | Merge Behavior | Use Cases |
 |---|---|---|
@@ -184,7 +201,48 @@ Concurrent writes **never conflict**. There is no V1 (last-write-wins) → V2 (f
 | **Yrs Text** | Sequence CRDT (OT-compatible) | Rich text, collaborative documents |
 | **Yrs Array** | Ordered sequence with insert/delete/move | To-do lists, ranked items |
 
-### 2. Zero-Trust Coordinator
+### Pillar 2: Three-Layer Storage Architecture
+
+Storage is divided into three layers, each with a single responsibility:
+
+```
+Query Engine + Logical Database
+    │  get / scan / query / transaction / watch
+    ▼
+Storage Manager
+    │  Placement / Compaction / Lifecycle / Page Allocator
+    ▼
+Block Device
+    │  Page-oriented stores (OPFS / IndexedDB / SQLite)
+```
+
+**Query Engine + Logical Database** — The Query Planner resolves every `getDocument` call by checking the fastest tier first: Resident (in-memory cache) → Recoverable (local page store) → Archived (compressed pages). The Logical Database exposes a database-oriented API (`get`, `scan`, `query`, `transaction`, `watch`) so the application never knows about storage tiers.
+
+**Storage Manager** — The sole authority for all storage access. No subsystem touches storage directly. The Storage Manager enforces placement, eviction, compaction, and lifecycle policy through internal engines: Placement Engine (segment layout), Integrity Engine (checksums), Lifecycle Engine (active → sealed → deleted), Segment Manager, and Page Allocator. Storage operates on page-oriented stores — each document type has its own independent set of pages. There is no global index. All serialization uses Postcard with minimal segment headers.
+
+**Block Device** — A thin adapter translating page-level operations (`allocate_page`, `read_page`, `write_page`, `free_page`) to the backend (OPFS file, SQLite row, IndexedDB record). It has no policy logic.
+
+### Pillar 3: Memory Manager
+
+The Memory Manager governs the in-memory document cache with a scoring algorithm that classifies every document into one of three tiers:
+
+| Tier | Access Pattern | Eviction |
+|---|---|---|
+| **Resident** | Frequently / recently accessed | Pinned — evicted only under memory pressure |
+| **Recoverable** | Occasionally accessed | Evicted first — pages on disk, fast reload |
+| **Archived** | Rarely accessed | Evicted eagerly — compressed pages on disk |
+
+The scoring algorithm weighs access frequency, recency, document size, and a pinning flag. The Memory Manager enforces a fixed memory budget — the Resident tier never exceeds it. When budget is exceeded, the lowest-scored documents are demoted to Recoverable or Archived.
+
+### Pillar 4: Resource Manager
+
+The Resource Manager is the single source of truth for device resources. It tracks CPU usage, battery level, memory pressure, disk space, network connectivity and quality, and idle state. The Scheduler consults the Resource Manager before dispatching any background work — compaction runs only when CPU and battery permit, prefetch runs only on idle + wifi, uploads batch more aggressively under memory pressure.
+
+### Pillar 5: Scheduler
+
+All asynchronous work — upload pipeline, download worker, leader election heartbeats, reconnection timers, compaction, prefetch — submits through the Scheduler's priority queue. The Scheduler enforces ordering (foreground reads always preempt background compaction), rate-limits by resource availability (consulting the Resource Manager), and self-optimizes its maintenance window without developer intervention.
+
+### Pillar 6: Zero-Trust Coordinator
 
 The sync server is **cryptographically blind** to your data. The coordinator stores:
 
@@ -201,20 +259,30 @@ The sync server is **cryptographically blind** to your data. The coordinator sto
 
 No field names. No field values. No schema info. Even if your coordinator is fully compromised, attackers see only encrypted bytes. Decryption keys never leave the device.
 
-### 3. Infrastructure-Agnostic
-
-The `Coordinator` is a **Rust trait**, not a specific service. Choose or build:
+The `Coordinator` is a **Rust trait**, not a specific service:
 
 ```rust
 pub trait Coordinator: Send + Sync + Debug {
     async fn push(mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>>;
     async fn pull(after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>>;
     async fn subscribe(from_sequence: SequenceId) -> Result<Box<dyn Stream<...>>>;
-    async fn register(namespace: &str, info: ReplicaInfo) -> Result<()>;
+    async fn register(namespace: &str, info: ReplicaInfo) -> Result<RegisterResult>;
+
+    // Snapshot support
+    async fn store_snapshot(&self, snapshot: &SnapshotPayload) -> Result<()>;
+    async fn list_snapshots(&self, namespace: &str) -> Result<Vec<SnapshotMetadata>>;
+
+    // Protocol metadata
+    fn max_sequence(&self) -> u64;
+    fn history_preserved(&self) -> bool;
 }
 ```
 
-Swap from Postgres to Redis to Cloudflare DO without changing a single line of application code.
+Swap from Postgres to Redis to Cloudflare DO without changing a single line of application code. Each backend implements `history_preserved()` to indicate whether mutation history survives coordinator restarts — in-memory coordinators return `false`, D1- or Postgres-backed coordinators return `true`. The client uses this to decide whether a generation mismatch requires a full cursor reset or just a re-registration.
+
+### Pillar 7: Cache-Aware Query Planner
+
+The Query Planner resolves every read request through the fastest available tier: Resident (in-memory, sub-microsecond) → Recoverable (local pages, sub-millisecond) → disk (OPFS/SQLite page read). It never deserializes more data than needed. Local indexes built from field-level filter patterns enable fast lookups without scanning all documents. The Planner works with the Storage Manager to choose the optimal resolution path — a frequently-accessed document stays Resident, an occasionally-accessed one reloads from the Recoverable tier on each query.
 
 ---
 
@@ -458,13 +526,27 @@ Network reconnects
 VaultSync reconnects to coordinator (exponential backoff: 1s → 2s → 4s → ... → 30s)
        │
        ▼
-Step 1: Upload backlog
+Step 1: Re-register
+  → Send REGISTER with stored generation_id and cursor
+  → Receive REGISTER_ACK with coordinator's generation_id + history_preserved
+       │
+       ▼
+Step 2: Smart recovery
+  → generation_id matches? → skip recovery, resume sync
+  → generation_id changed + history_preserved = true?
+     → Keep cursor, re-register with same after value (data intact on coordinator)
+  → generation_id changed + history_preserved = false?
+     → Reset cursor to 0, drain MSG_SNAPSHOT frames, restore from snapshots,
+       then pull all mutations since max_snapshot_seq
+       │
+       ▼
+Step 3: Upload backlog
   → Read all pending mutations from oplog
   → Sort by local timestamp
   → Upload in batches (encrypted)
        │
        ▼
-Step 2: Download missed mutations
+Step 4: Download missed mutations
   → Request all mutations with sequence > last_synced_sequence
   → Decrypt each
   → Merge into local CRDT documents
@@ -481,12 +563,14 @@ Resume real-time sync
 
 | Scenario | Result |
 |---|---|
-| Process crash | Mutations in oplog survive — re-uploaded on restart |
+| Process crash | Mutations in page store survive — re-uploaded on restart |
 | Tab close | Shared memory ring buffer preserves in-flight mutations; new leader replays them |
-| Power failure | Oplog on persistent storage survives; re-uploaded on restart |
-| Local storage theft | E2EE oplog encrypted at rest — attacker sees only ciphertext |
+| Power failure | Page store on persistent storage survives via verify-before-rename pattern; re-uploaded on restart |
+| Local storage theft | All pages encrypted at rest — attacker sees only ciphertext |
 
 CRDT uploads are **idempotent by mutation ID**. Re-uploading a mutation the coordinator has already seen causes a silent deduplicated no-op. Zero duplicates.
+
+All storage uses page-oriented stores with independent pages per document type — no global index. Serialization uses Postcard with minimal segment headers. Every write follows a crash-safe verify-before-rename pattern: write to a temporary page, verify checksum, rename into place.
 
 ---
 
@@ -594,9 +678,20 @@ All coordinator communication uses binary WebSocket frames with a 5-byte header:
 └──────────┴────────────┴────────────────────────────────────────┘
 ```
 
-Key message types: `AUTH`, `REGISTER`, `PUSH`, `PUSH_ACK`, `PULL`, `PULL_RESPONSE`, `MUTATION_PUSH`, `HEARTBEAT`, `KEY_FETCH`, `SCHEMA_SYNC`.
+Key message types: `AUTH`, `REGISTER`, `PUSH`, `PUSH_ACK`, `PULL`, `PULL_RESPONSE`, `MUTATION_PUSH`, `HEARTBEAT`, `KEY_FETCH`, `SCHEMA_SYNC`, `MSG_SNAPSHOT` (compacted document payload), `SUBSCRIBE` (after snapshot drain), `NAMESPACE_ACK` (namespace-level registration response), `PULL_REQUEST` (explicit pull without requiring a push first).
 
-`REGISTER_ACK` payload now includes a `generation_id` field (`#[serde(default)]` for backward compatibility). On register, the client compares this with its stored `SyncState.generation_id`. A mismatch triggers an eager cursor reset to 0 and full re-download — this handles server restart scenarios where the mutation store has been replaced.
+`REGISTER_ACK` and `NAMESPACE_ACK` payloads include both `generation_id` and `history_preserved` fields:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `generation_id` | UUID string | Server/DO instance identifier — changes on restart |
+| `history_preserved` | bool | `true` if mutation history survives coordinator restart (D1/Postgres), `false` if in-memory (ephemeral) |
+
+On register, the client compares `generation_id` with its stored `SyncState.generation_id`. A mismatch triggers the **smart recovery** protocol:
+- If `history_preserved: true` — keep the current cursor, re-register with the same `after` value. Data is intact on the coordinator.
+- If `history_preserved: false` — reset cursor to 0, re-download everything from scratch.
+
+After registration, the client drains any available `MSG_SNAPSHOT` frames with a 300ms timeout and computes `effective_after = max(after, max_snapshot_seq)` for the `SUBSCRIBE` request. This prevents the server from pushing mutations that are already covered by restored snapshots.
 
 ---
 
@@ -731,6 +826,10 @@ class MyCoordinator implements Coordinator {
   async push(mutations) { /* ... */ }
   async pull(after, limit) { /* ... */ }
   async subscribe(fromSequence) { /* ... */ }
+  get maxSequence() { return this.db.getMaxSequence() }
+  get historyPreserved() { return true }          // D1/Postgres: true. In-memory: false
+  async storeSnapshot(snapshot) { /* ... */ }
+  async listSnapshots(namespace) { /* ... */ }
 }
 ```
 
@@ -758,16 +857,21 @@ When a new device joins an existing namespace:
 
 ```
 1. New device sends REGISTER with last_sequence = 0
-2. Coordinator checks: snapshot available?
-3a. YES: returns snapshot_url (compressed batch of encrypted mutations)
-    → New device downloads, decompresses, decrypts each mutation
-    → Applies all Yrs diffs in sequence order to build local CRDT state
-    → Fetches remaining mutations since snapshot
-3b. NO: Paginates through full mutation history via PULL
-4. Normal real-time sync begins
+2. Coordinator sends REGISTER_ACK with generation_id + history_preserved
+3. Snapshot drain phase (WASM coordinator):
+   → Listens for MSG_SNAPSHOT frames with 300ms timeout
+   → Caches all received snapshots (deduplicated by document ID)
+   → Computes max_snapshot_seq = max of all received snapshot sequences
+4. SUBSCRIBE with effective_after = max(0, max_snapshot_seq)
+   → Prevents coordinator from pushing mutations already covered by snapshots
+5. Apply all cached snapshots in batch
+6. Download mutations since effective_after via PULL
+7. Normal real-time sync begins
 ```
 
-Coordinator snapshots are **encrypted compressed mutation batches** — the coordinator never decrypts to create them.
+Coordinator snapshots are **compressed, encrypted document payloads** (snapshot_url on server coordinators, MSG_SNAPSHOT frames on WebSocket coordinators). Each snapshot carries `schema_version` and `created_at` timestamps. The coordinator never decrypts to create them.
+
+Compaction runs on each namespace's mutation log, producing a snapshot per document. Each snapshot includes its sequence number, checksum, and byte payload. Snapshots are uploaded to the coordinator automatically during compaction, replacing the need for the new device to replay hundreds of individual mutations for documents that have been compacted.
 
 ### Transport Abstraction
 
@@ -791,20 +895,20 @@ Both are merged into a single self-filtering deduplication stream via **`Transpo
 - Mutations from the local replica are filtered out to prevent echo loops.
 - The merged stream is bridged through internal `futures::channel::mpsc::unbounded()` channels and `wasm_bindgen_futures::spawn_local` for WASM-compatible stream merging.
 
-This architecture keeps transport logic decoupled from the sync engine and allows adding future transports (WebRTC, libp2p) without engine changes.
+This architecture keeps transport logic decoupled from the sync engine and supports additional transports (WebRTC, libp2p) without engine changes.
 
-### MutationStore — OPFS-Backed Durable Queue
+### MutationStore — Page-Backed Durable Queue
 
-`MutationStore` provides a crash-recovery queue for pending mutations in the WASM environment:
+`MutationStore` provides a crash-recovery queue for pending mutations backed by the page store:
 
 ```
-push(entry)     → persist to OPFS as `<seq>-<uuid>.json` file
-pop_batch(limit) → load next N mutations for upload
-ack(id)          → remove mutation file (synced)
+push(entry)     → persist mutation to page store
+pop_batch(limit) → load next N pending mutations for upload
+ack(id)          → mark mutation as synced (in-page state)
 nack(id)         → leave in place for retry
 ```
 
-Each pending mutation is a JSON-serialized `OplogEntry` stored under a `_mutations/` directory in OPFS. On page load, the store scans existing files to recover any mutations that were in-flight during a crash. All local writes flow through `MutationStore.push()` before upload.
+Pending mutations share the same page-oriented segment abstraction as synced data — no individual files per mutation. On page load, the store scans the page store to recover any mutations that were in-flight during a crash. All local writes flow through `MutationStore.push()` before upload.
 
 ### Push-Primary — Real-Time via Subscribe Bridge
 
@@ -830,7 +934,7 @@ leave:     { type: "leave", replica_id, namespace }
 - **`beforeunload` hook** sends an immediate `leave` message when a tab closes.
 - **`Peer count** exposed via `PresenceManager.peer_count()` — reflected in the `active_peers` metric.
 - **Exported via `#[wasm_bindgen]`** — callable from JavaScript as `new PresenceManager(namespace, replicaId)`.
-- Peers that disappear without a `leave` (e.g., tab crash) are eventually detected by heartbeat timeout, though the BroadcastChannel API provides immediate notification on tab close.
+- Peers that disappear without a `leave` (e.g., tab crash) are detected by heartbeat timeout, though the BroadcastChannel API provides immediate notification on tab close.
 
 ---
 
@@ -849,6 +953,8 @@ leave:     { type: "leave", replica_id, namespace }
 | **Cross-tab notification** (shared memory / BroadcastChannel) | 2–10 µs | 1–5 ms |
 | **Snapshot load** (1MB Yrs document from mmap) | < 1 ms | 10–50 ms |
 
+All background tasks (uploads, downloads, compaction, prefetch, heartbeats) submit through the Scheduler's priority queue, which consults the Resource Manager (CPU/battery/memory/network/idle) to avoid starving foreground reads. Foreground reads always preempt background compaction.
+
 All benchmarks run via Criterion.rs. A > 10% regression fails the CI build.
 
 ### End-to-End Sync Targets (Engine + Typical Network)
@@ -863,7 +969,7 @@ All benchmarks run via Criterion.rs. A > 10% regression fails the CI build.
 
 ### Why Local-First Feels 0ms
 
-The UI updates **before** the network is involved. The write is committed to local SQLite/OPFS synchronously. The subscription fires synchronously after the local CRDT merge. The upload to the coordinator happens asynchronously in a background worker thread. Users see their action reflected immediately — network latency is invisible.
+The UI updates **before** the network is involved. The write goes through the Logical Database → Storage Manager → Block Device path synchronously. The Memory Manager keeps the Working Set hot. The subscription fires synchronously after the local CRDT merge. The upload to the coordinator is dispatched through the Scheduler as a background task. Users see their action reflected immediately — network latency is invisible.
 
 ---
 
@@ -1317,10 +1423,22 @@ const vaultsync = new VaultSync({
   transports: {
     coordinator: true,
     p2p: { enabled: true },   // WebRTC for same-LAN peers
-    mesh: { enabled: false }  // libp2p mesh (future)
+    mesh: { enabled: false }  // libp2p mesh
   }
 })
 ```
+
+---
+
+## 🚫 Anti-Patterns to Avoid
+
+1. **Global index** — Never store everything in one serialized blob. Each document type has its own independent set of pages.
+2. **Synchronous migration** — All migrations are crash-safe with rollback (verify → rename → delete).
+3. **Flat pending storage** — Never one file per pending mutation. Pending and synced mutations use the same page-oriented segment abstraction.
+4. **External manifest files** — No separate `manifest.json` listing all segments. Segment metadata (checksum, count, range) lives in the page headers.
+5. **Storage coupled to sync** — The document store doesn't know about oplog entries. The mutation store doesn't know about queries.
+6. **Event-driven background work** — Background work is scheduled through the Scheduler with priorities, not scattered as ad-hoc timers.
+7. **Developer-maintained health** — The engine self-optimizes. No `compact()`, `vacuum()`, or `cleanup()` in the public API.
 
 ---
 
@@ -1368,9 +1486,10 @@ Before deploying VaultSync to production:
 - [ ] **Soft delete enabled** on all synced tables — prevents sync gaps on delete operations
 - [ ] **Schema migrations tracked** — every field addition has a versioned migration
 - [ ] **CRDT types chosen per field** — LWW / Counter / OR-Set / Text selected intentionally
-- [ ] **Oplog compaction configured** — snapshot interval + tombstone GC threshold set
+- [ ] **Snapshot compaction configured** — `auto_compact_ns` namespaces and `auto_compact_interval_minutes` set; compacted snapshots (seq, checksum, bytes) upload to coordinator automatically
 - [ ] **Multi-tab election tested** — verified 3+ tab crash recovery scenario
 - [ ] **Coordinator backups running** — snapshot + mutation log backup to durable storage
+- [ ] **history_preserved flag verified** — in-memory coordinators return `false`, D1/Postgres coordinators return `true`; confirm client handles gen-mismatch correctly for each
 - [ ] **OpenTelemetry configured** — traces, metrics, logs exported to your observability backend
 - [ ] **Sync lag alerting set up** — alert if `vaultsync_sync_lag_ms` > threshold
 - [ ] **Offline replica alerts** — alert if a replica hasn't synced within tombstone retention
