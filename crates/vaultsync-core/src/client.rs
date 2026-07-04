@@ -895,7 +895,7 @@ impl VaultSyncClient {
                     loop {
                         match dq.process_batch().await {
                             Ok(0) => {
-                                tracing::debug!("[download_worker] process_batch -> 0");
+                                tracing::trace!("[download_worker] process_batch -> 0");
                                 break;
                             }
                             Ok(count) => {
@@ -1107,7 +1107,7 @@ impl VaultSyncClient {
             doc.get_field(key).as_ref().map_or(true, |existing| existing != value)
         });
         if !content_changed {
-            tracing::debug!(
+            tracing::trace!(
                 "[client.update] SKIP no-op mutation doc={} record={} — content unchanged",
                 doc_id, record_id,
             );
@@ -1206,11 +1206,11 @@ impl VaultSyncClient {
             .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
             .await;
         let write_elapsed = write_t0.elapsed();
-        tracing::debug!(
-            "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
-            entry.id, doc_id, record_id, write_elapsed.as_millis(),
-            if res.is_ok() { "ok" } else { "err" },
-        );
+            tracing::trace!(
+                "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
+                entry.id, doc_id, record_id, write_elapsed.as_millis(),
+                if res.is_ok() { "ok" } else { "err" },
+            );
         drop(append_guard);
 
         match res {
@@ -1347,7 +1347,7 @@ impl VaultSyncClient {
                 .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
                 .await;
             let write_elapsed = write_t0.elapsed();
-            tracing::debug!(
+            tracing::trace!(
                 "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
                 mutation_id, doc_id, record_id, write_elapsed.as_millis(),
                 if res.is_ok() { "ok" } else { "err" },

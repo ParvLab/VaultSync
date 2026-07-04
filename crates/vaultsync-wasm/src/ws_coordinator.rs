@@ -21,6 +21,8 @@ extern "C" {
     fn console_log_str(s: &str);
     #[wasm_bindgen(js_namespace = console, js_name = debug)]
     fn console_debug_str(s: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = trace)]
+    fn console_trace_str(s: &str);
     #[wasm_bindgen(js_namespace = console, js_name = warn)]
     fn console_warn_str(s: &str);
 }
@@ -31,6 +33,10 @@ macro_rules! console_log {
 
 macro_rules! console_debug {
     ($($t:tt)*) => (console_debug_str(&format!($($t)*)));
+}
+
+macro_rules! console_trace {
+    ($($t:tt)*) => (console_trace_str(&format!($($t)*)));
 }
 
 macro_rules! console_warn {
@@ -398,7 +404,7 @@ impl WasmWsCoordinator {
                     if let Ok((mt, pl)) = decode_frame(&bin) {
                         if mt == MSG_SNAPSHOT {
                             if let Ok(sp) = serde_json::from_slice::<SnapshotPayload>(pl) {
-                                console_debug!("[WasmWs] drained snapshot doc={} seq={}", sp.doc_id, sp.sequence);
+                                console_trace!("[WasmWs] drained snapshot doc={} seq={}", sp.doc_id, sp.sequence);
                                 let snapshot = Snapshot {
                                     doc_id: sp.doc_id,
                                     record_id: sp.record_id,
@@ -466,14 +472,14 @@ impl WasmWsCoordinator {
                             // Self-filter: skip mutations from our own replica
                             let self_rid = inner_clone.replica_id.lock().unwrap();
                             if mutat.replica_id == *self_rid {
-                                console_debug!(
+                                console_trace!(
                                     "[WasmWs] skipping own mutation: seq={}",
                                     mutat.sequence
                                 );
                                 continue;
                             }
                             drop(self_rid);
-                            console_debug!(
+                            console_trace!(
                                 "[WasmWs] push seq={}",
                                 mutat.sequence
                             );
@@ -508,7 +514,7 @@ impl WasmWsCoordinator {
                                 checksum: sp.checksum,
                             };
                             inner_clone.received_snapshots.lock().unwrap().push(snapshot);
-                            console_debug!("[reader] cached snapshot seq={}", sp.sequence);
+                            console_trace!("[reader] cached snapshot seq={}", sp.sequence);
                         }
                     } else if matches!(msg_type, MSG_HEARTBEAT | MSG_HEARTBEAT_ACK | MSG_ERROR) {
                         // System messages — no response routing needed
@@ -518,7 +524,7 @@ impl WasmWsCoordinator {
                                 json_val.get("request_id").and_then(|v| v.as_str())
                             {
                                 let mut reqs = inner_clone.pending_requests.lock().unwrap();
-                                console_debug!(
+                                console_trace!(
                                     "[reader] routing req={} pending_requests={}",
                                     req_id,
                                     reqs.len()
@@ -526,7 +532,7 @@ impl WasmWsCoordinator {
                                 if let Some(tx) = reqs.remove(req_id) {
                                     let _ = tx.send(bin);
                                 } else {
-                                    console_debug!("[reader] NO WAITER for req={}", req_id);
+                                    console_trace!("[reader] NO WAITER for req={}", req_id);
                                 }
                             }
                         }
@@ -672,20 +678,20 @@ impl WasmWsCoordinator {
             let state = self.inner.connection.lock().unwrap();
             if let Some(ref ws) = state.ws {
                 if ws.ready_state() == 1 {
-                    console_debug!("[ws] sending frame req={} type={:02X}", request_id, msg_type);
+                    console_trace!("[ws] sending frame req={} type={:02X}", request_id, msg_type);
                     ws.send_with_u8_array(&frame)
                         .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
                 } else {
-                    console_debug!("[ws] send_request NOT_AVAILABLE (ready_state={}) req={}", ws.ready_state(), request_id);
+                    console_trace!("[ws] send_request NOT_AVAILABLE (ready_state={}) req={}", ws.ready_state(), request_id);
                     return Err(CoordinatorError::NotAvailable);
                 }
             } else {
-                console_debug!("[ws] send_request NOT_AVAILABLE (no ws) req={}", request_id);
+                console_trace!("[ws] send_request NOT_AVAILABLE (no ws) req={}", request_id);
                 return Err(CoordinatorError::NotAvailable);
             }
         }
 
-        console_debug!("[ws] waiting for response req={}", request_id);
+        console_trace!("[ws] waiting for response req={}", request_id);
         let timeout =
             vaultsync_core::time_utils::sleep(std::time::Duration::from_secs(10));
 
@@ -985,7 +991,7 @@ impl Coordinator for WasmWsCoordinator {
             if ws.ready_state() == 1 {
                 ws.send_with_u8_array(&frame)
                     .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
-                console_debug!("[WasmWs] stored snapshot doc={} seq={}", snapshot.doc_id, snapshot.sequence);
+                console_trace!("[WasmWs] stored snapshot doc={} seq={}", snapshot.doc_id, snapshot.sequence);
             }
         }
         Ok(())

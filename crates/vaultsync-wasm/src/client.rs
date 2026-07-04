@@ -22,6 +22,8 @@ extern "C" {
     fn console_log_str(s: &str);
     #[wasm_bindgen(js_namespace = console, js_name = debug)]
     fn console_debug_str(s: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = trace)]
+    fn console_trace_str(s: &str);
     #[wasm_bindgen(js_namespace = console, js_name = warn)]
     fn console_warn_str(s: &str);
 }
@@ -32,6 +34,10 @@ macro_rules! console_log {
 
 macro_rules! console_debug {
     ($($t:tt)*) => (console_debug_str(&format!($($t)*)));
+}
+
+macro_rules! console_trace {
+    ($($t:tt)*) => (console_trace_str(&format!($($t)*)));
 }
 
 macro_rules! console_warn {
@@ -295,13 +301,13 @@ impl WasmVaultSyncClient {
             "insert" => {
                 let fields = json_to_fields(json)?;
                 let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
-                console_debug!("[BC] LEADER_INSERT_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
+                console_trace!("[BC] LEADER_INSERT_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
                 self.client.insert(doc_id, record_id, fields).await
             }
             "update" => {
                 let fields = json_to_fields(json)?;
                 let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
-                console_debug!("[BC] LEADER_UPDATE_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
+                console_trace!("[BC] LEADER_UPDATE_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
                 self.client.update(doc_id, record_id, fields).await
             }
             "delete" => self.client.delete(doc_id, record_id).await,
@@ -334,7 +340,7 @@ impl WasmVaultSyncClient {
             self.broadcast_invalidation(doc_id, record_id);
             Ok(())
         } else {
-            console_debug!("[BC] FOLLOW_INSERT_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
+            console_trace!("[BC] FOLLOW_INSERT_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
             self.send_command("insert", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
                 self.client.fire_local_subscription(doc_id, record_id, &fields);
@@ -353,7 +359,7 @@ impl WasmVaultSyncClient {
             self.broadcast_invalidation(doc_id, record_id);
             Ok(())
         } else {
-            console_debug!("[BC] FOLLOW_UPDATE_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
+            console_trace!("[BC] FOLLOW_UPDATE_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
             self.send_command("update", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
                 self.client.fire_local_subscription(doc_id, record_id, &fields);

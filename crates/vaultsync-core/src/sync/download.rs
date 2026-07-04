@@ -98,7 +98,7 @@ impl DownloadQueue {
             let mut changed = self.replay_changed_docs.lock().unwrap();
             changed.clear();
         }
-        tracing::debug!(
+        tracing::trace!(
             "[download_queue] replay_mode={}",
             active,
         );
@@ -118,7 +118,7 @@ impl DownloadQueue {
         if changed.is_empty() {
             return Ok(());
         }
-        tracing::debug!(
+        tracing::trace!(
             "[download_queue] flush_replay_notifications count={}",
             changed.len(),
         );
@@ -149,7 +149,7 @@ impl DownloadQueue {
                 Ok(true) => {
                     let new_after = self.last_sequence.load(std::sync::atomic::Ordering::SeqCst);
                     if new_after > after {
-                        tracing::debug!(
+                        tracing::trace!(
                             "[download_queue] snapshot catch-up: cursor {} -> {}",
                             after,
                             new_after
@@ -176,10 +176,10 @@ impl DownloadQueue {
                 for m in &mutations {
                     // Skip our own mutations to prevent echo loops
                     if m.replica_id == self.self_replica_id {
-                        tracing::debug!(
-                            mutation_id = m.id.as_str(),
-                            "Skipping own mutation to prevent echo loop"
-                        );
+                    tracing::trace!(
+                        mutation_id = m.id.as_str(),
+                        "Skipping own mutation to prevent echo loop"
+                    );
                         continue;
                     }
 
@@ -277,7 +277,7 @@ impl DownloadQueue {
                     let now_ms = crate::time_utils::system_time_now_ms();
                     state.last_sync_at = Some(now_ms);
                     self.storage.write_sync_state(&state).await?;
-                    tracing::debug!(
+                    tracing::trace!(
                         "[download_queue] write_sync_state cursor={} gen={} (from process_batch pull)",
                         state.last_synced_sequence,
                         state.generation_id
@@ -300,10 +300,9 @@ impl DownloadQueue {
                 if count > 0 {
                     self.metrics.record_download(count);
                 }
-                tracing::debug!(
-                    "[download_queue] process_batch done count={} t={}",
+                tracing::trace!(
+                    "[download_queue] process_batch done count={}",
                     count,
-                    crate::time_utils::system_time_now_ms(),
                 );
                 if count == 0 && after > 0 {
                     tracing::warn!("[download_queue] cursor={} but pull returned empty", after);
@@ -336,7 +335,7 @@ impl DownloadQueue {
     ) -> Result<(), VaultSyncError> {
         // Skip our own mutations to prevent echo loops
         if m.replica_id == self.self_replica_id {
-            tracing::debug!(
+            tracing::trace!(
                 mutation_id = m.id.as_str(),
                 "Skipping own P2P mutation to prevent echo loop"
             );
@@ -450,7 +449,7 @@ impl DownloadQueue {
         let snapshot_count = to_apply.len();
 
         for snapshot in &to_apply {
-            tracing::debug!(
+            tracing::trace!(
                 "[download_queue] applying snapshot doc={} record={} seq={}",
                 snapshot.doc_id,
                 snapshot.record_id,
@@ -505,7 +504,7 @@ impl DownloadQueue {
         let now_ms = crate::time_utils::system_time_now_ms();
         state.last_sync_at = Some(now_ms);
         self.storage.write_sync_state(&state).await?;
-        tracing::debug!(
+        tracing::trace!(
             "[download_queue] write_sync_state cursor={} gen={} (from snapshot catch-up)",
             state.last_synced_sequence,
             state.generation_id
@@ -552,7 +551,7 @@ impl DownloadQueue {
     ) -> Result<PushOutcome, VaultSyncError> {
         // Skip our own mutations to prevent echo loops
         if m.replica_id == self.self_replica_id {
-            tracing::debug!(
+            tracing::trace!(
                 mutation_id = m.id.as_str(),
                 "Skipping own push mutation to prevent echo loop"
             );
@@ -579,7 +578,7 @@ impl DownloadQueue {
         if let Ok(decoded) = Update::decode_v1(&decrypted_bytes) {
             let sv = decoded.state_vector();
             let sv_entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
-            tracing::debug!(
+            tracing::trace!(
                 "[download_queue] push_decrypted source=push id={} seq={} sha256={} state_vector={:?} len={}",
                 m.id, m.sequence, content_hash, sv_entries, decrypted_bytes.len(),
             );
@@ -645,7 +644,7 @@ impl DownloadQueue {
         state.last_synced_sequence = new_seq;
         state.last_sync_at = Some(now_ms);
         self.storage.write_sync_state(&state).await?;
-        tracing::debug!(
+        tracing::trace!(
             "[download_queue] write_sync_state cursor={} gen={} (from push mutation)",
             state.last_synced_sequence,
             state.generation_id
@@ -653,7 +652,7 @@ impl DownloadQueue {
 
         // Only advance in-memory cursor after persistence succeeds
         self.last_sequence.store(new_seq, std::sync::atomic::Ordering::SeqCst);
-        tracing::debug!(
+        tracing::trace!(
             "[download_queue] push cursor advanced {} -> {} (mutation={})",
             cursor_before,
             new_seq,
@@ -663,7 +662,7 @@ impl DownloadQueue {
         // Aggregated log: report how many stale pushes were skipped since last valid push
         let skipped = self.stale_skip_count.swap(0, std::sync::atomic::Ordering::SeqCst);
         if skipped > 0 {
-            tracing::debug!(
+            tracing::trace!(
                 "[download_queue] replay: suppressed {} stale pushes (cursor {} -> {})",
                 skipped, cursor_before, new_seq,
             );

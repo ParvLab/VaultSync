@@ -49,7 +49,7 @@ impl Reconciler {
         let state = doc.to_map();
         let mut subs = self.subscriptions.lock().unwrap();
         let listeners = subs.listener_count(doc_id);
-        tracing::debug!(
+        tracing::trace!(
             "[reconciler.fire_doc] doc={} record={} listeners={}",
             doc_id, record_id, listeners,
         );
@@ -59,7 +59,7 @@ impl Reconciler {
 
     fn is_deduped(&self, id: &str, record_id: &str) -> bool {
         let already_seen = self.seen_ids.lock().unwrap().0.contains(id);
-        tracing::debug!(
+        tracing::trace!(
             "[dedup] id={} record={} already_seen={}",
             id,
             record_id,
@@ -236,13 +236,13 @@ impl Reconciler {
         );
         if changed {
             if self.fire_suppressed.load(Ordering::SeqCst) {
-                tracing::debug!(
+                tracing::trace!(
                     "[reconciler.fire] SUPPRESSED source={} id={} doc={} record={}",
                     source, entry.id, entry.doc_id, entry.record_id,
                 );
             } else {
                 let listeners = self.subscriptions.lock().unwrap().listener_count(&entry.doc_id);
-                tracing::debug!(
+                tracing::trace!(
                     "[reconciler.fire] seq={} mutation={} doc={} record={} changed={} listeners={}",
                     entry.sequence.unwrap_or(0),
                     entry.id,
@@ -337,13 +337,13 @@ impl Reconciler {
         );
         if changed {
             if self.fire_suppressed.load(Ordering::SeqCst) {
-                tracing::debug!(
+                tracing::trace!(
                     "[reconciler.fire] SUPPRESSED source={} encrypted id={} doc={} record={}",
                     source, entry.id, entry.doc_id, entry.record_id,
                 );
             } else {
                 let listeners = self.subscriptions.lock().unwrap().listener_count(&entry.doc_id);
-                tracing::debug!(
+                tracing::trace!(
                     "[reconciler.fire] seq={} mutation={} doc={} record={} changed={} listeners={}",
                     entry.sequence.unwrap_or(0),
                     entry.id,
@@ -367,7 +367,7 @@ impl Reconciler {
     }
 
     pub async fn apply_batch(&self, source: &str, entries: &[OplogEntry]) -> Result<(), VaultSyncError> {
-        tracing::debug!("[reconciler] apply_batch start source={} count={}", source, entries.len());
+        tracing::trace!("[reconciler] apply_batch start source={} count={}", source, entries.len());
         if entries.is_empty() {
             return Ok(());
         }
@@ -423,27 +423,26 @@ impl Reconciler {
             }
         }
 
-        tracing::debug!(
+        tracing::trace!(
             "[reconciler] write_batch_reconciliation start docs={}",
             updated_docs.len()
         );
         self.storage
             .write_batch_reconciliation(updated_docs)
             .await?;
-        tracing::debug!("[reconciler] write_batch_reconciliation done");
 
         for id in uncommitted_ids {
             self.mark_dedup(&id);
         }
 
-        tracing::debug!(
+        tracing::trace!(
             "[reconciler.batch] docs_in_batch={} changed_count={} fire_suppressed={}",
             docs_in_batch,
             final_states.len(),
             self.fire_suppressed.load(Ordering::SeqCst),
         );
         if self.fire_suppressed.load(Ordering::SeqCst) {
-            tracing::debug!(
+            tracing::trace!(
                 "[reconciler.batch] SUPPRESSED source={} changed_count={}",
                 source, final_states.len(),
             );
@@ -456,12 +455,11 @@ impl Reconciler {
                 );
                 subs.fire(FireSource::ReconcilerPull, doc_id, record_id, state);
             }
-            tracing::debug!(
+            tracing::trace!(
                 "[subscription.batch] fired={}",
                 final_states.len(),
             );
         }
-        tracing::debug!("[reconciler] apply_batch done");
 
         Ok(())
     }

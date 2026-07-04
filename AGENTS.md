@@ -19,7 +19,7 @@ The engine follows these principles. Every feature proposal should be checked ag
 
 5. **Ownership Hierarchy** — Company → Workspace → Working Set → Replication Plan → Pages. Each level owns the one below.
 
-6. **Everything Is Replaceable** — Subsystems communicate through traits, not concrete implementations. ReplicationPlanner, StorageManager, PageStore can all be swapped without affecting others.
+6. **Everything Is Replaceable** — Subsystems communicate through traits, not concrete implementations. ReplicationPlanner, StorageManager, Storage can all be swapped without affecting others.
 
 ## Ownership Hierarchy
 ```
@@ -75,7 +75,7 @@ That's how people understand systems — not by reading modules, but by followin
 
 ## Progress
 ### Done
-- **Phase A — Storage Engine V2**: Created `page_store.rs` (PageStore abstraction over Storage trait), `migration.rs` (v1→v2 migration scaffold), rewrote `storage.rs` (`OpfsStorage` using `PagesDir<PageStore>`). `segment.rs` defines Page/Segment/SegmentMeta types. V2 layout: `pages/{namespace}/{doc_id}/{record_id}/{segment_id}.page`.
+- **Phase A — Storage Engine V2**: Created `Storage` trait (`traits.rs`) with read/write/delete/list/scan, `InMemoryStorage` and `SqliteStorage` implementations, `CompactionEngine`/`LifecycleEngine`/`StorageManager` layered architecture. WASM `OpfsStorage` uses `page_store.rs` (OPFS-backed page store). V2 layout uses flat `_pages/{store}/{id}.page` storage.
 - **Phase B — Segment lifecycle + compaction**: Created `compaction.rs` (`CompactionEngine`, `CompactionPolicy`, `CompactionDecision`), `lifecycle.rs` (`LifecycleEngine`, `SegmentState`), `manager.rs` (`StorageManager` trait + `DefaultStorageManager` with compact_namespace/run_lifecycle). Created `WasmStorageManager` adapter in WASM crate. `cargo check --workspace` passes.
 - **Phase C — WASM StorageManager adapter**: Both constructors (`new`, `new_with_coordinator`) wrap `BrowserStorage` in `DefaultStorageManager`. `WasmVaultSyncClient` stores `Arc<dyn StorageManager>`. Exposed JS methods: `compactNamespace()`, `runLifecycle()`, `storageStats()`. `wasm-pack build --target web` passes.
 - **Phase D — Resource Manager**: Created `resource_manager.rs` with `MemoryBudget` (512 MB default config), `AccessScore` scoring (recency*0.40 + frequency*0.30 + size_penalty*0.10 + predicted*0.20) × pinned_factor(100x), 5 memory tiers (ResidentActive/ResidentHot/RecoverableWarm/RecoverableCold/Archived), `eviction_candidates()` sorted lowest-score-first, `sweep()` recomputes scores and promotes/demotes tiers, pin/unpin API. Wired into `StorageManager` trait and `DefaultStorageManager` (read/write record access, delete removes tracking). Exposed `resourceSweep()` to JS. 9 unit tests pass.
@@ -113,6 +113,7 @@ That's how people understand systems — not by reading modules, but by followin
 - **L7 — Build verification**: `cargo check --workspace` ok; `wasm-pack build --target web` ok; `npm run build` (full SDK) ok.
 
 ### Done (Generation 3 — Data Locality)
+- **L8 — Final log cleanup**: 44 noisy log lines demoted from DEBUG→TRACE across reconciler.rs, download.rs, client.rs; 2 removed (zero-info); `console_trace!` macro added to both WASM files; 9 per-frame WS logs and 4 BC payload dumps demoted to console_trace; 2 SDK JS `[notify]` timing logs demoted from console.log→console.debug. `cargo check --workspace` ok. 160 tests pass.
 - **Phase F — Modular Scoring**: Created `scoring.rs` with `ScoringFactor` trait (Additive/Multiplier kinds), `CompositeScorer`, `ScoringContext`. Built-in factors: `RecencyFactor`, `FrequencyFactor`, `SizePenaltyFactor`, `PredictedAccessFactor`, `PinnedFactor` (Multiplier), `WorkingSetAffinityFactor`, `NetworkAwarenessFactor`. Refactored `ResourceManager` to use `CompositeScorer` instead of hardcoded formula. Added `set_scoring_weight()` API. 13 scoring tests pass.
 - **Phase G — Working Set Manager**: Created `working_set/mod.rs` with `WorkingSetManager`, `WorkingSet` (query-based document resolution), `QueryFilter` (status, tags, custom filters, timestamp ranges), `WorkingSetPolicy` (Manual/Automatic), `AutoPolicy` (max_documents, max_age, eviction_strategy). Added `resolve_documents()`, `prefetch_candidates()`, `effective_score()`. 23 working_set tests pass.
 - **Phase H — Workspace Manager**: Created `workspace/mod.rs` with `WorkspaceManager`, `Workspace` (id, name, namespace, schema, replication_policy, retention_policy). Added `WorkspaceSchema` (field definitions, validation), `ReplicationPolicy` (FullSync/Selective/ReadOnly/Offline), `RetentionPolicy` (max_age, auto_archive, tombstone_retention). 21 workspace tests pass.
@@ -145,10 +146,13 @@ That's how people understand systems — not by reading modules, but by followin
 - **Generation 2 architecture is complete**: Next evolution (Generation 3) should focus on Working Set Manager, Dataset Manager, Replication Planner — not more storage features.
 
 ## Next Steps
-1. **Verify production fetchInitial count** — Build production React app, confirm StrictMode double-invoke disappears.
-2. **8–12 hour soak test** — Overnight run with new lifecycle (worker spawn relocation).
-3. **Benchmark suite** — Startup time, snapshot restore, compaction, reconnect timing.
-4. **Add startup timing instrumentation** — Track total initialization breakdown (storage, coordinator, client, subscribe).
+1. **M1 Stabilization (v0.9.0-rc1)**: L8 log cleanup done. AGENTS.md alignment done. Tag v0.9.0-rc1.
+2. **M2 Data Integrity**: Document version watermarking → version enforcement on writes → register concrete migration → SchemaRegistry persistence → compatibility tests (v1→v4 skip-ahead)
+3. **M3 Observability**: Logger trait → module-level log config → Metrics API → Health API → replace ad-hoc log macros → optional OpenTelemetry integration
+4. **M4 Production Validation**: Benchmarks (Metadata Ready, First Query, Interactive, Background Sync), Reliability (8h/24h/72h soak), Resilience (crash/corruption/network/multi-tab failure injection), Scalability (10-10000 users)
+5. **M5 Security Review**: Encryption correctness, key rotation, replay protection, malformed snapshot handling, namespace isolation, DOS resistance
+6. **v1.0.0** after proven under realistic workloads
+7. **M6 Developer Experience**: VaultSync Inspector, ERP Validation Suite, CLI tool, telemetry dashboard, documentation
 
 ### Logging Architecture
 Log levels map to audience:
@@ -201,10 +205,10 @@ After integration work is complete, spend time on:
 - ERP-scale simulations (HR, Finance, CRM, Inventory together)
 
 ## Relevant Files
-- `crates/vaultsync-core/src/storage/page_store.rs`: PageStore — segment-level abstraction over Storage trait, write/read/scan/GC per segment
-- `crates/vaultsync-core/src/storage/segment.rs`: Page/Segment/SegmentMeta types for V2 layout
-- `crates/vaultsync-core/src/storage/migration.rs`: V1→V2 offline migration scaffold
-- `crates/vaultsync-core/src/storage/storage.rs`: Rewritten OpfsStorage using PagesDir<PageStore>
+- `crates/vaultsync-wasm/src/page_store.rs`: PageStore — OPFS-backed segment-level page store for WASM target, write/read/scan/GC per segment
+- `crates/vaultsync-wasm/src/migration.rs`: WASM V1→V2 offline migration scaffold
+- `crates/vaultsync-core/src/storage/traits.rs`: Storage trait — core read/write/delete/list/scan abstraction
+- `crates/vaultsync-core/src/storage/memory.rs`: InMemoryStorage implementation
 - `crates/vaultsync-core/src/storage/compaction.rs`: CompactionEngine, CompactionPolicy, CompactionDecision
 - `crates/vaultsync-core/src/storage/lifecycle.rs`: LifecycleEngine, SegmentState (Active/Sealed/Compacting/Deleted)
 - `crates/vaultsync-core/src/storage/manager.rs`: StorageManager trait + DefaultStorageManager
