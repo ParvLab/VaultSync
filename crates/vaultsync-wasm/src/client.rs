@@ -26,6 +26,12 @@ extern "C" {
     fn console_trace_str(s: &str);
     #[wasm_bindgen(js_namespace = console, js_name = warn)]
     fn console_warn_str(s: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error_str(s: &str);
+}
+
+macro_rules! console_error {
+    ($($t:tt)*) => (console_error_str(&format!($($t)*)));
 }
 
 macro_rules! console_log {
@@ -95,11 +101,13 @@ impl WasmVaultSyncClient {
         let coordinator = Arc::new(InMemoryCoordinator::new());
         let keyring = Arc::new(KeyRing::generate());
 
-        let client = Arc::new(
-            VaultSyncClient::new_with_storage(config, coordinator, keyring, storage)
-                .await
-                .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
-        );
+        let client = match VaultSyncClient::new_with_storage(config, coordinator, keyring, storage).await {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                console_error!("Offline client construction failed: {:?}", e);
+                return Err(JsValue::from_str(&format!("Client failed: {:?}", e)));
+            }
+        };
 
         // Settle leader election (Web Locks API - async, need to poll)
         let _ = client.leader_election.try_acquire();
@@ -164,27 +172,43 @@ impl WasmVaultSyncClient {
         let storage_manager: Arc<dyn StorageManager> = Arc::new(
             DefaultStorageManager::new(storage.clone(), CompactionPolicy::default()),
         );
+        phase_log("storage_manager ready");
 
         let workspace_manager = Arc::new(WorkspaceManager::new());
+        phase_log("workspace_manager ready");
+
         let working_set_manager = Arc::new(WorkingSetManager::new());
+        phase_log("working_set_manager ready");
+
         let replication_planner = Arc::new(ReplicationPlanner::new());
+        phase_log("replication_planner ready");
+
         let event_bus = Arc::new(EventBus::new());
+        phase_log("event_bus ready");
 
         phase_log("storage ready");
         let coordinator = Arc::new(crate::ws_coordinator::WasmWsCoordinator::new(
             coordinator_url,
             auth_token,
         ));
+        phase_log("coordinator ready");
+
         // Clone the Arc BEFORE coercing to dyn Coordinator, so we keep a concrete reference
         let coordinator_for_client: Arc<dyn vaultsync_core::coordinator::traits::Coordinator> =
             coordinator.clone();
         let keyring = Arc::new(KeyRing::generate());
+        phase_log("keyring ready");
 
-        let client = Arc::new(
-            VaultSyncClient::new_with_storage_skip_init(config, coordinator_for_client, keyring, storage)
-                .await
-                .map_err(|e| JsValue::from_str(&format!("Client failed: {:?}", e)))?,
-        );
+        let client = match VaultSyncClient::new_with_storage_skip_init(config, coordinator_for_client, keyring, storage).await {
+            Ok(client) => {
+                phase_log("core client built (skip_init)");
+                Arc::new(client)
+            }
+            Err(e) => {
+                console_error!("Client construction failed: {:?}", e);
+                return Err(JsValue::from_str(&format!("Client failed: {:?}", e)));
+            }
+        };
         phase_log("client built");
 
         // Wire WS mutation push → download/upload notifications BEFORE initialize (no race)
@@ -193,9 +217,10 @@ impl WasmVaultSyncClient {
 
         // Now start WS connection (background processor starts here, sender already set)
         phase_log("initialize start");
-        client.initialize().await.map_err(|e| {
-            JsValue::from_str(&format!("Initialize failed: {:?}", e))
-        })?;
+        if let Err(e) = client.initialize().await {
+            console_error!("Initialize failed: {:?}", e);
+            return Err(JsValue::from_str(&format!("Initialize failed: {:?}", e)));
+        }
         phase_log("initialize done");
 
         // NOTE: No bootstrap notify_download needed — download worker starts
