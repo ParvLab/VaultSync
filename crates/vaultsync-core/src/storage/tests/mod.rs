@@ -1,4 +1,5 @@
 pub mod conformance;
+pub mod manager_integration;
 
 #[cfg(test)]
 mod test_runners {

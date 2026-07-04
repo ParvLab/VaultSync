@@ -120,6 +120,8 @@ pub mod page_store;
 #[cfg(target_arch = "wasm32")]
 pub mod storage;
 #[cfg(target_arch = "wasm32")]
+pub mod storage_manager;
+#[cfg(target_arch = "wasm32")]
 pub mod transport;
 #[cfg(target_arch = "wasm32")]
 pub mod ws_coordinator;

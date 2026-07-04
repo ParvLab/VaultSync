@@ -2,8 +2,10 @@ pub mod clock;
 pub mod coordinator;
 pub mod crdt;
 pub mod e2ee;
+pub mod event_bus;
 pub mod ipc;
 pub mod oplog;
+pub mod replication;
 pub mod transport;
 pub mod schema;
 pub mod storage;
@@ -11,6 +13,8 @@ pub mod subscription;
 pub mod sync;
 pub mod telemetry;
 pub mod time_utils;
+pub mod workspace;
+pub mod working_set;
 #[cfg(feature = "coordinator-http")]
 pub mod vaultsync_server;
 

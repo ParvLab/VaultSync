@@ -4,7 +4,13 @@ use std::sync::Arc;
 use vaultsync_core::coordinator::memory::InMemoryCoordinator;
 use vaultsync_core::crdt::types::CrdtValue;
 use vaultsync_core::e2ee::keyring::KeyRing;
+use vaultsync_core::storage::compaction::CompactionPolicy;
+use vaultsync_core::storage::manager::{DefaultStorageManager, StorageManager};
 use vaultsync_core::storage::traits::StorageConfig;
+use vaultsync_core::workspace::WorkspaceManager;
+use vaultsync_core::working_set::WorkingSetManager;
+use vaultsync_core::replication::planner::ReplicationPlanner;
+use vaultsync_core::event_bus::EventBus;
 use vaultsync_core::VaultSyncClient;
 use vaultsync_core::VaultSyncConfig;
 use wasm_bindgen::prelude::*;
@@ -35,6 +41,11 @@ macro_rules! console_warn {
 #[wasm_bindgen]
 pub struct WasmVaultSyncClient {
     client: Arc<VaultSyncClient>,
+    storage_manager: Arc<dyn StorageManager>,
+    workspace_manager: Arc<WorkspaceManager>,
+    working_set_manager: Arc<WorkingSetManager>,
+    replication_planner: Arc<ReplicationPlanner>,
+    event_bus: Arc<EventBus>,
     presence: Option<crate::presence::PresenceManager>,
     cross_tab_channel: Option<web_sys::BroadcastChannel>,
     tab_id: String,
@@ -66,6 +77,15 @@ impl WasmVaultSyncClient {
             BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
         };
 
+        let storage_manager: Arc<dyn StorageManager> = Arc::new(
+            DefaultStorageManager::new(storage.clone(), CompactionPolicy::default()),
+        );
+
+        let workspace_manager = Arc::new(WorkspaceManager::new());
+        let working_set_manager = Arc::new(WorkingSetManager::new());
+        let replication_planner = Arc::new(ReplicationPlanner::new());
+        let event_bus = Arc::new(EventBus::new());
+
         let coordinator = Arc::new(InMemoryCoordinator::new());
         let keyring = Arc::new(KeyRing::generate());
 
@@ -93,6 +113,11 @@ impl WasmVaultSyncClient {
 
         Ok(Self {
             client,
+            storage_manager,
+            workspace_manager,
+            working_set_manager,
+            replication_planner,
+            event_bus,
             presence: None,
             cross_tab_channel,
             tab_id: replica_id.to_string(),
@@ -129,6 +154,15 @@ impl WasmVaultSyncClient {
         config.storage = match &*storage {
             BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
         };
+
+        let storage_manager: Arc<dyn StorageManager> = Arc::new(
+            DefaultStorageManager::new(storage.clone(), CompactionPolicy::default()),
+        );
+
+        let workspace_manager = Arc::new(WorkspaceManager::new());
+        let working_set_manager = Arc::new(WorkingSetManager::new());
+        let replication_planner = Arc::new(ReplicationPlanner::new());
+        let event_bus = Arc::new(EventBus::new());
 
         phase_log("storage ready");
         let coordinator = Arc::new(crate::ws_coordinator::WasmWsCoordinator::new(
@@ -191,6 +225,11 @@ impl WasmVaultSyncClient {
 
         Ok(Self {
             client,
+            storage_manager,
+            workspace_manager,
+            working_set_manager,
+            replication_planner,
+            event_bus,
             presence,
             cross_tab_channel,
             tab_id: replica_id.to_string(),
@@ -596,6 +635,87 @@ impl WasmVaultSyncClient {
         let snapshot = self.client.metrics.snapshot();
         serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
     }
+
+    /// Runs compaction on the given namespace, returns JSON stats.
+    #[wasm_bindgen(js_name = compactNamespace)]
+    pub async fn compact_namespace(&self, namespace: &str) -> Result<String, JsValue> {
+        let stats = self
+            .storage_manager
+            .compact_namespace(namespace)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Compaction failed: {:?}", e)))?;
+        serde_json::to_string(&stats)
+            .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))
+    }
+
+    /// Runs lifecycle (tombstone cleanup) on the given namespace, returns JSON stats.
+    #[wasm_bindgen(js_name = runLifecycle)]
+    pub async fn run_lifecycle(&self, namespace: &str) -> Result<String, JsValue> {
+        let stats = self
+            .storage_manager
+            .run_lifecycle(namespace)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Lifecycle failed: {:?}", e)))?;
+        serde_json::to_string(&stats)
+            .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))
+    }
+
+    /// Returns JSON with storage statistics (page count, segment state, etc.).
+    #[wasm_bindgen(js_name = storageStats)]
+    pub async fn storage_stats(&self) -> Result<String, JsValue> {
+        let stats = self
+            .storage_manager
+            .stats()
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Stats failed: {:?}", e)))?;
+        serde_json::to_string(&stats)
+            .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))
+    }
+
+    /// Runs the resource manager sweep (recompute access scores, promote/demote tiers).
+    /// Returns JSON with tier byte counts, promotions, demotions, eviction candidates.
+    #[wasm_bindgen(js_name = resourceSweep)]
+    pub async fn resource_sweep(&self) -> Result<String, JsValue> {
+        let stats = self
+            .storage_manager
+            .run_resource_sweep()
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Resource sweep failed: {:?}", e)))?;
+        serde_json::to_string(&stats)
+            .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))
+    }
+
+    /// Returns the workspace namespace proxy for CRUD operations.
+    #[wasm_bindgen(js_name = workspace)]
+    pub fn workspace(&self) -> WorkspaceNamespace {
+        WorkspaceNamespace {
+            manager: self.workspace_manager.clone(),
+        }
+    }
+
+    /// Returns the working sets namespace proxy for CRUD operations.
+    #[wasm_bindgen(js_name = workingSets)]
+    pub fn working_sets(&self) -> WorkingSetsNamespace {
+        WorkingSetsNamespace {
+            manager: self.working_set_manager.clone(),
+        }
+    }
+
+    /// Returns the replication namespace proxy.
+    #[wasm_bindgen(js_name = replication)]
+    pub fn replication(&self) -> ReplicationNamespace {
+        ReplicationNamespace {
+            planner: self.replication_planner.clone(),
+        }
+    }
+
+    /// Returns the event bus for publishing/subscribing to engine events.
+    #[wasm_bindgen(js_name = events)]
+    pub fn events(&self) -> EventBusProxy {
+        EventBusProxy {
+            bus: self.event_bus.clone(),
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -620,6 +740,175 @@ struct SendFunction(JsValue);
 
 unsafe impl Send for SendFunction {}
 unsafe impl Sync for SendFunction {}
+
+#[wasm_bindgen]
+pub struct WorkspaceNamespace {
+    manager: Arc<WorkspaceManager>,
+}
+
+#[wasm_bindgen]
+impl WorkspaceNamespace {
+    #[wasm_bindgen(js_name = create)]
+    pub fn create(
+        &self,
+        name: &str,
+        namespace: &str,
+        schema_json: &str,
+        retention_json: &str,
+    ) -> Result<u64, JsValue> {
+        let schema: vaultsync_core::workspace::WorkspaceSchema = serde_json::from_str(schema_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid schema: {:?}", e)))?;
+        let retention: vaultsync_core::workspace::RetentionPolicy = serde_json::from_str(retention_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid retention: {:?}", e)))?;
+        let now = js_sys::Date::now() as u64;
+        let id = self.manager.create_workspace(
+            name,
+            namespace,
+            schema,
+            vaultsync_core::workspace::ReplicationPolicy::FullSync,
+            retention,
+            now,
+        );
+        Ok(id.0)
+    }
+
+    #[wasm_bindgen(js_name = list)]
+    pub fn list(&self) -> Result<String, JsValue> {
+        let list = self.manager.list_workspaces();
+        serde_json::to_string(&list)
+            .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))
+    }
+
+    #[wasm_bindgen(js_name = get)]
+    pub fn get(&self, id: u64) -> Result<String, JsValue> {
+        let ws = self.manager.get_workspace(&vaultsync_core::workspace::WorkspaceId(id));
+        match ws {
+            Some(ws) => serde_json::to_string(&ws)
+                .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e))),
+            None => Ok("null".to_string()),
+        }
+    }
+
+    #[wasm_bindgen(js_name = update)]
+    pub fn update(&self, id: u64, name: Option<String>, retention_json: Option<String>) -> Result<bool, JsValue> {
+        let retention = match retention_json {
+            Some(json) => Some(serde_json::from_str::<vaultsync_core::workspace::RetentionPolicy>(&json)
+                .map_err(|e| JsValue::from_str(&format!("Invalid retention: {:?}", e)))?),
+            None => None,
+        };
+        let now = js_sys::Date::now() as u64;
+        Ok(self.manager.update_workspace(
+            &vaultsync_core::workspace::WorkspaceId(id),
+            name.as_deref(),
+            None,
+            None,
+            retention,
+            now,
+        ))
+    }
+
+    #[wasm_bindgen(js_name = delete)]
+    pub fn delete(&self, id: u64) -> bool {
+        self.manager.delete_workspace(&vaultsync_core::workspace::WorkspaceId(id))
+    }
+}
+
+#[wasm_bindgen]
+pub struct WorkingSetsNamespace {
+    manager: Arc<WorkingSetManager>,
+}
+
+#[wasm_bindgen]
+impl WorkingSetsNamespace {
+    #[wasm_bindgen(js_name = create)]
+    pub fn create(
+        &self,
+        name: &str,
+        filter_json: &str,
+        workspace_id: Option<u64>,
+    ) -> Result<u64, JsValue> {
+        let filter: vaultsync_core::working_set::QueryFilter = serde_json::from_str(filter_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid filter: {:?}", e)))?;
+        let now = js_sys::Date::now() as u64;
+        let id = self.manager.create_set(
+            name,
+            filter,
+            vaultsync_core::working_set::WorkingSetPolicy::Manual,
+            workspace_id,
+            now,
+        );
+        Ok(id.0)
+    }
+
+    #[wasm_bindgen(js_name = list)]
+    pub fn list(&self) -> Result<String, JsValue> {
+        let list = self.manager.list_sets();
+        serde_json::to_string(&list)
+            .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))
+    }
+
+    #[wasm_bindgen(js_name = setActive)]
+    pub fn set_active(&self, id: u64) -> bool {
+        let now = js_sys::Date::now() as u64;
+        self.manager.set_active(&vaultsync_core::working_set::WorkingSetId(id), now)
+    }
+
+    #[wasm_bindgen(js_name = getActive)]
+    pub fn get_active(&self) -> JsValue {
+        match self.manager.get_active() {
+            Some(id) => JsValue::from_f64(id.0 as f64),
+            None => JsValue::NULL,
+        }
+    }
+
+    #[wasm_bindgen(js_name = clearActive)]
+    pub fn clear_active(&self) {
+        self.manager.clear_active();
+    }
+
+    #[wasm_bindgen(js_name = delete)]
+    pub fn delete(&self, id: u64) -> bool {
+        self.manager.delete_set(&vaultsync_core::working_set::WorkingSetId(id))
+    }
+}
+
+#[wasm_bindgen]
+pub struct ReplicationNamespace {
+    planner: Arc<ReplicationPlanner>,
+}
+
+#[wasm_bindgen]
+impl ReplicationNamespace {
+    #[wasm_bindgen(js_name = predictNext)]
+    pub fn predict_next(&self, limit: usize) -> Result<String, JsValue> {
+        let predictions = self.planner.predict_next_documents(limit);
+        serde_json::to_string(&predictions)
+            .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))
+    }
+
+    #[wasm_bindgen(js_name = pendingCount)]
+    pub fn pending_count(&self) -> usize {
+        self.planner.pending_count()
+    }
+
+    #[wasm_bindgen(js_name = clearPending)]
+    pub fn clear_pending(&self) {
+        self.planner.clear_pending();
+    }
+}
+
+#[wasm_bindgen]
+pub struct EventBusProxy {
+    bus: Arc<EventBus>,
+}
+
+#[wasm_bindgen]
+impl EventBusProxy {
+    #[wasm_bindgen(js_name = subscriberCount)]
+    pub fn subscriber_count(&self) -> usize {
+        self.bus.subscriber_count()
+    }
+}
 
 fn json_to_fields(json: &str) -> Result<HashMap<String, CrdtValue>, JsValue> {
     let val: serde_json::Value = serde_json::from_str(json)
