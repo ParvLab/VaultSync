@@ -74,6 +74,7 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: 1000,
+            schema_version: 0,
             origin: MutationOrigin::Unknown,
             origin_context: String::new(),
         };
@@ -106,6 +107,7 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: 1001,
+            schema_version: 0,
             origin: MutationOrigin::Unknown,
             origin_context: String::new(),
         };
@@ -142,6 +144,7 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: 2000,
+            schema_version: 0,
             origin: MutationOrigin::Unknown,
             origin_context: String::new(),
         };
@@ -159,6 +162,7 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: 3000,
+            schema_version: 0,
             origin: MutationOrigin::Unknown,
             origin_context: String::new(),
         };
@@ -288,6 +292,7 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Failed,
             synced_at: None,
             created_at: 100, // 100ms epoch - very old
+            schema_version: 0,
             origin: MutationOrigin::Unknown,
             origin_context: String::new(),
         };
@@ -344,6 +349,7 @@ pub async fn run_storage_conformance_suite(storage: Arc<dyn Storage>) {
             sync_status: SyncStatus::Synced,
             synced_at: Some(10), // 10 seconds epoch
             created_at: 100,     // 100ms epoch
+            schema_version: 0,
             origin: MutationOrigin::Unknown,
             origin_context: String::new(),
         };

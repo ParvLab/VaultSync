@@ -1,10 +1,8 @@
 # Anchored Summary
 
 ## Goal
-- Build Storage Engine V2: page-store abstraction, segment lifecycle, compaction engine, resource manager, memory manager
-- Eliminate redundant mutation replay on coordinator restart via snapshot-based reconnection
-- Build proper logging architecture with configurable log levels
-- Build Generation 3: Data Locality Architecture (Working Sets, Workspaces, Replication Planner, Segment Snapshots)
+- Complete VaultSync Generation 3 Data Locality Architecture and production-hardening milestones M1–M6: Stabilization → Data Integrity → Observability → Validation → Security → Developer Experience
+- Evolve from "sync engine" into production-grade observable local-first data runtime with SchemaRegistry persistence, version enforcement, Logger trait, Metrics API, Health API, module-level log config
 
 ## Design Principles
 The engine follows these principles. Every feature proposal should be checked against them.
@@ -130,6 +128,11 @@ That's how people understand systems — not by reading modules, but by followin
 - **Phase 7 — Network-aware scoring**: `ResourceManager` stores `NetworkTier` via `set_network_tier()`. `compute_score()` uses stored tier instead of hardcoded WiFi. ReplicationPlanner's `on_network_change()` can now flow network state to scoring.
 - **Total: 160 tests pass** (up from 151). `cargo check --workspace` ok. `wasm-pack build --target web` ok. `npm run build` ok.
 
+### Done (M1-M6)
+- **M1 Stabilization (v0.9.0-rc1)** — fully complete. L8 log cleanup (44 DEBUG→TRACE, 2 removed), `console_trace!` macro in both WASM files, 2 SDK JS `[notify]` demotions. AGENTS.md alignment (stale file refs fixed, PageStore→Storage principle). v0.9.0-rc1 tagged at `c05154e`.
+- **M2 Data Integrity** — complete. Added `schema_version: u64` to OplogEntry with `#[serde(default)]` (22 callers updated). Version enforcement in client insert/update/delete paths. Watermarking on write success. SchemaRegistry rewritten with `load_from_storage()`, async `define()`, `validate_version()`, `watermark_version()`, `max_seen_version()` (no owned storage — takes &dyn Storage). Storage trait: `list_schemas()` (InMemory/SQLite/Encrypted impls), `clone_box()`. Client init loads persisted schemas. 9 unit tests (version validation, watermarks, persistence, skip-ahead compatibility, field validation). `cargo check --workspace` ok. 169 tests pass.
+- **M3 Observability** — complete. `Logger` trait (NoopLogger, TracingLogger) with structured `log_with_fields()` API. `ModuleLogConfig` for per-module log level filtering via `set_level()`/`reset()`/`reset_all()`. `HealthRegistry` with async `HealthCheck` trait, `HealthReport` (serializable), `HealthStatus` enum (Healthy/Degraded/Unhealthy), and built-in checks: `StorageHealthCheck`, `CoordinatorHealthCheck`, `OplogHealthCheck`. Storage trait: `is_healthy()` default impl. Wired into `VaultSyncClient` (`client.health()` accessor, health checks registered at init). 6 logger tests + 6 health tests pass. `cargo check --workspace` ok.
+
 ## Key Decisions
 - **Full snapshot system over keeping cursor on gen mismatch**: Safer — server could have been fully wiped. Cursor reset + snapshot fallback is correct for all cases.
 - **REST-based snapshot listing not used**: Would require auth token plumbing in WASM. WS push-based cache simpler.
@@ -146,13 +149,10 @@ That's how people understand systems — not by reading modules, but by followin
 - **Generation 2 architecture is complete**: Next evolution (Generation 3) should focus on Working Set Manager, Dataset Manager, Replication Planner — not more storage features.
 
 ## Next Steps
-1. **M1 Stabilization (v0.9.0-rc1)**: L8 log cleanup done. AGENTS.md alignment done. Tag v0.9.0-rc1.
-2. **M2 Data Integrity**: Document version watermarking → version enforcement on writes → register concrete migration → SchemaRegistry persistence → compatibility tests (v1→v4 skip-ahead)
-3. **M3 Observability**: Logger trait → module-level log config → Metrics API → Health API → replace ad-hoc log macros → optional OpenTelemetry integration
-4. **M4 Production Validation**: Benchmarks (Metadata Ready, First Query, Interactive, Background Sync), Reliability (8h/24h/72h soak), Resilience (crash/corruption/network/multi-tab failure injection), Scalability (10-10000 users)
-5. **M5 Security Review**: Encryption correctness, key rotation, replay protection, malformed snapshot handling, namespace isolation, DOS resistance
-6. **v1.0.0** after proven under realistic workloads
-7. **M6 Developer Experience**: VaultSync Inspector, ERP Validation Suite, CLI tool, telemetry dashboard, documentation
+1. **M4 Production Validation**: Benchmarks (Metadata Ready, First Query, Interactive, Background Sync), Reliability (8h/24h/72h soak), Resilience (crash/corruption/network/multi-tab failure injection), Scalability (10-10000 users)
+3. **M5 Security Review**: Encryption correctness, key rotation, replay protection, malformed snapshot handling, namespace isolation, DOS resistance
+4. **v1.0.0** after proven under realistic workloads
+5. **M6 Developer Experience**: VaultSync Inspector, ERP Validation Suite, CLI tool, telemetry dashboard, documentation
 
 ### Logging Architecture
 Log levels map to audience:
@@ -165,16 +165,16 @@ Log levels map to audience:
 | WARN | Operators | Coordinator unavailable, retrying, generation changed, snapshot unavailable |
 | ERROR | Everyone | Snapshot decode failed, OPFS write failed, coordinator auth failed, compaction failed |
 
-### Next Steps Plan (Detailed)
-1. **Production soak test**: 8–12 hour run with new Storage Engine V2.
-
-
 ## Critical Context
 - **Bug A (OPFS race) — FIXED**: Cross-tab OPFS race eliminated by per-tab storage paths. Upload pipeline health confirmed by consistent `PUSH_ACK sequences=[N]`, `AFTER_MARK_SYNCED pending=0`, `BATCH_DONE success=1`.
 - **Bug B (Focus guard loop) — FIXED**: One-way replication caused by `document.activeElement` check blocking external merges on the follower tab. Fixed with edit-timestamp cooldown. Both directions now confirmed working.
 - **Bidirectional sync is stable**: Logs show clean single-pipeline flow: `upload → PUSH_SEND → PUSH_ACK → AFTER_MARK_SYNCED pending=0 → BATCH_DONE → reconciler → subscription.fire → React callback → setData`. No repeating notification cycles, no pending uploads.
 - **The focus guard was the biggest remaining bug after OPFS fix**: We traced the issue through Rust/WASM/OPFS/CRDT/BC/WebSockets/React/browser event loop, and the root cause was a single line in a React component that blocked external merge when the textarea had focus.
 - **Instrumentation cleanup (L2-L5) completed** — per-mutation reconciler internals at TRACE, pipeline operations at DEBUG, summary events at INFO, errors at WARN/ERROR.
+- **L8 log cleanup complete**: 44 DEBUG→TRACE + 2 removed + `console_trace!` macros in both WASM files + 2 SDK JS demotions.
+- **v0.9.0-rc1 tagged** at `c05154e` on `feat/observability-and-validation`
+- **M2 Data Integrity complete**: OplogEntry schema_version (22 callers), version enforcement in insert/update/delete paths, watermarking on write success, SchemaRegistry persistence (load_from_storage at client init, async define with &dyn Storage), Storage trait list_schemas + clone_box (InMemory/SQLite/Encrypted), 9 unit tests. cargo check passes.
+- **M3 Observability complete**: Logger trait (NoopLogger, TracingLogger) with structured log_with_fields, ModuleLogConfig for per-module log levels, HealthRegistry with HealthCheck trait (Storage/Coordinator/Oplog checks), HealthStatus enum, client.health() accessor. 6 logger tests + 6 health tests pass.
 
 ## Future Research
 These are intentional future directions, not unfinished work.
@@ -242,3 +242,14 @@ After integration work is complete, spend time on:
 - `crates/vaultsync-core/src/crdt/segment_snapshot.rs`: SegmentSnapshot (cross-document atomic snapshots containing multiple Snapshots). 9 unit tests.
 - `crates/vaultsync-core/src/event_bus.rs`: EventBus (pub/sub), EngineEvent (13 types). 4 unit tests.
 - `crates/vaultsync-core/src/crdt/snapshot_store.rs`: SnapshotStore trait (store/get/list for Snapshot and SegmentSnapshot). InMemorySnapshotStore. 4 unit tests.
+- `crates/vaultsync-core/src/oplog/entry.rs`: Added `schema_version: u64` field (serde default); all 22 callers updated
+- `crates/vaultsync-core/src/schema/registry.rs`: Rewritten — `load_from_storage()`, async `define()`, `validate_version()`, `watermark_version()`, `max_seen_version()`. No owned storage (takes `&dyn Storage`). 9 unit tests.
+- `crates/vaultsync-core/src/storage/traits.rs`: Added `list_schemas()` (default empty vec), `clone_box()` (default panic)
+- `crates/vaultsync-core/src/storage/memory.rs`: Added `list_schemas()`
+- `crates/vaultsync-core/src/storage/sqlite.rs`: Added `list_schemas()` (SQL query), `clone_box()`
+- `crates/vaultsync-core/src/storage/encryption_shim.rs`: Added `list_schemas()` (delegate), `clone_box()`
+- `crates/vaultsync-core/src/client.rs`: Version enforcement in insert/update/delete paths; schema loading at init; watermarking on write success
+- `crates/vaultsync-core/src/error.rs`: Added `VersionMismatch(u64, u64, String)` variant
+- `crates/vaultsync-core/src/telemetry/logger.rs`: Logger trait (NoopLogger, TracingLogger), ModuleLogConfig for per-module log level filtering. 6 unit tests.
+- `crates/vaultsync-core/src/telemetry/health.rs`: HealthCheck trait, HealthRegistry, HealthReport (serializable), HealthStatus enum, built-in checks (Storage/Coordinator/Oplog). 6 unit tests.
+- `crates/vaultsync-core/src/storage/traits.rs`: Added `is_healthy()` default impl

@@ -52,6 +52,8 @@ pub struct VaultSyncClient {
     p2p_handle: Option<vaultsync_transport_libp2p::LibP2pTransportHandle>,
     pub metrics: Arc<crate::telemetry::metrics::VaultSyncMetrics>,
     pub debug_api: Arc<crate::telemetry::debug::DebugApi>,
+    pub health: Arc<crate::telemetry::health::HealthRegistry>,
+    pub logger: Arc<dyn crate::telemetry::logger::Logger>,
     pub leader_election: Arc<crate::ipc::leader_election::LeaderElection>,
     pub schema_version: u64,
     pub shared_memory: Arc<crate::ipc::shared_memory::SharedMemory>,
@@ -321,6 +323,21 @@ impl VaultSyncClient {
             storage.clone(),
             metrics.clone(),
         ));
+        let health = Arc::new(crate::telemetry::health::HealthRegistry::new());
+        let log_config = Arc::new(crate::telemetry::logger::ModuleLogConfig::new(config.log_level));
+        let logger: Arc<dyn crate::telemetry::logger::Logger> =
+            Arc::new(crate::telemetry::logger::TracingLogger::with_config(log_config.clone()));
+
+        // Register health checks using the Storage trait
+        use crate::telemetry::health::{CoordinatorHealthCheck, OplogHealthCheck, StorageHealthCheck};
+        health.register(Box::new(StorageHealthCheck::new("storage", storage.clone())));
+        health.register(Box::new(CoordinatorHealthCheck::new("coordinator", coordinator.clone())));
+        health.register(Box::new(OplogHealthCheck::new(
+            "oplog",
+            storage.clone(),
+            &config.namespace,
+            1000,
+        )));
 
         let upload_queue = Arc::new(UploadQueue::new(
             oplog.clone(),
@@ -345,6 +362,25 @@ impl VaultSyncClient {
         tracing::debug!("[client.new] queue init done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let schema = Arc::new(std::sync::Mutex::new(SchemaRegistry::new()));
+        // Load persisted schemas from storage (collect data before locking)
+        let schemas_from_storage: Vec<(String, Vec<u8>)> = {
+            match storage.list_schemas().await {
+                Ok(meta_list) => meta_list.into_iter().map(|m| (m.doc_id, m.schema_bytes)).collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to list schemas from storage");
+                    Vec::new()
+                }
+            }
+        };
+        {
+            let mut reg = schema.lock().unwrap();
+            for (doc_id, bytes) in schemas_from_storage {
+                if let Ok(schema_def) = serde_json::from_slice::<crate::schema::registry::DocumentSchema>(&bytes) {
+                    // Use define_local to avoid re-writing to storage
+                    let _ = reg.define_local(&doc_id, schema_def);
+                }
+            }
+        }
         let _telemetry = Arc::new(VaultSyncTelemetry::new());
 
         #[cfg(target_arch = "wasm32")]
@@ -457,6 +493,8 @@ impl VaultSyncClient {
             p2p_handle,
             metrics,
             debug_api,
+            health,
+            logger,
             leader_election: leader_election.clone(),
             schema_version,
             shared_memory,
@@ -918,6 +956,11 @@ impl VaultSyncClient {
         });
     }
 
+    /// Record the schema version watermark for a document.
+    fn watermark_version(&self, doc_id: &str, record_id: &str, version: u64) {
+        self.schema.lock().unwrap().watermark_version(doc_id, record_id, version);
+    }
+
     /// Filter out engine-managed metadata fields from user-provided field maps.
     /// These fields are auto-set by the engine to prevent unnecessary CRDT mutations.
     fn filter_meta_fields(fields: &mut HashMap<String, CrdtValue>) {
@@ -945,7 +988,13 @@ impl VaultSyncClient {
             .record_mutation_attempt(&self.config.namespace, "attempt");
 
         let mutation_id = uuid::Uuid::new_v4().to_string();
-        let mut doc = CRDTDocument::new(doc_id, record_id, 0);
+
+        // Version enforcement: if a schema is registered, use its version
+        let schema_version = {
+            let registry = self.schema.lock().unwrap();
+            registry.get(doc_id).map_or(0, |s| s.version)
+        };
+        let mut doc = CRDTDocument::new(doc_id, record_id, schema_version);
 
         // Auto-set updatedAt to HLC wall clock — it reflects when content was created
         let hlc = self.clock.now();
@@ -1019,6 +1068,7 @@ impl VaultSyncClient {
             SyncStatus::Optimistic,
             None,
             hlc.wall,
+            doc.schema_version,
             MutationOrigin::Insert,
             "",
         );
@@ -1057,6 +1107,8 @@ impl VaultSyncClient {
                     self.metrics
                         .set_oplog_size(&self.config.namespace, entries.len() as i64);
                 }
+
+                self.watermark_version(doc_id, record_id, doc.schema_version);
 
                 // Fire reactive subscriptions locally
                 let state = doc.to_map();
@@ -1099,8 +1151,16 @@ impl VaultSyncClient {
         let existing = self.storage.get_document(doc_id, record_id).await?;
         let mut doc = match existing {
             Some(bytes) => CRDTDocument::from_snapshot(&bytes)?,
-            None => CRDTDocument::new(doc_id, record_id, 0),
+            None => {
+                let sv = self.schema.lock().unwrap().get(doc_id).map_or(0, |s| s.version);
+                CRDTDocument::new(doc_id, record_id, sv)
+            },
         };
+        // Version enforcement: existing docs must match registered schema
+        {
+            let registry = self.schema.lock().unwrap();
+            registry.validate_version(doc_id, doc.schema_version)?;
+        }
 
         // ── Phase 0: skip no-op writes (no content field changed) ──
         let content_changed = fields.iter().any(|(key, value)| {
@@ -1190,6 +1250,7 @@ impl VaultSyncClient {
             SyncStatus::Optimistic,
             None,
             hlc.wall,
+            doc.schema_version,
             MutationOrigin::Update,
             "",
         );
@@ -1236,6 +1297,8 @@ impl VaultSyncClient {
                         .set_oplog_size(&self.config.namespace, entries.len() as i64);
                 }
 
+                self.watermark_version(doc_id, record_id, doc.schema_version);
+
                 // Fire reactive subscriptions locally
                 let state = doc.to_map();
                 let sub_span = tracing::info_span!("subscription.fire", doc_id = doc_id);
@@ -1270,6 +1333,11 @@ impl VaultSyncClient {
         let existing = self.storage.get_document(doc_id, record_id).await?;
         if let Some(bytes) = existing {
             let mut doc = CRDTDocument::from_snapshot(&bytes)?;
+            // Version enforcement: existing docs must match registered schema
+            {
+                let registry = self.schema.lock().unwrap();
+                registry.validate_version(doc_id, doc.schema_version)?;
+            }
             let mutation_id = uuid::Uuid::new_v4().to_string();
 
             let sv_before = doc.state_vector();
@@ -1331,6 +1399,7 @@ impl VaultSyncClient {
                 SyncStatus::Optimistic,
                 None,
                 hlc.wall,
+                doc.schema_version,
                 MutationOrigin::Delete,
                 "",
             );
@@ -1377,7 +1446,9 @@ impl VaultSyncClient {
                         .set_oplog_size(&self.config.namespace, entries.len() as i64);
                 }
 
-                    // Fire reactive subscriptions locally
+                self.watermark_version(doc_id, record_id, doc.schema_version);
+
+                // Fire reactive subscriptions locally
                     let state = doc.to_map();
                     let sub_span = tracing::info_span!("subscription.fire", doc_id = doc_id);
                     let _sub_guard = sub_span.enter();
@@ -1607,7 +1678,7 @@ impl VaultSyncClient {
         doc_id: &str,
         schema: DocumentSchema,
     ) -> Result<(), VaultSyncError> {
-        self.schema.lock().unwrap().define(doc_id, schema)
+        self.schema.lock().unwrap().define(doc_id, schema, None).await
     }
 
     pub async fn apply_migration(
@@ -1724,4 +1795,8 @@ impl VaultSyncClient {
 
     #[cfg(target_arch = "wasm32")]
     async fn broadcast_p2p(&self, _entry: &OplogEntry, _key_version: u64) {}
+
+    pub fn health(&self) -> &Arc<crate::telemetry::health::HealthRegistry> {
+        &self.health
+    }
 }

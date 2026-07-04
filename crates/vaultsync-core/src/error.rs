@@ -31,6 +31,9 @@ pub enum VaultSyncError {
 
     #[error("Clock skew error: mutation timestamp {0} is skewed compared to system time {1}")]
     ClockSkew(u64, u64),
+
+    #[error("Version mismatch: document schema version {0} does not match registered version {1} for doc '{2}'")]
+    VersionMismatch(u64, u64, String),
 }
 
 #[cfg(feature = "storage-sqlite")]

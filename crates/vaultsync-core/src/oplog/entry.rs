@@ -59,6 +59,9 @@ pub struct OplogEntry {
     pub sync_status: SyncStatus,
     pub synced_at: Option<u64>,
     pub created_at: u64,
+    /// Schema version at time of mutation (0 = unknown / unversioned).
+    #[serde(default)]
+    pub schema_version: u64,
     /// Provenance: which code path created this entry.
     #[serde(default)]
     pub origin: MutationOrigin,
@@ -86,6 +89,7 @@ impl OplogEntry {
         sync_status: SyncStatus,
         synced_at: Option<u64>,
         created_at: u64,
+        schema_version: u64,
         origin: MutationOrigin,
         origin_context: impl Into<String>,
     ) -> Self {
@@ -103,6 +107,7 @@ impl OplogEntry {
             sync_status,
             synced_at,
             created_at,
+            schema_version,
             origin: origin.clone(),
             origin_context: origin_context.into(),
         };

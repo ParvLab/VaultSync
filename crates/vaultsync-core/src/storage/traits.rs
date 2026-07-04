@@ -81,6 +81,10 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
 
     async fn read_schema(&self, doc_id: &str) -> Result<Option<SchemaMeta>, VaultSyncError>;
     async fn write_schema(&self, meta: &SchemaMeta) -> Result<(), VaultSyncError>;
+    /// List all registered schemas.
+    async fn list_schemas(&self) -> Result<Vec<SchemaMeta>, VaultSyncError> {
+        Ok(Vec::new())
+    }
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, VaultSyncError>;
     async fn write_migration(&self, record: &MigrationRecord) -> Result<(), VaultSyncError>;
 
@@ -144,5 +148,15 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
             self.insert_document(&doc_id, &record_id, &bytes).await?;
         }
         Ok(())
+    }
+
+    /// Clone self as a boxed trait object.
+    fn clone_box(&self) -> Box<dyn Storage> {
+        panic!("clone_box not implemented for this Storage type");
+    }
+
+    /// Check if storage is healthy and accessible.
+    fn is_healthy(&self) -> bool {
+        true
     }
 }

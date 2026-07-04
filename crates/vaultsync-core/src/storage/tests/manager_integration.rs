@@ -23,6 +23,7 @@ fn make_entry(doc_id: &str, record_id: &str, ns: &str) -> OplogEntry {
         SyncStatus::Pending,
         None,
         1000,
+        0,
         MutationOrigin::TestHarness,
         "integration_test",
     )
@@ -43,6 +44,7 @@ fn make_delete_entry(doc_id: &str, record_id: &str, ns: &str) -> OplogEntry {
         SyncStatus::Synced,
         Some(600),
         500,
+        0,
         MutationOrigin::TestHarness,
         "integration_test",
     )

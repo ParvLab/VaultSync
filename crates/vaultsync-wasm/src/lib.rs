@@ -127,4 +127,5 @@ pub mod transport;
 pub mod ws_coordinator;
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 fn placeholder() {} // no-op: crate is only built by wasm-pack for wasm32

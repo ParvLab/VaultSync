@@ -60,6 +60,7 @@ struct ObservationBuffer {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct QueryObservation {
     workspace_id: Option<u64>,
     filter_hash: u64,
@@ -67,6 +68,7 @@ struct QueryObservation {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct DocumentObservation {
     doc_id: String,
     record_id: String,

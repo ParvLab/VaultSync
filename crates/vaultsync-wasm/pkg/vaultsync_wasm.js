@@ -2,6 +2,33 @@
 import { acquire_web_lock, release_web_lock } from './snippets/vaultsync-core-569f5a5e15e207ef/inline0.js';
 
 
+export class EventBusProxy {
+    static __wrap(ptr) {
+        const obj = Object.create(EventBusProxy.prototype);
+        obj.__wbg_ptr = ptr;
+        EventBusProxyFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        EventBusProxyFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_eventbusproxy_free(ptr, 0);
+    }
+    /**
+     * @returns {number}
+     */
+    subscriberCount() {
+        const ret = wasm.eventbusproxy_subscriberCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+}
+if (Symbol.dispose) EventBusProxy.prototype[Symbol.dispose] = EventBusProxy.prototype.free;
+
 /**
  * Manages multi-tab presence awareness via BroadcastChannel.
  *
@@ -70,6 +97,58 @@ export class PresenceManager {
     }
 }
 if (Symbol.dispose) PresenceManager.prototype[Symbol.dispose] = PresenceManager.prototype.free;
+
+export class ReplicationNamespace {
+    static __wrap(ptr) {
+        const obj = Object.create(ReplicationNamespace.prototype);
+        obj.__wbg_ptr = ptr;
+        ReplicationNamespaceFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ReplicationNamespaceFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_replicationnamespace_free(ptr, 0);
+    }
+    clearPending() {
+        wasm.replicationnamespace_clearPending(this.__wbg_ptr);
+    }
+    /**
+     * @returns {number}
+     */
+    pendingCount() {
+        const ret = wasm.replicationnamespace_pendingCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @param {number} limit
+     * @returns {string}
+     */
+    predictNext(limit) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.replicationnamespace_predictNext(this.__wbg_ptr, limit);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) ReplicationNamespace.prototype[Symbol.dispose] = ReplicationNamespace.prototype.free;
 
 export class WasmIPC {
     static __wrap(ptr) {
@@ -191,6 +270,17 @@ export class WasmVaultSyncClient {
         return BigInt.asUintN(64, ret);
     }
     /**
+     * Runs compaction on the given namespace, returns JSON stats.
+     * @param {string} namespace
+     * @returns {Promise<string>}
+     */
+    compactNamespace(namespace) {
+        const ptr0 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmvaultsyncclient_compactNamespace(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
      * @param {string} doc_id
      * @param {string} schema_json
      * @returns {Promise<void>}
@@ -215,6 +305,14 @@ export class WasmVaultSyncClient {
         const len1 = WASM_VECTOR_LEN;
         const ret = wasm.wasmvaultsyncclient_delete(this.__wbg_ptr, ptr0, len0, ptr1, len1);
         return ret;
+    }
+    /**
+     * Returns the event bus for publishing/subscribing to engine events.
+     * @returns {EventBusProxy}
+     */
+    events() {
+        const ret = wasm.wasmvaultsyncclient_events(this.__wbg_ptr);
+        return EventBusProxy.__wrap(ret);
     }
     /**
      * @param {string} doc_id
@@ -384,6 +482,23 @@ export class WasmVaultSyncClient {
         }
     }
     /**
+     * Returns the replication namespace proxy.
+     * @returns {ReplicationNamespace}
+     */
+    replication() {
+        const ret = wasm.wasmvaultsyncclient_replication(this.__wbg_ptr);
+        return ReplicationNamespace.__wrap(ret);
+    }
+    /**
+     * Runs the resource manager sweep (recompute access scores, promote/demote tiers).
+     * Returns JSON with tier byte counts, promotions, demotions, eviction candidates.
+     * @returns {Promise<string>}
+     */
+    resourceSweep() {
+        const ret = wasm.wasmvaultsyncclient_resourceSweep(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * @returns {Promise<any>}
      */
     rotate_keys() {
@@ -391,10 +506,29 @@ export class WasmVaultSyncClient {
         return ret;
     }
     /**
+     * Runs lifecycle (tombstone cleanup) on the given namespace, returns JSON stats.
+     * @param {string} namespace
+     * @returns {Promise<string>}
+     */
+    runLifecycle(namespace) {
+        const ptr0 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmvaultsyncclient_runLifecycle(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
      * @returns {Promise<void>}
      */
     shutdown() {
         const ret = wasm.wasmvaultsyncclient_shutdown(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Returns JSON with storage statistics (page count, segment state, etc.).
+     * @returns {Promise<string>}
+     */
+    storageStats() {
+        const ret = wasm.wasmvaultsyncclient_storageStats(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -441,8 +575,218 @@ export class WasmVaultSyncClient {
         const ret = wasm.wasmvaultsyncclient_update(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
         return ret;
     }
+    /**
+     * Returns the working sets namespace proxy for CRUD operations.
+     * @returns {WorkingSetsNamespace}
+     */
+    workingSets() {
+        const ret = wasm.wasmvaultsyncclient_workingSets(this.__wbg_ptr);
+        return WorkingSetsNamespace.__wrap(ret);
+    }
+    /**
+     * Returns the workspace namespace proxy for CRUD operations.
+     * @returns {WorkspaceNamespace}
+     */
+    workspace() {
+        const ret = wasm.wasmvaultsyncclient_workspace(this.__wbg_ptr);
+        return WorkspaceNamespace.__wrap(ret);
+    }
 }
 if (Symbol.dispose) WasmVaultSyncClient.prototype[Symbol.dispose] = WasmVaultSyncClient.prototype.free;
+
+export class WorkingSetsNamespace {
+    static __wrap(ptr) {
+        const obj = Object.create(WorkingSetsNamespace.prototype);
+        obj.__wbg_ptr = ptr;
+        WorkingSetsNamespaceFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WorkingSetsNamespaceFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_workingsetsnamespace_free(ptr, 0);
+    }
+    clearActive() {
+        wasm.workingsetsnamespace_clearActive(this.__wbg_ptr);
+    }
+    /**
+     * @param {string} name
+     * @param {string} filter_json
+     * @param {bigint | null} [workspace_id]
+     * @returns {bigint}
+     */
+    create(name, filter_json, workspace_id) {
+        const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(filter_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.workingsetsnamespace_create(this.__wbg_ptr, ptr0, len0, ptr1, len1, !isLikeNone(workspace_id), isLikeNone(workspace_id) ? BigInt(0) : workspace_id);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return BigInt.asUintN(64, ret[0]);
+    }
+    /**
+     * @param {bigint} id
+     * @returns {boolean}
+     */
+    delete(id) {
+        const ret = wasm.workingsetsnamespace_delete(this.__wbg_ptr, id);
+        return ret !== 0;
+    }
+    /**
+     * @returns {any}
+     */
+    getActive() {
+        const ret = wasm.workingsetsnamespace_getActive(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {string}
+     */
+    list() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.workingsetsnamespace_list(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * @param {bigint} id
+     * @returns {boolean}
+     */
+    setActive(id) {
+        const ret = wasm.workingsetsnamespace_setActive(this.__wbg_ptr, id);
+        return ret !== 0;
+    }
+}
+if (Symbol.dispose) WorkingSetsNamespace.prototype[Symbol.dispose] = WorkingSetsNamespace.prototype.free;
+
+export class WorkspaceNamespace {
+    static __wrap(ptr) {
+        const obj = Object.create(WorkspaceNamespace.prototype);
+        obj.__wbg_ptr = ptr;
+        WorkspaceNamespaceFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WorkspaceNamespaceFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_workspacenamespace_free(ptr, 0);
+    }
+    /**
+     * @param {string} name
+     * @param {string} namespace
+     * @param {string} schema_json
+     * @param {string} retention_json
+     * @returns {bigint}
+     */
+    create(name, namespace, schema_json, retention_json) {
+        const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(schema_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(retention_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ret = wasm.workspacenamespace_create(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return BigInt.asUintN(64, ret[0]);
+    }
+    /**
+     * @param {bigint} id
+     * @returns {boolean}
+     */
+    delete(id) {
+        const ret = wasm.workspacenamespace_delete(this.__wbg_ptr, id);
+        return ret !== 0;
+    }
+    /**
+     * @param {bigint} id
+     * @returns {string}
+     */
+    get(id) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.workspacenamespace_get(this.__wbg_ptr, id);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * @returns {string}
+     */
+    list() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.workspacenamespace_list(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * @param {bigint} id
+     * @param {string | null} [name]
+     * @param {string | null} [retention_json]
+     * @returns {boolean}
+     */
+    update(id, name, retention_json) {
+        var ptr0 = isLikeNone(name) ? 0 : passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len0 = WASM_VECTOR_LEN;
+        var ptr1 = isLikeNone(retention_json) ? 0 : passStringToWasm0(retention_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len1 = WASM_VECTOR_LEN;
+        const ret = wasm.workspacenamespace_update(this.__wbg_ptr, id, ptr0, len0, ptr1, len1);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0] !== 0;
+    }
+}
+if (Symbol.dispose) WorkspaceNamespace.prototype[Symbol.dispose] = WorkspaceNamespace.prototype.free;
 
 /**
  * @param {Uint8Array} ciphertext
@@ -1047,6 +1391,9 @@ function __wbg_get_imports() {
             const ret = arg0.then(arg1, arg2);
             return ret;
         },
+        __wbg_trace_822dbcb10dfd03eb: function(arg0, arg1) {
+            console.trace(getStringFromWasm0(arg0, arg1));
+        },
         __wbg_transaction_b7261fed68fa4264: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.transaction(getStringFromWasm0(arg1, arg2), __wbindgen_enum_IdbTransactionMode[arg3]);
             return ret;
@@ -1067,47 +1414,47 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 455, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h7bc44194b3ab93f4);
-            return ret;
-        },
-        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 876, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1032, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1);
             return ret;
         },
+        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 690, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h7bc44194b3ab93f4);
+            return ret;
+        },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 453, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 688, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h38ebcc3efbfba5e6);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 455, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 690, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h7bc44194b3ab93f4_3);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 656, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 755, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2178f200c4e67708);
             return ret;
         },
         __wbindgen_cast_0000000000000006: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 656, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 755, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2178f200c4e67708_5);
             return ret;
         },
         __wbindgen_cast_0000000000000007: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 656, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 755, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2178f200c4e67708_6);
             return ret;
         },
         __wbindgen_cast_0000000000000008: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 710, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 835, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h51f55c9a10f889b7);
             return ret;
         },
         __wbindgen_cast_0000000000000009: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 712, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 837, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h22468ced884afd53);
             return ret;
         },
@@ -1193,9 +1540,15 @@ const __wbindgen_enum_IdbTransactionMode = ["readonly", "readwrite", "versioncha
 
 
 const __wbindgen_enum_RtcSdpType = ["offer", "pranswer", "answer", "rollback"];
+const EventBusProxyFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_eventbusproxy_free(ptr, 1));
 const PresenceManagerFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_presencemanager_free(ptr, 1));
+const ReplicationNamespaceFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_replicationnamespace_free(ptr, 1));
 const WasmIPCFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_wasmipc_free(ptr, 1));
@@ -1205,6 +1558,12 @@ const WasmSubscriptionHandleFinalization = (typeof FinalizationRegistry === 'und
 const WasmVaultSyncClientFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_wasmvaultsyncclient_free(ptr, 1));
+const WorkingSetsNamespaceFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_workingsetsnamespace_free(ptr, 1));
+const WorkspaceNamespaceFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_workspacenamespace_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();

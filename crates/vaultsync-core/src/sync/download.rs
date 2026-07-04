@@ -224,6 +224,7 @@ impl DownloadQueue {
                         SyncStatus::Synced,
                         None,
                         m.timestamp,
+                        0,
                         MutationOrigin::RemotePull,
                         "",
                     );
@@ -379,6 +380,7 @@ impl DownloadQueue {
             SyncStatus::Synced,
             None,
             m.timestamp,
+            0,
             MutationOrigin::P2PBroadcast,
             "",
         );
@@ -470,6 +472,7 @@ impl DownloadQueue {
                 SyncStatus::Synced,
                 None,
                 snapshot.created_at,
+                0,
                 MutationOrigin::Snapshot,
                 "",
             );
@@ -598,6 +601,7 @@ impl DownloadQueue {
             SyncStatus::Synced,
             None,
             m.timestamp,
+            0,
             MutationOrigin::PushMutation,
             "",
         );

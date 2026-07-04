@@ -225,6 +225,39 @@ impl Storage for InMemoryStorage {
         Ok(())
     }
 
+    async fn list_schemas(&self) -> Result<Vec<SchemaMeta>, VaultSyncError> {
+        Ok(self
+            .schemas
+            .read()
+            .map_err(|e| VaultSyncError::Storage(e.to_string()))?
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn clone_box(&self) -> Box<dyn Storage> {
+        Box::new(InMemoryStorage {
+            documents: RwLock::new(
+                self.documents.read().map_err(|_| ()).unwrap().clone()
+            ),
+            oplog: RwLock::new(
+                self.oplog.read().map_err(|_| ()).unwrap().clone()
+            ),
+            sync_states: RwLock::new(
+                self.sync_states.read().map_err(|_| ()).unwrap().clone()
+            ),
+            schemas: RwLock::new(
+                self.schemas.read().map_err(|_| ()).unwrap().clone()
+            ),
+            migrations: RwLock::new(
+                self.migrations.read().map_err(|_| ()).unwrap().clone()
+            ),
+            keys: RwLock::new(
+                self.keys.read().map_err(|_| ()).unwrap().clone()
+            ),
+        })
+    }
+
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, VaultSyncError> {
         Ok(self
             .migrations
