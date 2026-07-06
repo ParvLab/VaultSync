@@ -4,10 +4,11 @@ use vaultsync_core::oplog::entry::{MutationType, OplogEntry, SyncStatus};
 use vaultsync_core::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use vaultsync_core::sync::state::SyncState;
 use vaultsync_core::VaultSyncError;
+use wasm_bindgen::JsValue;
 use web_sys::*;
 
 use crate::migration::{DocEntry, PagesDir};
-use crate::page_store::PageStore;
+use crate::page_store::{PageId, PageStore};
 
 #[derive(Debug, Clone)]
 pub struct OpfsStorage {
@@ -43,6 +44,39 @@ impl OpfsStorage {
     fn lock_name(&self, store: &str) -> String {
         format!("vaultsync-opfs-{}", store)
     }
+
+    /// Physically remove tombstoned page files from disk.
+    /// Returns total number of pages cleaned across all stores.
+    pub async fn cleanup_tombstoned_pages(&self) -> Result<usize, VaultSyncError> {
+        let mut total = 0usize;
+        total += self.pages.doc_data.cleanup_tombstoned_pages().await?;
+        total += self.pages.oplog.cleanup_tombstoned_pages().await?;
+        total += self.pages.sync_states.cleanup_tombstoned_pages().await?;
+        total += self.pages.schemas.cleanup_tombstoned_pages().await?;
+        total += self.pages.migrations.cleanup_tombstoned_pages().await?;
+        total += self.pages.keys.cleanup_tombstoned_pages().await?;
+        Ok(total)
+    }
+
+    async fn tombstone_existing_doc_pages(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<usize, VaultSyncError> {
+        let page_ids = self.pages.doc_data.list_page_ids().await?;
+        let mut count = 0;
+        for id in page_ids {
+            if let Some(data) = self.pages.doc_data.read_page(id).await? {
+                if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
+                    if entry.doc_id == doc_id && entry.record_id == record_id {
+                        self.pages.doc_data.tombstone_page(id).await?;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
 }
 
 fn get_lock_manager() -> Result<LockManager, VaultSyncError> {
@@ -59,6 +93,13 @@ impl Storage for OpfsStorage {
         record_id: &str,
         bytes: &[u8],
     ) -> Result<(), VaultSyncError> {
+        let tombstoned = self.tombstone_existing_doc_pages(doc_id, record_id).await?;
+        if tombstoned > 1 {
+            tracing::warn!(
+                "[OpfsStorage] insert_document: tombstoned {} live pages for {}/{} (expected 1)",
+                tombstoned, doc_id, record_id
+            );
+        }
         let entry = DocEntry {
             doc_id: doc_id.to_string(),
             record_id: record_id.to_string(),
@@ -76,46 +117,54 @@ impl Storage for OpfsStorage {
         record_id: &str,
     ) -> Result<Option<Vec<u8>>, VaultSyncError> {
         let page_ids = self.pages.doc_data.list_page_ids().await?;
+        let mut found: Vec<(u64, Vec<u8>)> = Vec::new();
         for id in page_ids {
             if let Some(data) = self.pages.doc_data.read_page(id).await? {
                 if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
                     if entry.doc_id == doc_id && entry.record_id == record_id {
-                        return Ok(Some(entry.bytes));
+                        found.push((id, entry.bytes));
                     }
                 }
             }
         }
-        Ok(None)
+        match found.len() {
+            0 => Ok(None),
+            1 => Ok(Some(found.into_iter().next().unwrap().1)),
+            n => {
+                tracing::warn!(
+                    "[OpfsStorage] get_document: found {} live pages for {}/{}",
+                    n, doc_id, record_id
+                );
+                found.sort_by_key(|(id, _)| *id);
+                Ok(Some(found.into_iter().last().unwrap().1))
+            }
+        }
     }
 
     async fn delete_document(&self, doc_id: &str, record_id: &str) -> Result<(), VaultSyncError> {
-        let page_ids = self.pages.doc_data.list_page_ids().await?;
-        for id in page_ids {
-            if let Some(data) = self.pages.doc_data.read_page(id).await? {
-                if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
-                    if entry.doc_id == doc_id && entry.record_id == record_id {
-                        self.pages.doc_data.tombstone_page(id).await?;
-                        return Ok(());
-                    }
-                }
-            }
+        let count = self.tombstone_existing_doc_pages(doc_id, record_id).await?;
+        if count > 1 {
+            tracing::warn!(
+                "[OpfsStorage] delete_document: tombstoned {} live pages for {}/{}",
+                count, doc_id, record_id
+            );
         }
         Ok(())
     }
 
     async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, VaultSyncError> {
         let page_ids = self.pages.doc_data.list_page_ids().await?;
-        let mut results = Vec::new();
+        let mut latest: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
         for id in page_ids {
             if let Some(data) = self.pages.doc_data.read_page(id).await? {
                 if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
                     if entry.doc_id == doc_id {
-                        results.push((entry.record_id, entry.bytes));
+                        latest.insert(entry.record_id, entry.bytes);
                     }
                 }
             }
         }
-        Ok(results)
+        Ok(latest.into_iter().collect())
     }
 
     async fn write_document_and_oplog(
@@ -125,19 +174,38 @@ impl Storage for OpfsStorage {
         bytes: &[u8],
         entry: &OplogEntry,
     ) -> Result<(), VaultSyncError> {
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: tombstone_existing_doc_pages start doc={}/{}", doc_id, record_id);
+        let tombstoned = self.tombstone_existing_doc_pages(doc_id, record_id).await?;
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: tombstone_existing_doc_pages done count={}", tombstoned);
+        if tombstoned > 1 {
+            tracing::warn!(
+                "[OpfsStorage] write_document_and_oplog: tombstoned {} live pages for {}/{} (expected 1)",
+                tombstoned, doc_id, record_id
+            );
+        }
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: create DocEntry start");
         let doc_entry = DocEntry {
             doc_id: doc_id.to_string(),
             record_id: record_id.to_string(),
             bytes: bytes.to_vec(),
         };
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: encode doc entry start");
         let encoded_doc = postcard::to_allocvec(&doc_entry)
             .map_err(|e| VaultSyncError::Storage(format!("encode doc: {:?}", e)))?;
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: encode doc done len={}", encoded_doc.len());
         let doc_page_id = self.pages.doc_data.allocate_page_id().await?;
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: allocate doc page done id={}", doc_page_id);
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: write doc page start id={}", doc_page_id);
         self.pages.doc_data.write_page(doc_page_id, &encoded_doc).await?;
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: write doc page done");
 
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: encode oplog entry start");
         let encoded_entry = postcard::to_allocvec(&[entry.clone()])
             .map_err(|e| VaultSyncError::Storage(format!("encode oplog: {:?}", e)))?;
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: encode oplog done len={}", encoded_entry.len());
         let oplog_page_id = self.pages.oplog.allocate_page_id().await?;
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: allocate oplog page done id={}", oplog_page_id);
+        tracing::trace!("[OpfsStorage] write_document_and_oplog: write oplog page start");
         self.pages.oplog.write_page(oplog_page_id, &encoded_entry).await
     }
 
@@ -176,6 +244,9 @@ impl Storage for OpfsStorage {
     }
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), VaultSyncError> {
+        // Run deferred GC before accessing old pages.
+        self.pages.oplog.run_pending_gc().await?;
+
         let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
         let updated: Vec<OplogEntry> = entries
             .into_iter()
@@ -190,10 +261,19 @@ impl Storage for OpfsStorage {
         let encoded = postcard::to_allocvec(&updated)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.pages.oplog.allocate_page_id().await?;
-        self.pages.oplog.write_page(page_id, &encoded).await
+        self.pages.oplog.write_page(page_id, &encoded).await?;
+
+        // Mark this page as the current full-state snapshot.
+        self.pages.oplog.set_current_page(page_id).await?;
+
+        // Schedule deferred cleanup of old pages (runs on next access).
+        self.pages.oplog.schedule_gc();
+
+        Ok(())
     }
 
     async fn mark_failed(&self, id: &str, _error: &str) -> Result<(), VaultSyncError> {
+        self.pages.oplog.run_pending_gc().await?;
         let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
         let updated: Vec<OplogEntry> = entries
             .into_iter()
@@ -207,7 +287,13 @@ impl Storage for OpfsStorage {
         let encoded = postcard::to_allocvec(&updated)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.pages.oplog.allocate_page_id().await?;
-        self.pages.oplog.write_page(page_id, &encoded).await
+        self.pages.oplog.write_page(page_id, &encoded).await?;
+
+        // Mark as current full-state and schedule deferred GC.
+        self.pages.oplog.set_current_page(page_id).await?;
+        self.pages.oplog.schedule_gc();
+
+        Ok(())
     }
 
     async fn read_oplog_after_sequence(
@@ -283,6 +369,7 @@ impl Storage for OpfsStorage {
         namespace: &str,
         older_than_secs: u64,
     ) -> Result<usize, VaultSyncError> {
+        self.pages.oplog.run_pending_gc().await?;
         let cutoff = (js_sys::Date::now() as u64).saturating_sub(older_than_secs * 1000);
         let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
         let before = entries.len();
@@ -299,6 +386,11 @@ impl Storage for OpfsStorage {
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.pages.oplog.allocate_page_id().await?;
         self.pages.oplog.write_page(page_id, &encoded).await?;
+
+        // Full-state rewrite — mark as current and schedule deferred GC.
+        self.pages.oplog.set_current_page(page_id).await?;
+        self.pages.oplog.schedule_gc();
+
         Ok(removed)
     }
 
@@ -371,6 +463,7 @@ impl Storage for OpfsStorage {
         record_id: &str,
         timestamp: u64,
     ) -> Result<usize, VaultSyncError> {
+        self.pages.oplog.run_pending_gc().await?;
         let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
         let before = entries.len();
         let remaining: Vec<OplogEntry> = entries
@@ -388,6 +481,11 @@ impl Storage for OpfsStorage {
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.pages.oplog.allocate_page_id().await?;
         self.pages.oplog.write_page(page_id, &encoded).await?;
+
+        // Full-state rewrite — mark as current and schedule deferred GC.
+        self.pages.oplog.set_current_page(page_id).await?;
+        self.pages.oplog.schedule_gc();
+
         Ok(removed)
     }
 
@@ -396,6 +494,7 @@ impl Storage for OpfsStorage {
         namespace: &str,
         cutoff_ms: u64,
     ) -> Result<usize, VaultSyncError> {
+        self.pages.oplog.run_pending_gc().await?;
         let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
         let before = entries.len();
         let remaining: Vec<OplogEntry> = entries
@@ -411,25 +510,124 @@ impl Storage for OpfsStorage {
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.pages.oplog.allocate_page_id().await?;
         self.pages.oplog.write_page(page_id, &encoded).await?;
+
+        // Full-state rewrite — mark as current and schedule deferred GC.
+        self.pages.oplog.set_current_page(page_id).await?;
+        self.pages.oplog.schedule_gc();
+
         Ok(removed)
     }
 }
 
-async fn read_all_entries<T: serde::de::DeserializeOwned>(
+async fn read_all_entries<T: serde::de::DeserializeOwned + serde::Serialize>(
     store: &PageStore,
 ) -> Result<Vec<T>, VaultSyncError> {
-    let page_ids = store.list_page_ids().await?;
+    web_sys::console::info_1(&"[storage] read_all_entries: reading current_page".into());
+    let current = store.current_page().await;
+    web_sys::console::info_1(&format!("[storage] read_all_entries: current_page={}", current).into());
+
+    web_sys::console::info_1(&"[storage] read_all_entries: listing page_ids".into());
+    let page_ids = match store.list_page_ids().await {
+        Ok(ids) => ids,
+        Err(e) => {
+            web_sys::console::error_1(&format!("[storage] list_page_ids failed: {:?}", e).into());
+            return Ok(Vec::new());
+        }
+    };
+    web_sys::console::info_1(&format!("[storage] read_all_entries: page_ids.len={}", page_ids.len()).into());
+
+    // If manifest knows the current full-state page, only read that page
+    // plus any pages written after it (individual entries not yet consolidated).
+    let ids_to_read: Vec<PageId> = if current > 0 {
+        page_ids.into_iter().filter(|id| *id >= current).collect()
+    } else {
+        page_ids
+    };
+
+    let total = ids_to_read.len();
+    web_sys::console::info_1(&format!("[storage] read_all_entries: ids_to_read={}", total).into());
+
     let mut all = Vec::new();
-    for id in page_ids {
-        if let Some(data) = store.read_page(id).await? {
-            if let Ok(chunk) = postcard::from_bytes::<Vec<T>>(&data) {
-                all.extend(chunk);
-            } else if let Ok(single) = postcard::from_bytes::<T>(&data) {
-                all.push(single);
+    let mut next_log_pct = 10u8;
+    let mut read_errors = 0usize;
+    for (i, id) in ids_to_read.iter().enumerate() {
+        // Progress log every 10% for large scans (no current_page = legacy store)
+        if current == 0 && total > 100 {
+            let pct = ((i + 1) * 100 / total) as u8;
+            if pct >= next_log_pct {
+                next_log_pct = pct + 10;
+                web_sys::console::info_1(
+                    &format!("[storage] scanning page {}/{} ({}%)", i + 1, total, pct).into(),
+                );
+            }
+        }
+        // Gracefully handle individual page read/parse errors
+        match store.read_page(*id).await {
+            Ok(Some(data)) => {
+                // Size guard: skip pages > 10MB to prevent OOM or corrupt data
+                if data.len() > 10_000_000 {
+                    web_sys::console::warn_1(
+                        &format!("[storage] page {} oversized ({} bytes), skipping", id, data.len()).into(),
+                    );
+                    continue;
+                }
+                if let Ok(chunk) = postcard::from_bytes::<Vec<T>>(&data) {
+                    all.extend(chunk);
+                } else if let Ok(single) = postcard::from_bytes::<T>(&data) {
+                    all.push(single);
+                }
+            }
+            Ok(None) => {} // tombstoned or deleted
+            Err(e) => {
+                read_errors += 1;
+                if read_errors <= 3 {
+                    web_sys::console::warn_1(
+                        &format!("[storage] read_page {} error: {:?}", id, e).into(),
+                    );
+                }
+                if read_errors == 3 {
+                    web_sys::console::warn_1(&JsValue::from_str("[storage] suppressing further read_page errors"));
+                }
             }
         }
     }
+
+    if read_errors > 0 {
+        web_sys::console::warn_1(
+            &format!("[storage] read_all_entries: {} page read errors", read_errors).into(),
+        );
+    }
+
+    // First-time consolidation: if no current_page was set, merge all entries
+    // into a single consolidated page so subsequent reads skip the full scan.
+    if current == 0 && !all.is_empty() {
+        if let Err(e) = consolidate_all(store, &all).await {
+            web_sys::console::error_1(&format!("[storage] consolidation failed: {:?}", e).into());
+        }
+    }
+
     Ok(all)
+}
+
+/// Write all entries as a single consolidated page and update the manifest.
+async fn consolidate_all<T: serde::Serialize>(
+    store: &PageStore,
+    all: &[T],
+) -> Result<(), VaultSyncError> {
+    let encoded = postcard::to_allocvec(all)
+        .map_err(|e| VaultSyncError::Storage(format!("consolidate encode: {:?}", e)))?;
+    web_sys::console::info_1(
+        &format!("[storage] consolidating {} entries into 1 page ({} bytes)", all.len(), encoded.len()).into(),
+    );
+    let new_id = store.allocate_page_id().await?;
+    if let Err(e) = store.write_page(new_id, &encoded).await {
+        web_sys::console::error_1(&format!("[storage] write_page for consolidation failed: {:?}", e).into());
+        return Err(e);
+    }
+    store.set_current_page(new_id).await?;
+    store.schedule_gc();
+    web_sys::console::info_1(&format!("[storage] consolidation done page_id={}", new_id).into());
+    Ok(())
 }
 
 use crate::indexeddb::IndexedDbStorage;
@@ -441,6 +639,15 @@ pub enum BrowserStorage {
 }
 
 impl BrowserStorage {
+    /// Physically remove tombstoned page files from disk.
+    /// No-op for IndexedDB backend.
+    pub async fn cleanup_tombstoned_pages(&self) -> Result<usize, VaultSyncError> {
+        match self {
+            Self::Opfs(opfs) => opfs.cleanup_tombstoned_pages().await,
+            Self::Idb(_) => Ok(0),
+        }
+    }
+
     pub async fn new(db_name: &str, backend: Option<&str>) -> Result<Self, VaultSyncError> {
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
             "[Rust] BrowserStorage::new: db_name={}, requested_backend={:?}",

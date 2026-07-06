@@ -89,6 +89,16 @@ impl WasmVaultSyncClient {
             BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
         };
 
+        // Clean up tombstoned pages left by previous versions
+        match storage.cleanup_tombstoned_pages().await {
+            Ok(n) => {
+                if n > 0 {
+                    console_debug!("[cleanup] removed {} tombstoned pages", n);
+                }
+            }
+            Err(e) => console_warn!("[cleanup] tombstoned page cleanup: {:?}", e),
+        }
+
         let storage_manager: Arc<dyn StorageManager> = Arc::new(
             DefaultStorageManager::new(storage.clone(), CompactionPolicy::default()),
         );
@@ -168,6 +178,16 @@ impl WasmVaultSyncClient {
         config.storage = match &*storage {
             BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
         };
+
+        // Clean up tombstoned pages left by previous versions
+        match storage.cleanup_tombstoned_pages().await {
+            Ok(n) => {
+                if n > 0 {
+                    console_debug!("[cleanup] removed {} tombstoned pages", n);
+                }
+            }
+            Err(e) => console_warn!("[cleanup] tombstoned page cleanup: {:?}", e),
+        }
 
         let storage_manager: Arc<dyn StorageManager> = Arc::new(
             DefaultStorageManager::new(storage.clone(), CompactionPolicy::default()),
@@ -326,13 +346,13 @@ impl WasmVaultSyncClient {
             "insert" => {
                 let fields = json_to_fields(json)?;
                 let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
-                console_trace!("[BC] LEADER_INSERT_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
+                console_trace!("[BC] LEADER_INSERT_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), safe_utf8_slice(json, 300));
                 self.client.insert(doc_id, record_id, fields).await
             }
             "update" => {
                 let fields = json_to_fields(json)?;
                 let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
-                console_trace!("[BC] LEADER_UPDATE_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), &json[..json.len().min(300)]);
+                console_trace!("[BC] LEADER_UPDATE_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), safe_utf8_slice(json, 300));
                 self.client.update(doc_id, record_id, fields).await
             }
             "delete" => self.client.delete(doc_id, record_id).await,
@@ -365,7 +385,7 @@ impl WasmVaultSyncClient {
             self.broadcast_invalidation(doc_id, record_id);
             Ok(())
         } else {
-            console_trace!("[BC] FOLLOW_INSERT_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
+            console_trace!("[BC] FOLLOW_INSERT_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), safe_utf8_slice(json, 500));
             self.send_command("insert", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
                 self.client.fire_local_subscription(doc_id, record_id, &fields);
@@ -384,7 +404,7 @@ impl WasmVaultSyncClient {
             self.broadcast_invalidation(doc_id, record_id);
             Ok(())
         } else {
-            console_trace!("[BC] FOLLOW_UPDATE_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), &json[..json.len().min(500)]);
+            console_trace!("[BC] FOLLOW_UPDATE_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), safe_utf8_slice(json, 500));
             self.send_command("update", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
                 self.client.fire_local_subscription(doc_id, record_id, &fields);
@@ -409,6 +429,7 @@ impl WasmVaultSyncClient {
     }
 
     pub async fn get(&self, doc_id: &str, record_id: &str) -> Result<JsValue, JsValue> {
+        console_debug!("[get] doc={} record={}", doc_id, record_id);
         let doc_opt = self
             .client
             .get(doc_id, record_id)
@@ -586,11 +607,17 @@ impl WasmVaultSyncClient {
                             record_id_owned,
                             js_sys::Date::now()
                         );
+                        if cb_clone.is_null() || cb_clone.is_undefined() {
+                            console_warn!("[notify] seq={} record={} null_callback=true", seq, record_id_owned);
+                            return;
+                        }
                         let func: js_sys::Function = cb_clone.unchecked_into();
                         let record_id_js = JsValue::from_str(&record_id_owned);
                         let json_js = JsValue::from_str(&json_str);
                         let seq_js = JsValue::from_f64(seq as f64);
-                        let _ = func.call3(&JsValue::NULL, &record_id_js, &json_js, &seq_js);
+                        if let Err(e) = func.call3(&JsValue::NULL, &record_id_js, &json_js, &seq_js) {
+                            console_error!("[notify] seq={} record={} callback_error={:?}", seq, record_id_owned, e);
+                        }
                     });
                 }
             }),
@@ -961,4 +988,10 @@ fn json_to_fields(json: &str) -> Result<HashMap<String, CrdtValue>, JsValue> {
         fields.insert(k, crdt_val);
     }
     Ok(fields)
+}
+
+/// Truncate a &str to at most `max` characters, respecting UTF-8 boundaries.
+/// Returns the truncated string. Never panics on multi-byte boundaries.
+fn safe_utf8_slice(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
 }

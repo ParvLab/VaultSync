@@ -186,7 +186,7 @@ impl DownloadQueue {
                     // No clock skew check for pull mutations — coordinator already validated them
                     if m.encrypted_blob.len() >= 8 {
                         let header_version =
-                            u64::from_le_bytes(m.encrypted_blob[..8].try_into().unwrap());
+                            u64::from_le_bytes(m.encrypted_blob[..8].try_into().expect("guarded by len >= 8"));
                         if header_version != m.key_version {
                             tracing::warn!(
                                 blob_version = header_version,
@@ -353,7 +353,7 @@ impl DownloadQueue {
         }
 
         if m.encrypted_blob.len() >= 8 {
-            let header_version = u64::from_le_bytes(m.encrypted_blob[..8].try_into().unwrap());
+            let header_version = u64::from_le_bytes(m.encrypted_blob[..8].try_into().expect("guarded by len >= 8"));
             if header_version != m.key_version {
                 tracing::warn!(
                     blob_version = header_version,
@@ -563,7 +563,7 @@ impl DownloadQueue {
 
         // No clock skew check for push mutations — coordinator already validated them
         if m.encrypted_blob.len() >= 8 {
-            let header_version = u64::from_le_bytes(m.encrypted_blob[..8].try_into().unwrap());
+            let header_version = u64::from_le_bytes(m.encrypted_blob[..8].try_into().expect("guarded by len >= 8"));
             if header_version != m.key_version {
                 tracing::warn!(
                     blob_version = header_version,

@@ -128,11 +128,17 @@ impl UploadQueue {
                 self.metrics
                     .set_connection_status(&self.oplog.namespace(), true);
                 for (entry, seq) in entries.iter().zip(sequences.iter()) {
-                    tracing::debug!(
-                        "[upload_queue] MARK_SYNCED id={} seq={}",
+                    let t0 = crate::time_utils::system_time_now_ms();
+                    tracing::trace!(
+                        "[upload_queue] mark_synced begin id={} seq={}",
                         entry.id, *seq,
                     );
                     self.oplog.mark_synced(&entry.id, *seq).await?;
+                    tracing::trace!(
+                        "[upload_queue] mark_synced done id={} elapsed={}ms",
+                        entry.id,
+                        crate::time_utils::system_time_now_ms() - t0,
+                    );
                 }
                 // Verify: re-read pending count to confirm mark_synced persisted
                 match self.oplog.count_pending().await {
@@ -150,7 +156,13 @@ impl UploadQueue {
                     }
                 }
                 {
+                    let t0 = crate::time_utils::system_time_now_ms();
+                    tracing::trace!("[upload_queue] retry_engine success lock begin");
                     let mut engine = self.retry_engine.lock().unwrap();
+                    tracing::trace!(
+                        "[upload_queue] retry_engine success lock acquired elapsed={}ms",
+                        crate::time_utils::system_time_now_ms() - t0,
+                    );
                     for entry in &entries {
                         engine.record_success(&entry.id);
                     }
@@ -171,7 +183,13 @@ impl UploadQueue {
                     .set_connection_status(&self.oplog.namespace(), false);
                 self.metrics.record_sync_error();
                 let failed_ids: Vec<String> = {
+                    let t0 = crate::time_utils::system_time_now_ms();
+                    tracing::trace!("[upload_queue] retry_engine notavail lock begin");
                     let mut engine = self.retry_engine.lock().unwrap();
+                    tracing::trace!(
+                        "[upload_queue] retry_engine notavail lock acquired elapsed={}ms",
+                        crate::time_utils::system_time_now_ms() - t0,
+                    );
                     let mut exhausted = Vec::new();
                     for entry in &entries {
                         if engine.record_failure(&entry.id).is_none() {
@@ -197,7 +215,13 @@ impl UploadQueue {
                 self.metrics.record_sync_error();
                 let err_msg = format!("upload failed: {e:?}");
                 let failed_ids: Vec<String> = {
+                    let t0 = crate::time_utils::system_time_now_ms();
+                    tracing::trace!("[upload_queue] retry_engine error lock begin");
                     let mut engine = self.retry_engine.lock().unwrap();
+                    tracing::trace!(
+                        "[upload_queue] retry_engine error lock acquired elapsed={}ms",
+                        crate::time_utils::system_time_now_ms() - t0,
+                    );
                     let mut exhausted = Vec::new();
                     for entry in &entries {
                         if engine.record_failure(&entry.id).is_none() {

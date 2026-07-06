@@ -97,7 +97,7 @@ pub fn init() {
     console_error_panic_hook::set_once();
     let _ = tracing::subscriber::set_global_default(ConsoleSubscriber);
     tracing::warn!("================================================");
-    tracing::warn!("VaultSync WASM BUILD: {} instrumentation=v4", BUILD_ID);
+    tracing::warn!("VaultSync WASM BUILD: {} instrumentation=v6", BUILD_ID);
     tracing::warn!("================================================");
 }
 

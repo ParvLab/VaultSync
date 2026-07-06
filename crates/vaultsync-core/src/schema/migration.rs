@@ -96,6 +96,7 @@ pub fn get_global_migrations() -> Vec<Arc<MigrationDefinition>> {
 pub struct MigrationRunner {
     storage: Arc<dyn Storage>,
     migrations: Vec<Arc<MigrationDefinition>>,
+    applied_cache: Mutex<Option<Vec<crate::storage::traits::MigrationRecord>>>,
 }
 
 impl MigrationRunner {
@@ -103,12 +104,13 @@ impl MigrationRunner {
         Self {
             storage,
             migrations,
+            applied_cache: Mutex::new(None),
         }
     }
 
     /// Run all pending migrations in version order.
     pub async fn run_pending(&self) -> Result<(), VaultSyncError> {
-        let applied = self.storage.read_migrations().await?;
+        let applied = self.get_applied().await?;
 
         for migration in &self.migrations {
             let already_applied = applied.iter().any(|m| m.version == migration.version);
@@ -126,14 +128,29 @@ impl MigrationRunner {
                     checksum: migration.checksum.clone(),
                 };
                 self.storage.write_migration(&record).await?;
+                // Invalidate cache so current_version picks up the change
+                *self.applied_cache.lock().unwrap() = None;
             }
         }
         Ok(())
     }
 
+    /// Get applied migrations, using cache if available.
+    async fn get_applied(&self) -> Result<Vec<crate::storage::traits::MigrationRecord>, VaultSyncError> {
+        {
+            let cache = self.applied_cache.lock().unwrap();
+            if let Some(ref cached) = *cache {
+                return Ok(cached.clone());
+            }
+        }
+        let applied = self.storage.read_migrations().await?;
+        *self.applied_cache.lock().unwrap() = Some(applied.clone());
+        Ok(applied)
+    }
+
     /// Validate checksums of already-applied migrations.
     pub async fn validate_applied(&self) -> Result<(), VaultSyncError> {
-        let applied = self.storage.read_migrations().await?;
+        let applied = self.get_applied().await?;
 
         for record in applied {
             if let Some(registered) = self.migrations.iter().find(|m| m.version == record.version) {
@@ -149,8 +166,8 @@ impl MigrationRunner {
     }
 
     pub async fn current_version(&self) -> u64 {
-        if let Ok(applied) = self.storage.read_migrations().await {
-            applied
+        match self.get_applied().await {
+            Ok(applied) => applied
                 .iter()
                 .filter_map(|m| {
                     let digits: String = m
@@ -162,9 +179,8 @@ impl MigrationRunner {
                     digits.parse::<u64>().ok()
                 })
                 .max()
-                .unwrap_or(0)
-        } else {
-            0
+                .unwrap_or(0),
+            Err(_) => 0,
         }
     }
 }

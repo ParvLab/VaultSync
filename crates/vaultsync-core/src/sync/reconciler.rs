@@ -166,11 +166,19 @@ impl Reconciler {
             }
         };
 
-        // ── Phase C: content fingerprint before apply ──
+        // ── Phase C: skip apply if update is fully redundant ──
+        // Yrs can panic on stale updates in release wasm (panic=abort).
         let before_snap = doc.to_snapshot();
         let before_hash = hex::encode(&Sha256::digest(&before_snap)[..8]);
 
-        doc.apply_update(&entry.yrs_update)?;
+        if !redundant {
+            doc.apply_update(&entry.yrs_update)?;
+        } else {
+            tracing::trace!(
+                "[reconciler] skip_apply redundant=true source={} id={}",
+                source, entry.id,
+            );
+        }
 
         // ── Phase 4 diagnostic: log actual document text after apply ──
         let after_map = doc.to_map();
@@ -313,7 +321,24 @@ impl Reconciler {
             source, old_entries,
         );
 
-        doc.apply_update(plaintext_update)?;
+        // Skip apply if update is fully redundant (Yrs can panic on stale updates in release wasm)
+        let encrypted_redundant = if let Ok(decoded) = Update::decode_v1(plaintext_update) {
+            let update_sv = decoded.state_vector();
+            update_sv.iter().all(|(client_id, clock)| {
+                old_sv.get(client_id) >= *clock
+            })
+        } else {
+            false
+        };
+
+        if !encrypted_redundant {
+            doc.apply_update(plaintext_update)?;
+        } else {
+            tracing::trace!(
+                "[reconciler] skip_apply_enc redundant=true source={} id={}",
+                source, entry.id,
+            );
+        }
 
         // ── Phase 1 diagnostic: state vector after encrypted apply ──
         let new_sv = doc.state_vector();

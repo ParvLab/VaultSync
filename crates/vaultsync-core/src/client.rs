@@ -202,16 +202,16 @@ impl VaultSyncClient {
         migrations: Vec<Arc<crate::schema::migration::MigrationDefinition>>,
         auto_initialize: bool,
     ) -> Result<Self, VaultSyncError> {
-        let _t = crate::time_utils::system_time_now_ms();
-        tracing::debug!("[client.new] migration start");
+        let _t_mig = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] migration start");
         let runner = crate::schema::migration::MigrationRunner::new(storage.clone(), migrations);
         runner.validate_applied().await?;
         runner.run_pending().await?;
         let schema_version = runner.current_version().await;
-        tracing::debug!("[client.new] migration done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::info!("[client.new] migration done {} ms", crate::time_utils::system_time_now_ms() - _t_mig);
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::debug!("[client.new] keys start");
+        tracing::info!("[client.new] keys start");
         let mut stored_keys = storage.read_keys(&config.namespace).await?;
         if stored_keys.is_empty() {
             // Introduce a small random delay and re-read, to handle concurrent initialization races
@@ -277,23 +277,23 @@ impl VaultSyncClient {
             }
         }
 
-        tracing::debug!("[client.new] keys done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::info!("[client.new] keys done {} ms", crate::time_utils::system_time_now_ms() - _t);
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::debug!("[client.new] e2ee+subs+reconciler start");
+        tracing::info!("[client.new] e2ee+subs+reconciler start");
         let encryptor = Arc::new(E2eeEncryptor::new(keyring.clone()));
         let decryptor = Arc::new(E2eeDecryptor::new(keyring.clone()));
 
         let subscriptions = Arc::new(std::sync::Mutex::new(SubscriptionEngine::new()));
         let reconciler = Arc::new(Reconciler::new(storage.clone(), subscriptions.clone()));
-        tracing::debug!("[client.new] e2ee+subs+reconciler done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::info!("[client.new] e2ee+subs+reconciler done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::debug!("[client.new] oplog init start");
+        tracing::info!("[client.new] oplog init start");
         let oplog = Arc::new(OpLog::new(storage.clone(), &config.namespace));
-        tracing::debug!("[client.new] oplog init done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::info!("[client.new] oplog init done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::debug!("[client.new] read_sync_state start");
+        tracing::info!("[client.new] read_sync_state start");
         let last_sequence = match storage.read_sync_state(&config.namespace).await? {
             Some(state) => {
                 #[cfg(target_arch = "wasm32")]
@@ -317,7 +317,7 @@ impl VaultSyncClient {
         };
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::debug!("[client.new] queue init start");
+        tracing::info!("[client.new] queue init start");
         let metrics = Arc::new(crate::telemetry::metrics::VaultSyncMetrics::new());
         let debug_api = Arc::new(crate::telemetry::debug::DebugApi::new(
             storage.clone(),
@@ -359,8 +359,10 @@ impl VaultSyncClient {
             config.max_clock_skew,
             config.replica_id.clone(),
         ));
-        tracing::debug!("[client.new] queue init done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::info!("[client.new] queue init done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
+        let _t = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] schema loading start");
         let schema = Arc::new(std::sync::Mutex::new(SchemaRegistry::new()));
         // Load persisted schemas from storage (collect data before locking)
         let schemas_from_storage: Vec<(String, Vec<u8>)> = {
@@ -381,6 +383,7 @@ impl VaultSyncClient {
                 }
             }
         }
+        tracing::info!("[client.new] schema loading done {} ms", crate::time_utils::system_time_now_ms() - _t);
         let _telemetry = Arc::new(VaultSyncTelemetry::new());
 
         #[cfg(target_arch = "wasm32")]
@@ -391,7 +394,7 @@ impl VaultSyncClient {
 
         // Perform crash recovery on startup before starting the sync loop
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::debug!("[client.new] crash_recovery start");
+        tracing::info!("[client.new] crash_recovery start");
         let crash_recovery = crate::ipc::crash_recovery::CrashRecovery::new(
             storage.clone(),
             config.namespace.clone(),
@@ -399,15 +402,15 @@ impl VaultSyncClient {
         if let Err(e) = crash_recovery.recover(keyring.clone()).await {
             tracing::error!(error = %e, "Crash recovery failed during startup");
         }
-        tracing::debug!("[client.new] crash_recovery done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::info!("[client.new] crash_recovery done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::debug!("[client.new] leader_election start");
+        tracing::info!("[client.new] leader_election start");
         let leader_election = Arc::new(crate::ipc::leader_election::LeaderElection::new(
             &config.namespace,
             &config.storage,
         ));
-        tracing::debug!("[client.new] leader_election done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::info!("[client.new] leader_election done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         #[cfg(not(target_arch = "wasm32"))]
         let mut p2p_handle = None;
@@ -452,14 +455,14 @@ impl VaultSyncClient {
         }
 
         let _t = crate::time_utils::system_time_now_ms();
-        tracing::debug!("[client.new] shared_memory start");
+        tracing::info!("[client.new] shared_memory start");
         let shared_memory = Arc::new(
             crate::ipc::shared_memory::SharedMemory::create_with_namespace(
                 &config.namespace,
                 64 * 1024,
             )?,
         );
-        tracing::debug!("[client.new] shared_memory done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::info!("[client.new] shared_memory done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let _t = crate::time_utils::system_time_now_ms();
         #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
@@ -506,10 +509,13 @@ impl VaultSyncClient {
             pending_count_rx: std::sync::Mutex::new(Some(pending_count_rx)),
             download_worker_rx: std::sync::Mutex::new(Some(download_event_rx)),
         };
-        tracing::debug!("[client.new] construction done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::info!("[client.new] construction done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         // Initialize pending count cache from storage
+        let _t_pc = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] pending_count start");
         let initial_pending = upload_queue.pending_count().await.unwrap_or(0);
+        tracing::info!("[client.new] pending_count done {} ms initial_pending={}", crate::time_utils::system_time_now_ms() - _t_pc, initial_pending);
         pending_cache.store(initial_pending, std::sync::atomic::Ordering::Relaxed);
 
         let namespace_clone = client.config.namespace.clone();
@@ -900,6 +906,7 @@ impl VaultSyncClient {
                         break;
                     }
                     Some(Some(m)) => {
+                        let push_start = crate::time_utils::system_time_now_ms();
                         tracing::info!(
                             "[download_worker] push seq={} id={}",
                             m.sequence,
@@ -907,8 +914,10 @@ impl VaultSyncClient {
                         );
                         match dq.process_push_mutation(m).await {
                             Ok(outcome) => {
-                                tracing::debug!(
-                                    "[download_worker] push outcome={:?}",
+                                let push_elapsed = crate::time_utils::system_time_now_ms() - push_start;
+                                tracing::trace!(
+                                    "[download_worker] push elapsed={}ms outcome={:?}",
+                                    push_elapsed,
                                     outcome
                                 );
                                 needs_backfill = outcome == crate::sync::download::PushOutcome::GapDetected;
@@ -917,8 +926,10 @@ impl VaultSyncClient {
                                 }
                             }
                             Err(e) => {
+                                let push_elapsed = crate::time_utils::system_time_now_ms() - push_start;
                                 tracing::warn!(
-                                    "[download_worker] process_push_mutation error: {:?}",
+                                    "[download_worker] process_push_mutation error elapsed={}ms: {:?}",
+                                    push_elapsed,
                                     e
                                 );
                             }
@@ -931,20 +942,25 @@ impl VaultSyncClient {
 
                 if needs_backfill {
                     loop {
+                        let batch_start = crate::time_utils::system_time_now_ms();
                         match dq.process_batch().await {
                             Ok(0) => {
                                 tracing::trace!("[download_worker] process_batch -> 0");
                                 break;
                             }
                             Ok(count) => {
+                                let batch_elapsed = crate::time_utils::system_time_now_ms() - batch_start;
                                 tracing::info!(
-                                    "[download_worker] process_batch -> {}",
-                                    count
+                                    "[download_worker] process_batch -> {} ({:.0}ms)",
+                                    count,
+                                    batch_elapsed
                                 );
                             }
                             Err(e) => {
+                                let batch_elapsed = crate::time_utils::system_time_now_ms() - batch_start;
                                 tracing::warn!(
-                                    "[download_worker] process_batch error {:?}",
+                                    "[download_worker] process_batch error elapsed={}ms: {:?}",
+                                    batch_elapsed,
                                     e
                                 );
                                 break;

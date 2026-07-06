@@ -665,14 +665,18 @@ impl WasmWsCoordinator {
         request_id: &str,
         payload: &T,
     ) -> Result<Vec<u8>, CoordinatorError> {
+        tracing::trace!("[send_request] create oneshot channel req={}", request_id);
         let (tx, rx) = oneshot::channel::<Vec<u8>>();
         {
             let mut reqs = self.inner.pending_requests.lock().unwrap();
             reqs.insert(request_id.to_string(), tx);
+            tracing::trace!("[send_request] inserted pending req={} pending_count={}", request_id, reqs.len());
         }
 
+        tracing::trace!("[send_request] encode frame start req={}", request_id);
         let frame = encode_frame(msg_type, payload)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        tracing::trace!("[send_request] encode frame done req={} frame_len={}", request_id, frame.len());
 
         {
             let state = self.inner.connection.lock().unwrap();
@@ -681,17 +685,18 @@ impl WasmWsCoordinator {
                     console_trace!("[ws] sending frame req={} type={:02X}", request_id, msg_type);
                     ws.send_with_u8_array(&frame)
                         .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+                    tracing::trace!("[send_request] frame sent req={}", request_id);
                 } else {
-                    console_trace!("[ws] send_request NOT_AVAILABLE (ready_state={}) req={}", ws.ready_state(), request_id);
+                    tracing::trace!("[send_request] NOT_AVAILABLE (ready_state={}) req={}", ws.ready_state(), request_id);
                     return Err(CoordinatorError::NotAvailable);
                 }
             } else {
-                console_trace!("[ws] send_request NOT_AVAILABLE (no ws) req={}", request_id);
+                tracing::trace!("[send_request] NOT_AVAILABLE (no ws) req={}", request_id);
                 return Err(CoordinatorError::NotAvailable);
             }
         }
 
-        console_trace!("[ws] waiting for response req={}", request_id);
+        tracing::trace!("[send_request] awaiting response req={}", request_id);
         let timeout =
             vaultsync_core::time_utils::sleep(std::time::Duration::from_secs(10));
 
@@ -700,10 +705,12 @@ impl WasmWsCoordinator {
 
         match futures::future::select(rx, timeout).await {
             Either::Left((Ok(resp), _)) => {
+                tracing::trace!("[send_request] response received req={} resp_len={}", request_id, resp.len());
                 Ok(resp)
             }
 
             Either::Left((Err(_), _)) => {
+                tracing::trace!("[send_request] cancelled req={}", request_id);
                 Err(CoordinatorError::Internal("request cancelled".into()))
             }
 
@@ -775,13 +782,19 @@ impl Coordinator for WasmWsCoordinator {
             mutations,
         };
 
+        tracing::trace!("[WasmWs] push: send_request start req_id={}", req_id);
         let resp_bin = self.send_request(MSG_PUSH, &req_id, &payload).await?;
+        tracing::trace!("[WasmWs] push: send_request done resp_len={}", resp_bin.len());
+        tracing::trace!("[WasmWs] push: decode_frame start");
         let (msg_type, payload) =
             decode_frame(&resp_bin).map_err(|e| CoordinatorError::Internal(e))?;
+        tracing::trace!("[WasmWs] push: decode_frame done msg_type={:02X}", msg_type);
 
         if msg_type == MSG_PUSH_ACK {
+            tracing::trace!("[WasmWs] push: parse ack start");
             let ack: PushAckPayload = serde_json::from_slice(payload)
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            tracing::trace!("[WasmWs] push: parse ack done seq_count={}", ack.sequences.len());
             if let Some(err) = ack.error {
                 console_warn!("[WasmWs] push failed with error: {}", err);
                 return Err(CoordinatorError::Internal(err));
@@ -792,6 +805,7 @@ impl Coordinator for WasmWsCoordinator {
                     ack.sequences
                 );
             }
+            tracing::trace!("[WasmWs] push: return sequences ok");
             Ok(ack.sequences)
         } else {
             console_warn!("[WasmWs] push got invalid response type: {:02X}", msg_type);
