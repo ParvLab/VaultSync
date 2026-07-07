@@ -38,10 +38,7 @@ pub async fn try_migrate_from_v1(
         }
         Ok(None) => Ok(false),
         Err(e) => {
-            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                "[migrate] v1 index found but error: {:?}",
-                e
-            )));
+            engine_info!("[migrate] v1 index found but error: {:?}", e);
             Ok(false)
         }
     }
@@ -86,7 +83,7 @@ async fn migrate_index_to_pages(
     db_dir: &FileSystemDirectoryHandle,
     index: &V1Index,
 ) -> Result<(), VaultSyncError> {
-    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+    engine_info!(
         "[migrate] migrating {} oplog entries, {} docs, {} sync_states, {} schemas, {} migrations, {} keys",
         index.oplog.len(),
         index.doc_listing.values().map(|v| v.len()).sum::<usize>(),
@@ -94,7 +91,7 @@ async fn migrate_index_to_pages(
         index.schemas.len(),
         index.migrations.len(),
         index.keys.len(),
-    )));
+    );
 
     let stores = PagesDir::open(db_dir).await?;
 

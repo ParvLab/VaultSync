@@ -513,20 +513,12 @@ impl Storage for IndexedDbStorage {
             .cloned()
             .collect();
         let ids: Vec<&str> = pending.iter().map(|e| e.id.as_str()).collect();
-        web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[PENDING_READ:IDB] ns={} count={} ids={:?}",
-            namespace,
-            pending.len(),
-            ids,
-        )));
+        engine_debug!("[PENDING_READ:IDB] ns={} count={} ids={:?}", namespace, pending.len(), ids);
         Ok(pending)
     }
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), VaultSyncError> {
-        web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[MARK_SYNCED:IDB] id={} seq={}",
-            id, sequence,
-        )));
+        engine_debug!("[MARK_SYNCED:IDB] id={} seq={}", id, sequence);
         let _guard = self.tx_lock.lock().await;
         let mut index = self.get_fresh_index().await?;
         let before_ids: Vec<String> = index
@@ -539,16 +531,9 @@ impl Storage for IndexedDbStorage {
             let old_status = format!("{:?}", entry.sync_status);
             entry.sync_status = vaultsync_core::oplog::entry::SyncStatus::Synced;
             entry.sequence = Some(sequence);
-            web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
-                "[MARK_SYNCED:IDB] found id={} old_status={} origin={:?} ctx={}",
-                id, old_status, entry.origin, entry.origin_context,
-            )));
+            engine_debug!("[MARK_SYNCED:IDB] found id={} old_status={} origin={:?} ctx={}", id, old_status, entry.origin, entry.origin_context);
         } else {
-            web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
-                "[MARK_SYNCED:IDB] NOT FOUND id={} in oplog (oplog_len={})",
-                id,
-                index.oplog.len(),
-            )));
+            engine_debug!("[MARK_SYNCED:IDB] NOT FOUND id={} in oplog (oplog_len={})", id, index.oplog.len());
         }
         self.flush_index(&index).await?;
         let mut guard = self.index.lock().unwrap();
@@ -560,10 +545,7 @@ impl Storage for IndexedDbStorage {
             .map(|e| e.id.clone())
             .collect();
         drop(guard);
-        web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[MARK_SYNCED:IDB] done id={} pending_before={:?} pending_after={:?}",
-            id, before_ids, after_ids,
-        )));
+        engine_debug!("[MARK_SYNCED:IDB] done id={} pending_before={:?} pending_after={:?}", id, before_ids, after_ids);
         Ok(())
     }
 
@@ -601,10 +583,7 @@ impl Storage for IndexedDbStorage {
     }
 
     async fn write_sync_state(&self, state: &SyncState) -> Result<(), VaultSyncError> {
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[IDB.write_sync_state] ns={} cursor={} gen={}",
-            state.namespace, state.last_synced_sequence, state.generation_id
-        )));
+        engine_debug!("[IDB.write_sync_state] ns={} cursor={} gen={}", state.namespace, state.last_synced_sequence, state.generation_id);
         let _guard = self.tx_lock.lock().await;
         let mut index = self.get_fresh_index().await?;
         index

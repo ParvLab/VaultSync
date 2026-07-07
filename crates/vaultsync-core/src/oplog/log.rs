@@ -1,6 +1,7 @@
 use crate::error::VaultSyncError;
 use crate::oplog::entry::OplogEntry;
 use crate::storage::traits::Storage;
+use crate::storage::transaction::StorageTransaction;
 use std::sync::Arc;
 
 pub struct OpLog {
@@ -58,15 +59,15 @@ impl OpLog {
     }
 
     pub async fn count_pending(&self) -> Result<usize, VaultSyncError> {
-        Ok(self
-            .storage
-            .read_pending_oplog(&self.namespace, 50000)
-            .await?
-            .len())
+        self.storage.pending_count(&self.namespace).await
     }
 
     pub async fn delete_compacted(&self, _before_sequence: u64) -> Result<usize, VaultSyncError> {
         Ok(0)
+    }
+
+    pub async fn begin_transaction(&self) -> Result<Box<dyn StorageTransaction>, VaultSyncError> {
+        self.storage.begin_transaction().await
     }
 
     pub fn namespace(&self) -> &str {

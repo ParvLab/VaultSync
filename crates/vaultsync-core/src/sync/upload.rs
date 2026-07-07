@@ -70,6 +70,16 @@ impl UploadQueue {
             entries.len(),
         );
 
+        let first_ids: Vec<&str> = entries.iter().take(3).map(|e| e.id.as_str()).collect();
+        let first_sha = entries
+            .first()
+            .map(|e| hex::encode(&Sha256::digest(&e.yrs_update)[..8]))
+            .unwrap_or_default();
+        tracing::info!(
+            "[upload_batch] pending_before={} selected={} first_ids=[{}] sha256_first={}",
+            raw_count, entries.len(), first_ids.join(","), first_sha,
+        );
+
         for e in &entries {
             let yrs_sha256 = hex::encode(&Sha256::digest(&e.yrs_update)[..8]);
             let doc_id = &e.doc_id;
@@ -127,19 +137,44 @@ impl UploadQueue {
                 );
                 self.metrics
                     .set_connection_status(&self.oplog.namespace(), true);
-                for (entry, seq) in entries.iter().zip(sequences.iter()) {
-                    let t0 = crate::time_utils::system_time_now_ms();
-                    tracing::trace!(
-                        "[upload_queue] mark_synced begin id={} seq={}",
-                        entry.id, *seq,
-                    );
-                    self.oplog.mark_synced(&entry.id, *seq).await?;
-                    tracing::trace!(
-                        "[upload_queue] mark_synced done id={} elapsed={}ms",
-                        entry.id,
-                        crate::time_utils::system_time_now_ms() - t0,
-                    );
+
+                // Use a transaction for atomic batch marking
+                match self.oplog.begin_transaction().await {
+                    Ok(mut tx) => {
+                        for (entry, seq) in entries.iter().zip(sequences.iter()) {
+                            if let Err(e) = tx.mark_synced(&entry.id, *seq).await {
+                                tracing::warn!("[upload_queue] tx.mark_synced error: {:?}", e);
+                                // Fallback: mark individually
+                                for (entry, seq) in entries.iter().zip(sequences.iter()) {
+                                    self.oplog.mark_synced(&entry.id, *seq).await?;
+                                }
+                                break;
+                            }
+                        }
+                        match tx.commit().await {
+                            Ok(()) => {
+                                tracing::trace!(
+                                    "[upload_queue] tx.commit done count={}",
+                                    entries.len(),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("[upload_queue] tx.commit error: {:?}", e);
+                                // Fallback: mark individually
+                                for (entry, seq) in entries.iter().zip(sequences.iter()) {
+                                    self.oplog.mark_synced(&entry.id, *seq).await?;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Transaction not supported (e.g., InMemory storage) — mark individually
+                        for (entry, seq) in entries.iter().zip(sequences.iter()) {
+                            self.oplog.mark_synced(&entry.id, *seq).await?;
+                        }
+                    }
                 }
+
                 // Verify: re-read pending count to confirm mark_synced persisted
                 match self.oplog.count_pending().await {
                     Ok(remaining) => {
@@ -172,6 +207,10 @@ impl UploadQueue {
                     "[upload_queue] BATCH_DONE success={}",
                     entries.len(),
                 );
+                tracing::info!(
+                    "[upload_batch] batch_done acked={} sequences={:?}",
+                    entries.len(), sequences,
+                );
                 Ok(entries.len())
             }
             Err(CoordinatorError::NotAvailable) => {
@@ -182,7 +221,7 @@ impl UploadQueue {
                 self.metrics
                     .set_connection_status(&self.oplog.namespace(), false);
                 self.metrics.record_sync_error();
-                let failed_ids: Vec<String> = {
+                let failed_ids: Vec<(String, u32)> = {
                     let t0 = crate::time_utils::system_time_now_ms();
                     tracing::trace!("[upload_queue] retry_engine notavail lock begin");
                     let mut engine = self.retry_engine.lock().unwrap();
@@ -192,15 +231,16 @@ impl UploadQueue {
                     );
                     let mut exhausted = Vec::new();
                     for entry in &entries {
-                        if engine.record_failure(&entry.id).is_none() {
-                            exhausted.push(entry.id.clone());
+                        let remaining = engine.record_failure(&entry.id);
+                        if remaining.is_none() {
+                            exhausted.push((entry.id.clone(), engine.failure_count(&entry.id)));
                         }
                     }
                     exhausted
                 };
-                for id in failed_ids {
+                for (id, retry_count) in &failed_ids {
                     self.oplog
-                        .mark_failed(&id, "Coordinator not available: retry limit reached")
+                        .mark_failed(id, &format!("Coordinator not available ({} retries exhausted)", retry_count))
                         .await?;
                 }
                 Ok(0)

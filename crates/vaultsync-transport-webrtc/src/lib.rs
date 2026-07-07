@@ -521,6 +521,7 @@ mod tests {
                     public_key: vec![],
                     schema_version: 1,
                 },
+                0,
             )
             .await;
         assert!(matches!(reg_res, Err(CoordinatorError::NotSupported(_))));

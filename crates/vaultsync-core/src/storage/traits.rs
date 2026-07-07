@@ -1,5 +1,6 @@
 use crate::error::VaultSyncError;
 use crate::oplog::entry::OplogEntry;
+use crate::storage::transaction::StorageTransaction;
 use crate::sync::state::SyncState;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -148,6 +149,21 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
             self.insert_document(&doc_id, &record_id, &bytes).await?;
         }
         Ok(())
+    }
+
+    /// Get the count of pending (unsynced) oplog entries.
+    /// Default implementation falls back to scanning via `read_pending_oplog`.
+    async fn pending_count(&self, namespace: &str) -> Result<usize, VaultSyncError> {
+        Ok(self
+            .read_pending_oplog(namespace, 50000)
+            .await?
+            .len())
+    }
+
+    /// Begin a new storage transaction for atomic batch operations.
+    /// The default implementation is a no-op passthrough.
+    async fn begin_transaction(&self) -> Result<Box<dyn StorageTransaction>, VaultSyncError> {
+        Err(VaultSyncError::Storage("transactions not supported".into()))
     }
 
     /// Clone self as a boxed trait object.

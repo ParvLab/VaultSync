@@ -7,6 +7,13 @@ export function SyncBar() {
   const [isLeader, setIsLeader] = useState(false);
   const [showSyncing, setShowSyncing] = useState(false);
 
+  // Log badge changes for pending-count pipeline debugging
+  useEffect(() => {
+    if (status.pendingMutations > 0) {
+      console.debug(`[pending] badge pending=${status.pendingMutations} connected=${status.connected}`);
+    }
+  }, [status.pendingMutations, status.connected]);
+
   // Debounce: keep "Syncing..." visible for at least 1.5s after pending drops to 0
   useEffect(() => {
     if (status.pendingMutations > 0) {

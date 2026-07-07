@@ -7,7 +7,9 @@ use crate::sync::reconciler::Reconciler;
 use yrs::updates::decoder::Decode;
 use yrs::Update;
 use sha2::{Digest, Sha256};
+use crate::telemetry::log_data;
 use crate::telemetry::metrics::VaultSyncMetrics;
+use tracing::level_filters::LevelFilter;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
@@ -199,16 +201,20 @@ impl DownloadQueue {
             .decryptor
             .decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
-        // ── Phase 3 diagnostic: hash of decrypted pull payload (correlate with [upload_queue] entry log) ──
         let content_hash = hex::encode(&Sha256::digest(&decrypted_bytes)[..8]);
-        if let Ok(decoded) = Update::decode_v1(&decrypted_bytes) {
-            let sv = decoded.state_vector();
-            let sv_entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
-            tracing::trace!(
-                "[download_queue] pull_decrypted source=pull id={} seq={} sha256={} state_vector={:?} len={}",
-                m.id, m.sequence, content_hash, sv_entries, decrypted_bytes.len(),
-            );
-        }
+        let pull_sv: Option<Vec<(u64, u32)>> = log_data(LevelFilter::TRACE, || {
+            if let Ok(decoded) = Update::decode_v1(&decrypted_bytes) {
+                let sv = decoded.state_vector();
+                let entries: Vec<_> = sv.iter().map(|(&c, &cl)| (c, cl)).collect();
+                entries
+            } else {
+                Vec::new()
+            }
+        });
+        tracing::trace!(
+            "[download_queue] pull_decrypted source=pull id={} seq={} sha256={} state_vector={:?} len={}",
+            m.id, m.sequence, content_hash, pull_sv, decrypted_bytes.len(),
+        );
 
         let entry = OplogEntry::new(
                         m.id.clone(),
@@ -306,7 +312,7 @@ impl DownloadQueue {
                     count,
                 );
                 if count == 0 && after > 0 {
-                    tracing::warn!("[download_queue] cursor={} but pull returned empty", after);
+                    tracing::debug!("[download_queue] cursor={} but pull returned empty", after);
                 }
                 Ok(count)
             }
@@ -576,16 +582,20 @@ impl DownloadQueue {
             .decryptor
             .decrypt_symmetric(&m.encrypted_blob, &self.namespace)?;
 
-        // ── Phase 3 diagnostic: hash of decrypted push payload (correlate with [upload_queue] entry log) ──
         let content_hash = hex::encode(&Sha256::digest(&decrypted_bytes)[..8]);
-        if let Ok(decoded) = Update::decode_v1(&decrypted_bytes) {
-            let sv = decoded.state_vector();
-            let sv_entries: Vec<_> = sv.iter().map(|(c, cl)| (c, cl)).collect();
-            tracing::trace!(
-                "[download_queue] push_decrypted source=push id={} seq={} sha256={} state_vector={:?} len={}",
-                m.id, m.sequence, content_hash, sv_entries, decrypted_bytes.len(),
-            );
-        }
+        let push_sv: Option<Vec<(u64, u32)>> = log_data(LevelFilter::TRACE, || {
+            if let Ok(decoded) = Update::decode_v1(&decrypted_bytes) {
+                let sv = decoded.state_vector();
+                let entries: Vec<_> = sv.iter().map(|(&c, &cl)| (c, cl)).collect();
+                entries
+            } else {
+                Vec::new()
+            }
+        });
+        tracing::trace!(
+            "[download_queue] push_decrypted source=push id={} seq={} sha256={} state_vector={:?} len={}",
+            m.id, m.sequence, content_hash, push_sv, decrypted_bytes.len(),
+        );
 
         let entry = OplogEntry::new(
             m.id.clone(),

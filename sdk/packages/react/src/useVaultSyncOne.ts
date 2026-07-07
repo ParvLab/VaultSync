@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useVaultSyncClient } from './useVaultSyncClient.js';
 import type { RecordFields } from '@vaultsync/web';
 
@@ -7,6 +7,7 @@ export function useVaultSyncOne(docId: string, recordId: string) {
   const [data, setData] = useState<RecordFields | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
+  const revisionRef = useRef<string>('');
 
   useEffect(() => {
     let active = true;
@@ -15,6 +16,7 @@ export function useVaultSyncOne(docId: string, recordId: string) {
       try {
         const record = await client.get(docId, recordId);
         if (active) {
+          revisionRef.current = JSON.stringify(record);
           setData(record);
           setLoading(false);
         }
@@ -26,7 +28,6 @@ export function useVaultSyncOne(docId: string, recordId: string) {
       }
     }
 
-    // Register subscription FIRST so we don't miss fires from reconciler during startup
     let notifySeq = 0;
     const unsubscribe = client.subscribe(docId, async (changedRecordId: string) => {
       const seq = ++notifySeq;
@@ -35,6 +36,9 @@ export function useVaultSyncOne(docId: string, recordId: string) {
       if (changedRecordId === recordId) {
         try {
           const record = await client.get(docId, recordId);
+          const newRevision = JSON.stringify(record);
+          if (newRevision === revisionRef.current) return;
+          revisionRef.current = newRevision;
           console.debug(`[notify] seq=${seq} doc=${docId} record=${recordId} phase=react_setData_one t=${Date.now()}`);
           if (active) {
             setData(record);

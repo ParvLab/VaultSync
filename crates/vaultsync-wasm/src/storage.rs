@@ -4,11 +4,11 @@ use vaultsync_core::oplog::entry::{MutationType, OplogEntry, SyncStatus};
 use vaultsync_core::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use vaultsync_core::sync::state::SyncState;
 use vaultsync_core::VaultSyncError;
-use wasm_bindgen::JsValue;
 use web_sys::*;
 
 use crate::migration::{DocEntry, PagesDir};
 use crate::page_store::{PageId, PageStore};
+use crate::version_chain::VersionChain;
 
 #[derive(Debug, Clone)]
 pub struct OpfsStorage {
@@ -30,7 +30,7 @@ impl OpfsStorage {
 
         let migration_done = crate::migration::try_migrate_from_v1(db_name).await.unwrap_or(false);
         if migration_done {
-            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] v1→v2 migration complete"));
+            engine_info!("[opfs] v1→v2 migration complete");
         }
 
         let pages = PagesDir::open(&db_dir).await?;
@@ -206,7 +206,8 @@ impl Storage for OpfsStorage {
         let oplog_page_id = self.pages.oplog.allocate_page_id().await?;
         tracing::trace!("[OpfsStorage] write_document_and_oplog: allocate oplog page done id={}", oplog_page_id);
         tracing::trace!("[OpfsStorage] write_document_and_oplog: write oplog page start");
-        self.pages.oplog.write_page(oplog_page_id, &encoded_entry).await
+        self.pages.oplog.write_page(oplog_page_id, &encoded_entry).await?;
+        self.pages.oplog.adjust_pending_count(1).await
     }
 
     async fn delete_document_and_oplog(
@@ -219,14 +220,24 @@ impl Storage for OpfsStorage {
         let encoded = postcard::to_allocvec(&[entry.clone()])
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.pages.oplog.allocate_page_id().await?;
-        self.pages.oplog.write_page(page_id, &encoded).await
+        self.pages.oplog.write_page(page_id, &encoded).await?;
+        self.pages.oplog.adjust_pending_count(1).await
     }
 
     async fn append_oplog(&self, entry: &OplogEntry) -> Result<(), VaultSyncError> {
         let encoded = postcard::to_allocvec(&[entry.clone()])
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.pages.oplog.allocate_page_id().await?;
-        self.pages.oplog.write_page(page_id, &encoded).await
+        self.pages.oplog.write_page(page_id, &encoded).await?;
+        self.pages.oplog.adjust_pending_count(1).await
+    }
+
+    async fn pending_count(&self, _namespace: &str) -> Result<usize, VaultSyncError> {
+        Ok(self.pages.oplog.pending_count().await)
+    }
+
+    async fn begin_transaction(&self) -> Result<Box<dyn vaultsync_core::storage::transaction::StorageTransaction>, VaultSyncError> {
+        Ok(Box::new(crate::transaction::OpfsTransaction::new(&self.pages.oplog).await?))
     }
 
     async fn read_pending_oplog(
@@ -234,7 +245,7 @@ impl Storage for OpfsStorage {
         namespace: &str,
         limit: usize,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
-        let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
         let filtered: Vec<OplogEntry> = entries
             .into_iter()
             .filter(|e| e.namespace == namespace && e.sync_status.is_uploadable())
@@ -244,55 +255,69 @@ impl Storage for OpfsStorage {
     }
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), VaultSyncError> {
-        // Run deferred GC before accessing old pages.
-        self.pages.oplog.run_pending_gc().await?;
-
-        let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
-        let updated: Vec<OplogEntry> = entries
+        // Delta write: read only the entry to modify, write a small delta page.
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let mut updated: Vec<OplogEntry> = entries
             .into_iter()
-            .map(|mut e| {
-                if e.id == id {
-                    e.sync_status = SyncStatus::Synced;
-                    e.sequence = Some(sequence);
-                }
-                e
-            })
+            .filter(|e| e.id == id)
             .collect();
+        if updated.is_empty() {
+            return Ok(());
+        }
+        for e in &mut updated {
+            e.sync_status = SyncStatus::Synced;
+            e.sequence = Some(sequence);
+        }
         let encoded = postcard::to_allocvec(&updated)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.pages.oplog.allocate_page_id().await?;
         self.pages.oplog.write_page(page_id, &encoded).await?;
 
-        // Mark this page as the current full-state snapshot.
-        self.pages.oplog.set_current_page(page_id).await?;
-
-        // Schedule deferred cleanup of old pages (runs on next access).
+        // Delta page — do NOT update current_page. The base page stays canonical.
+        self.pages.oplog.adjust_pending_count(-1).await?;
         self.pages.oplog.schedule_gc();
+
+        // Verify persistence: re-read and log resolved status
+        let verify_entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let matched: Vec<_> = verify_entries.iter().filter(|e| e.id == id).collect();
+        let statuses: Vec<_> = matched.iter().map(|e| format!("{:?}", e.sync_status)).collect();
+        engine_info!(
+            "[mark_synced] id={} seq={} wrote_status=Synced read_back_count={} read_back_statuses=[{}]",
+            id, sequence, matched.len(), statuses.join(","),
+        );
 
         Ok(())
     }
 
-    async fn mark_failed(&self, id: &str, _error: &str) -> Result<(), VaultSyncError> {
-        self.pages.oplog.run_pending_gc().await?;
-        let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
-        let updated: Vec<OplogEntry> = entries
+    async fn mark_failed(&self, id: &str, error: &str) -> Result<(), VaultSyncError> {
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let mut updated: Vec<OplogEntry> = entries
             .into_iter()
-            .map(|mut e| {
-                if e.id == id {
-                    e.sync_status = SyncStatus::Failed;
-                }
-                e
-            })
+            .filter(|e| e.id == id)
             .collect();
+        if updated.is_empty() {
+            tracing::warn!("[mark_failed] id={}.. not found in storage, skipping", if id.len() >= 8 { &id[..8] } else { id });
+            return Ok(());
+        }
+        let before_status = format!("{:?}", updated[0].sync_status);
+        for e in &mut updated {
+            e.sync_status = SyncStatus::Failed;
+        }
         let encoded = postcard::to_allocvec(&updated)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.pages.oplog.allocate_page_id().await?;
         self.pages.oplog.write_page(page_id, &encoded).await?;
 
-        // Mark as current full-state and schedule deferred GC.
-        self.pages.oplog.set_current_page(page_id).await?;
+        self.pages.oplog.adjust_pending_count(-1).await?;
         self.pages.oplog.schedule_gc();
 
+        tracing::info!(
+            "[mark_failed] id={}.. before={} error={} page_id={}",
+            if id.len() >= 8 { &id[..8] } else { id },
+            before_status,
+            error,
+            page_id,
+        );
         Ok(())
     }
 
@@ -301,7 +326,7 @@ impl Storage for OpfsStorage {
         namespace: &str,
         seq: u64,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
-        let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
         let filtered: Vec<OplogEntry> = entries
             .into_iter()
             .filter(|e| e.namespace == namespace && e.sequence.map_or(false, |s| s > seq))
@@ -371,7 +396,7 @@ impl Storage for OpfsStorage {
     ) -> Result<usize, VaultSyncError> {
         self.pages.oplog.run_pending_gc().await?;
         let cutoff = (js_sys::Date::now() as u64).saturating_sub(older_than_secs * 1000);
-        let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
         let before = entries.len();
         let remaining: Vec<OplogEntry> = entries
             .into_iter()
@@ -401,7 +426,7 @@ impl Storage for OpfsStorage {
     ) -> Result<Vec<(String, String)>, VaultSyncError> {
         let now_ms = js_sys::Date::now() as u64;
         let threshold = now_ms.saturating_sub(older_than_secs * 1000);
-        let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
         let results: Vec<(String, String)> = entries
             .into_iter()
             .filter(|e| {
@@ -427,7 +452,7 @@ impl Storage for OpfsStorage {
         &self,
         namespace: &str,
     ) -> Result<Vec<(String, String)>, VaultSyncError> {
-        let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
         let mut seen = std::collections::HashSet::new();
         for entry in &entries {
             if entry.namespace == namespace {
@@ -443,7 +468,7 @@ impl Storage for OpfsStorage {
         doc_id: &str,
         record_id: &str,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
-        let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
         let results: Vec<OplogEntry> = entries
             .into_iter()
             .filter(|e| {
@@ -464,7 +489,7 @@ impl Storage for OpfsStorage {
         timestamp: u64,
     ) -> Result<usize, VaultSyncError> {
         self.pages.oplog.run_pending_gc().await?;
-        let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
         let before = entries.len();
         let remaining: Vec<OplogEntry> = entries
             .into_iter()
@@ -495,7 +520,7 @@ impl Storage for OpfsStorage {
         cutoff_ms: u64,
     ) -> Result<usize, VaultSyncError> {
         self.pages.oplog.run_pending_gc().await?;
-        let entries = read_all_entries::<OplogEntry>(&self.pages.oplog).await?;
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
         let before = entries.len();
         let remaining: Vec<OplogEntry> = entries
             .into_iter()
@@ -522,22 +547,22 @@ impl Storage for OpfsStorage {
 async fn read_all_entries<T: serde::de::DeserializeOwned + serde::Serialize>(
     store: &PageStore,
 ) -> Result<Vec<T>, VaultSyncError> {
-    web_sys::console::info_1(&"[storage] read_all_entries: reading current_page".into());
+    engine_debug!("[storage] read_all_entries: reading current_page");
     let current = store.current_page().await;
-    web_sys::console::info_1(&format!("[storage] read_all_entries: current_page={}", current).into());
+    engine_debug!("[storage] read_all_entries: current_page={}", current);
 
-    web_sys::console::info_1(&"[storage] read_all_entries: listing page_ids".into());
+    engine_debug!("[storage] read_all_entries: listing page_ids");
     let page_ids = match store.list_page_ids().await {
         Ok(ids) => ids,
         Err(e) => {
-            web_sys::console::error_1(&format!("[storage] list_page_ids failed: {:?}", e).into());
+            engine_error!("[storage] list_page_ids failed: {:?}", e);
             return Ok(Vec::new());
         }
     };
-    web_sys::console::info_1(&format!("[storage] read_all_entries: page_ids.len={}", page_ids.len()).into());
+    engine_debug!("[storage] read_all_entries: page_ids.len={}", page_ids.len());
 
     // If manifest knows the current full-state page, only read that page
-    // plus any pages written after it (individual entries not yet consolidated).
+    // plus any pages written after it (delta pages).
     let ids_to_read: Vec<PageId> = if current > 0 {
         page_ids.into_iter().filter(|id| *id >= current).collect()
     } else {
@@ -545,31 +570,30 @@ async fn read_all_entries<T: serde::de::DeserializeOwned + serde::Serialize>(
     };
 
     let total = ids_to_read.len();
-    web_sys::console::info_1(&format!("[storage] read_all_entries: ids_to_read={}", total).into());
+    engine_debug!("[storage] read_all_entries: ids_to_read={}", total);
 
     let mut all = Vec::new();
     let mut next_log_pct = 10u8;
     let mut read_errors = 0usize;
     for (i, id) in ids_to_read.iter().enumerate() {
-        // Progress log every 10% for large scans (no current_page = legacy store)
+        // Progress log at INFO every 10% for large scans (no current_page = legacy store)
         if current == 0 && total > 100 {
             let pct = ((i + 1) * 100 / total) as u8;
             if pct >= next_log_pct {
                 next_log_pct = pct + 10;
-                web_sys::console::info_1(
-                    &format!("[storage] scanning page {}/{} ({}%)", i + 1, total, pct).into(),
-                );
+                engine_info!("[storage] scanning page {}/{} ({}%)", i + 1, total, pct);
             }
         }
         // Gracefully handle individual page read/parse errors
         match store.read_page(*id).await {
             Ok(Some(data)) => {
-                // Size guard: skip pages > 10MB to prevent OOM or corrupt data
-                if data.len() > 10_000_000 {
-                    web_sys::console::warn_1(
-                        &format!("[storage] page {} oversized ({} bytes), skipping", id, data.len()).into(),
-                    );
-                    continue;
+                // Size guard: pages > 16MB trigger emergency split; attempt read regardless.
+                // This guard is a circuit breaker, not a data filter — we never silently skip.
+                if data.len() > 16_000_000 {
+                    engine_warn!("[storage] page {} oversized ({} bytes), attempting read", id, data.len());
+                } else if data.len() > 8_000_000 {
+                    engine_debug!("[storage] page {} large ({} bytes), scheduling background split", id, data.len());
+                    store.schedule_split(id).await;
                 }
                 if let Ok(chunk) = postcard::from_bytes::<Vec<T>>(&data) {
                     all.extend(chunk);
@@ -581,53 +605,78 @@ async fn read_all_entries<T: serde::de::DeserializeOwned + serde::Serialize>(
             Err(e) => {
                 read_errors += 1;
                 if read_errors <= 3 {
-                    web_sys::console::warn_1(
-                        &format!("[storage] read_page {} error: {:?}", id, e).into(),
-                    );
+                    engine_warn!("[storage] read_page {} error: {:?}", id, e);
                 }
                 if read_errors == 3 {
-                    web_sys::console::warn_1(&JsValue::from_str("[storage] suppressing further read_page errors"));
+                    engine_warn!("[storage] suppressing further read_page errors");
                 }
             }
         }
     }
 
     if read_errors > 0 {
-        web_sys::console::warn_1(
-            &format!("[storage] read_all_entries: {} page read errors", read_errors).into(),
-        );
-    }
-
-    // First-time consolidation: if no current_page was set, merge all entries
-    // into a single consolidated page so subsequent reads skip the full scan.
-    if current == 0 && !all.is_empty() {
-        if let Err(e) = consolidate_all(store, &all).await {
-            web_sys::console::error_1(&format!("[storage] consolidation failed: {:?}", e).into());
-        }
+        engine_warn!("[storage] read_all_entries: {} page read errors", read_errors);
     }
 
     Ok(all)
 }
 
-/// Write all entries as a single consolidated page and update the manifest.
-async fn consolidate_all<T: serde::Serialize>(
+/// Read all oplog entries, resolving base + delta pages via VersionChain.
+pub async fn read_all_oplog_entries(
     store: &PageStore,
-    all: &[T],
-) -> Result<(), VaultSyncError> {
-    let encoded = postcard::to_allocvec(all)
-        .map_err(|e| VaultSyncError::Storage(format!("consolidate encode: {:?}", e)))?;
-    web_sys::console::info_1(
-        &format!("[storage] consolidating {} entries into 1 page ({} bytes)", all.len(), encoded.len()).into(),
-    );
-    let new_id = store.allocate_page_id().await?;
-    if let Err(e) = store.write_page(new_id, &encoded).await {
-        web_sys::console::error_1(&format!("[storage] write_page for consolidation failed: {:?}", e).into());
-        return Err(e);
+) -> Result<Vec<OplogEntry>, VaultSyncError> {
+    let current = store.current_page().await;
+    let mut page_ids = store.list_page_ids().await.unwrap_or_default();
+    page_ids.sort_unstable();
+
+    if current == 0 || page_ids.is_empty() {
+        // No base page — fall back to generic read (append-only store)
+        // Use the qualified path to avoid recursion.
+        return self::read_all_entries::<OplogEntry>(store).await;
     }
-    store.set_current_page(new_id).await?;
-    store.schedule_gc();
-    web_sys::console::info_1(&format!("[storage] consolidation done page_id={}", new_id).into());
-    Ok(())
+
+    let deltas: Vec<PageId> = page_ids.iter().filter(|id| **id > current).copied().collect();
+    let total_pages = page_ids.len();
+    let mut chain = VersionChain::new(current);
+    for d in &deltas {
+        chain.add_delta(*d);
+    }
+    let resolved = chain.resolve(store).await?;
+
+    // Instrumentation: detect stuck entries that survive VersionChain merge
+    let uploadable: Vec<_> = resolved.iter().filter(|e| e.sync_status.is_uploadable()).collect();
+    if !uploadable.is_empty() {
+        let first_stuck = uploadable[0];
+        let stuck_id_short = if first_stuck.id.len() >= 8 { &first_stuck.id[..8] } else { &first_stuck.id };
+        engine_info!(
+            "[version_chain] current_page={} total_pages={} deltas={} resolved={} uploadable={} first_stuck_id={}.. first_stuck_status={:?}",
+            current, total_pages, deltas.len(), resolved.len(), uploadable.len(),
+            stuck_id_short, first_stuck.sync_status,
+        );
+
+        // Dump raw page entries for the first stuck entry to expose merge failure
+        for pid in &page_ids {
+            if let Ok(Some(data)) = store.read_page(*pid).await {
+                if let Ok(chunk) = postcard::from_bytes::<Vec<OplogEntry>>(&data) {
+                    for e in chunk.iter().filter(|e| e.id == first_stuck.id) {
+                        engine_info!(
+                            "[page_entry] page={} id={}.. status={:?} seq={:?}",
+                            pid, stuck_id_short, e.sync_status, e.sequence,
+                        );
+                    }
+                } else if let Ok(single) = postcard::from_bytes::<OplogEntry>(&data) {
+                    if single.id == first_stuck.id {
+                        engine_info!(
+                            "[page_entry] page={} id={}.. status={:?} seq={:?}",
+                            pid, stuck_id_short, single.sync_status, single.sequence,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(resolved)
 }
 
 use crate::indexeddb::IndexedDbStorage;
@@ -649,10 +698,7 @@ impl BrowserStorage {
     }
 
     pub async fn new(db_name: &str, backend: Option<&str>) -> Result<Self, VaultSyncError> {
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[Rust] BrowserStorage::new: db_name={}, requested_backend={:?}",
-            db_name, backend
-        )));
+        engine_debug!("[Rust] BrowserStorage::new: db_name={}, requested_backend={:?}", db_name, backend);
 
         match backend {
             Some("opfs") => {
@@ -667,10 +713,7 @@ impl BrowserStorage {
                 match OpfsStorage::new(db_name).await {
                     Ok(opfs) => Ok(Self::Opfs(opfs)),
                     Err(e) => {
-                        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                            "[Rust] OPFS unavailable, falling back to IndexedDB: {:?}",
-                            e
-                        )));
+                        engine_info!("[Rust] OPFS unavailable, falling back to IndexedDB: {:?}", e);
                         let idb = IndexedDbStorage::new(db_name).await?;
                         Ok(Self::Idb(idb))
                     }
@@ -754,6 +797,20 @@ impl Storage for BrowserStorage {
         match self {
             Self::Opfs(s) => s.append_oplog(entry).await,
             Self::Idb(s) => s.append_oplog(entry).await,
+        }
+    }
+
+    async fn pending_count(&self, namespace: &str) -> Result<usize, VaultSyncError> {
+        match self {
+            Self::Opfs(s) => s.pending_count(namespace).await,
+            Self::Idb(s) => s.pending_count(namespace).await,
+        }
+    }
+
+    async fn begin_transaction(&self) -> Result<Box<dyn vaultsync_core::storage::transaction::StorageTransaction>, VaultSyncError> {
+        match self {
+            Self::Opfs(s) => s.begin_transaction().await,
+            Self::Idb(s) => s.begin_transaction().await,
         }
     }
 

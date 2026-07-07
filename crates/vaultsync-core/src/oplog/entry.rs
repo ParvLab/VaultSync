@@ -124,7 +124,7 @@ impl OplogEntry {
             );
         }
         #[cfg(not(debug_assertions))]
-        tracing::info!(
+        tracing::debug!(
             "CREATE OPLOG id={} status={:?} origin={:?} ctx={}",
             entry.id,
             entry.sync_status,

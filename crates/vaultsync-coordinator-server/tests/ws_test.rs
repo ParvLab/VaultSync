@@ -27,6 +27,8 @@ async fn spawn_test_server(
         db_url: "".to_string(),
         auth_token,
         admin_token,
+        auto_compact_ns: String::new(),
+        auto_compact_interval_minutes: 0,
     };
 
     let coordinator =
@@ -44,6 +46,7 @@ async fn spawn_test_server(
         token_store,
         config,
         sessions: Default::default(),
+        generation_id: "test".to_string(),
     };
 
     let app = build_router(state);
@@ -321,6 +324,8 @@ async fn test_mux_reconnect() {
             db_url: "".to_string(),
             auth_token: None,
             admin_token: None,
+            auto_compact_ns: String::new(),
+            auto_compact_interval_minutes: 0,
         };
         let coordinator =
             Arc::new(vaultsync_coordinator_memory::coordinator::InMemoryCoordinator::new());
@@ -329,6 +334,7 @@ async fn test_mux_reconnect() {
             token_store: None,
             config,
             sessions: Default::default(),
+            generation_id: "test".to_string(),
         };
         let app = build_router(state);
         tokio::spawn(async move {

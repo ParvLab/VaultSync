@@ -1,6 +1,7 @@
 use crate::storage::BrowserStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use vaultsync_core::coordinator::memory::InMemoryCoordinator;
 use vaultsync_core::crdt::types::CrdtValue;
 use vaultsync_core::e2ee::keyring::KeyRing;
@@ -13,41 +14,14 @@ use vaultsync_core::replication::planner::ReplicationPlanner;
 use vaultsync_core::event_bus::EventBus;
 use vaultsync_core::VaultSyncClient;
 use vaultsync_core::VaultSyncConfig;
+use futures::stream::StreamExt;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 #[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = console, js_name = log)]
-    fn console_log_str(s: &str);
-    #[wasm_bindgen(js_namespace = console, js_name = debug)]
-    fn console_debug_str(s: &str);
-    #[wasm_bindgen(js_namespace = console, js_name = trace)]
-    fn console_trace_str(s: &str);
-    #[wasm_bindgen(js_namespace = console, js_name = warn)]
-    fn console_warn_str(s: &str);
-    #[wasm_bindgen(js_namespace = console, js_name = error)]
-    fn console_error_str(s: &str);
-}
-
-macro_rules! console_error {
-    ($($t:tt)*) => (console_error_str(&format!($($t)*)));
-}
-
-macro_rules! console_log {
-    ($($t:tt)*) => (console_log_str(&format!($($t)*)));
-}
-
-macro_rules! console_debug {
-    ($($t:tt)*) => (console_debug_str(&format!($($t)*)));
-}
-
-macro_rules! console_trace {
-    ($($t:tt)*) => (console_trace_str(&format!($($t)*)));
-}
-
-macro_rules! console_warn {
-    ($($t:tt)*) => (console_warn_str(&format!($($t)*)));
+#[repr(u32)]
+pub enum ClientEvent {
+    StatusDirty = 0,
 }
 
 #[wasm_bindgen]
@@ -61,6 +35,7 @@ pub struct WasmVaultSyncClient {
     presence: Option<crate::presence::PresenceManager>,
     cross_tab_channel: Option<web_sys::BroadcastChannel>,
     tab_id: String,
+    event_callback: Arc<Mutex<Option<SendFunction>>>,
 }
 
 #[wasm_bindgen]
@@ -93,10 +68,10 @@ impl WasmVaultSyncClient {
         match storage.cleanup_tombstoned_pages().await {
             Ok(n) => {
                 if n > 0 {
-                    console_debug!("[cleanup] removed {} tombstoned pages", n);
+                    engine_debug!("[cleanup] removed {} tombstoned pages", n);
                 }
             }
-            Err(e) => console_warn!("[cleanup] tombstoned page cleanup: {:?}", e),
+            Err(e) => engine_warn!("[cleanup] tombstoned page cleanup: {:?}", e),
         }
 
         let storage_manager: Arc<dyn StorageManager> = Arc::new(
@@ -114,7 +89,7 @@ impl WasmVaultSyncClient {
         let client = match VaultSyncClient::new_with_storage(config, coordinator, keyring, storage).await {
             Ok(c) => Arc::new(c),
             Err(e) => {
-                console_error!("Offline client construction failed: {:?}", e);
+                engine_error!("Offline client construction failed: {:?}", e);
                 return Err(JsValue::from_str(&format!("Client failed: {:?}", e)));
             }
         };
@@ -123,19 +98,20 @@ impl WasmVaultSyncClient {
         let _ = client.leader_election.try_acquire();
         for _ in 0..30 {
             if client.leader_election.is_leader() {
-                console_debug!("[LeaderElection] Leadership acquired for tab={}", replica_id);
+                engine_debug!("[LeaderElection] Leadership acquired for tab={}", replica_id);
                 break;
             }
             vaultsync_core::time_utils::sleep(std::time::Duration::from_millis(50)).await;
         }
         if !client.leader_election.is_leader() {
-            console_debug!("[LeaderElection] Acting as follower for tab={}", replica_id);
+            engine_debug!("[LeaderElection] Acting as follower for tab={}", replica_id);
         }
 
         let channel_name = format!("vaultsync-ipc-{}", namespace);
         let cross_tab_channel = web_sys::BroadcastChannel::new(&channel_name).ok();
 
-        Ok(Self {
+        let event_callback: Arc<Mutex<Option<SendFunction>>> = Arc::new(Mutex::new(None));
+        let result = Self {
             client,
             storage_manager,
             workspace_manager,
@@ -145,7 +121,12 @@ impl WasmVaultSyncClient {
             presence: None,
             cross_tab_channel,
             tab_id: replica_id.to_string(),
-        })
+            event_callback,
+        };
+
+        Self::spawn_pending_listener(&result);
+
+        Ok(result)
     }
 
     pub async fn new_with_coordinator(
@@ -159,7 +140,7 @@ impl WasmVaultSyncClient {
         let _t0 = js_sys::Date::now();
         let t = || -> f64 { js_sys::Date::now() - _t0 };
         let phase_log = |name: &str| {
-            console_log!("[{:.0} ms] {}", t(), name);
+            engine_info!("[{:.0} ms] {}", t(), name);
         };
         phase_log("startup");
         let mut config = VaultSyncConfig::default();
@@ -183,10 +164,10 @@ impl WasmVaultSyncClient {
         match storage.cleanup_tombstoned_pages().await {
             Ok(n) => {
                 if n > 0 {
-                    console_debug!("[cleanup] removed {} tombstoned pages", n);
+                    engine_debug!("[cleanup] removed {} tombstoned pages", n);
                 }
             }
-            Err(e) => console_warn!("[cleanup] tombstoned page cleanup: {:?}", e),
+            Err(e) => engine_warn!("[cleanup] tombstoned page cleanup: {:?}", e),
         }
 
         let storage_manager: Arc<dyn StorageManager> = Arc::new(
@@ -225,7 +206,7 @@ impl WasmVaultSyncClient {
                 Arc::new(client)
             }
             Err(e) => {
-                console_error!("Client construction failed: {:?}", e);
+                engine_error!("Client construction failed: {:?}", e);
                 return Err(JsValue::from_str(&format!("Client failed: {:?}", e)));
             }
         };
@@ -238,7 +219,7 @@ impl WasmVaultSyncClient {
         // Now start WS connection (background processor starts here, sender already set)
         phase_log("initialize start");
         if let Err(e) = client.initialize().await {
-            console_error!("Initialize failed: {:?}", e);
+            engine_error!("Initialize failed: {:?}", e);
             return Err(JsValue::from_str(&format!("Initialize failed: {:?}", e)));
         }
         phase_log("initialize done");
@@ -264,27 +245,33 @@ impl WasmVaultSyncClient {
         }
         let le_elapsed = (js_sys::Date::now() - le_t0) as u64;
         if client.leader_election.is_leader() {
-            console_log!("[{:.0} ms] leader election acquired attempts={} elapsed={}ms", t(), le_attempts, le_elapsed);
+            engine_info!("[{:.0} ms] leader election acquired attempts={} elapsed={}ms", t(), le_attempts, le_elapsed);
         } else {
-            console_debug!("[LeaderElection] Acting as follower for tab={} attempts={} elapsed={}ms", replica_id, le_attempts, le_elapsed);
+            engine_debug!("[LeaderElection] Acting as follower for tab={} attempts={} elapsed={}ms", replica_id, le_attempts, le_elapsed);
         }
 
-        console_log!("[{:.0} ms] READY", t());
+        engine_info!("[{:.0} ms] READY", t());
 
         let channel_name = format!("vaultsync-ipc-{}", namespace);
         let cross_tab_channel = web_sys::BroadcastChannel::new(&channel_name).ok();
 
-        Ok(Self {
+        let event_callback: Arc<Mutex<Option<SendFunction>>> = Arc::new(Mutex::new(None));
+        let result = Self {
             client,
             storage_manager,
             workspace_manager,
             working_set_manager,
             replication_planner,
             event_bus,
-            presence,
+            presence: None,
             cross_tab_channel,
             tab_id: replica_id.to_string(),
-        })
+            event_callback,
+        };
+
+        Self::spawn_pending_listener(&result);
+
+        Ok(result)
     }
 
     fn broadcast_invalidation(&self, doc_id: &str, record_id: &str) {
@@ -295,14 +282,14 @@ impl WasmVaultSyncClient {
             let _ = js_sys::Reflect::set(&msg, &"record_id".into(), &record_id.into());
             let _ = js_sys::Reflect::set(&msg, &"tab_id".into(), &self.tab_id.clone().into());
             if let Ok(json) = js_sys::JSON::stringify(&msg) {
-                console_debug!(
+                engine_debug!(
                     "[BC invalidate] tab_id={} doc_id={} record_id={} payload={}",
                     self.tab_id, doc_id, record_id, json,
                 );
                 let _ = bc.post_message(&json);
             }
         } else {
-            console_debug!("[BC invalidate] skipped (no channel) tab_id={} doc_id={} record_id={}", self.tab_id, doc_id, record_id);
+            engine_debug!("[BC invalidate] skipped (no channel) tab_id={} doc_id={} record_id={}", self.tab_id, doc_id, record_id);
         }
     }
 
@@ -317,14 +304,14 @@ impl WasmVaultSyncClient {
             let request_id = uuid::Uuid::new_v4().to_string();
             let _ = js_sys::Reflect::set(&msg, &"request_id".into(), &request_id.clone().into());
             if let Ok(json_str) = js_sys::JSON::stringify(&msg) {
-                console_debug!(
+                engine_debug!(
                     "[BC command] verb={} tab_id={} doc_id={} record_id={} request_id={}",
                     verb, self.tab_id, doc_id, record_id, request_id,
                 );
                 let _ = bc.post_message(&json_str);
             }
         } else {
-            console_debug!("[BC command] skipped (no channel) verb={} tab_id={} doc_id={} record_id={}", verb, self.tab_id, doc_id, record_id);
+            engine_debug!("[BC command] skipped (no channel) verb={} tab_id={} doc_id={} record_id={}", verb, self.tab_id, doc_id, record_id);
         }
     }
 
@@ -337,7 +324,7 @@ impl WasmVaultSyncClient {
         record_id: &str,
         json: &str,
     ) -> Result<(), JsValue> {
-        console_debug!("[leader] handle_command verb={} doc={} record={} tab={}", verb, doc_id, record_id, self.tab_id);
+        engine_debug!("[leader] handle_command verb={} doc={} record={} tab={}", verb, doc_id, record_id, self.tab_id);
         let t0 = web_sys::window()
             .and_then(|w| w.performance())
             .map(|p| p.now())
@@ -346,13 +333,13 @@ impl WasmVaultSyncClient {
             "insert" => {
                 let fields = json_to_fields(json)?;
                 let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
-                console_trace!("[BC] LEADER_INSERT_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), safe_utf8_slice(json, 300));
+                engine_trace!("[BC] LEADER_INSERT_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), safe_utf8_slice(json, 300));
                 self.client.insert(doc_id, record_id, fields).await
             }
             "update" => {
                 let fields = json_to_fields(json)?;
                 let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
-                console_trace!("[BC] LEADER_UPDATE_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), safe_utf8_slice(json, 300));
+                engine_trace!("[BC] LEADER_UPDATE_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), safe_utf8_slice(json, 300));
                 self.client.update(doc_id, record_id, fields).await
             }
             "delete" => self.client.delete(doc_id, record_id).await,
@@ -364,12 +351,12 @@ impl WasmVaultSyncClient {
             .unwrap_or(0.0);
         match result {
             Ok(()) => {
-                console_debug!("[leader] command done verb={} doc={} record={} elapsed={:.1}ms", verb, doc_id, record_id, elapsed);
+                engine_debug!("[leader] command done verb={} doc={} record={} elapsed={:.1}ms", verb, doc_id, record_id, elapsed);
                 self.broadcast_invalidation(doc_id, record_id);
                 Ok(())
             }
             Err(e) => {
-                console_warn!("[leader] command failed verb={} doc={} record={} elapsed={:.1}ms err={:?}", verb, doc_id, record_id, elapsed, e);
+                engine_warn!("[leader] command failed verb={} doc={} record={} elapsed={:.1}ms err={:?}", verb, doc_id, record_id, elapsed, e);
                 Err(JsValue::from_str(&format!("Command {} failed: {:?}", verb, e)))
             }
         }
@@ -385,7 +372,7 @@ impl WasmVaultSyncClient {
             self.broadcast_invalidation(doc_id, record_id);
             Ok(())
         } else {
-            console_trace!("[BC] FOLLOW_INSERT_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), safe_utf8_slice(json, 500));
+            engine_trace!("[BC] FOLLOW_INSERT_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), safe_utf8_slice(json, 500));
             self.send_command("insert", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
                 self.client.fire_local_subscription(doc_id, record_id, &fields);
@@ -404,7 +391,7 @@ impl WasmVaultSyncClient {
             self.broadcast_invalidation(doc_id, record_id);
             Ok(())
         } else {
-            console_trace!("[BC] FOLLOW_UPDATE_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), safe_utf8_slice(json, 500));
+            engine_trace!("[BC] FOLLOW_UPDATE_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), safe_utf8_slice(json, 500));
             self.send_command("update", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
                 self.client.fire_local_subscription(doc_id, record_id, &fields);
@@ -422,14 +409,14 @@ impl WasmVaultSyncClient {
             self.broadcast_invalidation(doc_id, record_id);
             Ok(())
         } else {
-            console_debug!("[Follower delete] sending command doc={} record={}", doc_id, record_id);
+            engine_debug!("[Follower delete] sending command doc={} record={}", doc_id, record_id);
             self.send_command("delete", doc_id, record_id, "");
             Ok(())
         }
     }
 
     pub async fn get(&self, doc_id: &str, record_id: &str) -> Result<JsValue, JsValue> {
-        console_debug!("[get] doc={} record={}", doc_id, record_id);
+        engine_debug!("[get] doc={} record={}", doc_id, record_id);
         let doc_opt = self
             .client
             .get(doc_id, record_id)
@@ -472,24 +459,24 @@ impl WasmVaultSyncClient {
         match self.client.get(doc_id, record_id).await {
             Ok(Some(state)) => {
                 let keys: Vec<String> = state.keys().cloned().collect();
-                console_debug!(
+                engine_debug!(
                     "[BC fire_subscription] doc={} record={} fields={} keys={:?}",
                     doc_id, record_id, state.len(), keys,
                 );
                 self.client.fire_local_subscription(doc_id, record_id, &state);
             }
             Ok(None) => {
-                console_debug!("[BC fire_subscription] doc={} record={} not_found=true", doc_id, record_id);
+                engine_debug!("[BC fire_subscription] doc={} record={} not_found=true", doc_id, record_id);
             }
             Err(e) => {
-                console_debug!("[BC fire_subscription] doc={} record={} error={:?}", doc_id, record_id, e);
+                engine_debug!("[BC fire_subscription] doc={} record={} error={:?}", doc_id, record_id, e);
             }
         }
         Ok(())
     }
 
     pub async fn find(&self, doc_id: &str) -> Result<js_sys::Array, JsValue> {
-        console_debug!("[timing] find call doc={} t={:.0}ms", doc_id, js_sys::Date::now());
+        engine_debug!("[timing] find call doc={} t={:.0}ms", doc_id, js_sys::Date::now());
         let records = self
             .client
             .find(doc_id, None)
@@ -530,6 +517,7 @@ impl WasmVaultSyncClient {
             .pending_uploads()
             .await
             .map_err(|e| JsValue::from_str(&format!("Pending uploads failed: {:?}", e)))?;
+        engine_debug!("[pending] js_query returns={}", pending);
 
         let connected =
             state.connection_status != vaultsync_core::sync::state::ConnectionStatus::Disconnected;
@@ -568,15 +556,45 @@ impl WasmVaultSyncClient {
         Ok(JsValue::from_str(&json_str))
     }
 
+    pub fn on_event(&self, callback: js_sys::Function) {
+        *self.event_callback.lock().unwrap() = Some(SendFunction(JsValue::from(callback)));
+    }
+
+    fn spawn_pending_listener(this: &Self) {
+        if let Some(mut rx) = this.client.take_pending_count_rx() {
+            let cb = this.event_callback.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                while let Some(count) = rx.next().await {
+                    engine_trace!("[event] pending_count={}", count);
+                    let func = {
+                        let guard = cb.lock().unwrap();
+                        guard.as_ref().map(|sf| sf.0.clone())
+                    };
+                    match func {
+                        Some(val) => {
+                            let f: js_sys::Function = val.unchecked_into();
+                            let _ = f.call1(
+                                &JsValue::NULL,
+                                &JsValue::from(ClientEvent::StatusDirty as u32),
+                            );
+                        }
+                        None => break,
+                    }
+                }
+                engine_debug!("[event] pending_listener ended");
+            });
+        }
+    }
+
     pub fn subscribe(&self, doc_id: &str, callback: js_sys::Function) -> WasmSubscriptionHandle {
-        console_debug!("[timing] subscribe call doc={} t={:.0}ms", doc_id, js_sys::Date::now());
+        engine_debug!("[timing] subscribe call doc={} t={:.0}ms", doc_id, js_sys::Date::now());
         static NOTIFY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let send_cb = SendFunction(JsValue::from(callback));
         let handle = self.client.subscribe(
             doc_id,
             Box::new(move |_doc_id, record_id, fields| {
                 let notify_seq = NOTIFY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                console_debug!(
+                engine_debug!(
                     "[notify] seq={} record={} phase=wasm_callback t={:.0}ms",
                     notify_seq,
                     record_id,
@@ -601,14 +619,14 @@ impl WasmVaultSyncClient {
                     let cb_clone = send_cb.0.clone();
                     let seq = notify_seq;
                     wasm_bindgen_futures::spawn_local(async move {
-                        console_debug!(
+                        engine_debug!(
                             "[notify] seq={} record={} phase=spawn_local t={:.0}ms",
                             seq,
                             record_id_owned,
                             js_sys::Date::now()
                         );
                         if cb_clone.is_null() || cb_clone.is_undefined() {
-                            console_warn!("[notify] seq={} record={} null_callback=true", seq, record_id_owned);
+                            engine_warn!("[notify] seq={} record={} null_callback=true", seq, record_id_owned);
                             return;
                         }
                         let func: js_sys::Function = cb_clone.unchecked_into();
@@ -616,7 +634,7 @@ impl WasmVaultSyncClient {
                         let json_js = JsValue::from_str(&json_str);
                         let seq_js = JsValue::from_f64(seq as f64);
                         if let Err(e) = func.call3(&JsValue::NULL, &record_id_js, &json_js, &seq_js) {
-                            console_error!("[notify] seq={} record={} callback_error={:?}", seq, record_id_owned, e);
+                            engine_error!("[notify] seq={} record={} callback_error={:?}", seq, record_id_owned, e);
                         }
                     });
                 }

@@ -18,6 +18,7 @@ export class SyncStatusObservable {
     this.intervalId = setInterval(async () => {
       try {
         const status = await this.client.syncStatus();
+        console.debug(`[pending] sdk_poll pendingMutations=${status.pendingMutations}`);
         if (
           !this.lastStatus ||
           this.lastStatus.connected !== status.connected ||

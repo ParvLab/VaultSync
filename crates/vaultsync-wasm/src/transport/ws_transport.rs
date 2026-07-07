@@ -13,19 +13,9 @@ use vaultsync_core::coordinator::ws_proto::*;
 use vaultsync_core::transport::traits::{
     InboundMutation, Transport, TransportError, TransportSource,
 };
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{BinaryType, MessageEvent, WebSocket};
-
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = console, js_name = log)]
-    fn console_log_str(s: &str);
-}
-
-macro_rules! log {
-    ($($t:tt)*) => (console_log_str(&format!($($t)*)));
-}
 
 /// WebSocket transport for cross-device mutation exchange
 ///
@@ -81,7 +71,7 @@ impl WasmWsTransport {
     /// Connect to the WebSocket server
     pub async fn connect(&self, namespace: &str) -> Result<WebSocket, CoordinatorError> {
         let ws_url = get_ws_url(&self.inner.url, namespace);
-        log!("[WasmWs] connecting to url={}", ws_url);
+        engine_debug!("[WasmWs] connecting to url={}", ws_url);
         let ws = WebSocket::new(&ws_url)
             .map_err(|e| CoordinatorError::Internal(format!("Failed to create WebSocket: {:?}", e)))?;
         ws.set_binary_type(BinaryType::Arraybuffer);
@@ -91,7 +81,7 @@ impl WasmWsTransport {
             let (open_tx, open_rx) = oneshot::channel::<()>();
             let open_tx_cell = std::cell::RefCell::new(Some(open_tx));
             let open_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-                log!("[WasmWs] WebSocket opened!");
+                engine_debug!("[WasmWs] WebSocket opened!");
                 if let Some(tx) = open_tx_cell.borrow_mut().take() {
                     let _ = tx.send(());
                 }
@@ -103,7 +93,7 @@ impl WasmWsTransport {
             let close_tx_cell = std::cell::RefCell::new(Some(close_tx));
             let inner_clone = self.inner.clone();
             let close_callback = Closure::wrap(Box::new(move |e: web_sys::Event| {
-                log!("[WasmWs] WebSocket closed/failed: {:?}", e);
+                engine_debug!("[WasmWs] WebSocket closed/failed: {:?}", e);
                 if let Some(tx) = close_tx_cell.borrow_mut().take() {
                     let _ = tx.send(());
                 }
@@ -117,10 +107,10 @@ impl WasmWsTransport {
 
         futures::select! {
             _ = open_rx.fuse() => {
-                log!("[WasmWs] connected!");
+                engine_debug!("[WasmWs] connected!");
             }
             _ = close_rx.fuse() => {
-                log!("[WasmWs] connection failed!");
+                engine_debug!("[WasmWs] connection failed!");
                 return Err(CoordinatorError::NotAvailable);
             }
         }

@@ -17,6 +17,10 @@ export type { MetricsSnapshot } from './types.js';
 
 const instancePromises = new Map<string, Promise<VaultSyncClient>>();
 
+export const ClientEvent = {
+    StatusDirty: 0,
+} as const;
+
 export class VaultSyncClient {
   private inner: any;
   private _keys?: KeyManager;
@@ -26,6 +30,7 @@ export class VaultSyncClient {
   private tabId: string;
   private commandQueue: Promise<void> = Promise.resolve();
   private subscriptionCache = new Map<string, { unsub: () => void; callbacks: Set<SubscriptionCallback> }>();
+  private eventListeners = new Set<(event: number) => void>();
 
   private constructor(inner: any, namespace: string, replicaId: string) {
     this.inner = inner;
@@ -153,6 +158,14 @@ export class VaultSyncClient {
 
       const client = new VaultSyncClient(inner, config.namespace, config.replicaId);
       client.setupBroadcastChannel(config.namespace);
+
+      // Wire event bridge: Rust → JS
+      inner.on_event((eventType: number) => {
+        for (const listener of client.eventListeners) {
+          listener(eventType);
+        }
+      });
+
       return client;
     })();
 
@@ -243,6 +256,11 @@ export class VaultSyncClient {
         this.subscriptionCache.delete(docId);
       }
     };
+  }
+
+  onEvent(listener: (event: number) => void): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
   }
 
   isLeader(): boolean {

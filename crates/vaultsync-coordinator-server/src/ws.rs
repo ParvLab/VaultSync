@@ -345,7 +345,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                     MSG_PUSH => {
                         if let Ok(push) = serde_json::from_slice::<PushPayload>(payload) {
                             let req_id = push.request_id.clone();
-                            tracing::info!(
+                            tracing::debug!(
                                 "[ws] MSG_PUSH received count={} req={}",
                                 push.mutations.len(),
                                 req_id
@@ -355,7 +355,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                                 Ok(seqs) => (seqs, None),
                                 Err(e) => (vec![], Some(format!("{:?}", e))),
                             };
-                            tracing::info!("[ws] MSG_PUSH stored, sending ACK req={}", req_id);
+                            tracing::debug!("[ws] MSG_PUSH stored, sending ACK req={}", req_id);
                             let ack = PushAckPayload {
                                 request_id: push.request_id,
                                 sequences: sequences.clone(),

@@ -1,8 +1,9 @@
 use js_sys::Uint8Array;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use vaultsync_core::time_utils::SendJsFuture;
+use vaultsync_core::oplog::entry::OplogEntry;
 use vaultsync_core::VaultSyncError;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::*;
@@ -71,6 +72,7 @@ pub struct PageStore {
     dir: Arc<FileSystemDirectoryHandle>,
     store_name: Arc<String>,
     gc_needed: Arc<AtomicBool>,
+    split_pending: Arc<AtomicBool>,
 }
 
 impl Clone for PageStore {
@@ -79,6 +81,7 @@ impl Clone for PageStore {
             dir: Arc::clone(&self.dir),
             store_name: Arc::clone(&self.store_name),
             gc_needed: Arc::clone(&self.gc_needed),
+            split_pending: Arc::clone(&self.split_pending),
         }
     }
 }
@@ -101,6 +104,7 @@ impl PageStore {
             dir: Arc::new(dir),
             store_name: Arc::new(store_name.to_string()),
             gc_needed: Arc::new(AtomicBool::new(false)),
+            split_pending: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -120,15 +124,55 @@ impl PageStore {
         Ok(page_id)
     }
 
+    /// Write raw page data without any split checks. Used by split_page internally.
+    async fn write_page_raw(&self, page_id: PageId, data: &[u8]) -> Result<(), VaultSyncError> {
+        // Log what we're about to write
+        if let Ok(entries) = postcard::from_bytes::<Vec<OplogEntry>>(data) {
+            let first_status = entries.first().map(|e| format!("{:?}", e.sync_status)).unwrap_or_default();
+            let first_id_short = entries.first().map(|e| if e.id.len() >= 8 { &e.id[..8] } else { &e.id }).unwrap_or("?").to_string();
+            let first_seq = entries.first().and_then(|e| e.sequence).unwrap_or(0);
+            tracing::info!(
+                "[write_page_raw] page={} entries={} first_id={}.. first_status={} first_seq={} bytes={}",
+                page_id, entries.len(), first_id_short, first_status, first_seq, data.len(),
+            );
+        } else if let Ok(entry) = postcard::from_bytes::<OplogEntry>(data) {
+            let id_short = if entry.id.len() >= 8 { &entry.id[..8] } else { &entry.id }.to_string();
+            tracing::info!(
+                "[write_page_raw] page={} entries=1 id={}.. status={:?} seq={:?} bytes={}",
+                page_id, id_short, entry.sync_status, entry.sequence, data.len(),
+            );
+        }
+        let buf = encode_v3_page(data, 0)?;
+        write_file(&self.dir, &page_filename(page_id), &buf).await?;
+        self.bump_manifest_live_page(page_id).await?;
+        tracing::info!("[write_page_raw] done page={}", page_id);
+        Ok(())
+    }
+
     pub async fn write_page(
         &self,
         page_id: PageId,
         data: &[u8],
     ) -> Result<(), VaultSyncError> {
-        let buf = encode_v3_page(data, 0)?;
-        write_file(&self.dir, &page_filename(page_id), &buf).await?;
-        self.bump_manifest_live_page(page_id).await?;
-        Ok(())
+        // Phase 2: Bounded Pages — check multi-metric thresholds.
+        let entry_count = Self::estimate_entry_count(data);
+
+        // Hard threshold: synchronous emergency split before write.
+        if data.len() > Self::HARD_SPLIT_BYTES || entry_count > Self::MAX_ENTRIES_PER_PAGE * 2 {
+            engine_warn!("[page_store] emergency split page {}: {} bytes, ~{} entries", page_id, data.len(), entry_count);
+            // Write to a temporary page, split it, and return instead of writing the oversized page.
+            let tmp_id = self.allocate_page_id().await?;
+            self.write_page_raw(tmp_id, data).await?;
+            return self.split_page(tmp_id).await;
+        }
+
+        // Soft threshold: schedule background split.
+        if data.len() > Self::SOFT_SPLIT_BYTES || entry_count > Self::MAX_ENTRIES_PER_PAGE {
+            engine_debug!("[page_store] scheduling background split for page {}: {} bytes, ~{} entries", page_id, data.len(), entry_count);
+            self.split_pending.store(true, Ordering::Release);
+        }
+
+        self.write_page_raw(page_id, data).await
     }
 
     pub async fn write_page_verify(
@@ -413,6 +457,145 @@ impl PageStore {
     /// Mark that GC is needed (called after a full-state rewrite).
     pub fn schedule_gc(&self) {
         self.gc_needed.store(true, Ordering::Release);
+    }
+
+    // ── Page splitting (Phase 2: Bounded Pages) ──────────────────────
+
+    /// Thresholds for page splitting.
+    const TARGET_PAGE_BYTES: usize = 4_000_000;
+    const SOFT_SPLIT_BYTES: usize = 8_000_000;
+    const HARD_SPLIT_BYTES: usize = 16_000_000;
+    const MAX_ENTRIES_PER_PAGE: usize = 4096;
+
+    /// Check whether a page should be split based on multiple metrics.
+    pub fn should_split(&self, data: &[u8], entry_count_hint: usize) -> bool {
+        data.len() > Self::HARD_SPLIT_BYTES
+            || entry_count_hint > Self::MAX_ENTRIES_PER_PAGE
+            || data.len() > Self::SOFT_SPLIT_BYTES
+    }
+
+    /// Estimate the number of entries in a postcard-encoded page.
+    /// Tries to decode as Vec<T> first; if that fails, estimates from byte length.
+    fn estimate_entry_count(data: &[u8]) -> usize {
+        // Try to decode as Vec<OplogEntry> (the most common case)
+        if let Ok(vec) = postcard::from_bytes::<Vec<vaultsync_core::oplog::entry::OplogEntry>>(data) {
+            return vec.len();
+        }
+        // Fallback: assume average entry size of ~256 bytes
+        if data.is_empty() {
+            return 0;
+        }
+        std::cmp::max(1, data.len() / 256)
+    }
+
+    /// Read a page, split its entries into two balanced pages, write both, and GC the original.
+    pub async fn split_page(&self, page_id: PageId) -> Result<(), VaultSyncError> {
+        let data = match self.read_page(page_id).await? {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+
+        // Try to split entries evenly
+        let entries: Vec<Vec<u8>> = if let Ok(vec) = postcard::from_bytes::<Vec<vaultsync_core::oplog::entry::OplogEntry>>(&data) {
+            let mid = vec.len() / 2;
+            let left: Vec<_> = vec[..mid].to_vec();
+            let right: Vec<_> = vec[mid..].to_vec();
+            vec![
+                postcard::to_allocvec(&left).map_err(|e| VaultSyncError::Storage(format!("split encode left: {:?}", e)))?,
+                postcard::to_allocvec(&right).map_err(|e| VaultSyncError::Storage(format!("split encode right: {:?}", e)))?,
+            ]
+        } else {
+            // Cannot decode — skip splitting this page
+            engine_warn!("[page_store] cannot split page {}: not a Vec<OplogEntry>", page_id);
+            return Ok(());
+        };
+
+        if entries.len() != 2 {
+            return Ok(());
+        }
+
+        let left_id = self.allocate_page_id().await?;
+        let right_id = self.allocate_page_id().await?;
+
+        self.write_page_raw(left_id, &entries[0]).await?;
+        self.write_page_raw(right_id, &entries[1]).await?;
+
+        self.tombstone_page(page_id).await?;
+
+        engine_debug!("[page_store] split page {} -> {} and {}", page_id, left_id, right_id);
+        Ok(())
+    }
+
+    /// Run pending page splits (triggered by write_page for oversized data).
+    pub async fn run_pending_split(&self) -> Result<usize, VaultSyncError> {
+        if !self.is_split_pending() {
+            return Ok(0);
+        }
+
+        let page_ids = self.list_page_ids().await?;
+        let mut split_count = 0usize;
+
+        for id in &page_ids {
+            if let Some(data) = self.read_page(*id).await? {
+                let entry_count = Self::estimate_entry_count(&data);
+                if data.len() > Self::SOFT_SPLIT_BYTES || entry_count > Self::MAX_ENTRIES_PER_PAGE {
+                    if let Err(e) = self.split_page(*id).await {
+                        engine_warn!("[page_store] split page {} failed: {:?}", id, e);
+                    } else {
+                        split_count += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(split_count)
+    }
+
+    /// Schedule a background page split for an oversized page.
+    pub async fn schedule_split(&self, page_id: &PageId) {
+        self.split_pending.store(true, Ordering::Release);
+    }
+
+    /// Check and clear the split-pending flag.
+    pub fn is_split_pending(&self) -> bool {
+        self.split_pending.swap(false, Ordering::Acquire)
+    }
+
+    /// Get pending count from manifest.
+    pub async fn pending_count(&self) -> usize {
+        let count = read_manifest(&self.dir)
+            .await
+            .map(|m| m.pending_count)
+            .unwrap_or(0);
+        engine_trace!("[pending] manifest pending_count={}", count);
+        count
+    }
+
+    /// Set pending count in manifest atomically.
+    pub async fn set_pending_count(&self, count: usize) -> Result<(), VaultSyncError> {
+        let manifest = read_manifest(&self.dir).await;
+        let mut m = match manifest {
+            Some(m) if m.verify() => m,
+            _ => StoreManifest::new(),
+        };
+        m.pending_count = count;
+        m.updated_at = js_sys::Date::now() as u64;
+        write_manifest(&self.dir, &m).await
+    }
+
+    /// Adjust pending count by a delta (positive or negative).
+    pub async fn adjust_pending_count(&self, delta: i32) -> Result<(), VaultSyncError> {
+        let manifest = read_manifest(&self.dir).await;
+        let before = manifest.as_ref().map(|m| m.pending_count).unwrap_or(0);
+        let mut m = match manifest {
+            Some(m) if m.verify() => m,
+            _ => StoreManifest::new(),
+        };
+        m.pending_count = (m.pending_count as i32).saturating_add(delta) as usize;
+        m.updated_at = js_sys::Date::now() as u64;
+        write_manifest(&self.dir, &m).await?;
+        engine_trace!("[pending] manifest_write before={} delta={} after={}", before, delta, m.pending_count);
+        Ok(())
     }
 
     /// Run pending GC if any — deletes pages older than the current full-state page.

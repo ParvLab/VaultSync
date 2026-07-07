@@ -1,23 +1,7 @@
 #[cfg(target_arch = "wasm32")]
+use std::sync::atomic::Ordering;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
-
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = console, js_name = log)]
-    fn console_log_str(s: &str);
-}
-
-#[cfg(target_arch = "wasm32")]
-use std::sync::atomic::{AtomicU8, Ordering};
-
-#[cfg(target_arch = "wasm32")]
-static LOG_LEVEL: AtomicU8 = AtomicU8::new(3); // 0=Off, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace
-
-#[cfg(target_arch = "wasm32")]
-pub fn set_log_level(level: u8) {
-    LOG_LEVEL.store(level.min(5), Ordering::SeqCst);
-}
 
 #[cfg(target_arch = "wasm32")]
 struct ConsoleSubscriber;
@@ -25,7 +9,7 @@ struct ConsoleSubscriber;
 #[cfg(target_arch = "wasm32")]
 impl tracing::Subscriber for ConsoleSubscriber {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        let level = LOG_LEVEL.load(Ordering::Relaxed);
+        let level = crate::log::LOG_LEVEL.load(Ordering::Relaxed);
         if level == 0 { return false; }
         let event_level = match *metadata.level() {
             tracing::Level::ERROR => 1,
@@ -66,7 +50,7 @@ impl tracing::Subscriber for ConsoleSubscriber {
             message: String::new(),
         };
         event.record(&mut visitor);
-        console_log_str(&format!("[Rust] {}", visitor.message));
+        crate::log::raw_console(&format!("[Rust] {}", visitor.message));
     }
 
     fn enter(&self, _span: &tracing::span::Id) {}
@@ -76,19 +60,55 @@ impl tracing::Subscriber for ConsoleSubscriber {
 
 pub const BUILD_ID: &str = concat!(env!("VAULTSYNC_BUILD_DATE"), "-", env!("VAULTSYNC_GIT_HASH"));
 
+#[macro_export]
+macro_rules! engine_trace {
+    ($($arg:tt)*) => {
+        if $crate::log::enabled($crate::log::LogLevel::Trace) {
+            $crate::log::trace(&format!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! engine_debug {
+    ($($arg:tt)*) => {
+        if $crate::log::enabled($crate::log::LogLevel::Debug) {
+            $crate::log::debug(&format!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! engine_info {
+    ($($arg:tt)*) => {
+        if $crate::log::enabled($crate::log::LogLevel::Info) {
+            $crate::log::info(&format!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! engine_warn {
+    ($($arg:tt)*) => {
+        if $crate::log::enabled($crate::log::LogLevel::Warn) {
+            $crate::log::warn(&format!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! engine_error {
+    ($($arg:tt)*) => {
+        if $crate::log::enabled($crate::log::LogLevel::Error) {
+            $crate::log::error(&format!($($arg)*));
+        }
+    };
+}
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn set_log_level_from_str(level: &str) {
-    let lvl = match level.to_lowercase().as_str() {
-        "off" => 0,
-        "error" => 1,
-        "warn" => 2,
-        "info" => 3,
-        "debug" => 4,
-        "trace" => 5,
-        _ => 3,
-    };
-    set_log_level(lvl);
+    crate::log::set_level_from_str(level);
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -101,6 +121,8 @@ pub fn init() {
     tracing::warn!("================================================");
 }
 
+#[cfg(target_arch = "wasm32")]
+pub mod log;
 #[cfg(target_arch = "wasm32")]
 pub mod client;
 #[cfg(target_arch = "wasm32")]
@@ -117,6 +139,10 @@ pub mod presence;
 pub mod migration;
 #[cfg(target_arch = "wasm32")]
 pub mod page_store;
+#[cfg(target_arch = "wasm32")]
+pub mod version_chain;
+#[cfg(target_arch = "wasm32")]
+pub mod transaction;
 #[cfg(target_arch = "wasm32")]
 pub mod storage;
 #[cfg(target_arch = "wasm32")]

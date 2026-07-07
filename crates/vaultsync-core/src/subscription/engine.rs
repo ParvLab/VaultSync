@@ -103,7 +103,7 @@ impl SubscriptionEngine {
         self.fire_count += 1;
         let seq = self.fire_count;
         let listeners = self.listener_count(doc_id);
-        tracing::info!(
+        tracing::debug!(
             "[subscription] fire seq={} source={} doc={} record={} listeners={}",
             seq,
             source,

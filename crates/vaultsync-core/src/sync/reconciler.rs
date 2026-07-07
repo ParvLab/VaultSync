@@ -3,10 +3,12 @@ use crate::error::VaultSyncError;
 use crate::oplog::entry::OplogEntry;
 use crate::storage::traits::Storage;
 use crate::subscription::engine::{FireSource, SubscriptionEngine};
+use crate::telemetry::log_data;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use tracing::level_filters::LevelFilter;
 use yrs::updates::decoder::Decode;
 use yrs::Update;
 use sha2::{Digest, Sha256};
@@ -114,25 +116,25 @@ impl Reconciler {
             source, doc_exists, old_len,
         );
 
-        // ── Phase 1 diagnostic: state vector before apply ──
         let old_sv = doc.state_vector();
         let old_entries: Vec<_> = old_sv.iter().map(|(c, cl)| (c, cl)).collect();
-        tracing::trace!(
-            "[reconciler] old_state_vector source={} entries={:?}",
-            source, old_entries,
-        );
 
-        // ── Phase 4 diagnostic: log actual document text before apply ──
-        let before_map = doc.to_map();
-        let before_title = before_map.get("title").map(|v| v.to_truncated(80)).unwrap_or_default();
-        let before_body = before_map.get("body").map(|v| v.to_truncated(80)).unwrap_or_default();
-        let before_updated_at = before_map.get("updatedAt").map(|v| v.to_truncated(80)).unwrap_or_default();
+        let before_diag = log_data(LevelFilter::TRACE, || {
+            let m = doc.to_map();
+            (
+                m.get("title").map(|v| v.to_truncated(80)).unwrap_or_default(),
+                m.get("body").map(|v| v.to_truncated(80)).unwrap_or_default(),
+                m.get("updatedAt").map(|v| v.to_truncated(80)).unwrap_or_default(),
+            )
+        });
         tracing::trace!(
             "[reconciler] doc_before source={} doc={} record={} title={} body={} updatedAt={}",
-            source, entry.doc_id, entry.record_id, before_title, before_body, before_updated_at,
+            source, entry.doc_id, entry.record_id,
+            before_diag.as_ref().map(|d| d.0.as_str()).unwrap_or("-"),
+            before_diag.as_ref().map(|d| d.1.as_str()).unwrap_or("-"),
+            before_diag.as_ref().map(|d| d.2.as_str()).unwrap_or("-"),
         );
 
-        // ── Phase 6: warn on empty update ──
         if entry.yrs_update.is_empty() {
             tracing::error!(
                 "[reconciler] LEN_ZERO source={} id={} doc={} record={} seq={:?}",
@@ -140,14 +142,14 @@ impl Reconciler {
             );
         }
 
-        // ── Phase 1 diagnostic: inspect the incoming update ──
-        // ── Phase C: redundancy check (scoped tightly: yrs::Update !Send) ──
         let redundant = {
             let decoded = Update::decode_v1(&entry.yrs_update);
             match decoded {
                 Ok(decoded_update) => {
                     let update_sv = decoded_update.state_vector();
-                    let update_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
+                    let update_entries = log_data(LevelFilter::TRACE, || {
+                        update_sv.iter().map(|(c, cl)| (c, cl)).collect::<Vec<_>>()
+                    });
                     tracing::trace!(
                         "[reconciler] incoming_update source={} state_vector={:?}",
                         source, update_entries,
@@ -166,10 +168,11 @@ impl Reconciler {
             }
         };
 
-        // ── Phase C: skip apply if update is fully redundant ──
         // Yrs can panic on stale updates in release wasm (panic=abort).
-        let before_snap = doc.to_snapshot();
-        let before_hash = hex::encode(&Sha256::digest(&before_snap)[..8]);
+        let before_hash = log_data(LevelFilter::TRACE, || {
+            let snap = doc.to_snapshot();
+            hex::encode(&Sha256::digest(&snap)[..8])
+        });
 
         if !redundant {
             doc.apply_update(&entry.yrs_update)?;
@@ -180,31 +183,34 @@ impl Reconciler {
             );
         }
 
-        // ── Phase 4 diagnostic: log actual document text after apply ──
-        let after_map = doc.to_map();
-        let after_title = after_map.get("title").map(|v| v.to_truncated(80)).unwrap_or_default();
-        let after_body = after_map.get("body").map(|v| v.to_truncated(80)).unwrap_or_default();
-        let after_updated_at = after_map.get("updatedAt").map(|v| v.to_truncated(80)).unwrap_or_default();
+        let after_diag = log_data(LevelFilter::TRACE, || {
+            let m = doc.to_map();
+            (
+                m.get("title").map(|v| v.to_truncated(80)).unwrap_or_default(),
+                m.get("body").map(|v| v.to_truncated(80)).unwrap_or_default(),
+                m.get("updatedAt").map(|v| v.to_truncated(80)).unwrap_or_default(),
+            )
+        });
         tracing::trace!(
             "[reconciler] doc_after source={} doc={} record={} title={} body={} updatedAt={}",
-            source, entry.doc_id, entry.record_id, after_title, after_body, after_updated_at,
+            source, entry.doc_id, entry.record_id,
+            after_diag.as_ref().map(|d| d.0.as_str()).unwrap_or("-"),
+            after_diag.as_ref().map(|d| d.1.as_str()).unwrap_or("-"),
+            after_diag.as_ref().map(|d| d.2.as_str()).unwrap_or("-"),
         );
 
-        // ── Phase 1 diagnostic: state vector after apply ──
         let new_sv = doc.state_vector();
         let new_entries: Vec<_> = new_sv.iter().map(|(c, cl)| (c, cl)).collect();
-        tracing::trace!(
-            "[reconciler] new_state_vector source={} entries={:?}",
-            source, new_entries,
-        );
         let snapshot = doc.to_snapshot();
-        let after_hash = hex::encode(&Sha256::digest(&snapshot)[..8]);
+        let after_hash = log_data(LevelFilter::TRACE, || {
+            hex::encode(&Sha256::digest(&snapshot)[..8])
+        });
         let doc_advanced = old_sv != new_sv;
         let doc_ptr_val = &doc as *const CRDTDocument as usize;
         let inner_doc_ptr_val = doc.inner_doc() as *const yrs::Doc as usize;
 
         tracing::trace!(
-            "[reconciler] crt_diag source={} id={} incoming={} before={} after={} snapshot_changed={} redundant={} sv_entries_old={} sv_entries_new={} doc_advanced={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x}",
+            "[reconciler] crt_diag source={} id={} incoming={} before={:?} after={:?} snapshot_changed={} redundant={} sv_entries_old={} sv_entries_new={} doc_advanced={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x}",
             source, entry.id, content_hash, before_hash, after_hash,
             before_hash != after_hash, redundant,
             old_entries.len(), new_entries.len(), doc_advanced,
@@ -212,17 +218,23 @@ impl Reconciler {
         );
 
         if !doc_advanced && redundant && !entry.yrs_update.is_empty() {
-            tracing::warn!(
-                "[reconciler] STALE_MUTATION source={} id={} doc={} record={} update_len={} redundant={} doc_advanced={} sv_old={:?} sv_new={:?} incoming={}",
+            // Normal case: push is a duplicate of an already-applied mutation.
+            // Expected during steady-state sync — the server echoes mutations
+            // that were already pulled via batch or received via another path.
+            tracing::debug!(
+                "[reconciler] DUPLICATE_MUTATION source={} id={} doc={} record={} update_len={} redundant={} doc_advanced={} client_count_before={} client_count_after={} incoming={}",
                 source, entry.id, entry.doc_id, entry.record_id, entry.yrs_update.len(),
-                redundant, doc_advanced, old_entries, new_entries, content_hash,
+                redundant, doc_advanced, old_entries.len(), new_entries.len(), content_hash,
             );
         }
         if !doc_advanced && !redundant && !entry.yrs_update.is_empty() {
+            // Suspicious: mutation was not redundant (claimed new state)
+            // yet document didn't advance. Indicates potential causal gap,
+            // clock skew, or CRDT merge issue.
             tracing::warn!(
-                "[reconciler] BLIND_SPOT source={} id={} doc={} record={} update_len={} redundant={} doc_advanced={} sv_old={:?} sv_new={:?} incoming={}",
+                "[reconciler] BLIND_SPOT source={} id={} doc={} record={} update_len={} redundant={} doc_advanced={} client_count_before={} client_count_after={} incoming={}",
                 source, entry.id, entry.doc_id, entry.record_id, entry.yrs_update.len(),
-                redundant, doc_advanced, old_entries, new_entries, content_hash,
+                redundant, doc_advanced, old_entries.len(), new_entries.len(), content_hash,
             );
         }
 
@@ -285,15 +297,19 @@ impl Reconciler {
             source, entry.doc_id, entry.record_id, entry.id, content_hash, plaintext_update.len(),
         );
 
-        // ── Phase 1 diagnostic: inspect the incoming encrypted update ──
-        if let Ok(decoded) = Update::decode_v1(plaintext_update) {
-            let update_sv = decoded.state_vector();
-            let update_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
-            tracing::trace!(
-                "[reconciler] incoming_encrypted_update source={} state_vector={:?}",
-                source, update_entries,
-            );
-        }
+        let encrypted_update_entries: Option<Vec<(u64, u32)>> = log_data(LevelFilter::TRACE, || {
+            if let Ok(decoded) = Update::decode_v1(plaintext_update) {
+                let sv = decoded.state_vector();
+                let entries: Vec<_> = sv.iter().map(|(&c, &cl)| (c, cl)).collect();
+                entries
+            } else {
+                Vec::new()
+            }
+        });
+        tracing::trace!(
+            "[reconciler] incoming_encrypted_update source={} state_vector={:?}",
+            source, encrypted_update_entries,
+        );
 
         if self.is_deduped(&entry.id, &entry.record_id) {
             tracing::trace!(
@@ -313,15 +329,7 @@ impl Reconciler {
             None => CRDTDocument::new(&entry.doc_id, &entry.record_id, 0),
         };
 
-        // ── Phase 1 diagnostic: state vector before encrypted apply ──
         let old_sv = doc.state_vector();
-        let old_entries: Vec<_> = old_sv.iter().map(|(c, cl)| (c, cl)).collect();
-        tracing::trace!(
-            "[reconciler] old_state_vector_enc source={} entries={:?}",
-            source, old_entries,
-        );
-
-        // Skip apply if update is fully redundant (Yrs can panic on stale updates in release wasm)
         let encrypted_redundant = if let Ok(decoded) = Update::decode_v1(plaintext_update) {
             let update_sv = decoded.state_vector();
             update_sv.iter().all(|(client_id, clock)| {
@@ -340,13 +348,6 @@ impl Reconciler {
             );
         }
 
-        // ── Phase 1 diagnostic: state vector after encrypted apply ──
-        let new_sv = doc.state_vector();
-        let new_entries: Vec<_> = new_sv.iter().map(|(c, cl)| (c, cl)).collect();
-        tracing::trace!(
-            "[reconciler] new_state_vector_enc source={} entries={:?}",
-            source, new_entries,
-        );
         let snapshot = doc.to_snapshot();
         self.storage
             .insert_document(&entry.doc_id, &entry.record_id, &snapshot)
