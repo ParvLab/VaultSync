@@ -277,15 +277,6 @@ impl Storage for OpfsStorage {
         self.pages.oplog.adjust_pending_count(-1).await?;
         self.pages.oplog.schedule_gc();
 
-        // Verify persistence: re-read and log resolved status
-        let verify_entries = read_all_oplog_entries(&self.pages.oplog).await?;
-        let matched: Vec<_> = verify_entries.iter().filter(|e| e.id == id).collect();
-        let statuses: Vec<_> = matched.iter().map(|e| format!("{:?}", e.sync_status)).collect();
-        engine_info!(
-            "[mark_synced] id={} seq={} wrote_status=Synced read_back_count={} read_back_statuses=[{}]",
-            id, sequence, matched.len(), statuses.join(","),
-        );
-
         Ok(())
     }
 
@@ -636,45 +627,11 @@ pub async fn read_all_oplog_entries(
     }
 
     let deltas: Vec<PageId> = page_ids.iter().filter(|id| **id > current).copied().collect();
-    let total_pages = page_ids.len();
     let mut chain = VersionChain::new(current);
     for d in &deltas {
         chain.add_delta(*d);
     }
     let resolved = chain.resolve(store).await?;
-
-    // Instrumentation: detect stuck entries that survive VersionChain merge
-    let uploadable: Vec<_> = resolved.iter().filter(|e| e.sync_status.is_uploadable()).collect();
-    if !uploadable.is_empty() {
-        let first_stuck = uploadable[0];
-        let stuck_id_short = if first_stuck.id.len() >= 8 { &first_stuck.id[..8] } else { &first_stuck.id };
-        engine_info!(
-            "[version_chain] current_page={} total_pages={} deltas={} resolved={} uploadable={} first_stuck_id={}.. first_stuck_status={:?}",
-            current, total_pages, deltas.len(), resolved.len(), uploadable.len(),
-            stuck_id_short, first_stuck.sync_status,
-        );
-
-        // Dump raw page entries for the first stuck entry to expose merge failure
-        for pid in &page_ids {
-            if let Ok(Some(data)) = store.read_page(*pid).await {
-                if let Ok(chunk) = postcard::from_bytes::<Vec<OplogEntry>>(&data) {
-                    for e in chunk.iter().filter(|e| e.id == first_stuck.id) {
-                        engine_info!(
-                            "[page_entry] page={} id={}.. status={:?} seq={:?}",
-                            pid, stuck_id_short, e.sync_status, e.sequence,
-                        );
-                    }
-                } else if let Ok(single) = postcard::from_bytes::<OplogEntry>(&data) {
-                    if single.id == first_stuck.id {
-                        engine_info!(
-                            "[page_entry] page={} id={}.. status={:?} seq={:?}",
-                            pid, stuck_id_short, single.sync_status, single.sequence,
-                        );
-                    }
-                }
-            }
-        }
-    }
 
     Ok(resolved)
 }

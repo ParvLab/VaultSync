@@ -126,26 +126,9 @@ impl PageStore {
 
     /// Write raw page data without any split checks. Used by split_page internally.
     async fn write_page_raw(&self, page_id: PageId, data: &[u8]) -> Result<(), VaultSyncError> {
-        // Log what we're about to write
-        if let Ok(entries) = postcard::from_bytes::<Vec<OplogEntry>>(data) {
-            let first_status = entries.first().map(|e| format!("{:?}", e.sync_status)).unwrap_or_default();
-            let first_id_short = entries.first().map(|e| if e.id.len() >= 8 { &e.id[..8] } else { &e.id }).unwrap_or("?").to_string();
-            let first_seq = entries.first().and_then(|e| e.sequence).unwrap_or(0);
-            tracing::info!(
-                "[write_page_raw] page={} entries={} first_id={}.. first_status={} first_seq={} bytes={}",
-                page_id, entries.len(), first_id_short, first_status, first_seq, data.len(),
-            );
-        } else if let Ok(entry) = postcard::from_bytes::<OplogEntry>(data) {
-            let id_short = if entry.id.len() >= 8 { &entry.id[..8] } else { &entry.id }.to_string();
-            tracing::info!(
-                "[write_page_raw] page={} entries=1 id={}.. status={:?} seq={:?} bytes={}",
-                page_id, id_short, entry.sync_status, entry.sequence, data.len(),
-            );
-        }
         let buf = encode_v3_page(data, 0)?;
         write_file(&self.dir, &page_filename(page_id), &buf).await?;
         self.bump_manifest_live_page(page_id).await?;
-        tracing::info!("[write_page_raw] done page={}", page_id);
         Ok(())
     }
 
