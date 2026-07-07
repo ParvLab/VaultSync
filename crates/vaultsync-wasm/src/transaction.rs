@@ -49,34 +49,18 @@ impl StorageTransaction for OpfsTransaction {
             sequence,
         });
         // Apply to cached entries immediately so subsequent ops in the same tx see the change
-        let mut found = false;
-        let mut before_status = String::new();
         for entry in &mut self.pending_entries {
             if entry.id == id {
-                found = true;
-                before_status = format!("{:?}", entry.sync_status);
                 entry.sync_status = vaultsync_core::oplog::entry::SyncStatus::Synced;
                 entry.sequence = Some(sequence);
             }
         }
-        tracing::info!(
-            "[tx.mark_synced] id={}.. seq={} found={} pending_entries={} before_status={}",
-            if id.len() >= 8 { &id[..8] } else { id },
-            sequence,
-            found,
-            self.pending_entries.len(),
-            before_status,
-        );
         Ok(())
     }
 
     async fn mark_failed(&mut self, id: &str, error: &str) -> Result<(), VaultSyncError> {
-        let mut found = false;
-        let mut before_status = String::new();
         for entry in &mut self.pending_entries {
             if entry.id == id {
-                found = true;
-                before_status = format!("{:?}", entry.sync_status);
                 entry.sync_status = vaultsync_core::oplog::entry::SyncStatus::Failed;
             }
         }
@@ -84,11 +68,6 @@ impl StorageTransaction for OpfsTransaction {
             id: id.to_string(),
             error: error.to_string(),
         });
-        tracing::info!(
-            "[tx.mark_failed] id={}.. found={} before={} error={} pending_entries={}",
-            if id.len() >= 8 { &id[..8] } else { id },
-            found, before_status, error, self.pending_entries.len(),
-        );
         Ok(())
     }
 
@@ -107,7 +86,6 @@ impl StorageTransaction for OpfsTransaction {
 
     async fn commit(self: Box<Self>) -> Result<(), VaultSyncError> {
         if self.ops.is_empty() {
-            tracing::info!("[tx.commit] ops=0 returning early");
             return Ok(());
         }
 
@@ -118,11 +96,6 @@ impl StorageTransaction for OpfsTransaction {
                 TxOp::MarkSynced { id, sequence } => {
                     let matched = self.pending_entries.iter().find(|e| e.id == *id);
                     if let Some(entry) = matched {
-                        let short_id = if id.len() >= 8 { &id[..8] } else { id };
-                        tracing::info!(
-                            "[tx.commit] MarkSynced id={}.. seq={} matched=true old_status={:?}",
-                            short_id, sequence, entry.sync_status,
-                        );
                         let mut delta = entry.clone();
                         delta.sync_status = vaultsync_core::oplog::entry::SyncStatus::Synced;
                         delta.sequence = Some(*sequence);
@@ -157,15 +130,7 @@ impl StorageTransaction for OpfsTransaction {
         let encoded = postcard::to_allocvec(&delta_entries)
             .map_err(|e| VaultSyncError::Storage(format!("tx encode: {:?}", e)))?;
         let page_id = self.store.allocate_page_id().await?;
-        tracing::info!(
-            "[tx.commit] writing delta_entries={} page_id={} first_id={}.. status=Synced seq={}",
-            delta_entries.len(),
-            page_id,
-            if delta_entries[0].id.len() >= 8 { &delta_entries[0].id[..8] } else { &delta_entries[0].id },
-            delta_entries[0].sequence.unwrap_or(0),
-        );
         self.store.write_page(page_id, &encoded).await?;
-        tracing::info!("[tx.commit] write_page done page_id={}", page_id);
 
         // Update pending_count: count pending entries in the resolved state
         let pending_count = self
@@ -176,10 +141,6 @@ impl StorageTransaction for OpfsTransaction {
         self.store.set_pending_count(pending_count).await?;
         self.store.schedule_gc();
 
-        tracing::info!(
-            "[tx.commit] complete page_id={} delta_entries={} pending_count={}",
-            page_id, delta_entries.len(), pending_count,
-        );
         Ok(())
     }
 

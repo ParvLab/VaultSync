@@ -290,7 +290,6 @@ impl Storage for OpfsStorage {
             tracing::warn!("[mark_failed] id={}.. not found in storage, skipping", if id.len() >= 8 { &id[..8] } else { id });
             return Ok(());
         }
-        let before_status = format!("{:?}", updated[0].sync_status);
         for e in &mut updated {
             e.sync_status = SyncStatus::Failed;
         }
@@ -302,13 +301,6 @@ impl Storage for OpfsStorage {
         self.pages.oplog.adjust_pending_count(-1).await?;
         self.pages.oplog.schedule_gc();
 
-        tracing::info!(
-            "[mark_failed] id={}.. before={} error={} page_id={}",
-            if id.len() >= 8 { &id[..8] } else { id },
-            before_status,
-            error,
-            page_id,
-        );
         Ok(())
     }
 
