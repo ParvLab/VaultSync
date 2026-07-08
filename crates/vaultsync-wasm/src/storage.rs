@@ -63,7 +63,7 @@ impl OpfsStorage {
         doc_id: &str,
         record_id: &str,
     ) -> Result<usize, VaultSyncError> {
-        let page_ids = self.pages.doc_data.list_page_ids().await?;
+        let page_ids = self.pages.doc_data.list_page_ids("tombstone_existing_doc_pages").await?;
         let mut count = 0;
         for id in page_ids {
             if let Some(data) = self.pages.doc_data.read_page(id).await? {
@@ -116,7 +116,7 @@ impl Storage for OpfsStorage {
         doc_id: &str,
         record_id: &str,
     ) -> Result<Option<Vec<u8>>, VaultSyncError> {
-        let page_ids = self.pages.doc_data.list_page_ids().await?;
+        let page_ids = self.pages.doc_data.list_page_ids("get_document").await?;
         let mut found: Vec<(u64, Vec<u8>)> = Vec::new();
         for id in page_ids {
             if let Some(data) = self.pages.doc_data.read_page(id).await? {
@@ -153,7 +153,7 @@ impl Storage for OpfsStorage {
     }
 
     async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, VaultSyncError> {
-        let page_ids = self.pages.doc_data.list_page_ids().await?;
+        let page_ids = self.pages.doc_data.list_page_ids("list_documents").await?;
         let mut latest: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
         for id in page_ids {
             if let Some(data) = self.pages.doc_data.read_page(id).await? {
@@ -318,7 +318,7 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_sync_state(&self, namespace: &str) -> Result<Option<SyncState>, VaultSyncError> {
-        let all = read_all_entries::<(String, SyncState)>(&self.pages.sync_states).await?;
+        let all = read_all_entries::<(String, SyncState)>(&self.pages.sync_states, "read_sync_state").await?;
         Ok(all.into_iter().find(|(ns, _)| ns == namespace).map(|(_, s)| s))
     }
 
@@ -330,7 +330,7 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_schema(&self, doc_id: &str) -> Result<Option<SchemaMeta>, VaultSyncError> {
-        let all = read_all_entries::<(String, SchemaMeta)>(&self.pages.schemas).await?;
+        let all = read_all_entries::<(String, SchemaMeta)>(&self.pages.schemas, "read_schema").await?;
         Ok(all.into_iter().find(|(d, _)| d == doc_id).map(|(_, s)| s))
     }
 
@@ -342,7 +342,7 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, VaultSyncError> {
-        read_all_entries::<MigrationRecord>(&self.pages.migrations).await
+        read_all_entries::<MigrationRecord>(&self.pages.migrations, "read_migrations").await
     }
 
     async fn write_migration(&self, record: &MigrationRecord) -> Result<(), VaultSyncError> {
@@ -353,7 +353,7 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_keys(&self, namespace: &str) -> Result<Vec<KeyRecord>, VaultSyncError> {
-        let all = read_all_entries::<KeyRecord>(&self.pages.keys).await?;
+        let all = read_all_entries::<KeyRecord>(&self.pages.keys, "read_keys").await?;
         Ok(all.into_iter().filter(|k| k.namespace == namespace).collect())
     }
 
@@ -364,6 +364,36 @@ impl Storage for OpfsStorage {
         self.pages.keys.write_page(page_id, &encoded).await
     }
 
+    // ADR-001: Failed Entry Lifecycle (WASM)
+    //
+    // Status: UNDEFINED PRODUCT BEHAVIOR — NOT A BUG
+    //
+    // The engine is behaving consistently. The product simply does not define
+    // what should happen to Failed entries after they reach that state.
+    //
+    // Current behavior:
+    //   Pending → Optimistic → Synced     ✓ (happy path)
+    //   Pending → Optimistic → Failed     ⚠️ (terminal — no transition defined)
+    //
+    // Consequences:
+    //   - Failed entries are NOT uploadable (is_uploadable() returns false)
+    //   - Failed entries survive compaction (delete_synced_before only removes Synced)
+    //   - No code path converts Failed→Pending on WASM (reset_stale_pending is a no-op)
+    //   - Failed entries accumulate indefinitely in OPFS storage
+    //   - IndexedDB backend HAS a real reset_stale_pending (converts Failed→Pending)
+    //
+    // Options (choose one):
+    //   A) Implement reset_stale_pending for WASM (convert Failed→Pending on reconnect,
+    //      matching IndexedDB behavior). Treats all failures as retryable transport errors.
+    //   B) Add RetryableFailed/PermanentFailed distinction. Transport failures retry
+    //      automatically; logical failures (schema, auth) surface to user. TTL-based
+    //      cleanup for RetryableFailed.
+    //   C) Do nothing — Failed accumulates forever. Acceptable if a storage wipe or
+    //      manual intervention path exists.
+    //
+    // Recommendation: Do NOT change failure semantics until the engine has been
+    // frozen and soak-tested. Changing this path risks reopening the upload pipeline.
+    // ============================================================================
     async fn reset_stale_pending(
         &self,
         _namespace: &str,
@@ -529,13 +559,14 @@ impl Storage for OpfsStorage {
 
 async fn read_all_entries<T: serde::de::DeserializeOwned + serde::Serialize>(
     store: &PageStore,
+    caller: &str,
 ) -> Result<Vec<T>, VaultSyncError> {
     engine_debug!("[storage] read_all_entries: reading current_page");
     let current = store.current_page().await;
     engine_debug!("[storage] read_all_entries: current_page={}", current);
 
     engine_debug!("[storage] read_all_entries: listing page_ids");
-    let page_ids = match store.list_page_ids().await {
+    let page_ids = match store.list_page_ids(caller).await {
         Ok(ids) => ids,
         Err(e) => {
             engine_error!("[storage] list_page_ids failed: {:?}", e);
@@ -609,13 +640,13 @@ pub async fn read_all_oplog_entries(
     store: &PageStore,
 ) -> Result<Vec<OplogEntry>, VaultSyncError> {
     let current = store.current_page().await;
-    let mut page_ids = store.list_page_ids().await.unwrap_or_default();
+    let mut page_ids = store.list_page_ids("read_all_oplog_entries").await.unwrap_or_default();
     page_ids.sort_unstable();
 
     if current == 0 || page_ids.is_empty() {
         // No base page — fall back to generic read (append-only store)
         // Use the qualified path to avoid recursion.
-        return self::read_all_entries::<OplogEntry>(store).await;
+        return self::read_all_entries::<OplogEntry>(store, "read_all_oplog_entries").await;
     }
 
     let deltas: Vec<PageId> = page_ids.iter().filter(|id| **id > current).copied().collect();

@@ -138,9 +138,9 @@ impl CRDTDocument {
     where
         F: FnOnce(&mut Self),
     {
-        let sv = self.state_vector();
+        let _sv = self.state_vector();
         f(self);
-        self.inner.transact().encode_diff_v1(&sv)
+        self.inner.transact().encode_state_as_update_v1(&yrs::StateVector::default())
     }
 
     pub fn delete_field(&mut self, field: &str) -> Vec<u8> {
@@ -439,5 +439,30 @@ mod tests {
 
             assert_eq!(doc_ab.to_map(), doc_a_bc.to_map());
         }
+    }
+
+    #[test]
+    fn cross_client_merge() {
+        let mut alice = CRDTDocument::new("doc-1", "rec-1", 0);
+        let alice_update = alice.capture_incremental_update(|doc| {
+            doc.set_field("k1", CrdtValue::String("val-a".to_string()));
+        });
+
+        let mut bob = CRDTDocument::new("doc-1", "rec-1", 0);
+        let bob_update = bob.capture_incremental_update(|doc| {
+            doc.set_field("k2", CrdtValue::String("val-b".to_string()));
+        });
+
+        let mut bob_apply = CRDTDocument::new("doc-1", "rec-1", 0);
+        bob_apply.apply_update(&alice_update).unwrap();
+        bob_apply.apply_update(&bob_update).unwrap();
+
+        alice.apply_update(&bob_update).unwrap();
+
+        let alice_map = alice.to_map();
+        let bob_map = bob_apply.to_map();
+        assert_eq!(alice_map, bob_map);
+        assert!(alice_map.contains_key("k1"));
+        assert!(alice_map.contains_key("k2"));
     }
 }

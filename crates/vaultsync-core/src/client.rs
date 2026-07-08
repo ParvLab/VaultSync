@@ -32,6 +32,73 @@ use sha2::{Digest, Sha256};
 
 pub type Callback = Box<dyn Fn(&str, &str, &HashMap<String, CrdtValue>) + Send>;
 
+// ============================================================================
+// VaultSync Engine Guarantees
+// ============================================================================
+//
+// These are the synchronization contract that all engine subsystems must
+// preserve. Every regression test in manager_integration.rs guards one or
+// more of these guarantees. Any future change that violates a guarantee is a
+// regression, not a refactor.
+//
+// Storage
+// - Every committed page is immutable. Pages are append-only.
+// - GC never mutates page contents — it only deletes pages by advancing
+//   current_page and running deferred garbage collection.
+// - The manifest has CRC32 checksum integrity. Corrupted manifests are
+//   detected on read and trigger a rebuild from page files.
+//
+// Merge
+// - VersionChain resolves by document ID: the latest page's entry for a
+//   given ID always wins. Delta pages are sorted by page ID before
+//   processing to guarantee deterministic merge order.
+// - Merge is deterministic and idempotent. Re-applying the same pages in
+//   the same order produces the same result.
+//
+// Upload
+// - Only entries with sync_status == Pending or Optimistic are uploadable.
+// - Synced and Failed entries are never picked up by the upload pipeline.
+// - Upload is idempotent: duplicate acknowledgements are harmless.
+// - Reconnect never duplicates committed mutations — cursor advancement
+//   prevents replay of already-synced entries.
+//
+// Compaction (delete_synced_before)
+// - Only Synced entries older than the cutoff are removed.
+// - Pending entries survive compaction regardless of age.
+// - Failed entries survive compaction regardless of age.
+// - Optimistic entries survive compaction regardless of age.
+// - Namespace isolation: compacting namespace A never touches namespace B.
+//
+// Lifecycle (run_lifecycle)
+// - Only documents with a CrdtDelete tombstone older than the retention
+//   policy are physically deleted.
+// - Active documents are never touched by lifecycle.
+//
+// Recovery
+// - Crash-safe after every committed page. A page write is all-or-nothing
+//   (atomic write to OPFS/IDB).
+// - Restart reconstructs engine state solely from persisted pages. No
+//   external state is required.
+// - Cursor is preserved across restarts when history_preserved is true.
+//   On generation mismatch with history_preserved=false, cursor resets to 0
+//   and a full snapshot restore is performed.
+//
+// Multi-tab
+// - Exactly one leader uploads. Followers observe via BroadcastChannel.
+// - BroadcastChannel messages are self-filtered (the sending tab ignores
+//   its own messages via origin-based filtering).
+// - Leader election uses a shared lock; tab crash triggers automatic
+//   re-election by the next tab.
+//
+// UI (Reactive Layer)
+// - Engine state drives UI exclusively through the event bridge:
+//   Core ClientEvent::StatusDirty → pending_count channel → WASM bridge →
+//   JS SDK → React Context.
+// - No polling. No setInterval. No redundant syncStatus() calls.
+// - Comparison guard in React's setSyncStatus prevents re-renders when
+//   status fields are identical.
+// ============================================================================
+
 pub struct VaultSyncClient {
     config: VaultSyncConfig,
     storage: Arc<dyn Storage>,
@@ -1637,6 +1704,19 @@ impl VaultSyncClient {
     /// after each batch and by write methods. Avoids OPFS reads on every call.
     pub async fn pending_uploads(&self) -> Result<usize, VaultSyncError> {
         Ok(self.pending_count_cache.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Attempt to acquire the leader lock. Returns true if this instance is now leader.
+    /// This is a synchronous lock attempt using the filesystem/advisory lock.
+    /// Use `sync_status()` to check the current status if no acquisition is needed.
+    pub fn try_acquire_leader(&self) -> Result<bool, VaultSyncError> {
+        self.leader_election.try_acquire()
+    }
+
+    /// Release the leader lock. Called when voluntarily stepping down.
+    /// Note: the lock is also released when all Arcs to the leader election are dropped.
+    pub fn release_leader(&self) {
+        self.leader_election.release();
     }
 
     /// Take the pending-count receiver for event-driven status updates.

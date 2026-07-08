@@ -1,6 +1,8 @@
 use js_sys::Uint8Array;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use vaultsync_core::time_utils::SendJsFuture;
 use vaultsync_core::oplog::entry::OplogEntry;
@@ -67,12 +69,51 @@ impl StoreManifest {
     }
 }
 
+/// Debug-only metrics for storage layer performance analysis.
+/// Tracks page-level operations to identify bottlenecks before/after caching.
+#[cfg(debug_assertions)]
+#[derive(Debug, Default)]
+pub struct StorageMetrics {
+    /// Number of full OPFS directory enumerations (list_page_ids calls)
+    pub page_enumerations: AtomicU64,
+    /// Number of individual page file reads (read_page calls, excluding headers)
+    pub page_reads: AtomicU64,
+    /// Number of page header reads (within list_page_ids for tombstone filtering)
+    pub header_reads: AtomicU64,
+    /// Number of page writes (write_page + write_page_raw)
+    pub page_writes: AtomicU64,
+    /// Number of page tombsone operations
+    pub page_tombstones: AtomicU64,
+    /// Cache hits (after Phase 3 — broadcast-invalidated page cache)
+    pub cache_hits: AtomicU64,
+    /// Cache misses (after Phase 3)
+    pub cache_misses: AtomicU64,
+}
+
+#[cfg(debug_assertions)]
+impl StorageMetrics {
+    pub fn snapshot(&self) -> String {
+        format!(
+            "enumerations={} reads={} headers={} writes={} tombstones={} cache_hits={} cache_misses={}",
+            self.page_enumerations.load(Ordering::Relaxed),
+            self.page_reads.load(Ordering::Relaxed),
+            self.header_reads.load(Ordering::Relaxed),
+            self.page_writes.load(Ordering::Relaxed),
+            self.page_tombstones.load(Ordering::Relaxed),
+            self.cache_hits.load(Ordering::Relaxed),
+            self.cache_misses.load(Ordering::Relaxed),
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct PageStore {
     dir: Arc<FileSystemDirectoryHandle>,
     store_name: Arc<String>,
     gc_needed: Arc<AtomicBool>,
     split_pending: Arc<AtomicBool>,
+    #[cfg(debug_assertions)]
+    metrics: Arc<StorageMetrics>,
 }
 
 impl Clone for PageStore {
@@ -82,6 +123,8 @@ impl Clone for PageStore {
             store_name: Arc::clone(&self.store_name),
             gc_needed: Arc::clone(&self.gc_needed),
             split_pending: Arc::clone(&self.split_pending),
+            #[cfg(debug_assertions)]
+            metrics: Arc::clone(&self.metrics),
         }
     }
 }
@@ -105,6 +148,8 @@ impl PageStore {
             store_name: Arc::new(store_name.to_string()),
             gc_needed: Arc::new(AtomicBool::new(false)),
             split_pending: Arc::new(AtomicBool::new(false)),
+            #[cfg(debug_assertions)]
+            metrics: Arc::new(StorageMetrics::default()),
         })
     }
 
@@ -126,6 +171,9 @@ impl PageStore {
 
     /// Write raw page data without any split checks. Used by split_page internally.
     async fn write_page_raw(&self, page_id: PageId, data: &[u8]) -> Result<(), VaultSyncError> {
+        #[cfg(debug_assertions)]
+        self.metrics.page_writes.fetch_add(1, Ordering::Relaxed);
+
         let buf = encode_v3_page(data, 0)?;
         write_file(&self.dir, &page_filename(page_id), &buf).await?;
         self.bump_manifest_live_page(page_id).await?;
@@ -186,6 +234,9 @@ impl PageStore {
     }
 
     pub async fn read_page(&self, page_id: PageId) -> Result<Option<Vec<u8>>, VaultSyncError> {
+        #[cfg(debug_assertions)]
+        self.metrics.page_reads.fetch_add(1, Ordering::Relaxed);
+
         let (header, data) = match read_page_file(&self.dir, &page_filename(page_id)).await? {
             Some(pair) => pair,
             None => return Ok(None),
@@ -219,11 +270,15 @@ impl PageStore {
     }
 
     pub async fn tombstone_page(&self, page_id: PageId) -> Result<(), VaultSyncError> {
+        #[cfg(debug_assertions)]
+        self.metrics.page_tombstones.fetch_add(1, Ordering::Relaxed);
+
         let name = page_filename(page_id);
         let existing = match read_all_bytes(&self.dir, &name).await {
             Ok(b) => b,
             Err(e) if is_not_found(&e) => {
-                return Err(VaultSyncError::Storage(format!("page {} not found", page_id)));
+                engine_debug!("[page_store] tombstone_page {}: page already removed", page_id);
+                return Ok(());
             }
             Err(e) => return Err(e),
         };
@@ -334,8 +389,13 @@ impl PageStore {
         Ok(cleaned)
     }
 
-    pub async fn list_page_ids(&self) -> Result<Vec<PageId>, VaultSyncError> {
+    pub async fn list_page_ids(&self, caller: &str) -> Result<Vec<PageId>, VaultSyncError> {
+        #[cfg(debug_assertions)]
+        self.metrics.page_enumerations.fetch_add(1, Ordering::Relaxed);
+
+        let _start = js_sys::Date::now();
         let mut ids = Vec::new();
+        let mut header_read_count = 0u32;
 
         let iter = self.dir.entries();
 
@@ -387,13 +447,24 @@ impl PageStore {
 
             if let Some(id) = parse_page_id(&name) {
                 match read_page_header(&self.dir, &name).await? {
-                    Some(header) if header.flags & 0x02 == 0 => {
-                        ids.push(id);
+                    Some(header) => {
+                        header_read_count += 1;
+                        #[cfg(debug_assertions)]
+                        self.metrics.header_reads.fetch_add(1, Ordering::Relaxed);
+                        if header.flags & 0x02 == 0 {
+                            ids.push(id);
+                        }
                     }
-                    _ => {}
+                    None => {}
                 }
             }
         }
+
+        let elapsed = js_sys::Date::now() - _start;
+        engine_debug!(
+            "[list_page_ids] caller={} pages={} headers_read={} elapsed={}ms",
+            caller, ids.len(), header_read_count, elapsed as u64,
+        );
 
         Ok(ids)
     }
@@ -440,6 +511,14 @@ impl PageStore {
     /// Mark that GC is needed (called after a full-state rewrite).
     pub fn schedule_gc(&self) {
         self.gc_needed.store(true, Ordering::Release);
+    }
+
+    /// Get a snapshot of debug storage metrics. Returns empty string in release builds.
+    pub fn metrics_snapshot(&self) -> String {
+        #[cfg(debug_assertions)]
+        { self.metrics.snapshot() }
+        #[cfg(not(debug_assertions))]
+        { String::new() }
     }
 
     // ── Page splitting (Phase 2: Bounded Pages) ──────────────────────
@@ -515,7 +594,7 @@ impl PageStore {
             return Ok(0);
         }
 
-        let page_ids = self.list_page_ids().await?;
+        let page_ids = self.list_page_ids("run_pending_split").await?;
         let mut split_count = 0usize;
 
         for id in &page_ids {
