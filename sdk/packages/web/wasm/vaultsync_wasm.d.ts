@@ -50,6 +50,10 @@ export class WasmIPC {
     free(): void;
     [Symbol.dispose](): void;
     static new(channel_name: string): WasmIPC;
+    /**
+     * Create WasmIPC from an existing BroadcastChannel (used by client integration)
+     */
+    static new_with_channel(channel: BroadcastChannel): WasmIPC;
     on_message(callback: Function): void;
     receive(): string;
     send(msg: string): void;
@@ -114,6 +118,10 @@ export class WasmVaultSyncClient {
      * Runs lifecycle (tombstone cleanup) on the given namespace, returns JSON stats.
      */
     runLifecycle(namespace: string): Promise<string>;
+    /**
+     * Engine V2: expose Runtime + StorageEngine health stats to JS
+     */
+    runtime_storage_stats(): any;
     shutdown(): Promise<void>;
     /**
      * Returns JSON with storage statistics (page count, segment state, etc.).
@@ -172,18 +180,26 @@ export interface InitOutput {
     readonly presencemanager_activePeers: (a: number) => [number, number];
     readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly presencemanager_peer_count: (a: number) => number;
+    readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly init: () => void;
+    readonly set_log_level_from_str: (a: number, b: number) => void;
     readonly __wbg_eventbusproxy_free: (a: number, b: number) => void;
     readonly __wbg_replicationnamespace_free: (a: number, b: number) => void;
+    readonly __wbg_wasmipc_free: (a: number, b: number) => void;
     readonly __wbg_wasmsubscriptionhandle_free: (a: number, b: number) => void;
     readonly __wbg_wasmvaultsyncclient_free: (a: number, b: number) => void;
     readonly __wbg_workingsetsnamespace_free: (a: number, b: number) => void;
     readonly __wbg_workspacenamespace_free: (a: number, b: number) => void;
-    readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
-    readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly eventbusproxy_subscriberCount: (a: number) => number;
     readonly replicationnamespace_clearPending: (a: number) => void;
     readonly replicationnamespace_pendingCount: (a: number) => number;
     readonly replicationnamespace_predictNext: (a: number, b: number) => [number, number, number, number];
+    readonly wasmipc_new: (a: number, b: number) => [number, number, number];
+    readonly wasmipc_new_with_channel: (a: any) => number;
+    readonly wasmipc_on_message: (a: number, b: any) => void;
+    readonly wasmipc_receive: (a: number) => [number, number];
+    readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
     readonly wasmsubscriptionhandle_cancel: (a: number, b: number) => [number, number];
     readonly wasmvaultsyncclient_active_key_version: (a: number) => bigint;
     readonly wasmvaultsyncclient_compactNamespace: (a: number, b: number, c: number) => any;
@@ -207,6 +223,7 @@ export interface InitOutput {
     readonly wasmvaultsyncclient_resourceSweep: (a: number) => any;
     readonly wasmvaultsyncclient_rotate_keys: (a: number) => any;
     readonly wasmvaultsyncclient_runLifecycle: (a: number, b: number, c: number) => any;
+    readonly wasmvaultsyncclient_runtime_storage_stats: (a: number) => [number, number, number];
     readonly wasmvaultsyncclient_shutdown: (a: number) => any;
     readonly wasmvaultsyncclient_storageStats: (a: number) => any;
     readonly wasmvaultsyncclient_subscribe: (a: number, b: number, c: number, d: any) => number;
@@ -226,13 +243,6 @@ export interface InitOutput {
     readonly workspacenamespace_get: (a: number, b: bigint) => [number, number, number, number];
     readonly workspacenamespace_list: (a: number) => [number, number, number, number];
     readonly workspacenamespace_update: (a: number, b: bigint, c: number, d: number, e: number, f: number) => [number, number, number];
-    readonly init: () => void;
-    readonly set_log_level_from_str: (a: number, b: number) => void;
-    readonly __wbg_wasmipc_free: (a: number, b: number) => void;
-    readonly wasmipc_new: (a: number, b: number) => [number, number, number];
-    readonly wasmipc_on_message: (a: number, b: any) => void;
-    readonly wasmipc_receive: (a: number) => [number, number];
-    readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h6742839cb717cdad: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h7bc44194b3ab93f4: (a: number, b: number, c: any) => void;

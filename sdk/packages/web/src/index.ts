@@ -2,6 +2,7 @@ import init, { WasmVaultSyncClient } from '../wasm/vaultsync_wasm.js';
 import type { VaultSyncConfig, RecordFields, SyncStatus, MetricsSnapshot, SubscriptionCallback, UnsubscribeFn } from './types.js';
 import type { PresenceManager } from '../wasm/vaultsync_wasm.js';
 import { KeyManager } from './keys.js';
+import { RuntimeStore } from './store.js';
 import { createDbProxy, DbProxy, Collection } from './db.js';
 import { defineSchema, FieldDef, SchemaDefinition } from './schema.js';
 
@@ -10,6 +11,7 @@ export { KeyManager, DbProxy, Collection, defineSchema, FieldDef, SchemaDefiniti
 export { VaultSync } from './vaultsync.js';
 export { Subscription } from './subscription.js';
 export { SyncStatusObservable } from './sync.js';
+export { RuntimeStore } from './store.js';
 export { PostgresCoordinator } from './coordinator/postgres.js';
 export { RedisCoordinator } from './coordinator/redis.js';
 export { CustomCoordinator } from './coordinator/custom.js';
@@ -25,6 +27,7 @@ export class VaultSyncClient {
   private inner: any;
   private _keys?: KeyManager;
   private _db?: any;
+  private _runtimeStore?: RuntimeStore;
   private channel?: BroadcastChannel;
   private namespace: string;
   private tabId: string;
@@ -36,6 +39,20 @@ export class VaultSyncClient {
     this.inner = inner;
     this.namespace = namespace;
     this.tabId = replicaId;
+  }
+
+  /** RuntimeStore for cache-first reads. Created by default. */
+  get runtimeStore(): RuntimeStore {
+    if (!this._runtimeStore) {
+      this._runtimeStore = new RuntimeStore();
+    }
+    return this._runtimeStore;
+  }
+
+  /** Enable RuntimeStore-based cache reads. Call once after construction. */
+  enableRuntimeStore(): void {
+    const store = this.runtimeStore;
+    (this.inner as any).__runtimeStore = store;
   }
 
   /** Serializes mutations (local + remote) so they run one-at-a-time on the leader. */
@@ -66,13 +83,38 @@ export class VaultSyncClient {
     this.channel.onmessage = (e) => {
       const raw = typeof e.data === 'string' ? e.data : JSON.stringify(e.data);
       if (typeof e.data === 'string') {
+        // Engine V2: direct MUTATION format — update RuntimeStore
+        if (e.data.startsWith('MUTATION|')) {
+          const parts = e.data.split('|');
+          if (parts.length >= 5) {
+            const docId = parts[2];
+            const recordId = parts[3];
+            const fieldsJson = parts[4];
+            try {
+              const fields = JSON.parse(fieldsJson);
+              for (const [field, value] of Object.entries(fields)) {
+                this.runtimeStore.applySetField(docId, recordId, field, value);
+              }
+            } catch (err) {
+              console.debug('[JS BC] MUTATION parse error:', err);
+            }
+          }
+          return;
+        }
+
+        // LEADER_ELECTED: another tab announced leadership
+        if (e.data.startsWith('LEADER_ELECTED|')) {
+          console.debug('[JS BC] LEADER_ELECTED received');
+          return;
+        }
+
         try {
           const val = JSON.parse(e.data);
           if (!val) {
-            return; // no message payload
+            return;
           }
           if (!val.type) {
-            val.type = 'invalidate'; // backward compat: old WASM sent no type
+            val.type = 'invalidate';
           }
           const sender = val.tab_id || '(missing)';
           const receiver = this.tabId || '(missing)';
@@ -87,7 +129,6 @@ export class VaultSyncClient {
                 if (ignored) break;
                 setTimeout(async () => {
                   try {
-                    console.debug(`[JS BC] fire sender=${sender} receiver=${receiver} doc=${val.doc_id} record=${val.record_id}`);
                     await this.inner.fire_subscription(val.doc_id, val.record_id);
                   } catch (err) {
                     console.error("[JS BC] Failed to fire subscription: ", err);
@@ -166,6 +207,9 @@ export class VaultSyncClient {
         }
       });
 
+      // Enable RuntimeStore for cache-first reads
+      client.enableRuntimeStore();
+
       return client;
     })();
 
@@ -175,21 +219,35 @@ export class VaultSyncClient {
 
   async insert(docId: string, recordId: string, fields: RecordFields): Promise<void> {
     if (this.inner.is_leader()) {
-      return this.enqueueMutation(() => this.inner.insert(docId, recordId, JSON.stringify(fields)));
+      return this.enqueueMutation(async () => {
+        // Apply to RuntimeStore first for instant cache hit
+        for (const [field, value] of Object.entries(fields)) {
+          this.runtimeStore.applySetField(docId, recordId, field, value);
+        }
+        await this.inner.insert(docId, recordId, JSON.stringify(fields));
+      });
     }
     await this.inner.insert(docId, recordId, JSON.stringify(fields));
   }
 
   async update(docId: string, recordId: string, fields: RecordFields): Promise<void> {
     if (this.inner.is_leader()) {
-      return this.enqueueMutation(() => this.inner.update(docId, recordId, JSON.stringify(fields)));
+      return this.enqueueMutation(async () => {
+        for (const [field, value] of Object.entries(fields)) {
+          this.runtimeStore.applySetField(docId, recordId, field, value);
+        }
+        await this.inner.update(docId, recordId, JSON.stringify(fields));
+      });
     }
     await this.inner.update(docId, recordId, JSON.stringify(fields));
   }
 
   async delete(docId: string, recordId: string): Promise<void> {
     if (this.inner.is_leader()) {
-      return this.enqueueMutation(() => this.inner.delete(docId, recordId));
+      return this.enqueueMutation(async () => {
+        this.runtimeStore.applyDeleteDocument(docId, recordId);
+        await this.inner.delete(docId, recordId);
+      });
     }
     await this.inner.delete(docId, recordId);
   }
@@ -217,6 +275,12 @@ export class VaultSyncClient {
   /** Returns a snapshot of all metrics counters. */
   async metrics(): Promise<MetricsSnapshot> {
     const jsonStr = await this.inner.metricsSnapshot();
+    return JSON.parse(jsonStr);
+  }
+
+  /** Engine V2: expose Runtime + StorageEngine stats (WAL, page cache, health). */
+  async runtimeStorageStats(): Promise<any> {
+    const jsonStr = await this.inner.runtime_storage_stats();
     return JSON.parse(jsonStr);
   }
 

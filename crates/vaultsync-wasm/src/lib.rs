@@ -151,6 +151,32 @@ pub mod storage_manager;
 pub mod transport;
 #[cfg(target_arch = "wasm32")]
 pub mod ws_coordinator;
+#[cfg(target_arch = "wasm32")]
+pub mod scheduler;
+#[cfg(target_arch = "wasm32")]
+pub mod metrics;
+#[cfg(target_arch = "wasm32")]
+pub mod memory;
+#[cfg(target_arch = "wasm32")]
+pub mod runtime;
+#[cfg(target_arch = "wasm32")]
+pub mod storage_engine;
+#[cfg(target_arch = "wasm32")]
+pub mod capability;
+#[cfg(target_arch = "wasm32")]
+pub mod access_tracker;
+#[cfg(target_arch = "wasm32")]
+pub mod broadcast_manager;
+#[cfg(target_arch = "wasm32")]
+pub mod heartbeat_manager;
+#[cfg(target_arch = "wasm32")]
+pub mod snapshot_manager;
+#[cfg(target_arch = "wasm32")]
+pub mod prefetch_manager;
+#[cfg(target_arch = "wasm32")]
+pub mod follower;
+#[cfg(target_arch = "wasm32")]
+pub mod recovery_manager;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]

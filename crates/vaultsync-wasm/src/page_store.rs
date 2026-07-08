@@ -1,11 +1,13 @@
 use js_sys::Uint8Array;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::collections::VecDeque;
 use vaultsync_core::time_utils::SendJsFuture;
-use vaultsync_core::oplog::entry::OplogEntry;
 use vaultsync_core::VaultSyncError;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::*;
@@ -15,6 +17,118 @@ pub type PageId = u64;
 /// V3 format: [0x56, 0x53] + [postcard PageHeader] + [data]
 const PAGE_MAGIC: [u8; 2] = [0x56, 0x53];
 
+/// Phase 1: Runtime generations for the storage layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageGeneration(pub u64);
+
+impl Default for StorageGeneration {
+    fn default() -> Self { Self(0) }
+}
+
+/// Phase 1: Index key types for ContentIndex lookups.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexKey {
+    Document { doc_id: String, record_id: String },
+    Sequence(u64),
+    Namespace(String),
+    Schema(String),
+    Migration(String),
+}
+
+/// Phase 1: Index entry with metadata for future-proofing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexEntry {
+    pub page_id: PageId,
+    pub storage_gen: StorageGeneration,
+    pub checksum: u32,
+    pub size: u32,
+    pub last_modified: u64,
+}
+
+/// Phase 1: Content index — maps keys to page IDs, eliminating OPFS directory scans.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentIndex {
+    pub generation: StorageGeneration,
+    pub entries: HashMap<IndexKey, IndexEntry>,
+    pub live_pages: BTreeSet<PageId>,
+}
+
+impl ContentIndex {
+    pub fn new() -> Self {
+        Self {
+            generation: StorageGeneration(0),
+            entries: HashMap::new(),
+            live_pages: BTreeSet::new(),
+        }
+    }
+
+    pub fn lookup(&self, key: &IndexKey) -> Option<&IndexEntry> {
+        self.entries.get(key)
+    }
+
+    pub fn lookup_page_id(&self, key: &IndexKey) -> Option<PageId> {
+        self.entries.get(key).map(|e| e.page_id)
+    }
+
+    pub fn insert(&mut self, key: IndexKey, entry: IndexEntry) {
+        self.live_pages.insert(entry.page_id);
+        self.entries.insert(key, entry);
+    }
+
+    pub fn remove(&mut self, key: &IndexKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.live_pages.remove(&entry.page_id);
+        }
+    }
+
+    pub async fn async_rebuild_from_scan(dir: &FileSystemDirectoryHandle) -> Result<Self, VaultSyncError> {
+        let mut index = ContentIndex::new();
+        let iter = dir.entries();
+        loop {
+            let next_fn = match js_sys::Reflect::get(&iter, &JsValue::from_str("next"))
+                .ok()
+                .and_then(|v| v.dyn_into::<js_sys::Function>().ok())
+            {
+                Some(f) => f,
+                None => break,
+            };
+            let result = match next_fn.call0(&iter) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            let entry = if let Some(promise) = result.dyn_ref::<js_sys::Promise>() {
+                match SendJsFuture::from(promise.clone()).await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                }
+            } else {
+                result
+            };
+            let done = js_sys::Reflect::get(&entry, &JsValue::from_str("done"))
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if done { break; }
+            let name = match js_sys::Reflect::get(&entry, &JsValue::from_str("value"))
+                .ok()
+                .and_then(|v| {
+                    v.as_string().or_else(|| {
+                        js_sys::Reflect::get(&v, &JsValue::from_f64(0.0))
+                            .ok()
+                            .and_then(|n| n.as_string())
+                    })
+                }) {
+                Some(n) => n,
+                None => continue,
+            };
+            if let Some(id) = parse_page_id(&name) {
+                index.live_pages.insert(id);
+            }
+        }
+        Ok(index)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageHeader {
     pub version: u8,
@@ -23,25 +137,29 @@ pub struct PageHeader {
     pub data_len: u32,
 }
 
+/// Phase 1: Merged StoreManifest with embedded ContentIndex.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoreManifest {
-    version: u8,
-    highest_page_id: PageId,
-    current_page: PageId,
-    last_sequence: u64,
-    pending_count: usize,
-    live_pages: usize,
-    tombstoned_pages: usize,
-    created_at: u64,
-    updated_at: u64,
-    checksum: u32,
+pub struct StoreManifest {
+    pub version: u8,
+    pub generation: StorageGeneration,
+    pub highest_page_id: PageId,
+    pub current_page: PageId,
+    pub last_sequence: u64,
+    pub pending_count: usize,
+    pub live_pages: usize,
+    pub tombstoned_pages: usize,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub content_index: ContentIndex,
+    pub checksum: u32,
 }
 
 impl StoreManifest {
     fn new() -> Self {
         let now = js_sys::Date::now() as u64;
         let mut m = Self {
-            version: 1,
+            version: 2,
+            generation: StorageGeneration(0),
             highest_page_id: 0,
             current_page: 0,
             last_sequence: 0,
@@ -50,22 +168,29 @@ impl StoreManifest {
             tombstoned_pages: 0,
             created_at: now,
             updated_at: now,
+            content_index: ContentIndex::new(),
             checksum: 0,
         };
         m.checksum = m.compute_checksum();
         m
     }
 
-    fn compute_checksum(&self) -> u32 {
-        let buf = postcard::to_allocvec(self).unwrap_or_default();
+    pub fn compute_checksum(&self) -> u32 {
+        let mut copy = self.clone();
+        copy.checksum = 0;
+        let buf = postcard::to_allocvec(&copy).unwrap_or_default();
         crc32fast::hash(&buf)
     }
 
-    fn verify(&self) -> bool {
+    pub fn verify(&self) -> bool {
         let expected = self.checksum;
         let mut copy = self.clone();
         copy.checksum = 0;
         copy.compute_checksum() == expected
+    }
+
+    pub fn increment_generation(&mut self) {
+        self.generation = StorageGeneration(self.generation.0 + 1);
     }
 }
 
@@ -106,12 +231,110 @@ impl StorageMetrics {
     }
 }
 
+/// Phase 3: PageCache — LRU cache inside PageStore for frequently-accessed pages.
+#[derive(Debug)]
+pub struct PageCache {
+    max_entries: usize,
+    max_bytes: usize,
+    entries: HashMap<PageId, CachedPage>,
+    order: VecDeque<PageId>,
+    current_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPage {
+    data: Arc<Vec<u8>>,
+    last_access: u64,
+    size: usize,
+}
+
+impl PageCache {
+    pub fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            max_entries,
+            max_bytes,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            current_bytes: 0,
+        }
+    }
+
+    pub fn get(&mut self, page_id: PageId) -> Option<Arc<Vec<u8>>> {
+        if let Some(entry) = self.entries.get_mut(&page_id) {
+            entry.last_access = js_sys::Date::now() as u64;
+            // Move to back (most recently used)
+            if let Some(pos) = self.order.iter().position(|id| *id == page_id) {
+                self.order.remove(pos);
+                self.order.push_back(page_id);
+            }
+            Some(Arc::clone(&entry.data))
+        } else {
+            None
+        }
+    }
+
+    pub fn insert(&mut self, page_id: PageId, data: Vec<u8>) {
+        let size = data.len();
+        // If already present, update
+        if let Some(existing) = self.entries.get_mut(&page_id) {
+            self.current_bytes = self.current_bytes.saturating_sub(existing.size);
+            existing.data = Arc::new(data);
+            existing.size = size;
+            existing.last_access = js_sys::Date::now() as u64;
+            self.current_bytes += size;
+            return;
+        }
+        // Evict if needed
+        while self.entries.len() >= self.max_entries || self.current_bytes + size > self.max_bytes {
+            if !self.evict_one() {
+                break;
+            }
+        }
+        self.entries.insert(page_id, CachedPage {
+            data: Arc::new(data),
+            last_access: js_sys::Date::now() as u64,
+            size,
+        });
+        self.order.push_back(page_id);
+        self.current_bytes += size;
+    }
+
+    pub fn remove(&mut self, page_id: PageId) {
+        if let Some(entry) = self.entries.remove(&page_id) {
+            self.current_bytes = self.current_bytes.saturating_sub(entry.size);
+            if let Some(pos) = self.order.iter().position(|id| *id == page_id) {
+                self.order.remove(pos);
+            }
+        }
+    }
+
+    fn evict_one(&mut self) -> bool {
+        if let Some(page_id) = self.order.pop_front() {
+            if let Some(entry) = self.entries.remove(&page_id) {
+                self.current_bytes = self.current_bytes.saturating_sub(entry.size);
+                #[cfg(debug_assertions)]
+                tracing::trace!("[page_cache] evicted page {} ({} bytes)", page_id, entry.size);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.current_bytes = 0;
+    }
+}
+
 #[derive(Debug)]
 pub struct PageStore {
     dir: Arc<FileSystemDirectoryHandle>,
     store_name: Arc<String>,
     gc_needed: Arc<AtomicBool>,
     split_pending: Arc<AtomicBool>,
+    pub(crate) manifest: Arc<StdMutex<Option<StoreManifest>>>,
+    page_cache: Arc<StdMutex<PageCache>>,
     #[cfg(debug_assertions)]
     metrics: Arc<StorageMetrics>,
 }
@@ -123,6 +346,8 @@ impl Clone for PageStore {
             store_name: Arc::clone(&self.store_name),
             gc_needed: Arc::clone(&self.gc_needed),
             split_pending: Arc::clone(&self.split_pending),
+            manifest: Arc::clone(&self.manifest),
+            page_cache: Arc::clone(&self.page_cache),
             #[cfg(debug_assertions)]
             metrics: Arc::clone(&self.metrics),
         }
@@ -135,38 +360,123 @@ impl PageStore {
         store_name: &str,
     ) -> Result<Self, VaultSyncError> {
         let dir = ensure_dir(root, store_name).await?;
-        let manifest = match read_manifest(&dir).await {
-            Some(m) if m.verify() => m,
+        let (manifest, has_content_index) = match read_manifest(&dir).await {
+            Some(m) if m.verify() => {
+                let has_ci = !m.content_index.entries.is_empty() || m.live_pages > 0;
+                (m, has_ci)
+            }
             _ => {
-                let rebuilt = rebuild_manifest(&dir).await?;
+                // Phase 1: rebuild with ContentIndex from scan
+                let rebuilt = rebuild_manifest_with_index(&dir).await?;
                 write_manifest(&dir, &rebuilt).await?;
-                rebuilt
+                (rebuilt, true)
             }
         };
+        let cache = PageCache::new(500, 20 * 1024 * 1024);
         Ok(Self {
             dir: Arc::new(dir),
             store_name: Arc::new(store_name.to_string()),
             gc_needed: Arc::new(AtomicBool::new(false)),
             split_pending: Arc::new(AtomicBool::new(false)),
+            manifest: Arc::new(StdMutex::new(Some(manifest))),
+            page_cache: Arc::new(StdMutex::new(cache)),
             #[cfg(debug_assertions)]
             metrics: Arc::new(StorageMetrics::default()),
         })
     }
 
+    /// Expose directory handle for recovery rebuild
+    pub fn dir(&self) -> &FileSystemDirectoryHandle {
+        &self.dir
+    }
+
+    /// Return page cache usage stats: (current_entries, current_bytes)
+    pub fn page_cache_stats(&self) -> (usize, usize) {
+        let cache = self.page_cache.lock().unwrap();
+        (cache.entries.len(), cache.current_bytes)
+    }
+
+    /// Phase 1: list_page_ids returns live_pages from ContentIndex — no OPFS enumeration.
+    pub async fn list_page_ids(&self, caller: &str) -> Result<Vec<PageId>, VaultSyncError> {
+        #[cfg(debug_assertions)]
+        self.metrics.page_enumerations.fetch_add(1, Ordering::Relaxed);
+
+        let guard = self.manifest.lock().unwrap();
+        if let Some(ref manifest) = *guard {
+            let ids: Vec<PageId> = manifest.content_index.live_pages.iter().copied().collect();
+            engine_debug!("[list_page_ids] caller={} pages={} (from index)", caller, ids.len());
+            Ok(ids)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Phase 1: content_index_lookup — single O(1) lookup instead of OPFS scan.
+    pub fn content_index_lookup(&self, key: &IndexKey) -> Option<IndexEntry> {
+        let guard = self.manifest.lock().unwrap();
+        guard.as_ref()?.content_index.lookup(key).cloned()
+    }
+
+    /// Phase 1: update_content_index after write.
+    pub(crate) async fn update_content_index(&self, key: IndexKey, page_id: PageId) -> Result<(), VaultSyncError> {
+        let cloned = {
+            let mut guard = self.manifest.lock().unwrap();
+            if let Some(ref mut manifest) = *guard {
+                manifest.increment_generation();
+                let entry = IndexEntry {
+                    page_id,
+                    storage_gen: manifest.generation,
+                    checksum: 0,
+                    size: 0,
+                    last_modified: js_sys::Date::now() as u64,
+                };
+                manifest.content_index.insert(key, entry);
+                manifest.live_pages = manifest.content_index.live_pages.len();
+                manifest.updated_at = js_sys::Date::now() as u64;
+                Some(manifest.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(ref m) = cloned {
+            write_manifest(&self.dir, m).await?;
+        }
+        Ok(())
+    }
+
+    /// Phase 1: remove from content_index after tombstone.
+    pub(crate) async fn remove_from_index(&self, key: &IndexKey) -> Result<(), VaultSyncError> {
+        let cloned = {
+            let mut guard = self.manifest.lock().unwrap();
+            if let Some(ref mut manifest) = *guard {
+                manifest.increment_generation();
+                manifest.content_index.remove(key);
+                manifest.tombstoned_pages += 1;
+                manifest.live_pages = manifest.content_index.live_pages.len();
+                manifest.updated_at = js_sys::Date::now() as u64;
+                Some(manifest.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(ref m) = cloned {
+            write_manifest(&self.dir, m).await?;
+        }
+        Ok(())
+    }
+
     pub async fn allocate_page_id(&self) -> Result<PageId, VaultSyncError> {
-        let manifest = read_manifest(&self.dir).await.unwrap_or_else(|| {
-            // Fallback: should not happen after open() rebuilds, but be safe
-            let mut m = StoreManifest::new();
-            m.checksum = m.compute_checksum();
-            m
-        });
-        let page_id = manifest.highest_page_id;
-        let mut updated = manifest.clone();
-        updated.highest_page_id = page_id + 1;
-        updated.live_pages += 1;
-        updated.updated_at = js_sys::Date::now() as u64;
-        write_manifest(&self.dir, &updated).await?;
-        Ok(page_id)
+        let manifest_copy = {
+            let mut guard = self.manifest.lock().unwrap();
+            let manifest = guard.as_mut().unwrap();
+            let page_id = manifest.highest_page_id;
+            manifest.highest_page_id = page_id + 1;
+            manifest.live_pages += 1;
+            manifest.updated_at = js_sys::Date::now() as u64;
+            (page_id, manifest.clone())
+        };
+        write_manifest(&self.dir, &manifest_copy.1).await?;
+        Ok(manifest_copy.0)
     }
 
     /// Write raw page data without any split checks. Used by split_page internally.
@@ -176,6 +486,13 @@ impl PageStore {
 
         let buf = encode_v3_page(data, 0)?;
         write_file(&self.dir, &page_filename(page_id), &buf).await?;
+
+        // Phase 3: cache the written data
+        {
+            let mut cache = self.page_cache.lock().unwrap();
+            cache.insert(page_id, data.to_vec());
+        }
+
         self.bump_manifest_live_page(page_id).await?;
         Ok(())
     }
@@ -234,6 +551,18 @@ impl PageStore {
     }
 
     pub async fn read_page(&self, page_id: PageId) -> Result<Option<Vec<u8>>, VaultSyncError> {
+        // Phase 3: Check page cache first
+        {
+            let mut cache = self.page_cache.lock().unwrap();
+            if let Some(cached) = cache.get(page_id) {
+                #[cfg(debug_assertions)]
+                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some((*cached).clone()));
+            }
+        }
+        #[cfg(debug_assertions)]
+        self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
+
         #[cfg(debug_assertions)]
         self.metrics.page_reads.fetch_add(1, Ordering::Relaxed);
 
@@ -251,20 +580,39 @@ impl PageStore {
         if header.flags & 0x02 != 0 {
             return Ok(None);
         }
+        // Phase 3: cache the read data
+        {
+            let mut cache = self.page_cache.lock().unwrap();
+            cache.insert(page_id, data.clone());
+        }
         Ok(Some(data))
     }
 
     pub async fn delete_page(&self, page_id: PageId) -> Result<(), VaultSyncError> {
         delete_file(&self.dir, &page_filename(page_id)).await?;
-        let manifest = read_manifest(&self.dir).await;
-        if let Some(mut m) = manifest {
-            if m.live_pages > 0 {
-                m.live_pages = m.live_pages.saturating_sub(1);
-            } else if m.tombstoned_pages > 0 {
-                m.tombstoned_pages = m.tombstoned_pages.saturating_sub(1);
+        // Phase 3: remove from cache
+        {
+            let mut cache = self.page_cache.lock().unwrap();
+            cache.remove(page_id);
+        }
+        // Phase 1: use cached manifest
+        let cloned = {
+            let mut guard = self.manifest.lock().unwrap();
+            if let Some(ref mut m) = *guard {
+                m.increment_generation();
+                if m.live_pages > 0 {
+                    m.live_pages = m.live_pages.saturating_sub(1);
+                } else if m.tombstoned_pages > 0 {
+                    m.tombstoned_pages = m.tombstoned_pages.saturating_sub(1);
+                }
+                m.updated_at = js_sys::Date::now() as u64;
+                Some(m.clone())
+            } else {
+                None
             }
-            m.updated_at = js_sys::Date::now() as u64;
-            write_manifest(&self.dir, &m).await?;
+        };
+        if let Some(ref m) = cloned {
+            write_manifest(&self.dir, m).await?;
         }
         Ok(())
     }
@@ -287,32 +635,50 @@ impl PageStore {
         let buf = encode_v3_page(&data, 0x02)?;
         write_file(&self.dir, &name, &buf).await?;
 
-        // Update manifest: move from live to tombstoned
-        let manifest = read_manifest(&self.dir).await;
-        if let Some(mut m) = manifest {
-            if m.live_pages > 0 {
-                m.live_pages = m.live_pages.saturating_sub(1);
+        // Phase 3: remove from cache
+        {
+            let mut cache = self.page_cache.lock().unwrap();
+            cache.remove(page_id);
+        }
+
+        // Phase 1: update cached manifest
+        let cloned = {
+            let mut guard = self.manifest.lock().unwrap();
+            if let Some(ref mut m) = *guard {
+                m.increment_generation();
+                if m.live_pages > 0 {
+                    m.live_pages = m.live_pages.saturating_sub(1);
+                }
+                m.tombstoned_pages += 1;
+                m.updated_at = js_sys::Date::now() as u64;
+                Some(m.clone())
+            } else {
+                None
             }
-            m.tombstoned_pages += 1;
-            m.updated_at = js_sys::Date::now() as u64;
-            write_manifest(&self.dir, &m).await?;
+        };
+        if let Some(ref m) = cloned {
+            write_manifest(&self.dir, m).await?;
         }
         Ok(())
     }
 
     /// Update manifest after writing a new or existing live page.
     async fn bump_manifest_live_page(&self, page_id: PageId) -> Result<(), VaultSyncError> {
-        let manifest = read_manifest(&self.dir).await;
-        if let Some(mut m) = manifest {
-            if page_id >= m.highest_page_id {
-                m.highest_page_id = page_id + 1;
+        let cloned = {
+            let mut guard = self.manifest.lock().unwrap();
+            if let Some(ref mut m) = *guard {
+                m.increment_generation();
+                if page_id >= m.highest_page_id {
+                    m.highest_page_id = page_id + 1;
+                }
+                m.updated_at = js_sys::Date::now() as u64;
+                Some(m.clone())
+            } else {
+                None
             }
-            // Check if this is a new page (not already counted as live or tombstoned)
-            if page_id >= m.highest_page_id.saturating_sub(1) {
-                // Likely a new allocation — already counted in allocate_page_id
-            }
-            m.updated_at = js_sys::Date::now() as u64;
-            write_manifest(&self.dir, &m).await?;
+        };
+        if let Some(ref m) = cloned {
+            write_manifest(&self.dir, m).await?;
         }
         Ok(())
     }
@@ -387,86 +753,6 @@ impl PageStore {
         }
 
         Ok(cleaned)
-    }
-
-    pub async fn list_page_ids(&self, caller: &str) -> Result<Vec<PageId>, VaultSyncError> {
-        #[cfg(debug_assertions)]
-        self.metrics.page_enumerations.fetch_add(1, Ordering::Relaxed);
-
-        let _start = js_sys::Date::now();
-        let mut ids = Vec::new();
-        let mut header_read_count = 0u32;
-
-        let iter = self.dir.entries();
-
-        loop {
-            let next_fn = match js_sys::Reflect::get(&iter, &JsValue::from_str("next"))
-                .ok()
-                .and_then(|v| v.dyn_into::<js_sys::Function>().ok())
-            {
-                Some(f) => f,
-                None => break,
-            };
-
-            let result = match next_fn.call0(&iter) {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-
-            let entry = if let Some(promise) = result.dyn_ref::<js_sys::Promise>() {
-                match SendJsFuture::from(promise.clone()).await {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                }
-            } else {
-                result
-            };
-
-            let done = js_sys::Reflect::get(&entry, &JsValue::from_str("done"))
-                .ok()
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-
-            if done {
-                break;
-            }
-
-            let name = match js_sys::Reflect::get(&entry, &JsValue::from_str("value"))
-                .ok()
-                .and_then(|v| {
-                    v.as_string().or_else(|| {
-                        js_sys::Reflect::get(&v, &JsValue::from_f64(0.0))
-                            .ok()
-                            .and_then(|n| n.as_string())
-                    })
-                })
-            {
-                Some(n) => n,
-                None => continue,
-            };
-
-            if let Some(id) = parse_page_id(&name) {
-                match read_page_header(&self.dir, &name).await? {
-                    Some(header) => {
-                        header_read_count += 1;
-                        #[cfg(debug_assertions)]
-                        self.metrics.header_reads.fetch_add(1, Ordering::Relaxed);
-                        if header.flags & 0x02 == 0 {
-                            ids.push(id);
-                        }
-                    }
-                    None => {}
-                }
-            }
-        }
-
-        let elapsed = js_sys::Date::now() - _start;
-        engine_debug!(
-            "[list_page_ids] caller={} pages={} headers_read={} elapsed={}ms",
-            caller, ids.len(), header_read_count, elapsed as u64,
-        );
-
-        Ok(ids)
     }
 
     /// Set the current full-state page ID in the manifest.
@@ -1021,7 +1307,7 @@ async fn read_page_file(
     }
 }
 
-async fn ensure_dir(
+pub(crate) async fn ensure_dir(
     root: &FileSystemDirectoryHandle,
     name: &str,
 ) -> Result<FileSystemDirectoryHandle, VaultSyncError> {
@@ -1034,14 +1320,14 @@ async fn ensure_dir(
     Ok(val.into())
 }
 
-async fn read_manifest(dir: &FileSystemDirectoryHandle) -> Option<StoreManifest> {
+pub async fn read_manifest(dir: &FileSystemDirectoryHandle) -> Option<StoreManifest> {
     read_all_bytes(dir, "_manifest").await.ok().and_then(|bytes| {
         let m: StoreManifest = postcard::from_bytes(&bytes).ok()?;
         if m.verify() { Some(m) } else { None }
     })
 }
 
-async fn write_manifest(dir: &FileSystemDirectoryHandle, m: &StoreManifest) -> Result<(), VaultSyncError> {
+pub async fn write_manifest(dir: &FileSystemDirectoryHandle, m: &StoreManifest) -> Result<(), VaultSyncError> {
     let mut copy = m.clone();
     copy.checksum = 0;
     copy.checksum = copy.compute_checksum();
@@ -1050,7 +1336,86 @@ async fn write_manifest(dir: &FileSystemDirectoryHandle, m: &StoreManifest) -> R
     write_file(dir, "_manifest", &bytes).await
 }
 
-/// Scan all pages to rebuild the manifest.
+/// Phase 1: Rebuild manifest with ContentIndex from OPFS scan.
+/// Used on first startup after upgrade or after corruption.
+pub async fn rebuild_manifest_with_index(dir: &FileSystemDirectoryHandle) -> Result<StoreManifest, VaultSyncError> {
+    let now = js_sys::Date::now() as u64;
+    let mut highest_page_id: PageId = 0;
+    let mut index = ContentIndex::new();
+
+    let iter = dir.entries();
+    loop {
+        let next_fn = match js_sys::Reflect::get(&iter, &JsValue::from_str("next"))
+            .ok()
+            .and_then(|v| v.dyn_into::<js_sys::Function>().ok())
+        {
+            Some(f) => f,
+            None => break,
+        };
+        let result = match next_fn.call0(&iter) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let entry = if let Some(promise) = result.dyn_ref::<js_sys::Promise>() {
+            match SendJsFuture::from(promise.clone()).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            }
+        } else {
+            result
+        };
+        let done = js_sys::Reflect::get(&entry, &JsValue::from_str("done"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if done { break; }
+        let name = match js_sys::Reflect::get(&entry, &JsValue::from_str("value"))
+            .ok()
+            .and_then(|v| {
+                v.as_string().or_else(|| {
+                    js_sys::Reflect::get(&v, &JsValue::from_f64(0.0))
+                        .ok()
+                        .and_then(|n| n.as_string())
+                })
+            }) {
+            Some(n) => n,
+            None => continue,
+        };
+        if let Some(id) = parse_page_id(&name) {
+            if id > highest_page_id {
+                highest_page_id = id;
+            }
+            let is_tombstoned = match read_page_header(dir, &name).await? {
+                Some(header) => header.flags & 0x02 != 0,
+                None => true,
+            };
+            if !is_tombstoned {
+                index.live_pages.insert(id);
+            }
+        }
+    }
+
+    let mut m = StoreManifest {
+        version: 2,
+        generation: StorageGeneration(0),
+        highest_page_id,
+        current_page: 0,
+        last_sequence: 0,
+        pending_count: 0,
+        live_pages: index.live_pages.len(),
+        tombstoned_pages: 0,
+        created_at: now,
+        updated_at: now,
+        content_index: index,
+        checksum: 0,
+    };
+    m.checksum = m.compute_checksum();
+    Ok(m)
+}
+
+/// Legacy rebuild for backward compatibility during migration.
+/// Same as rebuild_manifest_with_index but without the Phase 1 ContentIndex.
+/// Used by cleanup_tombstoned_pages which only needs page counts.
 async fn rebuild_manifest(dir: &FileSystemDirectoryHandle) -> Result<StoreManifest, VaultSyncError> {
     let now = js_sys::Date::now() as u64;
     let mut highest_page_id: PageId = 0;
@@ -1111,6 +1476,7 @@ async fn rebuild_manifest(dir: &FileSystemDirectoryHandle) -> Result<StoreManife
 
     let mut m = StoreManifest {
         version: 1,
+        generation: StorageGeneration(0),
         highest_page_id,
         current_page: 0,
         last_sequence: 0,
@@ -1119,6 +1485,7 @@ async fn rebuild_manifest(dir: &FileSystemDirectoryHandle) -> Result<StoreManife
         tombstoned_pages,
         created_at: now,
         updated_at: now,
+        content_index: ContentIndex::new(),
         checksum: 0,
     };
     m.checksum = m.compute_checksum();

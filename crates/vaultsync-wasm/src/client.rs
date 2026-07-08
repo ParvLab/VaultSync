@@ -1,4 +1,10 @@
+use crate::broadcast_manager::BroadcastManager;
+use crate::capability::{CapabilityManager, RuntimeCapability};
+use crate::ipc::WasmIPC;
+use crate::runtime::Runtime;
 use crate::storage::BrowserStorage;
+use crate::page_store::PageStore;
+use crate::storage_engine::{OpfsStorageEngine, StorageEngine};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -14,6 +20,7 @@ use vaultsync_core::replication::planner::ReplicationPlanner;
 use vaultsync_core::event_bus::EventBus;
 use vaultsync_core::VaultSyncClient;
 use vaultsync_core::VaultSyncConfig;
+use vaultsync_core::VaultSyncError;
 use futures::stream::StreamExt;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -36,6 +43,11 @@ pub struct WasmVaultSyncClient {
     cross_tab_channel: Option<web_sys::BroadcastChannel>,
     tab_id: String,
     event_callback: Arc<Mutex<Option<SendFunction>>>,
+    // Engine V2 modules
+    runtime: Option<Arc<Runtime>>,
+    capability_manager: Option<Arc<CapabilityManager>>,
+    broadcast_manager: Option<Arc<BroadcastManager>>,
+    storage_engine: Option<Arc<dyn StorageEngine>>,
 }
 
 #[wasm_bindgen]
@@ -59,6 +71,7 @@ impl WasmVaultSyncClient {
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?,
         );
+        let storage_for_engine = storage.clone();
 
         config.storage = match &*storage {
             BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
@@ -86,7 +99,7 @@ impl WasmVaultSyncClient {
         let coordinator = Arc::new(InMemoryCoordinator::new());
         let keyring = Arc::new(KeyRing::generate());
 
-        let client = match VaultSyncClient::new_with_storage(config, coordinator, keyring, storage).await {
+        let client = match VaultSyncClient::new_with_storage(config, coordinator, keyring, storage.clone()).await {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 engine_error!("Offline client construction failed: {:?}", e);
@@ -111,6 +124,51 @@ impl WasmVaultSyncClient {
         let cross_tab_channel = web_sys::BroadcastChannel::new(&channel_name).ok();
 
         let event_callback: Arc<Mutex<Option<SendFunction>>> = Arc::new(Mutex::new(None));
+
+        // Engine V2: initialize Runtime and managers
+        let runtime = Runtime::new(replica_id.to_string());
+        let capability_manager = Arc::new(CapabilityManager::new());
+
+        // Engine V2: create StorageEngine if OPFS backend (best-effort, skip on failure)
+        let storage_engine: Option<Arc<dyn StorageEngine>> = if let BrowserStorage::Opfs(opfs) = &*storage_for_engine {
+            match Self::build_storage_engine(opfs.clone().into(), runtime.clone()).await {
+                Ok(engine) => Some(engine),
+                Err(e) => {
+                    engine_warn!("[engine] storage_engine init skipped: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Engine V2: restore WAL checkpoint from OPFS
+        if let Some(ref se) = storage_engine {
+            match se.load_checkpoint().await {
+                Ok((seq, count)) if seq > 0 => {
+                    runtime.metadata_store.lock().unwrap().cursor = seq;
+                    runtime.metadata_store.lock().unwrap().pending_count = count;
+                    engine_info!("[engine] restored WAL checkpoint: seq={} pending={}", seq, count);
+                }
+                Ok(_) => {}
+                Err(e) => engine_warn!("[engine] load_checkpoint: {:?}", e),
+            }
+        }
+
+        let broadcast_manager = cross_tab_channel.clone().map(|bc| {
+            let ipc = Arc::new(WasmIPC::new_with_channel(bc));
+            Arc::new(BroadcastManager::new(runtime.clone(), ipc, Arc::new(crate::metrics::RuntimeMetrics::default())))
+        });
+
+        // Wire CapabilityManager based on leader election
+        let is_leader = client.leader_election.is_leader();
+        if is_leader {
+            capability_manager.set(RuntimeCapability::Leader);
+            runtime.set_status(crate::runtime::RuntimeStatus::Leader);
+        } else {
+            capability_manager.set(RuntimeCapability::Follower);
+        }
+
         let result = Self {
             client,
             storage_manager,
@@ -122,7 +180,18 @@ impl WasmVaultSyncClient {
             cross_tab_channel,
             tab_id: replica_id.to_string(),
             event_callback,
+            runtime: Some(runtime.clone()),
+            capability_manager: Some(capability_manager),
+            broadcast_manager: broadcast_manager.clone(),
+            storage_engine,
         };
+
+        // Phase II: new leader announces via BC
+        if is_leader {
+            if let Some(ref bm) = broadcast_manager {
+                bm.broadcast_leader_announcement(replica_id);
+            }
+        }
 
         Self::spawn_pending_listener(&result);
 
@@ -155,6 +224,7 @@ impl WasmVaultSyncClient {
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Storage failed: {:?}", e)))?,
         );
+        let storage_for_engine = storage.clone();
 
         config.storage = match &*storage {
             BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
@@ -256,6 +326,53 @@ impl WasmVaultSyncClient {
         let cross_tab_channel = web_sys::BroadcastChannel::new(&channel_name).ok();
 
         let event_callback: Arc<Mutex<Option<SendFunction>>> = Arc::new(Mutex::new(None));
+
+        // Engine V2: Runtime::new() already returns Arc<Runtime>
+        let runtime = Runtime::new(replica_id.to_string());
+        let capability_manager = Arc::new(CapabilityManager::new());
+
+        // Engine V2: create StorageEngine if OPFS backend (best-effort, skip on failure)
+        let storage_engine: Option<Arc<dyn StorageEngine>> = if let BrowserStorage::Opfs(opfs) = &*storage_for_engine {
+            match Self::build_storage_engine(opfs.clone().into(), runtime.clone()).await {
+                Ok(engine) => Some(engine),
+                Err(e) => {
+                    engine_warn!("[engine] storage_engine init skipped: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Engine V2: restore WAL checkpoint from OPFS
+        if let Some(ref se) = storage_engine {
+            match se.load_checkpoint().await {
+                Ok((seq, count)) if seq > 0 => {
+                    runtime.metadata_store.lock().unwrap().cursor = seq;
+                    runtime.metadata_store.lock().unwrap().pending_count = count;
+                    engine_info!("[engine] restored WAL checkpoint: seq={} pending={}", seq, count);
+                }
+                Ok(_) => {}
+                Err(e) => engine_warn!("[engine] load_checkpoint: {:?}", e),
+            }
+        }
+
+        let broadcast_manager = cross_tab_channel.clone().map(|bc| {
+            let ipc = Arc::new(WasmIPC::new_with_channel(bc));
+            Arc::new(BroadcastManager::new(runtime.clone(), ipc, Arc::new(crate::metrics::RuntimeMetrics::default())))
+        });
+
+        // Wire CapabilityManager based on leader election
+        if client.leader_election.is_leader() {
+            capability_manager.set(RuntimeCapability::Leader);
+            runtime.set_status(crate::runtime::RuntimeStatus::Leader);
+        } else {
+            capability_manager.set(RuntimeCapability::Follower);
+        }
+
+        // Phase II: check leader before moving client into result
+        let is_leader = client.leader_election.is_leader();
+
         let result = Self {
             client,
             storage_manager,
@@ -267,11 +384,36 @@ impl WasmVaultSyncClient {
             cross_tab_channel,
             tab_id: replica_id.to_string(),
             event_callback,
+            runtime: Some(runtime.clone()),
+            capability_manager: Some(capability_manager),
+            broadcast_manager: broadcast_manager.clone(),
+            storage_engine,
         };
 
+        // Phase II: new leader announces via BC
+        if is_leader {
+            if let Some(ref bm) = broadcast_manager {
+                bm.broadcast_leader_announcement(replica_id);
+            }
+        }
+
         Self::spawn_pending_listener(&result);
+        Self::spawn_bc_message_handler(&result);
 
         Ok(result)
+    }
+
+    /// Helper: build OpfsStorageEngine from an OpfsStorage Arc.
+    async fn build_storage_engine(
+        storage: Arc<crate::storage::OpfsStorage>,
+        runtime: Arc<Runtime>,
+    ) -> Result<Arc<dyn StorageEngine>, VaultSyncError> {
+        let db_dir = storage.db_dir().await?;
+        let pages_root = crate::page_store::ensure_dir(&db_dir, "_pages").await?;
+        let doc_data = PageStore::open(&pages_root, "doc_data").await?;
+        let oplog = PageStore::open(&pages_root, "oplog").await?;
+        let engine = OpfsStorageEngine::new(storage, doc_data, oplog).with_runtime(runtime);
+        Ok(Arc::new(engine))
     }
 
     fn broadcast_invalidation(&self, doc_id: &str, record_id: &str) {
@@ -324,6 +466,12 @@ impl WasmVaultSyncClient {
         record_id: &str,
         json: &str,
     ) -> Result<(), JsValue> {
+        // Engine V2: capability check
+        if let Some(ref cm) = self.capability_manager {
+            if !cm.can_write() {
+                return Err(JsValue::from_str("cannot execute command: runtime role is read-only"));
+            }
+        }
         engine_debug!("[leader] handle_command verb={} doc={} record={} tab={}", verb, doc_id, record_id, self.tab_id);
         let t0 = web_sys::window()
             .and_then(|w| w.performance())
@@ -334,15 +482,32 @@ impl WasmVaultSyncClient {
                 let fields = json_to_fields(json)?;
                 let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
                 engine_trace!("[BC] LEADER_INSERT_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), safe_utf8_slice(json, 300));
+                // Engine V2: Runtime first
+                if let Some(ref rt) = self.runtime {
+                    for (field, value) in &fields {
+                        rt.set_field(doc_id, record_id, field, value.clone());
+                    }
+                }
                 self.client.insert(doc_id, record_id, fields).await
             }
             "update" => {
                 let fields = json_to_fields(json)?;
                 let keys: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
                 engine_trace!("[BC] LEADER_UPDATE_BEGIN doc={} record={} field_count={} keys=[{}] payload_len={} payload={}", doc_id, record_id, fields.len(), keys.join(","), json.len(), safe_utf8_slice(json, 300));
+                // Engine V2: Runtime first
+                if let Some(ref rt) = self.runtime {
+                    for (field, value) in &fields {
+                        rt.set_field(doc_id, record_id, field, value.clone());
+                    }
+                }
                 self.client.update(doc_id, record_id, fields).await
             }
-            "delete" => self.client.delete(doc_id, record_id).await,
+            "delete" => {
+                if let Some(ref rt) = self.runtime {
+                    rt.delete_field(doc_id, record_id, "__deleted__");
+                }
+                self.client.delete(doc_id, record_id).await
+            }
             _ => return Err(JsValue::from_str(&format!("Unknown command verb: {}", verb))),
         };
         let elapsed = web_sys::window()
@@ -364,17 +529,53 @@ impl WasmVaultSyncClient {
 
     pub async fn insert(&self, doc_id: &str, record_id: &str, json: &str) -> Result<(), JsValue> {
         if self.client.leader_election.is_leader() {
+            // Engine V2: capability check
+            if let Some(ref cm) = self.capability_manager {
+                if !cm.can_write() {
+                    return Err(JsValue::from_str("cannot write: runtime role is read-only"));
+                }
+            }
+
             let fields = json_to_fields(json)?;
+
+            // Engine V2: Runtime first (in-memory DocumentStore + WAL), then persist
+            if let Some(ref rt) = self.runtime {
+                for (field, value) in &fields {
+                    rt.set_field(doc_id, record_id, field, value.clone());
+                }
+            }
+
             self.client
                 .insert(doc_id, record_id, fields)
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Insert failed: {:?}", e)))?;
-            self.broadcast_invalidation(doc_id, record_id);
+
+            // Engine V2: checkpoint WAL if threshold reached
+            if let (Some(ref rt), Some(ref se)) = (self.runtime.clone(), self.storage_engine.clone()) {
+                if rt.wal.lock().unwrap().needs_checkpoint() {
+                    if let Err(e) = se.checkpoint_wal().await {
+                        engine_warn!("[engine] checkpoint_wal failed: {:?}", e);
+                    }
+                }
+            }
+
+            // Engine V2: broadcast structured mutation
+            if let Some(ref bm) = self.broadcast_manager {
+                bm.broadcast_mutation(doc_id, record_id, json);
+            } else {
+                self.broadcast_invalidation(doc_id, record_id);
+            }
             Ok(())
         } else {
             engine_trace!("[BC] FOLLOW_INSERT_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), safe_utf8_slice(json, 500));
             self.send_command("insert", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
+                // Engine V2: apply follower mutation to local Runtime cache
+                if let Some(ref rt) = self.runtime {
+                    for (field, value) in &fields {
+                        rt.set_field(doc_id, record_id, field, value.clone());
+                    }
+                }
                 self.client.fire_local_subscription(doc_id, record_id, &fields);
             }
             Ok(())
@@ -383,17 +584,52 @@ impl WasmVaultSyncClient {
 
     pub async fn update(&self, doc_id: &str, record_id: &str, json: &str) -> Result<(), JsValue> {
         if self.client.leader_election.is_leader() {
+            // Engine V2: capability check
+            if let Some(ref cm) = self.capability_manager {
+                if !cm.can_write() {
+                    return Err(JsValue::from_str("cannot write: runtime role is read-only"));
+                }
+            }
+
             let fields = json_to_fields(json)?;
+
+            // Engine V2: Runtime first
+            if let Some(ref rt) = self.runtime {
+                for (field, value) in &fields {
+                    rt.set_field(doc_id, record_id, field, value.clone());
+                }
+            }
+
             self.client
                 .update(doc_id, record_id, fields)
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Update failed: {:?}", e)))?;
-            self.broadcast_invalidation(doc_id, record_id);
+
+            // Engine V2: checkpoint WAL if threshold reached
+            if let (Some(ref rt), Some(ref se)) = (self.runtime.clone(), self.storage_engine.clone()) {
+                if rt.wal.lock().unwrap().needs_checkpoint() {
+                    if let Err(e) = se.checkpoint_wal().await {
+                        engine_warn!("[engine] checkpoint_wal failed: {:?}", e);
+                    }
+                }
+            }
+
+            // Engine V2: broadcast structured mutation
+            if let Some(ref bm) = self.broadcast_manager {
+                bm.broadcast_mutation(doc_id, record_id, json);
+            } else {
+                self.broadcast_invalidation(doc_id, record_id);
+            }
             Ok(())
         } else {
             engine_trace!("[BC] FOLLOW_UPDATE_BEGIN doc={} record={} payload_len={} payload={}", doc_id, record_id, json.len(), safe_utf8_slice(json, 500));
             self.send_command("update", doc_id, record_id, json);
             if let Ok(fields) = json_to_fields(json) {
+                if let Some(ref rt) = self.runtime {
+                    for (field, value) in &fields {
+                        rt.set_field(doc_id, record_id, field, value.clone());
+                    }
+                }
                 self.client.fire_local_subscription(doc_id, record_id, &fields);
             }
             Ok(())
@@ -402,11 +638,38 @@ impl WasmVaultSyncClient {
 
     pub async fn delete(&self, doc_id: &str, record_id: &str) -> Result<(), JsValue> {
         if self.client.leader_election.is_leader() {
+            // Engine V2: capability check
+            if let Some(ref cm) = self.capability_manager {
+                if !cm.can_write() {
+                    return Err(JsValue::from_str("cannot write: runtime role is read-only"));
+                }
+            }
+
+            // Engine V2: Runtime first
+            if let Some(ref rt) = self.runtime {
+                rt.delete_field(doc_id, record_id, "__deleted__");
+            }
+
             self.client
                 .delete(doc_id, record_id)
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Delete failed: {:?}", e)))?;
-            self.broadcast_invalidation(doc_id, record_id);
+
+            // Engine V2: checkpoint WAL if threshold reached
+            if let (Some(ref rt), Some(ref se)) = (self.runtime.clone(), self.storage_engine.clone()) {
+                if rt.wal.lock().unwrap().needs_checkpoint() {
+                    if let Err(e) = se.checkpoint_wal().await {
+                        engine_warn!("[engine] checkpoint_wal failed: {:?}", e);
+                    }
+                }
+            }
+
+            // Engine V2: broadcast structured mutation
+            if let Some(ref bm) = self.broadcast_manager {
+                bm.broadcast_mutation(doc_id, record_id, "{\"__deleted__\":true}");
+            } else {
+                self.broadcast_invalidation(doc_id, record_id);
+            }
             Ok(())
         } else {
             engine_debug!("[Follower delete] sending command doc={} record={}", doc_id, record_id);
@@ -556,8 +819,129 @@ impl WasmVaultSyncClient {
         Ok(JsValue::from_str(&json_str))
     }
 
+    /// Engine V2: expose Runtime + StorageEngine health stats to JS
+    pub fn runtime_storage_stats(&self) -> Result<JsValue, JsValue> {
+        let mut map = serde_json::Map::new();
+
+        if let Some(ref rt) = self.runtime {
+            let meta = rt.metadata_store.lock().unwrap();
+            map.insert("cursor".to_string(), serde_json::Value::Number(serde_json::Number::from(meta.cursor)));
+            map.insert("pendingCount".to_string(), serde_json::Value::Number(serde_json::Number::from(meta.pending_count as u64)));
+            drop(meta);
+            let wal = rt.wal.lock().unwrap();
+            map.insert("walLength".to_string(), serde_json::Value::Number(serde_json::Number::from(wal.len() as u64)));
+            map.insert("walLastCheckpoint".to_string(), serde_json::Value::Number(serde_json::Number::from(wal.last_checkpoint_time())));
+        }
+        if let Some(ref se) = self.storage_engine {
+            let health = se.health();
+            map.insert("isHealthy".to_string(), serde_json::Value::Bool(health.wal_ok && health.manifest_ok && !health.corruption_detected));
+            map.insert("opfsAvailable".to_string(), serde_json::Value::Bool(health.opfs_available));
+            map.insert("manifestOk".to_string(), serde_json::Value::Bool(health.manifest_ok));
+            map.insert("walOk".to_string(), serde_json::Value::Bool(health.wal_ok));
+            map.insert("pageCacheUsed".to_string(), serde_json::Value::Number(serde_json::Number::from(health.page_cache_usage.0 as u64)));
+            map.insert("pageCacheCapacity".to_string(), serde_json::Value::Number(serde_json::Number::from(health.page_cache_usage.1 as u64)));
+            map.insert("lastCheckpointSeq".to_string(), serde_json::Value::Number(serde_json::Number::from(health.last_checkpoint)));
+            map.insert("corruptionDetected".to_string(), serde_json::Value::Bool(health.corruption_detected));
+        }
+
+        let json_str = serde_json::to_string(&serde_json::Value::Object(map))
+            .map_err(|e| JsValue::from_str(&format!("Serialize error: {:?}", e)))?;
+        Ok(JsValue::from_str(&json_str))
+    }
+
     pub fn on_event(&self, callback: js_sys::Function) {
         *self.event_callback.lock().unwrap() = Some(SendFunction(JsValue::from(callback)));
+    }
+
+    /// Engine V2: Listen for invalidation and MUTATION messages on BC.
+    fn spawn_bc_message_handler(this: &Self) {
+        if let Some(ref bc) = this.cross_tab_channel {
+            let rt = this.runtime.clone();
+            let client = this.client.clone();
+            let bm = this.broadcast_manager.clone();
+            let tab_id = this.tab_id.clone();
+            let cm = this.capability_manager.clone();
+
+            let onmsg = Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
+                if let Some(msg_str) = e.data().as_string() {
+                    // Engine V2 MUTATION: apply directly to Runtime cache
+                    if msg_str.starts_with("MUTATION|") {
+                        if let Some(ref rt) = rt {
+                            let parts: Vec<&str> = msg_str.splitn(5, '|').collect();
+                            if parts.len() >= 5 {
+                                let doc_id = parts[2];
+                                let record_id = parts[3];
+                                let fields_str = parts[4];
+                                if let Ok(fields) = json_to_fields(fields_str) {
+                                    for (field, value) in &fields {
+                                        rt.set_field(doc_id, record_id, field, value.clone());
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+
+                    // LEADER_ELECTED: another tab won election
+                    if msg_str.starts_with("LEADER_ELECTED|") {
+                        let parts: Vec<&str> = msg_str.splitn(5, '|').collect();
+                        let other_tab = parts.get(1).unwrap_or(&"");
+                        if other_tab != &tab_id {
+                            if let Some(ref cm) = cm {
+                                if cm.is_leader() {
+                                    cm.set(RuntimeCapability::Follower);
+                                    if let Some(ref rt) = rt {
+                                        rt.set_status(crate::runtime::RuntimeStatus::Follower);
+                                    }
+                                    engine_info!("[BC] demoted by LEADER_ELECTED from tab={}", other_tab);
+                                }
+                            }
+                            // Send FOLLOWER_ATTACH
+                            if let Some(ref bm) = bm {
+                                let msg = format!("FOLLOWER_ATTACH|{}|{}|leader", tab_id, 1);
+                                let _ = bm.channel.send(&msg);
+                            }
+                        }
+                        return;
+                    }
+
+                    // LEADER_TRANSFER: sync state from old leader
+                    if msg_str.starts_with("LEADER_TRANSFER|") {
+                        let parts: Vec<&str> = msg_str.splitn(4, '|').collect();
+                        if parts.len() >= 4 {
+                            if let Some(ref rt) = rt {
+                                let mut meta = rt.metadata_store.lock().unwrap();
+                                meta.runtime_gen = crate::runtime::RuntimeGeneration(parts[1].parse().unwrap_or(0));
+                                meta.bus_gen = crate::runtime::BusGeneration(parts[2].parse().unwrap_or(0));
+                                meta.cursor = parts[3].parse().unwrap_or(0);
+                            }
+                        }
+                        return;
+                    }
+
+                    // Legacy invalidation: trigger subscription re-fire
+                    if let Ok(val) = js_sys::JSON::parse(&msg_str) {
+                        let msg_type = js_sys::Reflect::get(&val, &"type".into())
+                            .ok().and_then(|v| v.as_string());
+                        if msg_type.as_deref() == Some("invalidate") {
+                            let doc_id = js_sys::Reflect::get(&val, &"doc_id".into())
+                                .ok().and_then(|v| v.as_string()).unwrap_or_default();
+                            let record_id = js_sys::Reflect::get(&val, &"record_id".into())
+                                .ok().and_then(|v| v.as_string()).unwrap_or_default();
+                            let c = client.clone();
+                            let _ = wasm_bindgen_futures::spawn_local(
+                                async move {
+                                    let _ = c.fire_local_subscription(&doc_id, &record_id, &HashMap::new());
+                                }
+                            );
+                        }
+                    }
+                }
+            }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+
+            bc.set_onmessage(Some(onmsg.as_ref().unchecked_ref()));
+            onmsg.forget();
+        }
     }
 
     fn spawn_pending_listener(this: &Self) {

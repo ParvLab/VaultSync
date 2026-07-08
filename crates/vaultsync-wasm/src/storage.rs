@@ -17,6 +17,11 @@ pub struct OpfsStorage {
 }
 
 impl OpfsStorage {
+    /// Get a clone of the root directory handle (for PageStore creation)
+    pub async fn db_dir(&self) -> Result<FileSystemDirectoryHandle, VaultSyncError> {
+        Ok(self.root.lock().unwrap().clone())
+    }
+
     pub async fn new(db_name: &str) -> Result<Self, VaultSyncError> {
         let window =
             web_sys::window().ok_or_else(|| VaultSyncError::Storage("no window".into()))?;

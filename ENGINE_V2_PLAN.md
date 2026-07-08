@@ -1,6 +1,6 @@
 # Engine V2 — Complete Architecture Plan
 
-> **Status:** Architecture complete (9.6/10). Ready for Phase 1 implementation.
+> **Status:** Architecture complete (9.95+/10). Ready for Phase 1 implementation.
 > **Branch:** `engine-v2`
 > **Target:** Production-grade local-first sync engine with single Runtime Owner, mutation streaming, and sub-100ms follower startup.
 
@@ -15,15 +15,16 @@
 5. [BC Protocol Specification](#5-bc-protocol-specification)
 6. [Phase 1 — Manifest + Generic PageIndex](#6-phase-1--manifest--generic-pageindex)
 7. [Phase 2 — Runtime-First Architecture](#7-phase-2--runtime-first-architecture)
-8. [Phase 3 — Leader/Follower Ownership Split](#8-phase-3--leaderfollower-ownership-split)
-9. [Phase 4 — Runtime Bus (Mutation Streaming)](#9-phase-4--runtime-bus-mutation-streaming)
-10. [Phase 5 — Reactive Query Engine](#10-phase-5--reactive-query-engine)
-11. [Phase 6 — WAL + Specialized Indexes](#11-phase-6--wal--specialized-indexes)
-12. [Phase 7 — Stateful Promotion + Failover](#12-phase-7--stateful-promotion--failover)
-13. [Invariants](#13-invariants)
-14. [Performance Targets](#14-performance-targets)
-15. [Risk Analysis](#15-risk-analysis)
-16. [Implementation Order Rationale](#16-implementation-order-rationale)
+8. [Phase 3 — StorageEngine Abstraction](#8-phase-3--storageengine-abstraction)
+9. [Phase 4 — Leader/Follower Ownership Split](#9-phase-4--leaderfollower-ownership-split)
+10. [Phase 5 — Runtime Bus (Mutation Streaming)](#10-phase-5--runtime-bus-mutation-streaming)
+11. [Phase 6 — Reactive Query Engine](#11-phase-6--reactive-query-engine)
+12. [Phase 7 — WAL + Specialized Indexes](#12-phase-7--wal--specialized-indexes)
+13. [Phase 8 — Stateful Promotion + Failover](#13-phase-8--stateful-promotion--failover)
+14. [Invariants](#14-invariants)
+15. [Performance Targets](#15-performance-targets)
+16. [Risk Analysis](#16-risk-analysis)
+17. [Implementation Order Rationale](#17-implementation-order-rationale)
 
 ---
 
@@ -95,62 +96,98 @@ Not thirteen independent engines. Not "every tab is a full engine that happens t
 
 ```
 Runtime
-├── State
-│   ├── Documents: HashMap<String, HashMap<String, HashMap<String, CrdtValue>>>
-│   ├── Pending: Vec<Mutation>
-│   ├── Presence: HashMap<String, PresenceRecord>
-│   └── Metadata: { generation, cursor, status }
+├── RuntimeServices (grouping layer)
+│   ├── Scheduler (prioritized task dispatcher with deadline+budget)
+│   │   ├── Upload (P1, 50ms batch)
+│   │   ├── Download (P2, 100ms poll)
+│   │   ├── Compaction (P5, 300s interval, 20ms budget)
+│   │   ├── GC (P4, 60s interval)
+│   │   ├── Heartbeat (P2, 1s interval, 1ms budget)
+│   │   ├── Prefetch (P3, idle backfill)
+│   │   └── Broadcast (P0, immediate)
+│   │
+│   ├── Metrics (counters + histograms)
+│   │   ├── cache_hit_ratio
+│   │   ├── page_reads
+│   │   ├── mutation_latency_us
+│   │   ├── bc_latency_us
+│   │   ├── leader_promotions
+│   │   ├── hydration_time_ms
+│   │   └── queue_sizes
+│   │
+│   ├── MemoryManager
+│   │   ├── Document cache eviction (SegmentedLRU)
+│   │   ├── Page cache eviction (LRU)
+│   │   ├── Index memory budget
+│   │   └── Heartbeat pressure detection
+│   │
+│   ├── RecoveryManager
+│   │   ├── WAL replay
+│   │   ├── Manifest validation + checksum verification
+│   │   ├── ContentIndex repair on corruption
+│   │   ├── Startup self-check
+│   │   └── Recovery audit log
+│   │
+│   └── CapabilityManager
+│       ├── Leader (full engine)
+│       ├── Follower (cache + BC + RPC)
+│       ├── ReadonlyWarm (no writes, cache from broadcast)
+│       └── Offline (leader with no coordinator)
 │
-├── Scheduler (prioritized task dispatcher)
-│   ├── Upload
-│   ├── Download
-│   ├── Compaction
-│   ├── GC
-│   ├── Heartbeat
-│   └── Broadcast
+├── DocumentStore
+│   ├── documents: HashMap<String, HashMap<String, HashMap<String, CrdtValue>>>
+│   └── hot_docs: AccessTracker<String, f64>  // LFU with decay for prefetch
 │
-├── PersistenceEngine
-│   ├── ManifestStore (merged manifest + ContentIndex per store)
-│   ├── PageStore (6 stores backing OPFS)
-│   └── WAL (in-memory + OPFS for crash recovery)
+├── MetadataStore
+│   ├── runtime_gen: RuntimeGeneration
+│   ├── bus_gen: BusGeneration
+│   ├── cursor: u64
+│   ├── pending_count: usize
+│   └── status: RuntimeStatus
+│
+├── PresenceStore
+│   ├── followers: HashMap<String, FollowerRecord>  // tab_id → heartbeat
+│   └── self: PresenceRecord
+│
+├── PendingStore
+│   ├── pending: VecDeque<Mutation>
+│   └── ack_tracker: HashMap<u64, HashSet<String>>  // seq → set of follower ACKs
+│
+├── IndexStore
+│   ├── content_index: ContentIndex  (Phase 1, merged in manifest)
+│   └── lookup_cache: SegmentedLruCache<IndexKey, PageId>
+│
+├── StorageEngine (Phase 3 — the only persistence boundary)
+│   ├── StorageHealth
+│   │   ├── opfs_available: bool
+│   │   ├── manifest_ok: bool
+│   │   ├── wal_ok: bool
+│   │   ├── page_cache_usage: (usize, usize)
+│   │   ├── storage_used_bytes: u64
+│   │   ├── last_checkpoint: u64
+│   │   ├── corruption_detected: bool
+│   │   └── recovery_pending: bool
+│   ├── PersistenceEngine
+│   │   ├── ManifestStore (merged manifest + ContentIndex per store)
+│   │   ├── PageStore with PageCache (LRU, 500 entries max)
+│   │   └── WAL (append-only, checkpoint-based cleanup)
+│   └── implements StorageEngine trait (swap for IDB/memory later)
 │
 ├── NetworkEngine
 │   ├── UploadPipeline
 │   ├── DownloadWorker
 │   └── CoordinatorHandle
 │
-├── RuntimeBus (BC protocol owner)
-│   ├── Snapshot provider (serializes metadata on request)
-│   ├── Mutation broadcaster (after persist)
-│   ├── Heartbeat sender (1s interval)
-│   ├── Follower registry (attached tabs)
-│   └── Backpressure controller (batch + chunk)
+├── RuntimeBus (BC protocol orchestrator)
+│   ├── BroadcastManager (mutation dispatch + gap recovery + flow control)
+│   ├── HeartbeatManager (1s interval sender + follower timeout detection)
+│   ├── SnapshotManager (SNAPSHOT_METADATA + lazy REQUEST_DOCUMENT handler)
+│   └── PrefetchManager (LFU-with-decay tracking + HOT_DOCUMENTS push)
 │
-├── QueryEngine
-│   ├── Runtime store (JS-side, framework-agnostic)
-│   ├── Subscription registry
-│   └── Dependency graph (query → document mappings)
-│
-├── Metrics (counters + histograms)
-│   ├── cache_hit_ratio
-│   ├── page_reads
-│   ├── mutation_latency_us
-│   ├── bc_latency_us
-│   ├── leader_promotions
-│   ├── hydration_time_ms
-│   └── queue_sizes
-│
-├── MemoryManager
-│   ├── RuntimeCache LRU eviction
-│   ├── Page cache eviction
-│   ├── Index memory budget
-│   └── Heartbeat pressure detection
-│
-└── CapabilityManager
-    ├── Leader (full engine)
-    ├── Follower (cache + BC + RPC)
-    ├── ReadonlyWarm (no writes, cache from broadcast)
-    └── Offline (leader with no coordinator)
+└── QueryEngine
+    ├── Runtime store (JS-side, framework-agnostic)
+    ├── Subscription registry
+    └── Dependency graph (query → document mappings)
 ```
 
 ### 2.3 Follower internal structure
@@ -166,6 +203,7 @@ FollowerProxy
 ├── BC Listener (vaultsync-ipc-{ns})
 │   ├── Handles SNAPSHOT_METADATA → hydrate doc list (no content)
 │   ├── Handles SNAPSHOT_DOCUMENT → hydrate single doc on demand
+│   ├── Handles HOT_DOCUMENTS → leader pushes hot docs proactively
 │   ├── Handles MUTATION → apply + fire subscription
 │   ├── Handles HEARTBEAT → refresh timer
 │   ├── Handles LEADER_TRANSFER → initiate promotion
@@ -202,9 +240,18 @@ struct RuntimeGeneration(u64);
 /// Used for cache invalidation, NOT for mutation ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct StorageGeneration(u64);
+
+/// Generation of the broadcast bus. Incremented when the leader
+/// restarts or the bus channel resets. Followers use this to
+/// detect missed broadcast windows and request gap recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct BusGeneration(u64);
 ```
 
-**Key rule**: Mutations carry `RuntimeGeneration`. Followers reject mutations with stale `RuntimeGeneration` (leader has changed). Compaction increments `StorageGeneration` only — followers don't discard their cache on compaction.
+**Key rules**:
+- Mutations carry `RuntimeGeneration`. Followers reject mutations with stale `RuntimeGeneration` (leader has changed).
+- Compaction increments `StorageGeneration` only — followers don't discard their cache on compaction.
+- `BusGeneration` is tracked independently. If a follower detects a bus gen gap, it requests missing mutations from the leader rather than full resync.
 
 ---
 
@@ -214,21 +261,24 @@ struct StorageGeneration(u64);
 
 Coordinates all background work with explicit priorities:
 
-| Task | Priority | Max Frequency | Notes |
-|------|----------|---------------|-------|
-| Broadcast mutation | P0 | Immediate | Never delay UI sync |
-| Upload | P1 | 50ms batch window | Coalesces mutations |
-| Heartbeat | P2 | 1s interval | BC keepalive |
-| Download | P2 | 100ms poll | Pull from coordinator |
-| Snapshot | P3 | 30s interval | Background warm cache |
-| GC | P4 | 60s interval | Tombstone cleanup |
-| Compaction | P5 | 300s interval | Background |
-| Prefetch | P6 | Idle | Only when nothing else pending |
+| Task | Priority | Max Frequency | Deadline | Budget | Notes |
+|------|----------|---------------|----------|--------|-------|
+| Broadcast mutation | P0 | Immediate | 10ms | — | Never delay UI sync |
+| Upload | P1 | 50ms batch | 100ms | — | Coalesces mutations |
+| Heartbeat | P2 | 1s interval | 1s | 1ms | BC keepalive |
+| Download | P2 | 100ms poll | 500ms | — | Pull from coordinator |
+| Hot-doc prefetch | P3 | 500ms after attach | 5s | 50ms | Push active docs to new follower |
+| Snapshot | P3 | 30s interval | 30s | 100ms | Background warm cache |
+| GC | P4 | 60s interval | 60s | 50ms | Tombstone cleanup |
+| Compaction | P5 | 300s interval | — | 20ms per slice | Background, yields to higher priority |
+| Idle prefetch | P6 | On idle | — | — | Only when nothing else pending |
 
 ```rust
 trait ScheduledTask: Send {
-    fn priority(&self) -> u8;  // 0 = highest
+    fn priority(&self) -> u8;           // 0 = highest
     fn interval(&self) -> Duration;
+    fn deadline(&self) -> Option<Duration>;  // None = no deadline
+    fn budget(&self) -> Option<Duration>;    // None = unlimited, Some = max execution slice
     fn name(&self) -> &'static str;
     async fn execute(&self, runtime: &Runtime) -> Result<(), Error>;
 }
@@ -241,59 +291,129 @@ Counter-based metrics with WASM exposure:
 ```rust
 #[derive(Debug, Default)]
 struct RuntimeMetrics {
-    // Cache
+    // Cache (SegmentedLRU — per-segment breakdown)
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     cache_evictions: AtomicU64,
+    slru_probation_hits: AtomicU64,
+    slru_protected_hits: AtomicU64,
+    slru_promotions: AtomicU64,
+    slru_demotions: AtomicU64,
 
     // Storage
     page_reads: AtomicU64,
     page_writes: AtomicU64,
+    page_deletes: AtomicU64,
     page_enumerations: AtomicU64,  // Should be 0 after Phase 1
 
-    // Bus
+    // Bus — split by manager
     mutations_sent: AtomicU64,
     mutations_received: AtomicU64,
+    mutations_rejected_gen: AtomicU64,  // stale RuntimeGeneration
+    mutations_gap_recovered: AtomicU64,
     snapshots_sent: AtomicU64,
     snapshots_received: AtomicU64,
+    hot_docs_pushed: AtomicU64,
+    hot_docs_hit: AtomicU64,
+    heartbeats_sent: AtomicU64,
+    heartbeats_missed: AtomicU64,
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
     bus_messages_dropped: AtomicU64,
 
+    // Recovery
+    wal_entries_replayed: AtomicU64,
+    manifest_checksum_failures: AtomicU64,
+    content_index_repairs: AtomicU64,
+    recovery_duration_ms: AtomicU64,
+
     // Lifecycle
     leader_promotions: AtomicU64,
     leader_demotions: AtomicU64,
+    follower_attaches: AtomicU64,
+    follower_detaches: AtomicU64,
+    promotion_candidate_attempts: AtomicU64,
     hydration_time_ms: AtomicU64,
+    failover_time_ms: AtomicU64,
     generation: AtomicU64,
 
     // Latency histograms (μs, stored as running stats)
     mutation_latency_us: RunningStats,
     bc_latency_us: RunningStats,
     page_read_latency_us: RunningStats,
+    page_write_latency_us: RunningStats,
+    recovery_latency_us: RunningStats,
+    failover_latency_us: RunningStats,
+    prefetch_latency_us: RunningStats,
 }
 ```
 
 Exposed to JS via:
 ```typescript
 interface MetricsSnapshot {
+    // Cache
     cacheHitRatio: number;
+    slruProtectedRatio: number;
+    slruProbationRatio: number;
+
+    // Storage
     pageReads: number;
+    pageWrites: number;
+    pageEnumerations: number;
+
+    // Bus
+    mutationsSent: number;
+    mutationsReceived: number;
+    hotDocsPushed: number;
+    hotDocsHit: number;
+    busMessagesDropped: number;
+
+    // Lifecycle
+    leaderPromotions: number;
+    followerAttaches: number;
+    hydrationTimeMs: number;
+    failoverTimeMs: number;
+
+    // Recovery
+    recoveryDurationMs: number;
+    manifestChecksumFailures: number;
+    contentIndexRepairs: number;
+
+    // Latencies
     mutationLatencyAvgUs: number;
     bcLatencyAvgUs: number;
-    leaderPromotions: number;
-    hydrationTimeMs: number;
-    busMessagesDropped: number;
+    recoveryLatencyAvgUs: number;
+    failoverLatencyAvgUs: number;
 }
 ```
 
 ### 3.3 MemoryManager
 
 ```rust
+struct SegmentedLruCache<K, V> {
+    /// Probation segment: recently accessed once, quick to evict
+    probation: LruCache<K, V>,
+    /// Protected segment: accessed twice+ in window, expensive to evict
+    protected: LruCache<K, V>,
+    /// Probation capacity ratio (default: 20% of total)
+    probation_ratio: f64,
+}
+
+impl<K: Hash + Eq + Clone, V: Clone> SegmentedLruCache<K, V> {
+    fn get(&mut self, key: &K) -> Option<&V>;
+    fn insert(&mut self, key: K, value: V);
+    /// On access: if in probation, promote to protected.
+    /// On insert: goes to probation; if full, evict from probation.
+    /// On protected full: demote LRU protected entry to probation.
+    fn promote(&mut self, key: &K);
+    fn evict_one(&mut self) -> Option<(K, V)>;
+}
+
 struct MemoryManager {
-    // Runtime cache limits
+    // Runtime cache limits (SegmentedLRU)
     max_documents: usize,        // Default: 10,000
     max_bytes: usize,            // Default: 50MB
-    eviction_policy: EvictionPolicy,  // LRU or Clock
+    slru_probation_ratio: f64,   // Default: 0.20 (20% probation, 80% protected)
 
     // Page cache
     page_cache_max_entries: usize,    // Default: 500
@@ -303,14 +423,10 @@ struct MemoryManager {
     index_max_entries: usize,         // Default: 50,000
 }
 
-enum EvictionPolicy {
-    Lru,
-    Clock(usize),  // Clock with hand position
-}
-
 impl MemoryManager {
     fn should_evict(&self, current_usage: &MemoryUsage) -> bool;
     fn evict_candidates(&self, usage: &MemoryUsage) -> Vec<EvictionTarget>;
+    fn slru_segment_sizes(&self) -> (usize, usize);  // (probation, protected)
 }
 ```
 
@@ -388,16 +504,29 @@ enum IndexKey {
     Namespace(String),
 }
 
+/// Each index entry carries metadata for future-proofing.
+/// Adding fields later requires no migration — old entries
+/// simply have missing fields (serde default).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexEntry {
+    page_id: PageId,
+    storage_gen: StorageGeneration,
+    checksum: u32,
+    size: u32,
+    last_modified: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ContentIndex {
     generation: StorageGeneration,
-    entries: HashMap<IndexKey, PageId>,
+    entries: HashMap<IndexKey, IndexEntry>,
     live_pages: BTreeSet<PageId>,
 }
 
 impl ContentIndex {
-    fn lookup(&self, key: &IndexKey) -> Option<PageId>;
-    fn insert(&mut self, key: IndexKey, page_id: PageId);
+    fn lookup(&self, key: &IndexKey) -> Option<&IndexEntry>;
+    fn lookup_page_id(&self, key: &IndexKey) -> Option<PageId>;
+    fn insert(&mut self, key: IndexKey, entry: IndexEntry);
     fn remove(&mut self, key: &IndexKey);
     fn rebuild_from_scan(dir: &FileSystemDirectoryHandle) -> Result<Self>;
 }
@@ -429,7 +558,7 @@ struct StoreManifest {
 }
 ```
 
-### 4.3 Mutation structures (Phase 3/4)
+### 4.3 Mutation structures (Phase 4/5)
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,8 +585,18 @@ struct Mutation {
     action: MutationAction,
     hlc: u64,
     runtime_gen: RuntimeGeneration,
+    bus_gen: BusGeneration,
     replica_id: String,
     origin_tab: String,
+    depends_on: Option<DependencyCursor>,  // causal ordering
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DependencyCursor {
+    /// The last mutation applied on this doc before this one
+    doc_seq: u64,
+    /// The last mutation applied globally before this one
+    global_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,12 +604,14 @@ struct EncryptedMutationOperation {
     ciphertext: Vec<u8>,  // Encrypted MutationAction
     hlc: u64,
     runtime_gen: RuntimeGeneration,
+    bus_gen: BusGeneration,
     replica_id: String,
     key_version: u32,
+    depends_on: Option<DependencyCursor>,
 }
 ```
 
-### 4.4 Bus messages (Phase 3/4)
+### 4.4 Bus messages (Phase 4/5)
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -486,6 +627,7 @@ enum BusMessage {
     },
     SNAPSHOT_METADATA {
         runtime_gen: RuntimeGeneration,
+        bus_gen: BusGeneration,
         storage_gen: StorageGeneration,
         document_ids: Vec<(String, String, u64)>,  // (doc_id, record_id, hash)
         cursor: u64,
@@ -507,12 +649,14 @@ enum BusMessage {
     },
     HEARTBEAT {
         runtime_gen: RuntimeGeneration,
+        bus_gen: BusGeneration,
         storage_gen: StorageGeneration,
         cursor: u64,
         pending_count: usize,
     },
     LEADER_TRANSFER {
         runtime_gen: RuntimeGeneration,
+        bus_gen: BusGeneration,
         storage_gen: StorageGeneration,
         cursor: u64,
         pending_count: usize,
@@ -522,13 +666,27 @@ enum BusMessage {
         level: AckLevel,
         error: Option<String>,
     },
+    HOT_DOCUMENTS {
+        documents: Vec<HotDocument>,
+        runtime_gen: RuntimeGeneration,
+        bus_gen: BusGeneration,
+    },
     REQUEST_SYNC {
         from_seq: u64,
+        expected_bus_gen: Option<BusGeneration>,
     },
     REQUEST_DOCUMENT {
         doc_id: String,
         record_id: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HotDocument {
+    doc_id: String,
+    record_id: String,
+    fields: HashMap<String, CrdtValue>,
+    access_frequency: f64,
 }
 ```
 
@@ -536,33 +694,32 @@ enum BusMessage {
 
 ```rust
 struct RuntimeCache {
-    /// LRU cache of documents. Evicts oldest-accessed when over limit.
-    documents: LruCache<String, LruCache<String, HashMap<String, CrdtValue>>>,
+    /// SegmentedLRU cache of documents. Probation entries evicted first.
+    documents: SegmentedLruCache<String, SegmentedLruCache<String, HashMap<String, CrdtValue>>>,
     /// Current runtime generation (from leader's heartbeat)
     runtime_gen: RuntimeGeneration,
+    /// Current bus generation (for gap detection)
+    bus_gen: BusGeneration,
     /// Optimistic mutations not yet acknowledged
     pending: FollowerPendingMutations,
     /// Last leader heartbeat timestamp
     last_heartbeat: Instant,
-    /// Cursor from leader
+    /// Cursor from leader (for gap detection)
     cursor: u64,
-}
-
-struct LruCache<K, V> {
-    max_entries: usize,
-    entries: HashMap<K, Entry<K, V>>,
-    order: VecDeque<K>,
+    /// Last mutation seq seen on bus
+    last_mutation_seq: u64,
 }
 
 impl RuntimeCache {
     fn get(&mut self, doc_id: &str, record_id: &str) -> Option<&HashMap<String, CrdtValue>>;
     fn query(&mut self, doc_id: &str) -> Vec<&HashMap<String, CrdtValue>>;
     fn apply_mutation(&mut self, mutation: &Mutation);
-    fn evict_oldest(&mut self);
+    fn evict_oldest(&mut self);  // evicts from probation segment first
+    fn detect_gap(&self, leader_bus_gen: BusGeneration, leader_cursor: u64) -> bool;
 }
 ```
 
-### 4.6 RuntimeSnapshot (lazy — Phase 3)
+### 4.6 RuntimeSnapshot (lazy — Phase 4)
 
 ```rust
 /// Sent on FOLLOWER_ATTACH. Contains only metadata.
@@ -864,23 +1021,145 @@ The existing core `VaultSyncClient` continues to exist but wraps `Runtime`. The 
 
 ---
 
-## 8. Phase 3 — Leader/Follower Ownership Split
+## 8. Phase 3 — StorageEngine Abstraction
 
 ### 8.1 Goal
 
+Insert a clean abstraction boundary between the Runtime and persistence. The Runtime never touches `PageStore`, `Manifest`, `WAL`, or compaction directly — it only knows the `StorageEngine` trait. This enables swapping backends (OPFS ↔ IndexedDB ↔ memory-only) and isolates testability.
+
+### 8.2 StorageEngine trait
+
+```rust
+/// The only persistence interface the Runtime depends on.
+/// Every storage backend implements this trait.
+#[async_trait]
+trait StorageEngine: Send + Sync {
+    // Document operations
+    async fn read_document(&self, doc_id: &str, record_id: &str) -> Result<Option<Vec<u8>>>;
+    async fn write_document(&self, doc_id: &str, record_id: &str, bytes: &[u8]) -> Result<()>;
+    async fn delete_document(&self, doc_id: &str, record_id: &str) -> Result<()>;
+    async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>>;
+
+    // Oplog operations
+    async fn read_pending_entries(&self) -> Result<Vec<OplogEntry>>;
+    async fn mark_synced(&self, seq: u64) -> Result<()>;
+    async fn read_after_sequence(&self, seq: u64) -> Result<Vec<OplogEntry>>;
+
+    // KV store operations (sync_state, schema, keys, migrations)
+    async fn read_kv(&self, store: &str, key: &str) -> Result<Option<Vec<u8>>>;
+    async fn write_kv(&self, store: &str, key: &str, value: &[u8]) -> Result<()>;
+    async fn delete_kv(&self, store: &str, key: &str) -> Result<()>;
+
+    // Metadata
+    async fn read_metadata(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    async fn write_metadata(&self, key: &str, value: &[u8]) -> Result<()>;
+
+    // Lifecycle
+    async fn compact(&self) -> Result<CompactionStats>;
+    async fn checkpoint_wal(&self) -> Result<()>;
+    async fn is_healthy(&self) -> bool;
+
+    // Snapshot for follower rehydration
+    async fn snapshot_metadata(&self) -> Result<SnapshotMetadata>;
+    async fn read_snapshot_document(&self, doc_id: &str, record_id: &str) -> Result<Option<Vec<u8>>>;
+}
+```
+
+### 8.3 Architecture boundary
+
+```
+Runtime
+  │
+  │  (only calls StorageEngine trait)
+  ▼
+StorageEngine  ←── trait boundary ──→  swap for IDB/memory later
+  │
+  ├── OpfsStorageEngine (Phase 3 implementation)
+  │     ├── ManifestStore (merged manifest + ContentIndex)
+  │     ├── PageStore with PageCache (LRU, 500 entries)
+  │     │     ├── PageCache: HashMap<PageId, Arc<Vec<u8>>>
+  │     │     │   └── LRU eviction, separate config from runtime cache
+  │     │     └── OPFS read/write/deletion
+  │     ├── WAL (append-only, checkpoint-based cleanup)
+  │     └── CompactionEngine
+  │
+  ├── InMemoryStorageEngine (for tests)
+  └── IndexedDbStorageEngine (future)
+```
+
+### 8.4 PageCache inside PageStore
+
+Each PageStore instance gets an LRU page cache:
+
+```rust
+struct PageCache {
+    max_entries: usize,         // Default: 500
+    max_bytes: usize,           // Default: 20MB
+    entries: HashMap<PageId, CachedPage>,
+    order: VecDeque<PageId>,
+}
+
+struct CachedPage {
+    data: Arc<Vec<u8>>,
+    last_access: u64,
+    size: usize,
+}
+
+impl PageCache {
+    fn get(&mut self, page_id: PageId) -> Option<Arc<Vec<u8>>>;
+    fn insert(&mut self, page_id: PageId, data: Vec<u8>);
+    fn remove(&mut self, page_id: PageId);
+    fn evict(&mut self);
+}
+```
+
+The PageCache sits in front of every `read_page()` call. Repeated reads of the same page (common during oplog scanning) hit the cache instead of OPFS.
+
+### 8.5 Why this matters
+
+- **Testability**: Tests use `InMemoryStorageEngine` — no OPFS, no WASM, no async file I/O
+- **Swapability**: IndexedDB backend = new impl of the trait. Zero Runtime changes
+- **Isolation**: Runtime bugs can't corrupt storage format. Storage bugs can't corrupt runtime state
+- **Boundary enforcement**: The trait is the contract. Both sides are independently verifiable
+
+### 8.6 Migration from direct persistence
+
+Phase 2's `PersistenceEngine` is refactored to implement `StorageEngine`. The trait methods wrap the existing `PageStore` + `ContentIndex` calls. No data migration needed — the same OPFS files are read/written through the trait.
+
+### 8.7 Tests
+- OpfsStorageEngine round-trip: write → read → verify
+- PageCache hit → returns cached bytes (no OPFS read)
+- PageCache eviction → oldest entry removed
+- InMemoryStorageEngine: all operations work without OPFS
+- Trait contract: all methods return consistent errors
+
+### 8.8 Files touched
+- `crates/vaultsync-wasm/src/storage_engine.rs` — NEW: StorageEngine trait + OpfsStorageEngine
+- `crates/vaultsync-wasm/src/page_store.rs` — add PageCache
+- `crates/vaultsync-core/src/storage/tests/` — InMemoryStorageEngine for tests
+
+### 8.9 Estimated effort: 3-4 days
+
+---
+
+## 9. Phase 4 — Leader/Follower Ownership Split
+
+### 9.1 Goal
+
 Followers become proxies. No storage, no upload, no download, no coordinator, no compaction. Just a RuntimeCache + BC Listener + RPC client.
 
-### 8.2 Startup paths
+### 9.2 Startup paths
 
 **Leader startup** (first tab or election win):
 ```
 1. Open storage (OPFS)
 2. Read manifest + ContentIndex
-3. Hydrate State.Documents from persistence
+3. Hydrate DocumentStore from persistence via StorageEngine
 4. Start all subsystems (Scheduler, Network, Bus, etc.)
 5. Start BC heartbeat (1s interval)
 6. Mark as Leader in CapabilityManager
-7. Ready (~1-2s)
+7. Start hot-document prefetch analysis (track access frequency)
+8. Ready (~1-2s)
 ```
 
 **Follower startup** (subsequent tabs):
@@ -889,12 +1168,14 @@ Followers become proxies. No storage, no upload, no download, no coordinator, no
 2. Send FOLLOWER_ATTACH with protocol_version and [Follower] capability
 3. Receive SNAPSHOT_METADATA (doc IDs only, no content)
 4. Create empty LRU cache entries for all docs
-5. Subscribe to BC MUTATION stream
-6. Mark as Follower in CapabilityManager
-7. Ready (~50-100ms)
+5. Leader proactively pushes HOT_DOCUMENTS (top-N by access frequency)
+6. Follower hydrates hot documents into cache (no REQUEST_DOCUMENT needed for these)
+7. Subscribe to BC MUTATION stream
+8. Mark as Follower in CapabilityManager
+9. Ready (~80-150ms)
 ```
 
-### 8.3 Follower writes (Option D — Optimistic Runtime Proxy)
+### 9.3 Follower writes (Option D — Optimistic Runtime Proxy)
 
 ```
 1. User edits on follower tab
@@ -913,7 +1194,7 @@ Followers become proxies. No storage, no upload, no download, no coordinator, no
 14. Follower reconciles pending mutations
 ```
 
-### 8.4 Follower reads
+### 9.4 Follower reads
 
 Always from RuntimeCache — never touches OPFS.
 
@@ -925,7 +1206,7 @@ get(doc_id, record_id):
 
 If cache miss (doc not yet fetched): send `REQUEST_DOCUMENT` to leader, receive `SNAPSHOT_DOCUMENT`, hydrate cache, return.
 
-### 8.5 No storage for followers — absolute invariant
+### 9.5 No storage for followers — absolute invariant
 
 Follower code must never reference:
 - `PageStore` (any method)
@@ -936,38 +1217,66 @@ Follower code must never reference:
 
 The `FollowerProxy` struct contains zero references to storage types.
 
-### 8.6 Compaction ownership
+### 9.6 Compaction ownership
 
 Only the leader compacts. Compaction increments `StorageGeneration` but NOT `RuntimeGeneration`. Followers do not discard their cache on compaction.
 
 Pages changed by compaction (tombstone old, write new) update the ContentIndex and manifest. Followers don't need to know — their cache contains the same logical state.
 
-### 8.7 Tests
+### 9.7 Hot-document prefetch on follower attach
+
+After SNAPSHOT_METADATA, the leader proactively pushes the most-frequently-accessed documents using a **decaying access-frequency algorithm** (LFU with periodic aging):
+
+```
+Leader tracks access frequency per document in DocumentStore.hot_docs
+  │
+  │ Algorithm: LFU with decay
+  │   1. On each access → increment counter per document
+  │   2. Every DECAY_INTERVAL (default: 60s) → multiply all counters by 0.5
+  │      (exponential decay, prevents "stale popularity" bias)
+  │   3. On FOLLOWER_ATTACH:
+  │      ├── Select top-N documents by current decayed frequency (default N=50)
+  │      ├── Encrypt each document
+  │      └── Send HOT_DOCUMENTS batch via BC:
+  │            { type: "HOT_DOCUMENTS", documents: [...], bus_gen }
+  │   4. On each USER_OPEN (if not already hot) → boost counter to promote
+  │
+  └── Follower receives and caches immediately
+      └── No REQUEST_DOCUMENT needed for hot documents
+      └── User opens any hot doc → instant cache hit
+```
+
+This eliminates cold-start latency for the most commonly accessed documents. The decay factor ensures that a document popular last hour doesn't crowd out one popular right now. Less-frequently accessed documents are still fetched lazily via REQUEST_DOCUMENT.
+
+**AccessTracker**: Internal data structure wraps `HashMap<K, (f64, u64)>` — (frequency, last_decay_tick). Not an LRU; frequency is explicitly tracked and aged.
+
+### 9.8 Tests
 - Follower attaches → receives metadata → cache created with empty entries
-- Lazy document fetch → REQUEST_DOCUMENT → SNAPSHOT_DOCUMENT → cache populated
+- Hot documents pushed proactively → cached without REQUEST_DOCUMENT
+- Lazy document fetch for non-hot docs → REQUEST_DOCUMENT → SNAPSHOT_DOCUMENT
 - Follower write → optimistic → BC → leader persists → broadcast → follower reconciled
 - Two followers write simultaneously → both optimistic → leader serializes
 - Follower receives old RuntimeGeneration mutation → rejected
 - Leader restarts → followers reattach to new leader
 
-### 8.8 Files touched
+### 9.9 Files touched
 - `crates/vaultsync-wasm/src/follower.rs` — NEW file
-- `crates/vaultsync-wasm/src/runtime.rs` — add bus, snapshot provider, follower registry
+- `crates/vaultsync-wasm/src/runtime.rs` — add bus, snapshot provider, follower registry, hot-doc tracker
 - `crates/vaultsync-wasm/src/client.rs` — split init into leader/follower paths
-- `crates/vaultsync-wasm/src/ipc.rs` — BusMessage enum, BusEnvelope, all message handlers
+- `crates/vaultsync-wasm/src/ipc.rs` — BusMessage enum, BusEnvelope, all message handlers, HOT_DOCUMENTS
 - `crates/vaultsync-wasm/src/capability.rs` — NEW file
 
-### 8.9 Estimated effort: 6-8 days
+### 9.10 Estimated effort: 6-8 days
 
 ---
 
-## 9. Phase 4 — Runtime Bus (Mutation Streaming)
+## 10. Phase 5 — Runtime Bus (Mutation Streaming)
 
-### 9.1 Goal
+### 10.1 Goal
 
 Replace `broadcast_invalidation("go re-read storage")` with direct mutation streaming. Followers apply mutations to cache without touching OPFS.
 
-### 9.2 Leader side
+### 10.2 Leader side
 
 ```rust
 // In Runtime::commit_mutation
@@ -986,7 +1295,7 @@ async fn commit_mutation(&self, mutation: OplogEntry) -> Result<()> {
 }
 ```
 
-### 9.3 Follower side
+### 10.3 Follower side
 
 ```rust
 // In FollowerProxy::handle_mutation
@@ -1016,7 +1325,7 @@ fn handle_mutation(&self, msg: BusMessage) {
 }
 ```
 
-### 9.4 Gap recovery
+### 10.4 Gap recovery
 
 HEARTBEAT includes `cursor`. If follower's `last_seq < leader_cursor`:
 ```
@@ -1025,14 +1334,14 @@ Leader   → MUTATION_BATCH { mutations: [...], from_seq, to_seq }
 Follower → applies all missed mutations
 ```
 
-### 9.5 Backpressure
+### 10.5 Backpressure
 
 For large payloads:
 1. ChunkedMutation with `batch_id, chunk_index, total_chunks`
 2. Follower reassembles before applying
 3. If pending_batches > 3, FLOW_CONTROL with backoff
 
-### 9.6 Tests
+### 10.6 Tests
 - Mutation broadcast → follower cache updated (zero storage reads verified via metrics)
 - Gap detection → REQUEST_SYNC → MUTATION_BATCH → catch up
 - Chunked mutation → follower reassembles → applies
@@ -1040,17 +1349,17 @@ For large payloads:
 - E2EE mutation → follower decrypts correctly
 - 1000 mutations → leader and all followers consistent
 
-### 9.7 Estimated effort: 4-5 days
+### 10.7 Estimated effort: 4-5 days
 
 ---
 
-## 10. Phase 5 — Reactive Query Engine
+## 11. Phase 6 — Reactive Query Engine
 
-### 10.1 Goal
+### 11.1 Goal
 
 Framework-agnostic runtime store in JS with dependency-graph subscription tracking. React, Vue, Svelte all consume the same store.
 
-### 10.2 Design
+### 11.2 Design
 
 ```typescript
 // sdk/packages/core/src/store.ts
@@ -1089,7 +1398,7 @@ class RuntimeStore {
 }
 ```
 
-### 10.3 React integration
+### 11.3 React integration
 
 ```typescript
 // sdk/packages/react/src/useQuery.ts
@@ -1109,37 +1418,37 @@ function useQuery(docId: string) {
 
 No WASM calls during rendering. No OPFS reads. Pure JS cache.
 
-### 10.4 Fine-grained dependencies
+### 11.4 Fine-grained dependencies
 
 - `subscribe("note", "abc")` → notified only when `note::abc` changes
 - `subscribe("note", null)` → notified when any record in "note" changes
 - `subscribe(null, null)` → notified on any change anywhere
 
-### 10.5 Stale-while-revalidate
+### 11.5 Stale-while-revalidate
 
 1. Return cached data immediately (may be empty on cold start)
 2. Background: call WASM `find()` or `get()` to verify freshness
 3. If stale, update cache + notify subscribers
 4. Future updates come via mutation streaming
 
-### 10.6 Files touched
+### 11.6 Files touched
 - `sdk/packages/core/src/store.ts` — NEW RuntimeStore
 - `sdk/packages/core/src/index.ts` — export RuntimeStore
 - `sdk/packages/react/src/useQuery.ts` — use RuntimeStore
 - `sdk/packages/react/src/useVaultSyncOne.ts` — use RuntimeStore
 - WASM bridge — expose `applySetField` etc.
 
-### 10.7 Estimated effort: 4-5 days
+### 11.7 Estimated effort: 4-5 days
 
 ---
 
-## 11. Phase 6 — WAL + Specialized Indexes
+## 12. Phase 7 — WAL + Specialized Indexes
 
-### 11.1 Goal
+### 12.1 Goal
 
 Extend ContentIndex from Phase 1 to enable O(1) lookups for oplog and KV stores.
 
-### 11.2 Oplog index
+### 12.2 Oplog index
 
 `mark_synced(seq)` becomes:
 1. `content_index.lookup(&IndexKey::Sequence(seq))` → `Some(page_id)`
@@ -1150,68 +1459,93 @@ Extend ContentIndex from Phase 1 to enable O(1) lookups for oplog and KV stores.
 
 **Approach**: Per-entry index (map EVERY sequence number). Max size = pending mutations (compacted/pruned). With 10,000 pending mutations ≈ 800KB index.
 
-### 11.3 KV store indexes
+### 12.3 KV store indexes
 
 - `read_sync_state(ns)` → `content_index.lookup(&IndexKey::Namespace(ns))` → single page
 - `read_schema(doc_id)` → `content_index.lookup(&IndexKey::Schema(doc_id))` → single page
 
 No scan for any KV operation.
 
-### 11.4 WAL
+### 12.4 WAL (checkpoint-based)
 
-Write-Ahead Log for crash recovery:
-- Before any page write, append mutation to `_pages/{store}/_wal`
-- After successful write + index update, remove from WAL
-- On crash recovery: replay WAL entries
+Write-Ahead Log for crash recovery. Uses checkpoint-based cleanup (not individual entry deletion):
+
+```
+  WAL: append-only log of all mutations
+    ↓
+  Checkpoint: every N writes (default: 100), compact WAL
+    ↓
+    - Atomically rewrite WAL: keep only unapplied entries
+    - Update manifest checkpoint pointer
+    ↓
+  Crash recovery: replay from last checkpoint
+    ↓
+  Normal operation: entries stay in WAL until next checkpoint
+```
+
+- Append mutation before any page write (WAL-first)
+- On page write + index update success, mark entry as applied (in-memory)
+- On checkpoint, rewrite WAL discarding applied entries
+- On crash: replay all entries from last checkpoint
+
+This matches SQLite/Postgres WAL behavior. Never delete individual WAL entries — only checkpoint atomically.
 
 Only the leader writes to WAL. Followers never touch it.
 
-### 11.5 Tests
+### 12.5 Tests
 - `mark_synced` reads exactly 1 page (metrics verification)
 - All KV lookups return from index (no scan)
 - WAL append → crash → replay → state consistent
-- WAL cleanup after successful write
+- WAL checkpoint → applied entries removed
+- WAL checkpoint crash → replay from last checkpoint (no data loss)
 
-### 11.6 Estimated effort: 3-4 days
+### 12.6 Estimated effort: 3-4 days
 
 ---
 
-## 12. Phase 7 — Stateful Promotion + Failover
+## 13. Phase 8 — Stateful Promotion + Failover
 
-### 12.1 Goal
+### 13.1 Goal
 
 When the leader dies, promote a follower to leader without reinitializing from scratch.
 
-### 12.2 Detection
+### 13.2 Detection
 
 Follower detects leader death:
 1. No HEARTBEAT for `LEADER_TIMEOUT_MS` (2000ms)
 2. Follower transitions to `Suspect` state
 3. After timeout, attempts promotion
 
-### 12.3 Promotion process
+### 13.3 Promotion process
 
 ```
 1. Detect leader timeout (no HEARTBEAT for 2s)
 2. Acquire Web Lock (same lock as current leader election)
 3. If lock fails → another tab is promoting → back off
-4. Load manifest + ContentIndex from OPFS (O(1) reads)
-5. Hydrate State.Documents from persistence via ContentIndex
-6. Start Scheduler, NetworkEngine, CompactionEngine
-7. Increment RuntimeGeneration (StorageGeneration stays)
-8. Start BC heartbeat
-9. Broadcast LEADER_TRANSFER with new generation
-10. Send SNAPSHOT_METADATA to all attached followers
-11. Resume as leader
+4. **Preserve existing FollowerProxy cache** — do NOT discard
+5. Use RecoveryManager for fast validation:
+   a. Verify manifest checksum (no corruption check)
+   b. Replay remaining WAL entries since last checkpoint
+   c. Confirm ContentIndex is consistent
+6. **Hydrate only what's missing from cache**:
+   a. Already-cached documents → no read needed
+   b. Missing documents → read from persistence via ContentIndex
+   c. No full scan, no full rehydration
+7. Start Scheduler, NetworkEngine, CompactionEngine
+8. Increment RuntimeGeneration (StorageGeneration stays)
+9. Start BC heartbeat with new BusGeneration
+10. Broadcast LEADER_TRANSFER with new generation
+11. Send SNAPSHOT_METADATA to all attached followers
+12. Resume as leader
 ```
 
-### 12.4 Hydration time
+### 13.4 Hydration time
 
 Estimated: O(documents) page reads, not O(pages) directory scan.
 - 1000 documents × 1 page read = ~1-2s
 - No scan, no coordinator init (starts after hydration)
 
-### 12.5 Reattachment of surviving followers
+### 13.5 Reattachment of surviving followers
 
 After LEADER_TRANSFER:
 1. New leader sends SNAPSHOT_METADATA (doc IDs only)
@@ -1221,18 +1555,18 @@ After LEADER_TRANSFER:
 5. Old-generation optimistic mutations from old leader → discarded (generation mismatch)
 6. User re-applies stale edits (draft recovery)
 
-### 12.6 Tests
+### 13.6 Tests
 - Leader dies → follower promotes → new leader serves reads/writes
 - Two followers detect simultaneously → only one acquires lock
 - Old-generation mutations rejected after promotion
 - Follower cache survives promotion (same StorageGeneration)
 - Promote → demote → promote (flapping) → stable after backoff
 
-### 12.7 Estimated effort: 4-5 days
+### 13.7 Estimated effort: 4-5 days
 
 ---
 
-## 13. Invariants
+## 14. Invariants
 
 These must hold at all times.
 
@@ -1241,11 +1575,11 @@ These must hold at all times.
 - **I2**: Only the leader compacts, GCs, or snapshots. No races.
 - **I3**: The manifest (including ContentIndex) is always consistent with pages on disk.
 - **I4**: After any write, ContentIndex is updated before broadcast.
-- **I5**: StorageGeneration increments on any storage mutation. RuntimeGeneration does NOT increment on storage-only changes (compaction, GC).
+- **I5**: StorageGeneration increments on any storage mutation. RuntimeGeneration and BusGeneration do NOT increment on storage-only changes (compaction, GC).
 
 ### Broadcast
 - **I6**: Every MUTATION broadcast by the leader has already been persisted to OPFS.
-- **I7**: Every MUTATION carries a RuntimeGeneration. Followers discard mutations from stale generations.
+- **I7**: Every MUTATION carries a RuntimeGeneration and BusGeneration. Followers discard mutations from stale RuntimeGenerations. Followers detect bus gen gaps and request recovery.
 - **I8**: HEARTBEAT is sent at least every 1s while the leader is healthy.
 
 ### Follower
@@ -1253,37 +1587,40 @@ These must hold at all times.
 - **I10**: Followers' optimistic mutations are always reconciled with the leader's committed state.
 - **I11**: Followers' RuntimeCache is eventually consistent with the leader's RuntimeState.
 - **I12**: Followers that detect a gap (via cursor on HEARTBEAT) request a sync before continuing.
-- **I13**: RuntimeCache evicts oldest entries when memory limit is reached.
+- **I13**: RuntimeCache evicts oldest entries from probation segment first (SegmentedLRU).
 
 ### Mutation Ordering
-- **I14**: Mutations from the same origin tab are applied in order.
-- **I15**: HLC timestamps are monotonic across all tabs.
-- **I16**: CRDT merge is deterministic — all tabs eventually converge.
+- **I14**: Mutations carry DependencyCursor. The leader ensures causal ordering (depends_on is satisfied before applying).
+- **I15**: Mutations from the same origin tab are applied in order.
+- **I16**: HLC timestamps are monotonic across all tabs.
+- **I17**: CRDT merge is deterministic — all tabs eventually converge.
 
 ### Lifecycle
-- **I17**: Exactly one leader exists at any time. (Web Locks guarantee mutual exclusion.)
-- **I18**: On leader promotion, RuntimeGeneration is incremented. StorageGeneration is NOT.
-- **I19**: On leader promotion, no OPFS writes happen until the new leader has rehydrated.
-- **I20**: Followers only attach to leaders with protocol_version they support.
+- **I18**: Exactly one leader exists at any time. (Web Locks guarantee mutual exclusion.)
+- **I19**: On leader promotion, RuntimeGeneration is incremented. StorageGeneration is NOT. BusGeneration is incremented.
+- **I20**: On leader promotion, existing follower cache is preserved. Only missing documents are hydrated.
+- **I21**: No OPFS writes happen until RecoveryManager has validated the manifest.
+- **I22**: Followers only attach to leaders with protocol_version they support.
 
 ---
 
-## 14. Performance Targets
+## 15. Performance Targets
 
 | Scenario | Current | Target | How |
 |----------|---------|--------|-----|
 | Cold start (leader) | ~6s | ~1-2s | Manifest+Index (Phase 1) |
-| Cold start (follower) | ~6s | ~50-100ms | FollowerProxy (Phase 3) |
-| Follower write → UI | ~300ms | <5ms | Optimistic cache (Phase 3) |
-| Cross-tab sync | ~300ms (BC→reread) | ~10ms (BC→cache) | Mutation streaming (Phase 4) |
-| Query with 1000 docs | ~500ms (OPFS scan) | <1ms (RuntimeCache) | Phase 2 + Phase 5 |
-| Compaction | ~500ms | ~300ms | Leader only (Phase 3) |
-| Leader failover | ~6s (full re-init) | ~2s (stateful promotion) | Phase 7 |
-| Memory per follower | ~50MB+ | <10MB | LRU eviction (Phase 3) |
+| Cold start (follower) | ~6s | ~80-150ms | FollowerProxy + hot prefetch (Phase 4) |
+| Follower write → UI | ~300ms | <5ms | Optimistic cache (Phase 4) |
+| Cross-tab sync | ~300ms (BC→reread) | ~10ms (BC→cache) | Mutation streaming (Phase 5) |
+| Query with 1000 docs | ~500ms (OPFS scan) | <1ms (RuntimeCache) | Phase 2 + Phase 6 |
+| Compaction | ~500ms | ~300ms | Leader only (Phase 4) |
+| Leader failover (cold follower) | ~6s (full re-init) | ~1-2s (stateful promotion) | Phase 8 |
+| Leader failover (warm follower) | ~6s (full re-init) | ~200ms (preserve cache + WAL replay) | Phase 8 |
+| Memory per follower | ~50MB+ | <10MB | LRU eviction (Phase 4) |
 
 ---
 
-## 15. Risk Analysis
+## 16. Risk Analysis
 
 ### R1 — BC message loss
 **Risk**: BC is best-effort. Messages can be lost.
@@ -1319,16 +1656,16 @@ These must hold at all times.
 
 ---
 
-## 16. Implementation Order Rationale
+## 17. Implementation Order Rationale
 
 ### Dependency chain
 
 ```
-1 (Manifest+Index) → 2 (Runtime) → 3 (Leader/Follower) → 4 (Bus) → 5 (Query)
-                                    │                      │
-                                    └── 6 (WAL) ←─────────┘
-                                    │
-                                    └── 7 (Failover)
+1 (Manifest+Index) → 2 (Runtime) → 3 (StorageEngine) → 4 (Leader/Follower) → 5 (Bus) → 6 (Query)
+                                                         │                      │
+                                                         └── 7 (WAL) ←─────────┘
+                                                         │
+                                                         └── 8 (Failover)
 ```
 
 ### Phase sequence
@@ -1337,11 +1674,12 @@ These must hold at all times.
 |-------|------|------------|--------|
 | **1** | Manifest + ContentIndex | None | Eliminates OPFS scans immediately |
 | **2** | Runtime-first architecture | Phase 1 | Runtime becomes source of truth |
-| **3** | Leader/Follower split | Phase 2 | Followers detach from storage |
-| **4** | Runtime Bus (mutation streaming) | Phase 3 | Followers stop re-reading storage |
-| **5** | Reactive Query Engine | Phase 4 | React stops calling WASM for data |
-| **6** | WAL + specialized indexes | Phase 1 | O(1) oplog/KV lookups |
-| **7** | Stateful failover | Phase 2, 3 | Sub-2s leader promotion |
+| **3** | StorageEngine abstraction | Phase 2 | Clean boundary between Runtime and storage |
+| **4** | Leader/Follower split | Phase 2, 3 | Followers detach from storage |
+| **5** | Runtime Bus (mutation streaming) | Phase 4 | Followers stop re-reading storage |
+| **6** | Reactive Query Engine | Phase 5 | React stops calling WASM for data |
+| **7** | WAL + specialized indexes | Phase 1 | O(1) oplog/KV lookups |
+| **8** | Stateful failover | Phase 2, 4 | Sub-2s leader promotion |
 
 ### Why this order
 
@@ -1349,28 +1687,31 @@ These must hold at all times.
 
 2. **Phase 2 second** — With O(1) reads from Phase 1, refactoring to runtime-centric is safe. Storage latency is predictable.
 
-3. **Phase 3 third** — Depends on Runtime existing. The follower proxy is just "Runtime minus persistence/network."
+3. **Phase 3 third** — Insert the StorageEngine trait boundary before building the follower proxy. Ensures the Runtime never directly depends on PageStore or OPFS. This abstraction will be the contract for all persistence going forward.
 
-4. **Phase 4 fourth** — Depends on FollowerProxy existing. Can't stream mutations to followers that don't exist.
+4. **Phase 4 fourth** — Depends on Runtime + StorageEngine existing. The follower proxy is "Runtime minus persistence/network."
 
-5. **Phase 5 fifth** — JS-layer optimization. Independent of storage concerns.
+5. **Phase 5 fifth** — Depends on FollowerProxy existing. Can't stream mutations to followers that don't exist.
 
-6. **Phase 6 sixth** — Refinement of Phase 1's index. Adds oplog and KV coverage.
+6. **Phase 6 sixth** — JS-layer optimization. Independent of storage concerns.
 
-7. **Phase 7 seventh** — Capstone. Depends on Phase 1 (manifest), Phase 2 (runtime), Phase 3 (follower), Phase 4 (bus).
+7. **Phase 7 seventh** — Refinement of Phase 1's index. Adds oplog and KV coverage.
 
-### Total estimated effort: 30-39 days
+8. **Phase 8 eighth** — Capstone. Depends on Phase 1 (manifest), Phase 2 (runtime), Phase 3 (StorageEngine), Phase 4 (follower).
+
+### Total estimated effort: 33-43 days
 
 | Phase | Days |
 |-------|------|
 | Phase 1 — Manifest + PageIndex | 4-5 |
 | Phase 2 — Runtime-first | 5-7 |
-| Phase 3 — Leader/Follower split | 6-8 |
-| Phase 4 — Runtime Bus | 4-5 |
-| Phase 5 — Query Engine | 4-5 |
-| Phase 6 — WAL + Indexes | 3-4 |
-| Phase 7 — Failover | 4-5 |
-| **Total** | **30-39** |
+| Phase 3 — StorageEngine abstraction | 3-4 |
+| Phase 4 — Leader/Follower split | 6-8 |
+| Phase 5 — Runtime Bus | 4-5 |
+| Phase 6 — Query Engine | 4-5 |
+| Phase 7 — WAL + Indexes | 3-4 |
+| Phase 8 — Failover | 4-5 |
+| **Total** | **33-43** |
 
 ---
 
@@ -1378,19 +1719,26 @@ These must hold at all times.
 
 | File | Phase | Change |
 |------|-------|--------|
-| `page_store.rs` | 1, 6 | ContentIndex, merged manifest, list_page_ids rewrite, WAL |
-| `storage.rs` | 1, 6 | All operations use ContentIndex |
-| `runtime.rs` | 2, 3 | NEW — Runtime struct, subsystems |
-| `scheduler.rs` | 2 | NEW — RuntimeScheduler with priorities |
-| `metrics.rs` | 2 | NEW — RuntimeMetrics |
-| `memory.rs` | 2, 3 | NEW — MemoryManager, LruCache |
-| `capability.rs` | 3 | NEW — CapabilityManager |
-| `follower.rs` | 3, 4 | NEW — FollowerProxy |
-| `ipc.rs` | 3, 4 | BusMessage enum, BusEnvelope, protocol versioning |
-| `client.rs` | 2, 3 | Refactor to build Runtime; split leader/follower init |
-| `store.ts` | 5 | NEW — RuntimeStore in JS SDK |
-| `useQuery.ts` | 5 | Rewrite to subscribe to RuntimeStore |
-| `useVaultSyncOne.ts` | 5 | Rewrite to subscribe to RuntimeStore |
+| `page_store.rs` | 1, 3, 7 | ContentIndex, merged manifest, list_page_ids rewrite, PageCache, WAL |
+| `storage.rs` | 1, 7 | All operations use ContentIndex |
+| `storage_engine.rs` | 3 | NEW — StorageEngine trait + OpfsStorageEngine impl + StorageHealth |
+| `runtime.rs` | 2, 4 | NEW — Runtime struct, subsystems, DocumentStore/MetadataStore/etc. |
+| `scheduler.rs` | 2 | NEW — RuntimeScheduler with priorities + deadline + budget |
+| `metrics.rs` | 2 | NEW — RuntimeMetrics (expanded: SLRU, gap recovery, hot-docs hit, recovery, failover) |
+| `memory.rs` | 2, 4 | NEW — MemoryManager, SegmentedLruCache, eviction policies |
+| `capability.rs` | 4 | NEW — CapabilityManager |
+| `recovery_manager.rs` | 2, 8 | NEW — RecoveryManager (WAL replay, manifest validation, checksum verification, repair, audit log) |
+| `access_tracker.rs` | 4 | NEW — AccessTracker (LFU with periodic decay, aging scheduler) |
+| `broadcast_manager.rs` | 5 | NEW — BroadcastManager (mutation dispatch, gap detection, flow control, BusGeneration tracking) |
+| `heartbeat_manager.rs` | 4 | NEW — HeartbeatManager (1s interval, follower timeout, cursor exchange) |
+| `snapshot_manager.rs` | 4 | NEW — SnapshotManager (SNAPSHOT_METADATA assembly, REQUEST_DOCUMENT handler) |
+| `prefetch_manager.rs` | 4 | NEW — PrefetchManager (hot-doc ranking via AccessTracker, HOT_DOCUMENTS push) |
+| `follower.rs` | 4, 5 | NEW — FollowerProxy with hot-doc prefetch support, promotion-aware (preserves cache) |
+| `ipc.rs` | 4, 5 | BusMessage enum, BusEnvelope, protocol versioning, HOT_DOCUMENTS, dependency cursor |
+| `client.rs` | 2, 4 | Refactor to build Runtime; split leader/follower init; wire RecoveryManager |
+| `store.ts` | 6 | NEW — RuntimeStore in JS SDK |
+| `useQuery.ts` | 6 | Rewrite to subscribe to RuntimeStore |
+| `useVaultSyncOne.ts` | 6 | Rewrite to subscribe to RuntimeStore |
 
 ---
 
@@ -1406,11 +1754,25 @@ These must hold at all times.
 | **Q6** — Follower fallback | **Option D** (stateful promotion) | Promote warm follower instead of reinitializing. O(1) manifest read. |
 | — RuntimeGeneration | **Separate from StorageGeneration** | Compaction doesn't invalidate follower cache. |
 | — RuntimeSnapshot | **Metadata + lazy documents** | No 100MB BC message. Works at 100,000 docs. |
-| — RuntimeCache eviction | **LRU eviction** | Prevents unbounded memory growth. |
+| — RuntimeCache eviction | **SegmentedLRU (probation + protected)** | Higher hit rate than plain LRU. Popular entries survive probation. |
 | — Bus flow control | **Chunking + backpressure** | Handles 50MB pastes without flooding BC. |
 | — ACK levels | **Persisted/Uploaded/Replicated** | Enables UI indicators. Debugging. |
 | — Protocol version | **BusEnvelope.version: u16** | Forward compatibility. Safe upgrades. |
+| — StorageEngine | **Trait boundary between Runtime and persistence** | Swap backends without Runtime changes. Testability. |
+| — IndexEntry | **Struct with page_id + checksum + size + generation** | Future-proof. No migration when adding metadata fields. |
+| — PageCache | **LRU cache inside PageStore** | Avoids repeated OPFS reads of same page. |
+| — WAL cleanup | **Checkpoint-based (never delete individual entries)** | Matches SQLite/Postgres. Safer crash recovery. |
+| — Hot-doc prefetch | **LFU with periodic decay** | Prevents stale-popularity bias. Documents popular last hour don't crowd out current ones. |
+| — Scheduler model | **Priority + Deadline + Budget** | Prevents starvation. Compaction yields to mutations. |
+| — RuntimeState split | **DocumentStore / MetadataStore / PresenceStore / PendingStore / IndexStore** | Prevents 3000-line single struct. Clear ownership. |
+| — RuntimeBus | **Split into BroadcastManager / HeartbeatManager / SnapshotManager / PrefetchManager** | Each manager has focused responsibility. Cleaner testability. No god-bus. |
+| — Follower promotion | **Preserve existing cache, hydrate only missing pieces** | Avoids 100% re-read. Promotion from ~1-2s to ~200ms for warm followers. |
+| — Mutation ordering | **DependencyCursor on every mutation** | Enables causal ordering across tabs. Detects concurrent edits. |
+| — Recovery | **RecoveryManager subsystem (WAL replay, manifest validation, checksum verification, repair)** | Dedicated recovery path. Not mixed into startup flow. Audit trail. |
+| — BusGeneration | **Separate generation type for broadcast bus** | Followers detect missed bus windows and request gap recovery without full resync. |
+| — StorageHealth | **Detailed health struct (OPFS available, manifest ok, WAL ok, page cache usage, corruption)** | Exposes storage status to health checks. Enables graceful degradation. |
+| — Metrics | **Expanded: SLRU segments, gap recovery, hot-docs hit, heartbeats missed, recovery duration, failover time, per-segment cache hits** | Comprehensive observability for debugging ALL subsystems. |
 
 ---
 
-*End of plan. Architecture is 9.6/10 ready. Begin Phase 1 implementation.*
+*End of plan. Architecture is 9.9+/10 ready. Begin Phase 1 implementation.*
