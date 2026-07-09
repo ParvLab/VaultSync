@@ -64,6 +64,14 @@ pub struct RuntimeMetrics {
     pub hot_docs_hit: AtomicU64,
     pub heartbeats_sent: AtomicU64,
     pub heartbeats_missed: AtomicU64,
+    pub heartbeats_received: AtomicU64,
+    // HELLO/DISCOVER protocol (Phase 4 v2)
+    pub hello_sent: AtomicU64,
+    pub hello_received: AtomicU64,
+    pub discover_sent: AtomicU64,
+    pub discover_received: AtomicU64,
+    pub snapshot_requests_sent: AtomicU64,
+    pub snapshot_requests_received: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub bytes_received: AtomicU64,
     pub bus_messages_dropped: AtomicU64,
@@ -84,6 +92,15 @@ pub struct RuntimeMetrics {
     pub hydration_time_ms: AtomicU64,
     pub failover_time_ms: AtomicU64,
 
+    // Phase 8 — Runtime performance metrics
+    pub startup_ms: AtomicU64,           // total startup duration
+    pub snapshot_size: AtomicU64,        // bytes in snapshot payloads
+    pub pending_count: AtomicU64,        // current pending mutations
+    pub page_count: AtomicU64,           // total pages across all stores
+    pub tombstone_count: AtomicU64,      // tombstone pages
+    pub live_pages: AtomicU64,           // live page count
+    pub dirty_pages: AtomicU64,          // dirty (un-uploaded) page count
+
     // Latency histograms
     pub mutation_latency_us: RunningStats,
     pub bc_latency_us: RunningStats,
@@ -92,6 +109,10 @@ pub struct RuntimeMetrics {
     pub recovery_latency_us: RunningStats,
     pub failover_latency_us: RunningStats,
     pub prefetch_latency_us: RunningStats,
+    /// Phase 8: Upload/download/compaction latency
+    pub upload_latency_us: RunningStats,
+    pub download_latency_us: RunningStats,
+    pub compaction_latency_us: RunningStats,
 }
 
 impl RuntimeMetrics {
@@ -132,9 +153,19 @@ impl RuntimeMetrics {
             "failoverTimeMs": self.failover_time_ms.load(Ordering::Relaxed),
             "recoveryDurationMs": self.recovery_duration_ms.load(Ordering::Relaxed),
             "manifestChecksumFailures": self.manifest_checksum_failures.load(Ordering::Relaxed),
+            "startupMs": self.startup_ms.load(Ordering::Relaxed),
+            "snapshotSize": self.snapshot_size.load(Ordering::Relaxed),
+            "pendingCount": self.pending_count.load(Ordering::Relaxed),
+            "pageCount": self.page_count.load(Ordering::Relaxed),
+            "tombstoneCount": self.tombstone_count.load(Ordering::Relaxed),
+            "livePages": self.live_pages.load(Ordering::Relaxed),
+            "dirtyPages": self.dirty_pages.load(Ordering::Relaxed),
             "mutationLatencyAvgUs": self.mutation_latency_us.avg(),
             "recoveryLatencyAvgUs": self.recovery_latency_us.avg(),
             "failoverLatencyAvgUs": self.failover_latency_us.avg(),
+            "uploadLatencyAvgUs": self.upload_latency_us.avg(),
+            "downloadLatencyAvgUs": self.download_latency_us.avg(),
+            "compactionLatencyAvgUs": self.compaction_latency_us.avg(),
         }).to_string()
     }
 }

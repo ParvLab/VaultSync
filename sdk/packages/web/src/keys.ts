@@ -1,4 +1,4 @@
-import type { WasmVaultSyncClient } from '../wasm/vaultsync_wasm.js';
+import type { VaultSyncRuntime } from '../wasm/vaultsync_wasm.js';
 
 export interface KeyInfo {
   version: number;

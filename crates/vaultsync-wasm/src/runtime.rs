@@ -1,8 +1,10 @@
 use crate::memory::SegmentedLruCache;
 use crate::metrics::RuntimeMetrics;
+use crate::migration::PagesDir;
 use crate::scheduler::{RuntimeScheduler, Task, TaskType};
+use crate::upload_scheduler::{UploadAction, UploadScheduler};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use vaultsync_core::crdt::types::CrdtValue;
 
 /// Phase 2: Runtime generations
@@ -148,6 +150,9 @@ pub struct MetadataStore {
     pub cursor: u64,
     pub pending_count: usize,
     pub status: RuntimeStatus,
+    /// Phase 4 v2: Leader info (used by followers)
+    pub leader_tab: Option<String>,
+    pub leader_gen: u64,
 }
 
 impl MetadataStore {
@@ -158,6 +163,8 @@ impl MetadataStore {
             cursor: 0,
             pending_count: 0,
             status: RuntimeStatus::Initializing,
+            leader_tab: None,
+            leader_gen: 0,
         }
     }
 }
@@ -310,31 +317,43 @@ impl WriteAheadLog {
     }
 }
 
+/// Phase 4: RuntimeSnapshot — single BC message for entire runtime state.
+/// Replaces doc-by-doc SNAPSHOT_METADATA/SNAPSHOT_DOCUMENT for initial hydration.
+/// NOTE: REMOVED in Phase 5 — followers read from OPFS directly.
+
 /// Phase 2: Main Runtime struct
+/// Phase 3: Runtime owns storage references — all reads go through Runtime, not OPFS directly.
 pub struct Runtime {
     pub scheduler: RuntimeScheduler,
     pub metrics: RuntimeMetrics,
-    pub document_store: std::sync::Mutex<DocumentStore>,
+    pub document_store: Arc<Mutex<DocumentStore>>,
     pub metadata_store: std::sync::Mutex<MetadataStore>,
     pub presence_store: std::sync::Mutex<PresenceStore>,
     pub pending_store: std::sync::Mutex<PendingStore>,
     pub index_store: std::sync::Mutex<IndexStore>,
     pub wal: std::sync::Mutex<WriteAheadLog>,
+    /// Phase 5: UploadScheduler — single entry point for uploads
+    pub upload_scheduler: UploadScheduler,
     pub start_time: js_sys::Date,
+    /// Phase 3: PageStore instances owned by Runtime — shared with all subsystems
+    pub pages: std::sync::Mutex<Option<PagesDir>>,
 }
 
 impl Runtime {
     pub fn new(tab_id: String) -> Arc<Self> {
+        let doc_store = Arc::new(Mutex::new(DocumentStore::new()));
         let runtime = Arc::new(Self {
             scheduler: RuntimeScheduler::new(),
             metrics: RuntimeMetrics::default(),
-            document_store: std::sync::Mutex::new(DocumentStore::new()),
+            document_store: doc_store.clone(),
             metadata_store: std::sync::Mutex::new(MetadataStore::new()),
             presence_store: std::sync::Mutex::new(PresenceStore::new(tab_id)),
             pending_store: std::sync::Mutex::new(PendingStore::new()),
             index_store: std::sync::Mutex::new(IndexStore::new()),
             wal: std::sync::Mutex::new(WriteAheadLog::new(100)),
+            upload_scheduler: UploadScheduler::new(200),
             start_time: js_sys::Date::new_0(),
+            pages: std::sync::Mutex::new(None),
         });
 
         // Schedule periodic tasks
@@ -344,9 +363,14 @@ impl Runtime {
         runtime
     }
 
+    /// Phase 3: Set the PagesDir after construction (storage may not be ready at new() time).
+    pub fn set_pages(&self, pages: PagesDir) {
+        *self.pages.lock().unwrap() = Some(pages);
+    }
+
     pub fn set_field(&self, doc_id: &str, record_id: &str, field: &str, value: CrdtValue) {
         let mut store = self.document_store.lock().unwrap();
-        store.set_field(doc_id, record_id, field, value);
+        store.set_field(doc_id, record_id, field, value.clone());
         store.record_access(doc_id);
 
         // WAL-first: log mutation before anything else
@@ -375,7 +399,12 @@ impl Runtime {
             meta.pending_count += 1;
         }
 
-        // Schedule upload
+        // Phase 5: Schedule via UploadScheduler (single entry point for uploads)
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(field.to_string(), value);
+        self.upload_scheduler.schedule(UploadAction::Insert, doc_id, record_id, fields);
+
+        // Schedule upload task
         self.scheduler.schedule(Task::new(TaskType::Upload).with_budget(50));
     }
 
@@ -396,6 +425,10 @@ impl Runtime {
         });
         drop(wal);
         self.metadata_store.lock().unwrap().cursor = seq;
+
+        // Phase 5: Schedule delete via UploadScheduler
+        self.upload_scheduler.schedule_delete(doc_id, record_id);
+        self.scheduler.schedule(Task::new(TaskType::Upload).with_budget(50));
     }
 
     pub fn record_document_access(&self, doc_id: &str) {

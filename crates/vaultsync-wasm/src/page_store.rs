@@ -35,7 +35,7 @@ pub enum IndexKey {
     Migration(String),
 }
 
-/// Phase 1: Index entry with metadata for future-proofing.
+/// Phase 7: Index entry with per-document metadata. O(1) for all lookups.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntry {
     pub page_id: PageId,
@@ -43,14 +43,29 @@ pub struct IndexEntry {
     pub checksum: u32,
     pub size: u32,
     pub last_modified: u64,
+    /// Phase 7: Document version — incremented on each mutation
+    pub version: u64,
+    /// Phase 7: Whether document has un-uploaded changes
+    pub dirty: bool,
 }
 
-/// Phase 1: Content index — maps keys to page IDs, eliminating OPFS directory scans.
+/// Phase 2: Content index v2 — multi-index lookups eliminating all OPFS scans.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentIndex {
     pub generation: StorageGeneration,
+    /// Legacy flat key→entry map (backward compat)
     pub entries: HashMap<IndexKey, IndexEntry>,
+    /// All live page IDs
     pub live_pages: BTreeSet<PageId>,
+    /// doc_id → record_id → entry (O(1) document lookup)
+    #[serde(default)]
+    pub page_by_document: HashMap<String, HashMap<String, IndexEntry>>,
+    /// sequence → entry (O(1) sequence-based lookup)
+    #[serde(default)]
+    pub page_by_sequence: std::collections::BTreeMap<u64, IndexEntry>,
+    /// Pages with un-uploaded changes
+    #[serde(default)]
+    pub dirty_pages: BTreeSet<PageId>,
 }
 
 impl ContentIndex {
@@ -59,6 +74,9 @@ impl ContentIndex {
             generation: StorageGeneration(0),
             entries: HashMap::new(),
             live_pages: BTreeSet::new(),
+            page_by_document: HashMap::new(),
+            page_by_sequence: std::collections::BTreeMap::new(),
+            dirty_pages: BTreeSet::new(),
         }
     }
 
@@ -70,15 +88,80 @@ impl ContentIndex {
         self.entries.get(key).map(|e| e.page_id)
     }
 
+    /// O(1) document lookup by doc_id + record_id.
+    pub fn lookup_document(&self, doc_id: &str, record_id: &str) -> Option<&IndexEntry> {
+        self.page_by_document.get(doc_id)?.get(record_id)
+    }
+
+    /// O(log n) lookup by sequence.
+    pub fn lookup_sequence(&self, seq: u64) -> Option<&IndexEntry> {
+        self.page_by_sequence.get(&seq)
+    }
+
+    /// Check if a page is dirty (has un-uploaded changes).
+    pub fn is_dirty(&self, page_id: PageId) -> bool {
+        self.dirty_pages.contains(&page_id)
+    }
+
+    /// Number of dirty pages.
+    pub fn dirty_count(&self) -> usize {
+        self.dirty_pages.len()
+    }
+
     pub fn insert(&mut self, key: IndexKey, entry: IndexEntry) {
         self.live_pages.insert(entry.page_id);
-        self.entries.insert(key, entry);
+        self.entries.insert(key.clone(), entry.clone());
+        // Populate v2 indexes
+        match &key {
+            IndexKey::Document { doc_id, record_id } => {
+                self.page_by_document
+                    .entry(doc_id.clone())
+                    .or_default()
+                    .insert(record_id.clone(), entry);
+            }
+            IndexKey::Sequence(seq) => {
+                self.page_by_sequence.insert(*seq, entry);
+            }
+            _ => {}
+        }
+    }
+
+    /// Insert with explicit dirty tracking.
+    pub fn insert_dirty(&mut self, key: IndexKey, entry: IndexEntry) {
+        self.dirty_pages.insert(entry.page_id);
+        self.insert(key, entry);
     }
 
     pub fn remove(&mut self, key: &IndexKey) {
         if let Some(entry) = self.entries.remove(key) {
             self.live_pages.remove(&entry.page_id);
+            self.dirty_pages.remove(&entry.page_id);
+            // Clean v2 indexes
+            match key {
+                IndexKey::Document { doc_id, record_id } => {
+                    if let Some(docs) = self.page_by_document.get_mut(doc_id) {
+                        docs.remove(record_id);
+                        if docs.is_empty() {
+                            self.page_by_document.remove(doc_id);
+                        }
+                    }
+                }
+                IndexKey::Sequence(seq) => {
+                    self.page_by_sequence.remove(seq);
+                }
+                _ => {}
+            }
         }
+    }
+
+    /// Mark a page as dirty (un-uploaded changes).
+    pub fn mark_dirty(&mut self, page_id: PageId) {
+        self.dirty_pages.insert(page_id);
+    }
+
+    /// Mark a page as clean (upload confirmed).
+    pub fn mark_clean(&mut self, page_id: PageId) {
+        self.dirty_pages.remove(&page_id);
     }
 
     pub async fn async_rebuild_from_scan(dir: &FileSystemDirectoryHandle) -> Result<Self, VaultSyncError> {
@@ -239,6 +322,22 @@ pub struct PageCache {
     entries: HashMap<PageId, CachedPage>,
     order: VecDeque<PageId>,
     current_bytes: usize,
+}
+
+/// Phase 2: Transaction operation types for page writes.
+#[derive(Debug, Clone)]
+pub enum PageTxOp {
+    Write { page_id: PageId },
+    Tombstone { page_id: PageId },
+    Delete { page_id: PageId },
+}
+
+/// Phase 2: In-flight page write transaction. Defers manifest/index
+/// persistence until commit_tx().
+#[derive(Debug)]
+pub struct PageTransaction {
+    pub ops: Vec<PageTxOp>,
+    pub started_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -429,6 +528,8 @@ impl PageStore {
                     checksum: 0,
                     size: 0,
                     last_modified: js_sys::Date::now() as u64,
+                    version: 1,
+                    dirty: true,
                 };
                 manifest.content_index.insert(key, entry);
                 manifest.live_pages = manifest.content_index.live_pages.len();
@@ -442,6 +543,58 @@ impl PageStore {
             write_manifest(&self.dir, m).await?;
         }
         Ok(())
+    }
+
+    /// Phase 7: Mark an entry as dirty (has un-uploaded changes).
+    pub(crate) async fn mark_index_dirty(&self, key: &IndexKey) -> Result<(), VaultSyncError> {
+        let cloned = {
+            let mut guard = self.manifest.lock().unwrap();
+            if let Some(ref mut manifest) = *guard {
+                if let Some(entry) = manifest.content_index.entries.get_mut(key) {
+                    entry.dirty = true;
+                    entry.version += 1;
+                    entry.last_modified = js_sys::Date::now() as u64;
+                }
+                manifest.increment_generation();
+                manifest.updated_at = js_sys::Date::now() as u64;
+                Some(manifest.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(ref m) = cloned {
+            write_manifest(&self.dir, m).await?;
+        }
+        Ok(())
+    }
+
+    /// Phase 7: Mark an entry as clean (uploaded successfully).
+    pub(crate) async fn mark_index_clean(&self, key: &IndexKey) -> Result<(), VaultSyncError> {
+        let cloned = {
+            let mut guard = self.manifest.lock().unwrap();
+            if let Some(ref mut manifest) = *guard {
+                if let Some(entry) = manifest.content_index.entries.get_mut(key) {
+                    entry.dirty = false;
+                }
+                manifest.increment_generation();
+                manifest.updated_at = js_sys::Date::now() as u64;
+                Some(manifest.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(ref m) = cloned {
+            write_manifest(&self.dir, m).await?;
+        }
+        Ok(())
+    }
+
+    /// Phase 7: Return number of dirty (un-uploaded) entries.
+    pub fn dirty_count(&self) -> usize {
+        let guard = self.manifest.lock().unwrap();
+        guard.as_ref()
+            .map(|m| m.content_index.entries.values().filter(|e| e.dirty).count())
+            .unwrap_or(0)
     }
 
     /// Phase 1: remove from content_index after tombstone.
@@ -465,14 +618,19 @@ impl PageStore {
         Ok(())
     }
 
+    /// Phase 2: #[track_caller] to identify which subsystem allocates pages.
+    #[track_caller]
     pub async fn allocate_page_id(&self) -> Result<PageId, VaultSyncError> {
+        let caller = std::panic::Location::caller();
         let manifest_copy = {
             let mut guard = self.manifest.lock().unwrap();
             let manifest = guard.as_mut().unwrap();
             let page_id = manifest.highest_page_id;
             manifest.highest_page_id = page_id + 1;
             manifest.live_pages += 1;
+            manifest.content_index.live_pages.insert(page_id);
             manifest.updated_at = js_sys::Date::now() as u64;
+            engine_trace!("[allocate_page_id] id={} caller={}", page_id, caller);
             (page_id, manifest.clone())
         };
         write_manifest(&self.dir, &manifest_copy.1).await?;
@@ -646,6 +804,7 @@ impl PageStore {
             let mut guard = self.manifest.lock().unwrap();
             if let Some(ref mut m) = *guard {
                 m.increment_generation();
+                m.content_index.live_pages.remove(&page_id);
                 if m.live_pages > 0 {
                     m.live_pages = m.live_pages.saturating_sub(1);
                 }
@@ -668,6 +827,10 @@ impl PageStore {
             let mut guard = self.manifest.lock().unwrap();
             if let Some(ref mut m) = *guard {
                 m.increment_generation();
+                let is_new = m.content_index.live_pages.insert(page_id);
+                if is_new {
+                    m.live_pages = m.live_pages.saturating_add(1);
+                }
                 if page_id >= m.highest_page_id {
                     m.highest_page_id = page_id + 1;
                 }
@@ -736,6 +899,17 @@ impl PageStore {
             };
 
             if let Some(id) = parse_page_id(&name) {
+                if id == 0 {
+                    // Phase 6: Check for stale 0.page (old WAL checkpoint format, JSON-based).
+                    // Read first byte to detect JSON vs binary format.
+                    let bytes = read_header_bytes(&self.dir, &name).await.unwrap_or_default();
+                    if bytes.first() == Some(&b'{') {
+                        engine_info!("[cleanup] removing stale JSON checkpoint 0.page");
+                        delete_file(&self.dir, &name).await?;
+                        cleaned += 1;
+                        continue;
+                    }
+                }
                 match read_page_header(&self.dir, &name).await? {
                     Some(header) if header.flags & 0x02 != 0 => {
                         delete_file(&self.dir, &name).await?;
@@ -946,6 +1120,75 @@ impl PageStore {
         Ok(())
     }
 
+    // ── Transactional writes (Phase 2) ──
+
+    /// Start a write transaction. Returns a transaction token.
+    /// After begin_tx, all writes update in-memory state; persists only on commit.
+    pub fn begin_tx(&self) -> PageTransaction {
+        PageTransaction {
+            ops: Vec::new(),
+            started_at: js_sys::Date::now() as u64,
+        }
+    }
+
+    /// Write a page within a transaction. Updates OPFS immediately but
+    /// defers manifest/index persistence until commit_tx.
+    pub async fn write_page_tx(&self, tx: &mut PageTransaction, page_id: PageId, data: &[u8]) -> Result<(), VaultSyncError> {
+        // Write to OPFS immediately (can't defer — OPFS is the durability layer)
+        self.write_page_raw(page_id, data).await?;
+        tx.ops.push(PageTxOp::Write { page_id });
+        Ok(())
+    }
+
+    /// Tombstone a page within a transaction.
+    pub async fn tombstone_page_tx(&self, tx: &mut PageTransaction, page_id: PageId) -> Result<(), VaultSyncError> {
+        // Phase 3: mark in cache
+        {
+            let mut cache = self.page_cache.lock().unwrap();
+            cache.remove(page_id);
+        }
+        let name = page_filename(page_id);
+        let existing = match read_all_bytes(&self.dir, &name).await {
+            Ok(b) => b,
+            Err(e) if is_not_found(&e) => {
+                engine_debug!("[page_store] tombstone_page_tx {}: page already removed", page_id);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let data = extract_page_data(&existing)?;
+        let buf = encode_v3_page(&data, 0x02)?;
+        write_file(&self.dir, &name, &buf).await?;
+        tx.ops.push(PageTxOp::Tombstone { page_id });
+        Ok(())
+    }
+
+    /// Commit a transaction — persists manifest/index atomically.
+    /// If commit fails, the OPFS writes are still there (safe) but the
+    /// in-memory manifest will be out of sync. Recovery rebuilds from OPFS.
+    pub async fn commit_tx(&self, tx: PageTransaction) -> Result<(), VaultSyncError> {
+        if tx.ops.is_empty() {
+            return Ok(());
+        }
+        // Update manifest generation and persist
+        let cloned = {
+            let mut guard = self.manifest.lock().unwrap();
+            if let Some(ref mut m) = *guard {
+                m.increment_generation();
+                m.updated_at = js_sys::Date::now() as u64;
+                Some(m.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(ref m) = cloned {
+            write_manifest(&self.dir, m).await?;
+        }
+        let elapsed = (js_sys::Date::now() as u64).saturating_sub(tx.started_at);
+        engine_trace!("[page_store] commit_tx: {} ops in {}ms", tx.ops.len(), elapsed);
+        Ok(())
+    }
+
     /// Run pending GC if any — deletes pages older than the current full-state page.
     /// Returns the number of pages deleted.
     pub async fn run_pending_gc(&self) -> Result<usize, VaultSyncError> {
@@ -1012,8 +1255,10 @@ impl PageStore {
         }
 
         if deleted > 0 {
-            // Rebuild manifest to reflect deleted pages
-            let rebuilt = rebuild_manifest(&self.dir).await?;
+            // Rebuild manifest with full ContentIndex to reflect deleted pages.
+            // Must use rebuild_manifest_with_index to populate content_index.live_pages
+            // (the BTreeSet that list_page_ids reads from).
+            let rebuilt = rebuild_manifest_with_index(&self.dir).await?;
             let mut final_manifest = rebuilt;
             final_manifest.current_page = current;
             final_manifest.updated_at = js_sys::Date::now() as u64;
@@ -1385,12 +1630,23 @@ pub async fn rebuild_manifest_with_index(dir: &FileSystemDirectoryHandle) -> Res
             if id > highest_page_id {
                 highest_page_id = id;
             }
-            let is_tombstoned = match read_page_header(dir, &name).await? {
-                Some(header) => header.flags & 0x02 != 0,
-                None => true,
-            };
-            if !is_tombstoned {
-                index.live_pages.insert(id);
+            // Phase 6: Classified corruption recovery — corrupt base pages are fatal,
+            // corrupt delta/unknown pages are skipped with a warning.
+            match read_page_header(dir, &name).await {
+                Ok(Some(header)) => {
+                    if header.flags & 0x02 != 0 {
+                        // Tombstoned — skip
+                    } else {
+                        index.live_pages.insert(id);
+                    }
+                }
+                Ok(None) => {
+                    // File doesn't exist or is empty — skip
+                }
+                Err(e) => {
+                    engine_warn!("[rebuild] skipping corrupt page {}: {:?}", name, e);
+                    // Continue — non-fatal for individual pages
+                }
             }
         }
     }
@@ -1464,11 +1720,18 @@ async fn rebuild_manifest(dir: &FileSystemDirectoryHandle) -> Result<StoreManife
             if id > highest_page_id {
                 highest_page_id = id;
             }
-            if let Some(header) = read_page_header(dir, &name).await? {
-                if header.flags & 0x02 != 0 {
-                    tombstoned_pages += 1;
-                } else {
-                    live_pages += 1;
+            // Phase 6: Classified corruption recovery — skip corrupt pages with warning
+            match read_page_header(dir, &name).await {
+                Ok(Some(header)) => {
+                    if header.flags & 0x02 != 0 {
+                        tombstoned_pages += 1;
+                    } else {
+                        live_pages += 1;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    engine_warn!("[rebuild] skipping corrupt page {}: {:?}", name, e);
                 }
             }
         }

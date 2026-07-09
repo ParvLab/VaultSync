@@ -1,4 +1,4 @@
-import init, { WasmVaultSyncClient } from '../wasm/vaultsync_wasm.js';
+import init, { VaultSyncRuntime } from '../wasm/vaultsync_wasm.js';
 import type { VaultSyncConfig, RecordFields, SyncStatus, MetricsSnapshot, SubscriptionCallback, UnsubscribeFn } from './types.js';
 import type { PresenceManager } from '../wasm/vaultsync_wasm.js';
 import { KeyManager } from './keys.js';
@@ -108,6 +108,11 @@ export class VaultSyncClient {
           return;
         }
 
+        // PROTO| namespace: protocol messages handled entirely by Rust
+        if (e.data.startsWith('PROTO|')) {
+          return;
+        }
+
         try {
           const val = JSON.parse(e.data);
           if (!val) {
@@ -180,7 +185,7 @@ export class VaultSyncClient {
       const mode = config.mode || (config.coordinatorUrl ? 'online' : 'offline');
       let inner: any;
       if (mode === 'online' && config.coordinatorUrl) {
-        inner = await WasmVaultSyncClient.new_with_coordinator(
+        inner = await VaultSyncRuntime.new_with_coordinator(
           config.namespace,
           config.replicaId,
           config.coordinatorUrl,
@@ -189,7 +194,7 @@ export class VaultSyncClient {
           config.storageBackend || null
         );
       } else {
-        inner = await WasmVaultSyncClient.new(
+        inner = await VaultSyncRuntime.new(
           config.namespace,
           config.replicaId,
           config.dbName || null,

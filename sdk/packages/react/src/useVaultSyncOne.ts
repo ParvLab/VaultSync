@@ -1,89 +1,30 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useVaultSyncClient } from './useVaultSyncClient.js';
 import { RuntimeStore } from '@vaultsync/web';
 import type { RecordFields } from '@vaultsync/web';
 
-/** Phase 6: useVaultSyncOne with RuntimeStore cache. */
+/** Phase 9: useVaultSyncOne reads exclusively from RuntimeStore. No WASM calls.
+ *  The store is hydrated via RuntimeSnapshot (Phase 4) and kept current
+ *  via BC mutation streaming. One mutation → one store update → one render. */
 export function useVaultSyncOne(docId: string, recordId: string) {
   const client = useVaultSyncClient();
-  const [data, setData] = useState<RecordFields | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<Error | null>(null);
-  const revisionRef = useRef<string>('');
+  const [data, setData] = useState<RecordFields | null>(() => {
+    const store = (client as any).__runtimeStore as RuntimeStore | undefined;
+    return (store?.get(docId, recordId) ?? null) as RecordFields | null;
+  });
 
   useEffect(() => {
-    let active = true;
-
     const store = (client as any).__runtimeStore as RuntimeStore | undefined;
+    if (!store) return;
 
-    async function fetchInitial() {
-      try {
-        if (store) {
-          const cached = store.get(docId, recordId);
-          if (cached) {
-            revisionRef.current = JSON.stringify(cached);
-            if (active) {
-              setData(cached as RecordFields);
-              setLoading(false);
-              return;
-            }
-          }
-        }
-        const record = await client.get(docId, recordId);
-        if (active) {
-          revisionRef.current = JSON.stringify(record);
-          setData(record);
-          setLoading(false);
-        }
-      } catch (err) {
-        if (active) {
-          setError(err as Error);
-          setLoading(false);
-        }
-      }
-    }
-
-    let notifySeq = 0;
-    const unsubscribe = client.subscribe(docId, async (changedRecordId: string) => {
-      const seq = ++notifySeq;
-      if (!active) return;
-      if (changedRecordId === recordId) {
-        try {
-          if (store) {
-            const cached = store.get(docId, recordId);
-            if (cached) {
-              const newRev = JSON.stringify(cached);
-              if (newRev !== revisionRef.current) {
-                revisionRef.current = newRev;
-                if (active) setData(cached as RecordFields);
-              }
-              return;
-            }
-          }
-          const record = await client.get(docId, recordId);
-          const newRevision = JSON.stringify(record);
-          if (newRevision === revisionRef.current) return;
-          revisionRef.current = newRevision;
-          if (active) {
-            setData(record);
-          }
-        } catch (err) {
-          console.error('Failed to refresh single record:', err);
-        }
-      }
+    // Subscribe directly to RuntimeStore with record-level granularity
+    const unsub = store.subscribe(docId, recordId, () => {
+      const record = store.get(docId, recordId) as RecordFields | null;
+      setData(record);
     });
 
-    fetchInitial();
-
-    return () => {
-      active = false;
-      unsubscribe();
-    };
+    return unsub;
   }, [client, docId, recordId]);
 
-  return {
-    data,
-    loading,
-    error,
-  };
+  return { data, loading: false, error: null };
 }

@@ -1,8 +1,10 @@
 use async_trait::async_trait;
+use js_sys::Uint8Array;
 use std::sync::{Arc, Mutex};
 use vaultsync_core::oplog::entry::{MutationType, OplogEntry, SyncStatus};
 use vaultsync_core::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use vaultsync_core::sync::state::SyncState;
+use vaultsync_core::time_utils::SendJsFuture;
 use vaultsync_core::VaultSyncError;
 use web_sys::*;
 
@@ -17,9 +19,72 @@ pub struct OpfsStorage {
 }
 
 impl OpfsStorage {
+    /// Expose the PagesDir so all subsystems share the same PageStore instances
+    pub fn pages(&self) -> &PagesDir {
+        &self.pages
+    }
+
     /// Get a clone of the root directory handle (for PageStore creation)
     pub async fn db_dir(&self) -> Result<FileSystemDirectoryHandle, VaultSyncError> {
         Ok(self.root.lock().unwrap().clone())
+    }
+
+    /// Write a file to _pages/_system/ for metadata (checkpoint, manifest backups, etc.)
+    pub(crate) async fn write_system_file(&self, name: &str, data: &[u8]) -> Result<(), VaultSyncError> {
+        let db_dir = self.root.lock().unwrap().clone();
+        let pages_root = ensure_dir(&db_dir, "_pages").await?;
+        let sys_dir = ensure_dir(&pages_root, "_system").await?;
+        let opts = FileSystemGetFileOptions::new();
+        opts.set_create(true);
+        let file_val = SendJsFuture::from(sys_dir.get_file_handle_with_options(name, &opts))
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("get_file_handle: {:?}", e)))?;
+        let file_handle: FileSystemFileHandle = file_val.into();
+        let writable_val = SendJsFuture::from(file_handle.create_writable())
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("create_writable: {:?}", e)))?;
+        let writable: FileSystemWritableFileStream = writable_val.into();
+        let js_array = Uint8Array::new_with_length(data.len() as u32);
+        js_array.copy_from(data);
+        let write_promise = writable
+            .write_with_buffer_source(&js_array)
+            .map_err(|e| VaultSyncError::Storage(format!("write: {:?}", e)))?;
+        SendJsFuture::from(write_promise)
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("write done: {:?}", e)))?;
+        let ws: web_sys::WritableStream = writable.into();
+        SendJsFuture::from(ws.close())
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("close: {:?}", e)))?;
+        Ok(())
+    }
+
+    /// Read a file from _pages/_system/.
+    pub(crate) async fn read_system_file(&self, name: &str) -> Result<Option<Vec<u8>>, VaultSyncError> {
+        let db_dir = self.root.lock().unwrap().clone();
+        let pages_root = ensure_dir(&db_dir, "_pages").await?;
+        let sys_dir = ensure_dir(&pages_root, "_system").await?;
+        let opts = FileSystemGetFileOptions::new();
+        opts.set_create(false);
+        let file_val = SendJsFuture::from(sys_dir.get_file_handle_with_options(name, &opts))
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("get_file_handle: {:?}", e)));
+        let file_handle: FileSystemFileHandle = match file_val {
+            Ok(v) => v.into(),
+            Err(_) => return Ok(None),
+        };
+        let file_val = SendJsFuture::from(file_handle.get_file())
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("get_file: {:?}", e)))?;
+        let file: File = file_val.into();
+        let blob: &Blob = file.as_ref();
+        let buf_val = SendJsFuture::from(blob.array_buffer())
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("array_buffer: {:?}", e)))?;
+        let uint8 = Uint8Array::new(&buf_val);
+        let mut bytes = vec![0u8; uint8.length() as usize];
+        uint8.copy_to(&mut bytes);
+        Ok(Some(bytes))
     }
 
     pub async fn new(db_name: &str) -> Result<Self, VaultSyncError> {
@@ -641,6 +706,7 @@ async fn read_all_entries<T: serde::de::DeserializeOwned + serde::Serialize>(
 }
 
 /// Read all oplog entries, resolving base + delta pages via VersionChain.
+/// Always deduplicates by entry ID — later pages override earlier ones.
 pub async fn read_all_oplog_entries(
     store: &PageStore,
 ) -> Result<Vec<OplogEntry>, VaultSyncError> {
@@ -648,20 +714,25 @@ pub async fn read_all_oplog_entries(
     let mut page_ids = store.list_page_ids("read_all_oplog_entries").await.unwrap_or_default();
     page_ids.sort_unstable();
 
-    if current == 0 || page_ids.is_empty() {
-        // No base page — fall back to generic read (append-only store)
-        // Use the qualified path to avoid recursion.
-        return self::read_all_entries::<OplogEntry>(store, "read_all_oplog_entries").await;
+    if page_ids.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let deltas: Vec<PageId> = page_ids.iter().filter(|id| **id > current).copied().collect();
-    let mut chain = VersionChain::new(current);
+    // When current_page is 0 (no full-state page yet), treat ALL pages as
+    // deltas with base_id=0. VersionChain deduplicates by entry ID — later
+    // pages (deltas written by mark_synced) override earlier ones, preventing
+    // stale Pending entries from causing upload loops (Bug C).
+    let (base_id, deltas): (PageId, Vec<PageId>) = if current > 0 {
+        (current, page_ids.into_iter().filter(|id| *id > current).collect())
+    } else {
+        (0, page_ids)
+    };
+
+    let mut chain = VersionChain::new(base_id);
     for d in &deltas {
         chain.add_delta(*d);
     }
-    let resolved = chain.resolve(store).await?;
-
-    Ok(resolved)
+    chain.resolve(store).await
 }
 
 use crate::indexeddb::IndexedDbStorage;

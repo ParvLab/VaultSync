@@ -28,7 +28,7 @@ const mockWasmClient: any = {
 jest.unstable_mockModule('../wasm/vaultsync_wasm.js', () => {
   return {
     default: (jest.fn() as any).mockResolvedValue(true),
-    WasmVaultSyncClient: mockWasmClient,
+    VaultSyncRuntime: mockWasmClient,
   };
 });
 

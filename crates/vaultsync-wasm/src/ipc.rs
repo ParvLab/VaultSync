@@ -16,6 +16,7 @@ pub enum BusMessage {
     FOLLOWER_DETACH {
         tab_id: String,
     },
+    /// Legacy — replaced by RUNTIME_SNAPSHOT (Phase 4). Kept for BC gap recovery.
     SNAPSHOT_METADATA {
         runtime_gen: u64,
         bus_gen: u64,
@@ -23,6 +24,7 @@ pub enum BusMessage {
         cursor: u64,
         pending_count: usize,
     },
+    /// Legacy — replaced by RUNTIME_SNAPSHOT (Phase 4). Kept for BC gap recovery.
     SNAPSHOT_DOCUMENT {
         doc_id: String,
         record_id: String,
@@ -71,6 +73,15 @@ pub enum BusMessage {
     REQUEST_DOCUMENT {
         doc_id: String,
         record_id: String,
+    },
+    /// Phase 4: Single RuntimeSnapshot — replaces doc-by-doc SNAPSHOT_METADATA/SNAPSHOT_DOCUMENT.
+    /// payload_json is a serialized RuntimeSnapshotPayload.
+    RUNTIME_SNAPSHOT {
+        runtime_gen: u64,
+        bus_gen: u64,
+        cursor: u64,
+        pending_count: usize,
+        payload_json: String,
     },
 }
 
@@ -186,6 +197,9 @@ pub fn encode_message(msg: &BusMessage) -> String {
             BusMessage::MUTATION_BATCH { mutations, from_seq, to_seq } => {
                 format!("MUTATION_BATCH|{}|{}|{}", from_seq, to_seq, mutations.join(";"))
             }
+            BusMessage::RUNTIME_SNAPSHOT { runtime_gen, bus_gen, cursor, pending_count, payload_json } => {
+                format!("RUNTIME_SNAPSHOT|{}|{}|{}|{}|{}", runtime_gen, bus_gen, cursor, pending_count, payload_json)
+            }
         }
     }
 
@@ -291,6 +305,15 @@ pub fn parse_message(msg: &str) -> Option<BusMessage> {
                     mutations: fields[2].split(';').map(String::from).collect(),
                     from_seq: fields[0].parse().unwrap_or(0),
                     to_seq: fields[1].parse().unwrap_or(0),
+                })
+            }
+            "RUNTIME_SNAPSHOT" if fields.len() >= 5 => {
+                Some(BusMessage::RUNTIME_SNAPSHOT {
+                    runtime_gen: fields[0].parse().unwrap_or(0),
+                    bus_gen: fields[1].parse().unwrap_or(0),
+                    cursor: fields[2].parse().unwrap_or(0),
+                    pending_count: fields[3].parse().unwrap_or(0),
+                    payload_json: fields[4].to_string(),
                 })
             }
             _ => None,

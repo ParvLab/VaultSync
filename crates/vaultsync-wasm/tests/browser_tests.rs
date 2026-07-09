@@ -1,6 +1,6 @@
 #![cfg(target_arch = "wasm32")]
 
-use vaultsync_wasm::client::WasmVaultSyncClient;
+use vaultsync_wasm::client::VaultSyncRuntime;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_test::*;
 
@@ -8,9 +8,9 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 #[wasm_bindgen_test]
 async fn test_wasm_vaultsync_client_insert_get_update_delete() {
-    let client = WasmVaultSyncClient::new("test_ns", "replica_1", None, None)
+    let client = VaultSyncRuntime::new("test_ns", "replica_1", None, None)
         .await
-        .expect("Failed to create WasmVaultSyncClient");
+        .expect("Failed to create VaultSyncRuntime");
 
     let doc_id = "doc_1";
     let record_id = "rec_1";
@@ -75,9 +75,9 @@ async fn test_wasm_vaultsync_client_insert_get_update_delete() {
 
 #[wasm_bindgen_test]
 async fn test_find_returns_all_records() {
-    let client = WasmVaultSyncClient::new("test_ns_find", "replica_find", None, None)
+    let client = VaultSyncRuntime::new("test_ns_find", "replica_find", None, None)
         .await
-        .expect("Failed to create WasmVaultSyncClient");
+        .expect("Failed to create VaultSyncRuntime");
 
     let doc_id = "doc_find";
 
@@ -120,9 +120,9 @@ async fn test_subscribe_fires_on_insert() {
     use std::sync::{Arc, Mutex};
     use wasm_bindgen::JsCast;
 
-    let client = WasmVaultSyncClient::new("test_ns_sub", "replica_sub", None, None)
+    let client = VaultSyncRuntime::new("test_ns_sub", "replica_sub", None, None)
         .await
-        .expect("Failed to create WasmVaultSyncClient");
+        .expect("Failed to create VaultSyncRuntime");
 
     let doc_id = "doc_sub";
     let fired_data = Arc::new(Mutex::new(None));
@@ -172,9 +172,9 @@ async fn test_subscribe_fires_on_insert() {
 
 #[wasm_bindgen_test]
 async fn test_sync_status_returns_state() {
-    let client = WasmVaultSyncClient::new("test_ns_sync", "replica_sync", None, None)
+    let client = VaultSyncRuntime::new("test_ns_sync", "replica_sync", None, None)
         .await
-        .expect("Failed to create WasmVaultSyncClient");
+        .expect("Failed to create VaultSyncRuntime");
 
     let status_val = client
         .sync_status()
@@ -203,9 +203,9 @@ async fn test_sync_status_returns_state() {
 
 #[wasm_bindgen_test]
 async fn test_update_does_not_create_duplicates() {
-    let client = WasmVaultSyncClient::new("test_ns_dedup", "replica_dedup", None, None)
+    let client = VaultSyncRuntime::new("test_ns_dedup", "replica_dedup", None, None)
         .await
-        .expect("Failed to create WasmVaultSyncClient");
+        .expect("Failed to create VaultSyncRuntime");
 
     let doc_id = "doc_dedup";
     let record_id = "rec_dedup";

@@ -1,5 +1,5 @@
 use crate::ipc::WasmIPC;
-use crate::runtime::{BusGeneration, FollowerRecord, Runtime, RuntimeGeneration};
+use crate::runtime::{BusGeneration, Runtime, RuntimeGeneration};
 use crate::metrics::RuntimeMetrics;
 use std::sync::Arc;
 
@@ -37,10 +37,11 @@ impl BroadcastManager {
     pub fn broadcast_heartbeat(&self) {
         let meta = self.runtime.metadata_store.lock().unwrap();
         let msg = format!(
-            "HEARTBEAT|{}|{}|{}",
+            "HEARTBEAT|{}|{}|{}|{}",
             meta.runtime_gen.0,
             meta.bus_gen.0,
-            meta.cursor
+            meta.cursor,
+            meta.pending_count
         );
         drop(meta);
         let _ = self.channel.send(&msg);
@@ -72,23 +73,6 @@ impl BroadcastManager {
         engine_info!("[leader] announced tab={}", tab_id);
     }
 
-    pub fn broadcast_snapshot_metadata(&self) {
-        let meta = self.runtime.metadata_store.lock().unwrap();
-        let docs = self.runtime.hot_documents(100);
-        let doc_ids: Vec<String> = docs.iter().map(|d| format!("{}:0", d)).collect();
-        let msg = format!(
-            "SNAPSHOT_METADATA|{}|{}|{}|{}|{}",
-            meta.runtime_gen.0,
-            meta.bus_gen.0,
-            doc_ids.join(","),
-            meta.cursor,
-            meta.pending_count
-        );
-        drop(meta);
-        let _ = self.channel.send(&msg);
-        self.metrics.snapshots_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub fn handle_message(&self, msg: &str, from_tab: &str) {
         let parts: Vec<&str> = msg.splitn(2, '|').collect();
         if parts.len() < 1 { return; }
@@ -109,8 +93,6 @@ impl BroadcastManager {
                     self.runtime.presence_store.lock().unwrap()
                         .register_follower(from_tab.to_string(), version, caps);
                     self.metrics.follower_attaches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // Send snapshot metadata in response
-                    self.broadcast_snapshot_metadata();
                 }
             }
             "FOLLOWER_DETACH" => {
