@@ -8,20 +8,117 @@ use vaultsync_core::time_utils::SendJsFuture;
 use vaultsync_core::VaultSyncError;
 use web_sys::*;
 
+use crate::metadata_store::MetadataStore;
 use crate::migration::{DocEntry, PagesDir};
 use crate::page_store::{PageId, PageStore};
+use crate::storage_runtime::StorageRuntime;
 use crate::version_chain::VersionChain;
 
 #[derive(Debug, Clone)]
 pub struct OpfsStorage {
     root: Arc<Mutex<FileSystemDirectoryHandle>>,
     pages: PagesDir,
+    /// StorageRuntime for allocation authority and scheduling
+    storage_runtime: Arc<Mutex<Option<Arc<StorageRuntime>>>>,
+    /// MetadataStore for SyncState (singleton, not append-only)
+    sync_state_store: MetadataStore<SyncState>,
+    /// MetadataStore for Schema metadata (all schemas as a single page)
+    schema_store: MetadataStore<Vec<(String, SchemaMeta)>>,
+    /// MetadataStore for Migration records (all records as a single page)
+    migration_store: MetadataStore<Vec<MigrationRecord>>,
+    /// MetadataStore for Key records (all keys as a single page)
+    key_store: MetadataStore<Vec<KeyRecord>>,
 }
 
 impl OpfsStorage {
     /// Expose the PagesDir so all subsystems share the same PageStore instances
     pub fn pages(&self) -> &PagesDir {
         &self.pages
+    }
+
+    /// Set the StorageRuntime (called after construction from bootstrap).
+    /// Enables allocation routing through PageManager + StorageScheduler.
+    pub fn set_storage_runtime(&self, sr: Arc<StorageRuntime>) {
+        let mut guard = self.storage_runtime.lock().unwrap();
+        *guard = Some(sr);
+    }
+
+    /// Allocate a doc_data page ID, routing through StorageRuntime when available.
+    async fn alloc_doc_data(&self, reason: &'static str) -> Result<PageId, VaultSyncError> {
+        self.allocate_store_page_id("doc_data", &self.pages.doc_data, reason).await
+    }
+
+    /// Allocate an oplog page ID, routing through StorageRuntime when available.
+    async fn alloc_oplog(&self, reason: &'static str) -> Result<PageId, VaultSyncError> {
+        self.allocate_store_page_id("oplog", &self.pages.oplog, reason).await
+    }
+
+    /// Write a page through StorageRuntime scheduler (when available) or directly.
+    async fn write_store_page(&self, store_name: &'static str, store: &PageStore, page_id: PageId, data: Vec<u8>) -> Result<(), VaultSyncError> {
+        let sr = {
+            let guard = self.storage_runtime.lock().unwrap();
+            guard.clone()
+        };
+        if let Some(sr) = sr {
+            sr.enqueue_write_page(store_name, page_id, data).await
+        } else {
+            store.write_page(page_id, &data).await
+        }
+    }
+
+    /// Tombstone a page through StorageRuntime scheduler (when available) or directly.
+    async fn tombstone_store_page(&self, store_name: &'static str, store: &PageStore, page_id: PageId) -> Result<(), VaultSyncError> {
+        let sr = {
+            let guard = self.storage_runtime.lock().unwrap();
+            guard.clone()
+        };
+        if let Some(sr) = sr {
+            sr.enqueue_tombstone_page(store_name, page_id).await
+        } else {
+            store.tombstone_page(page_id).await
+        }
+    }
+
+    /// Write a doc_data page through the scheduler.
+    async fn write_doc_page(&self, page_id: PageId, data: Vec<u8>) -> Result<(), VaultSyncError> {
+        self.write_store_page("doc_data", &self.pages.doc_data, page_id, data).await
+    }
+
+    /// Write an oplog page through the scheduler.
+    async fn write_oplog_page(&self, page_id: PageId, data: Vec<u8>) -> Result<(), VaultSyncError> {
+        self.write_store_page("oplog", &self.pages.oplog, page_id, data).await
+    }
+
+    /// Tombstone a doc_data page through the scheduler.
+    async fn tombstone_doc_page(&self, page_id: PageId) -> Result<(), VaultSyncError> {
+        self.tombstone_store_page("doc_data", &self.pages.doc_data, page_id).await
+    }
+
+    /// Tombstone an oplog page through the scheduler.
+    async fn tombstone_oplog_page(&self, page_id: PageId) -> Result<(), VaultSyncError> {
+        self.tombstone_store_page("oplog", &self.pages.oplog, page_id).await
+    }
+
+    /// Allocate a page ID through StorageRuntime (when set) or PageStore (fallback).
+    /// StorageRuntime handles PageManager tracking; PageStore handles ContentIndex update.
+    async fn allocate_store_page_id(
+        &self,
+        store_name: &'static str,
+        store: &PageStore,
+        reason: &'static str,
+    ) -> Result<PageId, VaultSyncError> {
+        // Check if StorageRuntime is available (quick lock, no await in scope)
+        let page_id_opt = {
+            let guard = self.storage_runtime.lock().unwrap();
+            guard.as_ref().map(|sr| sr.allocate_page_id(store_name, reason))
+        };
+        if let Some(page_id) = page_id_opt {
+            // Commit the pre-allocated page to ContentIndex (no lock held)
+            store.commit_allocated_page_id(page_id).await?;
+            Ok(page_id)
+        } else {
+            store.allocate_page_id(reason).await
+        }
     }
 
     /// Get a clone of the root directory handle (for PageStore creation)
@@ -104,10 +201,19 @@ impl OpfsStorage {
         }
 
         let pages = PagesDir::open(&db_dir).await?;
+        let sync_state_store = MetadataStore::new(pages.sync_states.clone());
+        let schema_store = MetadataStore::new(pages.schemas.clone());
+        let migration_store = MetadataStore::new(pages.migrations.clone());
+        let key_store = MetadataStore::new(pages.keys.clone());
 
         Ok(Self {
             root: Arc::new(Mutex::new(db_dir)),
             pages,
+            storage_runtime: Arc::new(Mutex::new(None)),
+            sync_state_store,
+            schema_store,
+            migration_store,
+            key_store,
         })
     }
 
@@ -118,6 +224,45 @@ impl OpfsStorage {
     /// Physically remove tombstoned page files from disk.
     /// Returns total number of pages cleaned across all stores.
     pub async fn cleanup_tombstoned_pages(&self) -> Result<usize, VaultSyncError> {
+        self.cleanup_tombstoned_pages_routed().await
+    }
+
+    async fn tombstone_existing_doc_pages(
+        &self,
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<usize, VaultSyncError> {
+        let page_ids = self.list_doc_page_ids("tombstone_existing_doc_pages").await?;
+        let mut count = 0;
+        for id in page_ids {
+            if let Some(data) = self.read_doc_page(id).await? {
+                if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
+                    if entry.doc_id == doc_id && entry.record_id == record_id {
+                        self.tombstone_doc_page(id).await?;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+}
+
+// ── StorageRuntime routing helpers ──────────────────────────────────────
+// These check for an active StorageRuntime and route through it when
+// available, falling back to direct PageStore access otherwise.
+impl OpfsStorage {
+    /// Get StorageRuntime handle (cloned) if available.
+    fn with_sr(&self) -> Option<Arc<StorageRuntime>> {
+        let guard = self.storage_runtime.lock().unwrap();
+        guard.clone()
+    }
+
+    /// Route cleanup_tombstoned_pages through StorageRuntime or directly.
+    async fn cleanup_tombstoned_pages_routed(&self) -> Result<usize, VaultSyncError> {
+        // No per-store routing needed — iterates all stores
+        // StorageRuntime processes via scheduler, but cleanup is a bulk
+        // maintenance operation that reads disk directly.
         let mut total = 0usize;
         total += self.pages.doc_data.cleanup_tombstoned_pages().await?;
         total += self.pages.oplog.cleanup_tombstoned_pages().await?;
@@ -128,24 +273,58 @@ impl OpfsStorage {
         Ok(total)
     }
 
-    async fn tombstone_existing_doc_pages(
-        &self,
-        doc_id: &str,
-        record_id: &str,
-    ) -> Result<usize, VaultSyncError> {
-        let page_ids = self.pages.doc_data.list_page_ids("tombstone_existing_doc_pages").await?;
-        let mut count = 0;
-        for id in page_ids {
-            if let Some(data) = self.pages.doc_data.read_page(id).await? {
-                if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
-                    if entry.doc_id == doc_id && entry.record_id == record_id {
-                        self.pages.doc_data.tombstone_page(id).await?;
-                        count += 1;
-                    }
-                }
-            }
+    /// Route list_page_ids for doc_data through StorageRuntime or directly.
+    async fn list_doc_page_ids(&self, caller: &'static str) -> Result<Vec<PageId>, VaultSyncError> {
+        if let Some(sr) = self.with_sr() {
+            sr.list_page_ids("doc_data", caller).await
+        } else {
+            self.pages.doc_data.list_page_ids(caller).await
         }
-        Ok(count)
+    }
+
+    /// Route read_page for doc_data through StorageRuntime or directly.
+    async fn read_doc_page(&self, page_id: PageId) -> Result<Option<Vec<u8>>, VaultSyncError> {
+        if let Some(sr) = self.with_sr() {
+            sr.read_page("doc_data", page_id).await
+        } else {
+            self.pages.doc_data.read_page(page_id).await
+        }
+    }
+
+    /// Route adjust_pending_count on oplog through StorageRuntime or directly.
+    async fn adjust_oplog_pending_count(&self, delta: i32) -> Result<(), VaultSyncError> {
+        if let Some(sr) = self.with_sr() {
+            sr.adjust_pending_count("oplog", delta).await
+        } else {
+            self.pages.oplog.adjust_pending_count(delta).await
+        }
+    }
+
+    /// Route schedule_gc on oplog through StorageRuntime or directly.
+    fn schedule_oplog_gc(&self) {
+        if let Some(sr) = self.with_sr() {
+            sr.schedule_gc("oplog");
+        } else {
+            self.pages.oplog.schedule_gc();
+        }
+    }
+
+    /// Route run_pending_gc on oplog through StorageRuntime or directly.
+    async fn run_oplog_gc(&self) -> Result<usize, VaultSyncError> {
+        if let Some(sr) = self.with_sr() {
+            sr.run_pending_gc("oplog").await
+        } else {
+            self.pages.oplog.run_pending_gc().await
+        }
+    }
+
+    /// Route set_current_page on oplog through StorageRuntime or directly.
+    async fn set_oplog_current_page(&self, page_id: PageId) -> Result<(), VaultSyncError> {
+        if let Some(sr) = self.with_sr() {
+            sr.set_current_page("oplog", page_id).await
+        } else {
+            self.pages.oplog.set_current_page(page_id).await
+        }
     }
 }
 
@@ -175,10 +354,10 @@ impl Storage for OpfsStorage {
             record_id: record_id.to_string(),
             bytes: bytes.to_vec(),
         };
-        let page_id = self.pages.doc_data.allocate_page_id().await?;
+        let page_id = self.alloc_doc_data("insert_document").await?;
         let encoded = postcard::to_allocvec(&entry)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        self.pages.doc_data.write_page(page_id, &encoded).await
+        self.write_doc_page(page_id, encoded).await
     }
 
     async fn get_document(
@@ -186,10 +365,10 @@ impl Storage for OpfsStorage {
         doc_id: &str,
         record_id: &str,
     ) -> Result<Option<Vec<u8>>, VaultSyncError> {
-        let page_ids = self.pages.doc_data.list_page_ids("get_document").await?;
+        let page_ids = self.list_doc_page_ids("get_document").await?;
         let mut found: Vec<(u64, Vec<u8>)> = Vec::new();
         for id in page_ids {
-            if let Some(data) = self.pages.doc_data.read_page(id).await? {
+            if let Some(data) = self.read_doc_page(id).await? {
                 if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
                     if entry.doc_id == doc_id && entry.record_id == record_id {
                         found.push((id, entry.bytes));
@@ -223,10 +402,10 @@ impl Storage for OpfsStorage {
     }
 
     async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, VaultSyncError> {
-        let page_ids = self.pages.doc_data.list_page_ids("list_documents").await?;
+        let page_ids = self.list_doc_page_ids("list_documents").await?;
         let mut latest: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
         for id in page_ids {
-            if let Some(data) = self.pages.doc_data.read_page(id).await? {
+            if let Some(data) = self.read_doc_page(id).await? {
                 if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
                     if entry.doc_id == doc_id {
                         latest.insert(entry.record_id, entry.bytes);
@@ -263,21 +442,21 @@ impl Storage for OpfsStorage {
         let encoded_doc = postcard::to_allocvec(&doc_entry)
             .map_err(|e| VaultSyncError::Storage(format!("encode doc: {:?}", e)))?;
         tracing::trace!("[OpfsStorage] write_document_and_oplog: encode doc done len={}", encoded_doc.len());
-        let doc_page_id = self.pages.doc_data.allocate_page_id().await?;
+        let doc_page_id = self.alloc_doc_data("write_document").await?;
         tracing::trace!("[OpfsStorage] write_document_and_oplog: allocate doc page done id={}", doc_page_id);
         tracing::trace!("[OpfsStorage] write_document_and_oplog: write doc page start id={}", doc_page_id);
-        self.pages.doc_data.write_page(doc_page_id, &encoded_doc).await?;
+        self.write_doc_page(doc_page_id, encoded_doc).await?;
         tracing::trace!("[OpfsStorage] write_document_and_oplog: write doc page done");
 
         tracing::trace!("[OpfsStorage] write_document_and_oplog: encode oplog entry start");
         let encoded_entry = postcard::to_allocvec(&[entry.clone()])
             .map_err(|e| VaultSyncError::Storage(format!("encode oplog: {:?}", e)))?;
         tracing::trace!("[OpfsStorage] write_document_and_oplog: encode oplog done len={}", encoded_entry.len());
-        let oplog_page_id = self.pages.oplog.allocate_page_id().await?;
+        let oplog_page_id = self.alloc_oplog("write_oplog").await?;
         tracing::trace!("[OpfsStorage] write_document_and_oplog: allocate oplog page done id={}", oplog_page_id);
         tracing::trace!("[OpfsStorage] write_document_and_oplog: write oplog page start");
-        self.pages.oplog.write_page(oplog_page_id, &encoded_entry).await?;
-        self.pages.oplog.adjust_pending_count(1).await
+        self.write_oplog_page(oplog_page_id, encoded_entry).await?;
+        self.adjust_oplog_pending_count(1).await
     }
 
     async fn delete_document_and_oplog(
@@ -289,17 +468,17 @@ impl Storage for OpfsStorage {
         self.delete_document(doc_id, record_id).await?;
         let encoded = postcard::to_allocvec(&[entry.clone()])
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        let page_id = self.pages.oplog.allocate_page_id().await?;
-        self.pages.oplog.write_page(page_id, &encoded).await?;
-        self.pages.oplog.adjust_pending_count(1).await
+        let page_id = self.alloc_oplog("delete_oplog").await?;
+        self.write_oplog_page(page_id, encoded).await?;
+        self.adjust_oplog_pending_count(1).await
     }
 
     async fn append_oplog(&self, entry: &OplogEntry) -> Result<(), VaultSyncError> {
         let encoded = postcard::to_allocvec(&[entry.clone()])
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        let page_id = self.pages.oplog.allocate_page_id().await?;
-        self.pages.oplog.write_page(page_id, &encoded).await?;
-        self.pages.oplog.adjust_pending_count(1).await
+        let page_id = self.alloc_oplog("append_oplog").await?;
+        self.write_oplog_page(page_id, encoded).await?;
+        self.adjust_oplog_pending_count(1).await
     }
 
     async fn pending_count(&self, _namespace: &str) -> Result<usize, VaultSyncError> {
@@ -307,7 +486,13 @@ impl Storage for OpfsStorage {
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn vaultsync_core::storage::transaction::StorageTransaction>, VaultSyncError> {
-        Ok(Box::new(crate::transaction::OpfsTransaction::new(&self.pages.oplog).await?))
+        let tx = crate::transaction::OpfsTransaction::new(&self.pages.oplog).await?;
+        let guard = self.storage_runtime.lock().unwrap();
+        if let Some(ref sr) = *guard {
+            Ok(Box::new(tx.with_runtime(sr.clone())))
+        } else {
+            Ok(Box::new(tx))
+        }
     }
 
     async fn read_pending_oplog(
@@ -340,12 +525,12 @@ impl Storage for OpfsStorage {
         }
         let encoded = postcard::to_allocvec(&updated)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        let page_id = self.pages.oplog.allocate_page_id().await?;
-        self.pages.oplog.write_page(page_id, &encoded).await?;
+        let page_id = self.alloc_oplog("mark_synced").await?;
+        self.write_oplog_page(page_id, encoded).await?;
 
         // Delta page — do NOT update current_page. The base page stays canonical.
-        self.pages.oplog.adjust_pending_count(-1).await?;
-        self.pages.oplog.schedule_gc();
+        self.adjust_oplog_pending_count(-1).await?;
+        self.schedule_oplog_gc();
 
         Ok(())
     }
@@ -365,11 +550,11 @@ impl Storage for OpfsStorage {
         }
         let encoded = postcard::to_allocvec(&updated)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        let page_id = self.pages.oplog.allocate_page_id().await?;
-        self.pages.oplog.write_page(page_id, &encoded).await?;
+        let page_id = self.alloc_oplog("mark_failed").await?;
+        self.write_oplog_page(page_id, encoded).await?;
 
-        self.pages.oplog.adjust_pending_count(-1).await?;
-        self.pages.oplog.schedule_gc();
+        self.adjust_oplog_pending_count(-1).await?;
+        self.schedule_oplog_gc();
 
         Ok(())
     }
@@ -387,51 +572,49 @@ impl Storage for OpfsStorage {
         Ok(filtered)
     }
 
-    async fn read_sync_state(&self, namespace: &str) -> Result<Option<SyncState>, VaultSyncError> {
-        let all = read_all_entries::<(String, SyncState)>(&self.pages.sync_states, "read_sync_state").await?;
-        Ok(all.into_iter().find(|(ns, _)| ns == namespace).map(|(_, s)| s))
+    async fn read_sync_state(&self, _namespace: &str) -> Result<Option<SyncState>, VaultSyncError> {
+        self.sync_state_store.read().await
     }
 
     async fn write_sync_state(&self, state: &SyncState) -> Result<(), VaultSyncError> {
-        let encoded = postcard::to_allocvec(&[(state.namespace.clone(), state.clone())])
-            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        let page_id = self.pages.sync_states.allocate_page_id().await?;
-        self.pages.sync_states.write_page(page_id, &encoded).await
+        self.sync_state_store.write(state).await
     }
 
     async fn read_schema(&self, doc_id: &str) -> Result<Option<SchemaMeta>, VaultSyncError> {
-        let all = read_all_entries::<(String, SchemaMeta)>(&self.pages.schemas, "read_schema").await?;
+        let all = self.schema_store.read().await?.unwrap_or_default();
         Ok(all.into_iter().find(|(d, _)| d == doc_id).map(|(_, s)| s))
     }
 
     async fn write_schema(&self, meta: &SchemaMeta) -> Result<(), VaultSyncError> {
-        let encoded = postcard::to_allocvec(&[(meta.doc_id.clone(), meta.clone())])
-            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        let page_id = self.pages.schemas.allocate_page_id().await?;
-        self.pages.schemas.write_page(page_id, &encoded).await
+        let mut all = self.schema_store.read().await?.unwrap_or_default();
+        // Upsert: replace existing entry for this doc_id
+        if let Some(pos) = all.iter().position(|(d, _)| d == &meta.doc_id) {
+            all[pos] = (meta.doc_id.clone(), meta.clone());
+        } else {
+            all.push((meta.doc_id.clone(), meta.clone()));
+        }
+        self.schema_store.write(&all).await
     }
 
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, VaultSyncError> {
-        read_all_entries::<MigrationRecord>(&self.pages.migrations, "read_migrations").await
+        Ok(self.migration_store.read().await?.unwrap_or_default())
     }
 
     async fn write_migration(&self, record: &MigrationRecord) -> Result<(), VaultSyncError> {
-        let encoded = postcard::to_allocvec(record)
-            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        let page_id = self.pages.migrations.allocate_page_id().await?;
-        self.pages.migrations.write_page(page_id, &encoded).await
+        let mut all = self.migration_store.read().await?.unwrap_or_default();
+        all.push(record.clone());
+        self.migration_store.write(&all).await
     }
 
     async fn read_keys(&self, namespace: &str) -> Result<Vec<KeyRecord>, VaultSyncError> {
-        let all = read_all_entries::<KeyRecord>(&self.pages.keys, "read_keys").await?;
+        let all = self.key_store.read().await?.unwrap_or_default();
         Ok(all.into_iter().filter(|k| k.namespace == namespace).collect())
     }
 
     async fn write_key(&self, key: &KeyRecord) -> Result<(), VaultSyncError> {
-        let encoded = postcard::to_allocvec(key)
-            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        let page_id = self.pages.keys.allocate_page_id().await?;
-        self.pages.keys.write_page(page_id, &encoded).await
+        let mut all = self.key_store.read().await?.unwrap_or_default();
+        all.push(key.clone());
+        self.key_store.write(&all).await
     }
 
     // ADR-001: Failed Entry Lifecycle (WASM)
@@ -477,7 +660,7 @@ impl Storage for OpfsStorage {
         namespace: &str,
         older_than_secs: u64,
     ) -> Result<usize, VaultSyncError> {
-        self.pages.oplog.run_pending_gc().await?;
+        self.run_oplog_gc().await?;
         let cutoff = (js_sys::Date::now() as u64).saturating_sub(older_than_secs * 1000);
         let entries = read_all_oplog_entries(&self.pages.oplog).await?;
         let before = entries.len();
@@ -492,12 +675,12 @@ impl Storage for OpfsStorage {
         let removed = before - remaining.len();
         let encoded = postcard::to_allocvec(&remaining)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        let page_id = self.pages.oplog.allocate_page_id().await?;
-        self.pages.oplog.write_page(page_id, &encoded).await?;
+        let page_id = self.alloc_oplog("delete_synced_oplog_older_than").await?;
+        self.write_oplog_page(page_id, encoded).await?;
 
         // Full-state rewrite — mark as current and schedule deferred GC.
-        self.pages.oplog.set_current_page(page_id).await?;
-        self.pages.oplog.schedule_gc();
+        self.set_oplog_current_page(page_id).await?;
+        self.schedule_oplog_gc();
 
         Ok(removed)
     }
@@ -571,7 +754,7 @@ impl Storage for OpfsStorage {
         record_id: &str,
         timestamp: u64,
     ) -> Result<usize, VaultSyncError> {
-        self.pages.oplog.run_pending_gc().await?;
+        self.run_oplog_gc().await?;
         let entries = read_all_oplog_entries(&self.pages.oplog).await?;
         let before = entries.len();
         let remaining: Vec<OplogEntry> = entries
@@ -587,12 +770,12 @@ impl Storage for OpfsStorage {
         let removed = before - remaining.len();
         let encoded = postcard::to_allocvec(&remaining)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        let page_id = self.pages.oplog.allocate_page_id().await?;
-        self.pages.oplog.write_page(page_id, &encoded).await?;
+        let page_id = self.alloc_oplog("delete_synced_oplog_before_timestamp").await?;
+        self.write_oplog_page(page_id, encoded).await?;
 
         // Full-state rewrite — mark as current and schedule deferred GC.
-        self.pages.oplog.set_current_page(page_id).await?;
-        self.pages.oplog.schedule_gc();
+        self.set_oplog_current_page(page_id).await?;
+        self.schedule_oplog_gc();
 
         Ok(removed)
     }
@@ -602,7 +785,7 @@ impl Storage for OpfsStorage {
         namespace: &str,
         cutoff_ms: u64,
     ) -> Result<usize, VaultSyncError> {
-        self.pages.oplog.run_pending_gc().await?;
+        self.run_oplog_gc().await?;
         let entries = read_all_oplog_entries(&self.pages.oplog).await?;
         let before = entries.len();
         let remaining: Vec<OplogEntry> = entries
@@ -616,12 +799,12 @@ impl Storage for OpfsStorage {
         let removed = before - remaining.len();
         let encoded = postcard::to_allocvec(&remaining)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        let page_id = self.pages.oplog.allocate_page_id().await?;
-        self.pages.oplog.write_page(page_id, &encoded).await?;
+        let page_id = self.alloc_oplog("delete_synced_before").await?;
+        self.write_oplog_page(page_id, encoded).await?;
 
         // Full-state rewrite — mark as current and schedule deferred GC.
-        self.pages.oplog.set_current_page(page_id).await?;
-        self.pages.oplog.schedule_gc();
+        self.set_oplog_current_page(page_id).await?;
+        self.schedule_oplog_gc();
 
         Ok(removed)
     }

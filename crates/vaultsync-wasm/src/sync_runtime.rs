@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use async_trait::async_trait;
 
 use crate::follower::MirrorRuntime;
 use crate::metrics::RuntimeMetrics;
+use vaultsync_core::runtime_state::RuntimeLifecycle;
 
 /// PendingIndex — tracks un-uploaded mutations by seq, doc_id, record_id.
 ///
@@ -213,5 +215,20 @@ impl SyncRuntime {
 
     pub fn mark_coord_connected(&self) {
         self.coord_connected.store(js_sys::Date::now() as u64, Ordering::Release);
+    }
+}
+
+#[async_trait]
+impl RuntimeLifecycle for SyncRuntime {
+    async fn boot(&self) -> Result<(), String> { Ok(()) }
+    async fn ready(&self) -> Result<(), String> { Ok(()) }
+    async fn warm(&self) -> Result<(), String> {
+        // Warm phase: pending index loaded, ready for replay
+        Ok(())
+    }
+    async fn idle(&self) -> Result<(), String> { Ok(()) }
+    async fn shutdown(&self) -> Result<(), String> {
+        self.pending_index.lock().unwrap().drain_all();
+        Ok(())
     }
 }

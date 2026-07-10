@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use vaultsync_core::VaultSyncError;
 use vaultsync_core::oplog::entry::OplogEntry;
@@ -5,6 +7,7 @@ use vaultsync_core::storage::transaction::{PrepareHandle, StorageTransaction};
 
 use crate::page_store::PageStore;
 use crate::storage; // for read_all_oplog_entries
+use crate::storage_runtime::StorageRuntime;
 
 enum TxOp {
     MarkSynced {
@@ -22,8 +25,10 @@ enum TxOp {
 
 /// An OPFS-backed storage transaction.
 /// Buffers all mutations in memory, then writes a single delta page on commit.
+/// Uses StorageRuntime (when available) for allocation and scheduling.
 pub struct OpfsTransaction {
     store: PageStore,
+    storage_runtime: Option<Arc<StorageRuntime>>,
     ops: Vec<TxOp>,
     // Read entries once at begin, cache for the transaction lifetime
     pending_entries: Vec<OplogEntry>,
@@ -31,13 +36,19 @@ pub struct OpfsTransaction {
 
 impl OpfsTransaction {
     pub async fn new(store: &PageStore) -> Result<Self, VaultSyncError> {
-        // Read the current resolved state once; all mutations operate on this snapshot.
         let pending_entries = storage::read_all_oplog_entries(store).await?;
         Ok(Self {
             store: store.clone(),
+            storage_runtime: None,
             ops: Vec::new(),
             pending_entries,
         })
+    }
+
+    /// Attach a StorageRuntime for allocation routing and scheduling.
+    pub fn with_runtime(mut self, sr: Arc<StorageRuntime>) -> Self {
+        self.storage_runtime = Some(sr);
+        self
     }
 }
 
@@ -129,17 +140,25 @@ impl StorageTransaction for OpfsTransaction {
         // Write all changes as a single delta page
         let encoded = postcard::to_allocvec(&delta_entries)
             .map_err(|e| VaultSyncError::Storage(format!("tx encode: {:?}", e)))?;
-        let page_id = self.store.allocate_page_id().await?;
-        self.store.write_page(page_id, &encoded).await?;
-
-        // Update pending_count: count pending entries in the resolved state
         let pending_count = self
             .pending_entries
             .iter()
             .filter(|e| e.sync_status.is_uploadable())
             .count();
-        self.store.set_pending_count(pending_count).await?;
-        self.store.schedule_gc();
+        if let Some(ref sr) = self.storage_runtime {
+            // Route through StorageRuntime for allocation + scheduling
+            let page_id = sr.allocate_page_id("oplog", "tx_commit");
+            self.store.commit_allocated_page_id(page_id).await?;
+            sr.enqueue_write_page("oplog", page_id, encoded).await?;
+            sr.set_pending_count("oplog", pending_count).await?;
+            sr.schedule_gc("oplog");
+        } else {
+            // Fallback: direct allocation + write (no StorageRuntime)
+            let page_id = self.store.allocate_page_id("tx_commit").await?;
+            self.store.write_page(page_id, &encoded).await?;
+            self.store.set_pending_count(pending_count).await?;
+            self.store.schedule_gc();
+        }
 
         Ok(())
     }

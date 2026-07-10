@@ -709,6 +709,28 @@ impl VaultSyncClient {
 
         // ── Download worker (push-driven) — spawned in initialize() after subscribe ──
 
+        // ── Background sync timer (periodic, respects sync_interval) ──────
+        let sync_interval = client.config.sync_interval;
+        let bg_uq = upload_queue.clone();
+        let bg_dq = download_queue.clone();
+        let bg_pc = pending_cache.clone();
+        let bg_le = leader_election.clone();
+        crate::time_utils::spawn(async move {
+            loop {
+                crate::time_utils::sleep(sync_interval).await;
+                // Leader uploads pending mutations
+                if bg_le.try_acquire().unwrap_or(false) {
+                    let _ = bg_uq.process_batch().await;
+                }
+                // All tabs download
+                let _ = bg_dq.process_batch().await;
+                // Reconcile pending count cache
+                if let Ok(count) = bg_uq.pending_count().await {
+                    bg_pc.store(count, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+
         // ── Leader election + compaction timer ────────────────────────────
         let le = leader_election.clone();
         let ns = namespace_clone.clone();
@@ -855,27 +877,43 @@ impl VaultSyncClient {
                     if let Some(mut state) = self.storage.read_sync_state(&self.config.namespace).await? {
                         if state.generation_id != server_gen {
                             let cursor_was = cursor_before;
+                            let history_ok = self.coordinator.history_preserved().await;
 
-                            // Keep cursor on gen mismatch — only reset if server proves cursor invalid
-                            state.generation_id = server_gen.clone();
-                            let now_ms = crate::time_utils::system_time_now_ms();
-                            state.last_sync_at = Some(now_ms);
-                            // Preserve cursor in sync state (don't reset to 0)
-                            self.storage.write_sync_state(&state).await?;
-                            let gen_elapsed = gen_t0.elapsed().as_millis();
-                            tracing::info!(
-                                "[Recovery] gen mismatch: cursor={} gen={} gen_check={}ms (will validate)",
-                                cursor_was,
-                                state.generation_id,
-                                gen_elapsed,
-                            );
+                            if history_ok {
+                                // history_preserved=true means the server kept all data.
+                                // No need to disconnect+re-register — just update gen and subscribe.
+                                state.generation_id = server_gen.clone();
+                                let now_ms = crate::time_utils::system_time_now_ms();
+                                state.last_sync_at = Some(now_ms);
+                                self.storage.write_sync_state(&state).await?;
+                                let gen_elapsed = gen_t0.elapsed().as_millis();
+                                tracing::info!(
+                                    "[Recovery] gen mismatch but history_preserved=true: cursor={} gen={} gen_check={}ms (no reconnect)",
+                                    cursor_was,
+                                    state.generation_id,
+                                    gen_elapsed,
+                                );
+                            } else {
+                                // history_preserved=false: server lost data, must re-register and replay.
+                                state.generation_id = server_gen.clone();
+                                let now_ms = crate::time_utils::system_time_now_ms();
+                                state.last_sync_at = Some(now_ms);
+                                // Preserve cursor in sync state (don't reset to 0)
+                                self.storage.write_sync_state(&state).await?;
+                                let gen_elapsed = gen_t0.elapsed().as_millis();
+                                tracing::info!(
+                                    "[Recovery] gen mismatch: cursor={} gen={} gen_check={}ms (will validate)",
+                                    cursor_was,
+                                    state.generation_id,
+                                    gen_elapsed,
+                                );
 
-                            self.download_queue.set_replay_mode(true);
-                            let reconnect_t0 = crate::time_utils::PlatformInstant::now();
-                            let _ = self.coordinator.disconnect().await;
-                            match self.coordinator
-                                .register(&self.config.namespace, replica_info.clone(), cursor_was)
-                                .await
+                                self.download_queue.set_replay_mode(true);
+                                let reconnect_t0 = crate::time_utils::PlatformInstant::now();
+                                let _ = self.coordinator.disconnect().await;
+                                match self.coordinator
+                                    .register(&self.config.namespace, replica_info.clone(), cursor_was)
+                                    .await
                             {
                                 Ok(()) => {
                                     let reconnect_elapsed = reconnect_t0.elapsed().as_millis();
@@ -921,11 +959,12 @@ impl VaultSyncClient {
                                     tracing::warn!("Re-register failed after gen change: {:?}", e);
                                 }
                             }
-                        } else {
-                            let gen_elapsed = gen_t0.elapsed().as_millis();
-                            tracing::info!("[Recovery] generation OK gen={} gen_check={}ms", server_gen, gen_elapsed);
                         }
+                    } else {
+                        let gen_elapsed = gen_t0.elapsed().as_millis();
+                        tracing::info!("[Recovery] generation OK gen={} gen_check={}ms", server_gen, gen_elapsed);
                     }
+                }
                 } else {
                     tracing::debug!("[Recovery] server does not support generation tracking");
                 }
@@ -1676,6 +1715,12 @@ impl VaultSyncClient {
     pub async fn force_sync(&self) -> Result<usize, VaultSyncError> {
         let uploaded = self.upload_queue.process_batch().await?;
         let downloaded = self.download_queue.process_batch().await?;
+        // Reconcile pending count cache after processing (retries may have
+        // exhausted and marked entries as Failed, changing the count).
+        if let Ok(count) = self.upload_queue.pending_count().await {
+            self.pending_count_cache
+                .store(count, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(uploaded + downloaded)
     }
 

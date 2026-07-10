@@ -1,4 +1,32 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use bitflags::bitflags;
+
+/// Runtime lifecycle state.
+///
+/// Every tab passes through these states. Transitions are deterministic:
+/// UNKNOWN → DISCOVERING → BUILDING or MIRRORING
+/// BUILDING → RECOVERING → CONNECTED → READY (as LEADER)
+/// MIRRORING → FOLLOWER → RECOVERING → PROMOTING → BUILDING (if leader dies)
+/// 6-variant connection state exposed to JS.
+/// Replaces the old boolean Connected/Offline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionState {
+    /// This tab is the leader — full engine running.
+    Leader,
+    /// This tab is a follower (mirror) — lightweight, no storage/recovery.
+    Mirror,
+    /// Engine is recovering (replay, snapshot catch-up).
+    Recovering,
+    /// Connecting to coordinator.
+    Connecting,
+    /// Follower promoting to leader (leader died).
+    Promoting,
+    /// No coordinator connection available.
+    Offline,
+}
 
 /// Runtime lifecycle state.
 ///
@@ -19,6 +47,7 @@ pub enum RuntimeState {
     Mirroring,
     Follower,
     Promoting,
+    Offline,
 }
 
 impl RuntimeState {
@@ -38,6 +67,17 @@ impl RuntimeState {
         matches!(self, Self::Follower)
     }
 
+    pub fn to_connection_state(&self) -> ConnectionState {
+        match self {
+            Self::Leading | Self::Ready => ConnectionState::Leader,
+            Self::Mirroring | Self::Follower => ConnectionState::Mirror,
+            Self::Recovering => ConnectionState::Recovering,
+            Self::Connecting | Self::Discovering => ConnectionState::Connecting,
+            Self::Promoting | Self::Building => ConnectionState::Promoting,
+            Self::Unknown | Self::Offline => ConnectionState::Offline,
+        }
+    }
+
     pub fn default_capabilities(&self) -> RuntimeCapabilities {
         match self {
             Self::Leading | Self::Ready => RuntimeCapabilities::all(),
@@ -49,8 +89,60 @@ impl RuntimeState {
             Self::Mirroring => RuntimeCapabilities::STORAGE,
             Self::Discovering => RuntimeCapabilities::empty(),
             Self::Unknown => RuntimeCapabilities::empty(),
+            Self::Offline => RuntimeCapabilities::empty(),
         }
     }
+}
+
+/// RuntimeLifecycle — consistent lifecycle interface for every runtime.
+///
+/// Every subsystem implements these phases:
+/// - `boot()`: blocking init (manifests, content index, metadata). Target: ~100ms.
+/// - `ready()`: blocking init (leader election, coordinator connect). Target: ~300ms.
+/// - `warm()`: non-blocking (replay, snapshot catch-up, pending queue).
+/// - `idle()`: non-blocking (compaction, GC, health probes, metrics).
+/// - `shutdown()`: cleanup (scheduler clear, cache flush, metrics).
+#[async_trait]
+pub trait RuntimeLifecycle: Send + Sync {
+    /// Boot phase: read manifests, CRC validate, load ContentIndex.
+    async fn boot(&self) -> Result<(), String>;
+    /// Ready phase: UI interactive. Leader election done, coordinator connected.
+    async fn ready(&self) -> Result<(), String>;
+    /// Warm phase: background recovery (replay, snapshot catch-up).
+    async fn warm(&self) -> Result<(), String>;
+    /// Idle phase: compaction, GC, health probes, metrics.
+    async fn idle(&self) -> Result<(), String>;
+    /// Shutdown: clear scheduler, flush caches.
+    async fn shutdown(&self) -> Result<(), String>;
+}
+
+/// Default no-op implementation for runtimes that don't need a phase.
+/// All methods return Ok(()).
+#[async_trait]
+impl RuntimeLifecycle for Arc<()> {
+    async fn boot(&self) -> Result<(), String> { Ok(()) }
+    async fn ready(&self) -> Result<(), String> { Ok(()) }
+    async fn warm(&self) -> Result<(), String> { Ok(()) }
+    async fn idle(&self) -> Result<(), String> { Ok(()) }
+    async fn shutdown(&self) -> Result<(), String> { Ok(()) }
+}
+
+/// Startup phase tracking for Boot→Ready→Warm→Idle lifecycle.
+///
+/// These are timing/UI-interactive markers, not connection states.
+/// A tab can be in Warm phase (background recovery) while showing
+/// ConnectionState::Leader (if the leader was already established).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum StartupPhase {
+    /// Reading manifests, CRC validate, load ContentIndex. UI not yet interactive.
+    #[default]
+    Boot,
+    /// UI interactive. Leader election done, coordinator connected.
+    Ready,
+    /// Background recovery: download replay, snapshot catch-up.
+    Warm,
+    /// Steady state: compaction, GC, health probes, metrics aggregation.
+    Idle,
 }
 
 bitflags! {

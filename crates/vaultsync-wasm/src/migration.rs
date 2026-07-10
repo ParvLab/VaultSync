@@ -102,8 +102,8 @@ async fn migrate_index_to_pages(
                     doc_id: doc_id.clone(),
                     record_id: record_id.clone(),
                     bytes,
-                };
-                let page_id = stores.doc_data.allocate_page_id().await?;
+                };  
+                let page_id = stores.doc_data.allocate_page_id("migrate_v1_doc").await?;
                 let encoded = postcard::to_allocvec(&entry)
                     .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
                 stores.doc_data.write_page(page_id, &encoded).await?;
@@ -115,35 +115,35 @@ async fn migrate_index_to_pages(
     while !oplog_batch.is_empty() {
         let chunk_len = oplog_batch.len().min(50);
         let chunk: Vec<OplogEntry> = oplog_batch.drain(..chunk_len).collect();
-        let page_id = stores.oplog.allocate_page_id().await?;
+        let page_id = stores.oplog.allocate_page_id("migrate_v1_oplog").await?;
         let encoded = postcard::to_allocvec(&chunk)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         stores.oplog.write_page(page_id, &encoded).await?;
     }
 
     for (ns, state) in &index.sync_states {
-        let page_id = stores.sync_states.allocate_page_id().await?;
+        let page_id = stores.sync_states.allocate_page_id("migrate_v1_sync_state").await?;
         let encoded = postcard::to_allocvec(&(ns.clone(), state.clone()))
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         stores.sync_states.write_page(page_id, &encoded).await?;
     }
 
     for (doc_id, schema) in &index.schemas {
-        let page_id = stores.schemas.allocate_page_id().await?;
+        let page_id = stores.schemas.allocate_page_id("migrate_v1_schema").await?;
         let encoded = postcard::to_allocvec(&(doc_id.clone(), schema.clone()))
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         stores.schemas.write_page(page_id, &encoded).await?;
     }
 
     for migration in &index.migrations {
-        let page_id = stores.migrations.allocate_page_id().await?;
+        let page_id = stores.migrations.allocate_page_id("migrate_v1_migration").await?;
         let encoded = postcard::to_allocvec(migration)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         stores.migrations.write_page(page_id, &encoded).await?;
     }
 
     for key in &index.keys {
-        let page_id = stores.keys.allocate_page_id().await?;
+        let page_id = stores.keys.allocate_page_id("migrate_v1_key").await?;
         let encoded = postcard::to_allocvec(key)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         stores.keys.write_page(page_id, &encoded).await?;

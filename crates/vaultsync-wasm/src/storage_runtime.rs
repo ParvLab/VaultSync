@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use async_trait::async_trait;
+use vaultsync_core::runtime_state::RuntimeLifecycle;
 use vaultsync_core::VaultSyncError;
 
 use crate::metrics::RuntimeMetrics;
@@ -29,13 +31,21 @@ pub struct PageManager {
 }
 
 impl PageManager {
+    /// Reserved system page range: IDs 0-99 for system use (metadata, WAL checkpoints).
+    const SYSTEM_PAGE_RESERVED: PageId = 100;
+
     pub fn new(highest_id: PageId) -> Self {
+        let start = if highest_id < Self::SYSTEM_PAGE_RESERVED {
+            Self::SYSTEM_PAGE_RESERVED
+        } else {
+            highest_id
+        };
         Self {
-            next_id: AtomicU64::new(highest_id),
+            next_id: AtomicU64::new(start),
             free_list: Mutex::new(Vec::new()),
             tombstone_count: AtomicU64::new(0),
             live_count: AtomicU64::new(0),
-            watermark_high: AtomicU64::new(highest_id),
+            watermark_high: AtomicU64::new(start),
             allocation_count: AtomicU64::new(0),
         }
     }
@@ -160,6 +170,71 @@ impl StorageRuntime {
         Ok(rt)
     }
 
+    /// Drain and execute all pending scheduler ops against actual PageStores.
+    /// Returns the number of ops processed.
+    pub async fn process_pending(&self) -> usize {
+        let ops = self.scheduler.drain_pending();
+        if ops.is_empty() {
+            return 0;
+        }
+        let count = ops.len();
+        for qop in &ops {
+            match &qop.op {
+                StorageOp::WritePage { store, page_id, data } => {
+                    if let Err(e) = self.get_store(store).write_page(*page_id, data).await {
+                        engine_error!("[scheduler] write_page failed store={} page={}: {:?}", store, page_id, e);
+                    }
+                }
+                StorageOp::TombstonePage { store, page_id } => {
+                    if let Err(e) = self.get_store(store).tombstone_page(*page_id).await {
+                        engine_error!("[scheduler] tombstone_page failed store={} page={}: {:?}", store, page_id, e);
+                    }
+                }
+                StorageOp::DeletePage { store, page_id } => {
+                    if let Err(e) = self.get_store(store).delete_page(*page_id).await {
+                        engine_error!("[scheduler] delete_page failed store={} page={}: {:?}", store, page_id, e);
+                    }
+                }
+                StorageOp::FlushManifest { .. } => {
+                    // Manifest persistence is handled inline by PageStore methods.
+                    // No action needed here.
+                }
+                _ => {
+                    // AllocatePageId, Checkpoint, Compaction are handled
+                    // by their respective subsystems, not here.
+                    engine_trace!("[scheduler] skipping op {:?} (handled elsewhere)", qop.op);
+                }
+            }
+        }
+        self.metrics.mutations_sent.fetch_add(count as u64, Ordering::Relaxed);
+        #[cfg(debug_assertions)]
+        engine_debug!("[scheduler] processed {} ops", count);
+        count
+    }
+
+    /// Enqueue a WritePage op and process it immediately (inline in WASM).
+    pub async fn enqueue_write_page(&self, store: &str, page_id: PageId, data: Vec<u8>) -> Result<(), VaultSyncError> {
+        let op = StorageOp::WritePage {
+            store: store.to_string(),
+            page_id,
+            data,
+        };
+        self.scheduler.enqueue(op, "write_page");
+        self.process_pending().await;
+        Ok(())
+    }
+
+    /// Enqueue a TombstonePage op and process it immediately.
+    pub async fn enqueue_tombstone_page(&self, store: &str, page_id: PageId) -> Result<(), VaultSyncError> {
+        let op = StorageOp::TombstonePage {
+            store: store.to_string(),
+            page_id,
+        };
+        self.scheduler.enqueue(op, "tombstone_page");
+        self.process_pending().await;
+        Ok(())
+    }
+
     /// Get PageManager index for a given store name.
     pub fn store_index(store: &str) -> usize {
         match store {
@@ -236,6 +311,44 @@ impl StorageRuntime {
         self.startup_done.load(Ordering::Acquire)
     }
 
+    /// Delegate: list page IDs from a PageStore.
+    pub async fn list_page_ids(&self, store: &str, caller: &'static str) -> Result<Vec<PageId>, VaultSyncError> {
+        self.get_store(store).list_page_ids(caller).await
+    }
+
+    /// Delegate: read a page from a PageStore.
+    pub async fn read_page(&self, store: &str, page_id: PageId) -> Result<Option<Vec<u8>>, VaultSyncError> {
+        self.get_store(store).read_page(page_id).await
+    }
+
+    /// Delegate: adjust pending count on a PageStore.
+    pub async fn adjust_pending_count(&self, store: &str, delta: i32) -> Result<(), vaultsync_core::VaultSyncError> {
+        self.get_store(store).adjust_pending_count(delta).await
+    }
+
+    /// Delegate: schedule GC on a PageStore.
+    pub fn schedule_gc(&self, store: &str) {
+        let ps = self.get_store(store);
+        ps.schedule_gc();
+    }
+
+    /// Delegate: run pending GC on a PageStore.
+    pub async fn run_pending_gc(&self, store: &str) -> Result<usize, vaultsync_core::VaultSyncError> {
+        let ps = self.get_store(store);
+        ps.run_pending_gc().await
+    }
+
+    /// Delegate: set pending count on a PageStore.
+    pub async fn set_pending_count(&self, store: &str, count: usize) -> Result<(), vaultsync_core::VaultSyncError> {
+        self.get_store(store).set_pending_count(count).await
+    }
+
+    /// Delegate: set current page on a PageStore.
+    pub async fn set_current_page(&self, store: &str, page_id: PageId) -> Result<(), vaultsync_core::VaultSyncError> {
+        let ps = self.get_store(store);
+        ps.set_current_page(page_id).await
+    }
+
     /// Get page count metrics from all page managers.
     pub fn page_count_metrics(&self) -> (u64, u64, u64) {
         let managers = self.page_managers.lock().unwrap();
@@ -243,5 +356,36 @@ impl StorageRuntime {
         let total_tombstones: u64 = managers.iter().map(|m| m.tombstone_count()).sum();
         let total_allocated: u64 = managers.iter().map(|m| m.total_allocated()).sum();
         (total_live, total_tombstones, total_allocated)
+    }
+}
+
+#[async_trait]
+impl RuntimeLifecycle for StorageRuntime {
+    async fn boot(&self) -> Result<(), String> {
+        engine_trace!("[storage_runtime] boot: page managers initialized");
+        Ok(())
+    }
+
+    async fn ready(&self) -> Result<(), String> {
+        self.mark_startup_done();
+        engine_debug!("[storage_runtime] ready: startup guard cleared");
+        Ok(())
+    }
+
+    async fn warm(&self) -> Result<(), String> {
+        engine_trace!("[storage_runtime] warm");
+        Ok(())
+    }
+
+    async fn idle(&self) -> Result<(), String> {
+        // Process any pending scheduler ops
+        self.process_pending().await;
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), String> {
+        self.scheduler.clear();
+        engine_info!("[storage_runtime] shutdown: scheduler cleared");
+        Ok(())
     }
 }

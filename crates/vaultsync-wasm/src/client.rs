@@ -3,7 +3,9 @@ use crate::capability::{CapabilityManager, RuntimeCapability};
 use crate::follower::MirrorRuntime;
 use crate::ipc::WasmIPC;
 use crate::runtime::Runtime;
+use crate::maintenance_runtime::MaintenanceRuntime;
 use crate::runtime_host::VaultRuntime;
+use crate::storage_runtime::StorageRuntime;
 use crate::storage::BrowserStorage;
 use crate::persistence_engine::{OpfsPersistenceEngine, PersistenceEngine};
 use crate::upload_scheduler::{PendingUpload, UploadAction};
@@ -92,6 +94,27 @@ impl VaultSyncRuntime {
             BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
         };
 
+        // Phase 3: Wire StorageRuntime into bootstrap (offline path)
+        let mut vault_runtime: Option<Arc<VaultRuntime>> = if let BrowserStorage::Opfs(opfs) = &*storage_for_engine {
+            let pages = opfs.pages().clone();
+            let metrics = Arc::new(crate::metrics::RuntimeMetrics::default());
+            match StorageRuntime::new(pages, metrics.clone()).await {
+                Ok(storage_runtime) => {
+                    opfs.set_storage_runtime(storage_runtime.clone());
+                    let runtime = Runtime::new(replica_id.to_string());
+                    let scheduler = storage_runtime.scheduler.clone();
+                    let vr = VaultRuntime::new(runtime, storage_runtime, scheduler, metrics);
+                    Some(vr)
+                }
+                Err(e) => {
+                    engine_debug!("[StorageRuntime] init deferred: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Clean up tombstoned pages left by previous versions
         match storage.cleanup_tombstoned_pages().await {
             Ok(n) => {
@@ -105,6 +128,18 @@ impl VaultSyncRuntime {
         let storage_manager: Arc<dyn StorageManager> = Arc::new(
             DefaultStorageManager::new(storage.clone(), CompactionPolicy::default()),
         );
+
+        // Phase 4.0: Attach MaintenanceRuntime to VaultRuntime (best-effort)
+        if let Some(ref vr) = vault_runtime {
+            let mr = MaintenanceRuntime::new(
+                vr.storage().clone(),
+                storage_manager.clone(),
+                vr.runtime().clone(),
+                vr.metrics().clone(),
+            );
+            vault_runtime = Some(vr.clone().with_maintenance(mr));
+            engine_debug!("[maintenance] attached to VaultRuntime");
+        }
 
         let workspace_manager = Arc::new(WorkspaceManager::new());
         let working_set_manager = Arc::new(WorkingSetManager::new());
@@ -149,7 +184,6 @@ impl VaultSyncRuntime {
         let persistence_engine: Option<Arc<dyn PersistenceEngine>> = if let BrowserStorage::Opfs(opfs) = &*storage_for_engine {
             match Self::build_persistence_engine(opfs.clone().into(), runtime.clone()).await {
                 Ok(engine) => {
-                    runtime.set_pages(opfs.pages().clone());
                     Some(engine)
                 }
                 Err(e) => {
@@ -216,6 +250,11 @@ impl VaultSyncRuntime {
             None
         };
 
+        // Wire compaction_scheduler into VaultRuntime's EngineContext
+        if let (Some(vr), Some(cs)) = (vault_runtime.clone(), compaction_scheduler.clone()) {
+            vault_runtime = Some(vr.with_compaction(cs));
+        }
+
         let result = Self {
             client: Some(client),
             storage_manager: Some(storage_manager),
@@ -228,7 +267,7 @@ impl VaultSyncRuntime {
             tab_id: replica_id.to_string(),
             event_callback,
             runtime: Some(runtime.clone()),
-            vault_runtime: None,
+            vault_runtime,
             capability_manager: Some(capability_manager),
             broadcast_manager: broadcast_manager.clone(),
             runtime_coordinator,
@@ -450,6 +489,27 @@ impl VaultSyncRuntime {
             BrowserStorage::Opfs(_) | BrowserStorage::Idb(_) => StorageConfig::Wasm,
         };
 
+        // Phase 3: Wire StorageRuntime into bootstrap (leader path)
+        let mut vault_runtime: Option<Arc<VaultRuntime>> = if let BrowserStorage::Opfs(opfs) = &*storage_for_engine {
+            let pages = opfs.pages().clone();
+            let metrics = Arc::new(crate::metrics::RuntimeMetrics::default());
+            match StorageRuntime::new(pages, metrics.clone()).await {
+                Ok(storage_runtime) => {
+                    opfs.set_storage_runtime(storage_runtime.clone());
+                    let runtime = Runtime::new(replica_id.to_string());
+                    let scheduler = storage_runtime.scheduler.clone();
+                    let vr = VaultRuntime::new(runtime, storage_runtime, scheduler, metrics);
+                    Some(vr)
+                }
+                Err(e) => {
+                    engine_debug!("[StorageRuntime] init deferred: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Clean up tombstoned pages left by previous versions
         match storage.cleanup_tombstoned_pages().await {
             Ok(n) => {
@@ -464,6 +524,18 @@ impl VaultSyncRuntime {
             DefaultStorageManager::new(storage.clone(), CompactionPolicy::default()),
         );
         phase_log("storage_manager ready");
+
+        // Phase 4.0: Attach MaintenanceRuntime to VaultRuntime (best-effort)
+        if let Some(ref vr) = vault_runtime {
+            let mr = MaintenanceRuntime::new(
+                vr.storage().clone(),
+                storage_manager.clone(),
+                vr.runtime().clone(),
+                vr.metrics().clone(),
+            );
+            vault_runtime = Some(vr.clone().with_maintenance(mr));
+            engine_debug!("[maintenance] attached to VaultRuntime");
+        }
 
         let workspace_manager = Arc::new(WorkspaceManager::new());
         phase_log("workspace_manager ready");
@@ -553,7 +625,6 @@ impl VaultSyncRuntime {
         let persistence_engine: Option<Arc<dyn PersistenceEngine>> = if let BrowserStorage::Opfs(opfs) = &*storage_for_engine {
             match Self::build_persistence_engine(opfs.clone().into(), runtime.clone()).await {
                 Ok(engine) => {
-                    runtime.set_pages(opfs.pages().clone());
                     Some(engine)
                 }
                 Err(e) => {
@@ -622,6 +693,11 @@ impl VaultSyncRuntime {
             None
         };
 
+        // Wire compaction_scheduler into VaultRuntime's EngineContext
+        if let (Some(vr), Some(cs)) = (vault_runtime.clone(), compaction_scheduler.clone()) {
+            vault_runtime = Some(vr.with_compaction(cs));
+        }
+
         let result = Self {
             client: Some(client),
             storage_manager: Some(storage_manager),
@@ -634,7 +710,7 @@ impl VaultSyncRuntime {
             tab_id: replica_id.to_string(),
             event_callback,
             runtime: Some(runtime.clone()),
-            vault_runtime: None,
+            vault_runtime,
             capability_manager: Some(capability_manager),
             broadcast_manager: broadcast_manager.clone(),
             runtime_coordinator,
@@ -1552,7 +1628,10 @@ impl VaultSyncRuntime {
     /// JS should call this periodically (e.g., every 30s via setInterval).
     #[wasm_bindgen(js_name = tryCompact)]
     pub async fn try_compact(&self) -> Result<JsValue, JsValue> {
-        match self.compaction_scheduler.as_ref() {
+        let cs = self.vault_runtime.as_ref()
+            .and_then(|vr| vr.compaction())
+            .or_else(|| self.compaction_scheduler.as_ref());
+        match cs {
             Some(cs) => {
                 match cs.try_compact().await {
                     Some(json) => {
@@ -1570,8 +1649,10 @@ impl VaultSyncRuntime {
     /// Phase 6: Returns last compaction duration in ms, or 0 if never run.
     #[wasm_bindgen(js_name = lastCompactionMs)]
     pub fn last_compaction_ms(&self) -> u64 {
-        self.compaction_scheduler.as_ref()
-            .map(|cs| cs.last_compaction_ms())
+        let cs = self.vault_runtime.as_ref()
+            .and_then(|vr| vr.compaction())
+            .or_else(|| self.compaction_scheduler.as_ref());
+        cs.map(|cs| cs.last_compaction_ms())
             .unwrap_or(0)
     }
 
@@ -1653,6 +1734,57 @@ impl VaultSyncRuntime {
     pub fn events(&self) -> EventBusProxy {
         EventBusProxy {
             bus: self.event_bus.clone().unwrap_or_else(|| Arc::new(EventBus::new())),
+        }
+    }
+
+    /// Run a single maintenance tick. Returns number of phases that ran.
+    #[wasm_bindgen(js_name = maintenanceTick)]
+    pub fn maintenance_tick(&self) -> u32 {
+        if let Some(ref vr) = self.vault_runtime {
+            if let Some(ref m) = vr.maintenance() {
+                return m.tick();
+            }
+        }
+        0
+    }
+
+    /// Check if cache eviction is needed.
+    #[wasm_bindgen(js_name = cacheNeedsEviction)]
+    pub fn cache_needs_eviction(&self) -> bool {
+        if let Some(ref vr) = self.vault_runtime {
+            return vr.cache().should_evict();
+        }
+        false
+    }
+
+    /// Get cache stats as JSON.
+    #[wasm_bindgen(js_name = cacheStats)]
+    pub fn cache_stats(&self) -> String {
+        if let Some(ref vr) = self.vault_runtime {
+            let cache = vr.cache();
+            format!(
+                r#"{{"budget":{},"usage":{},"watermark":{},"shouldEvict":{}}}"#,
+                cache.budget(),
+                cache.estimated_usage(),
+                cache.watermark(),
+                cache.should_evict(),
+            )
+        } else {
+            r#"{"budget":0,"usage":0,"watermark":0,"shouldEvict":false}"#.to_string()
+        }
+    }
+
+    /// List active namespaces as JSON array.
+    #[wasm_bindgen(js_name = listNamespaces)]
+    pub fn list_namespaces(&self) -> Vec<JsValue> {
+        if let Some(ref vr) = self.vault_runtime {
+            vr.workspace()
+                .list()
+                .into_iter()
+                .map(|n| JsValue::from_str(&n))
+                .collect()
+        } else {
+            Vec::new()
         }
     }
 }

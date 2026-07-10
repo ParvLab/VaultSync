@@ -81,6 +81,7 @@ impl RuntimeBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TestSubscriber {

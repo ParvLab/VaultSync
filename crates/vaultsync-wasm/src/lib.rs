@@ -182,6 +182,8 @@ pub mod upload_scheduler;
 #[cfg(target_arch = "wasm32")]
 pub mod compaction_scheduler;
 #[cfg(target_arch = "wasm32")]
+pub mod metadata_store;
+#[cfg(target_arch = "wasm32")]
 pub mod storage_scheduler;
 #[cfg(target_arch = "wasm32")]
 pub mod storage_runtime;
@@ -191,6 +193,14 @@ pub mod runtime_host;
 pub mod sync_runtime;
 #[cfg(target_arch = "wasm32")]
 pub mod document_runtime;
+#[cfg(target_arch = "wasm32")]
+pub mod maintenance_runtime;
+#[cfg(target_arch = "wasm32")]
+pub mod engine_context;
+#[cfg(target_arch = "wasm32")]
+pub mod cache_runtime;
+#[cfg(target_arch = "wasm32")]
+pub mod namespace_runtime;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]

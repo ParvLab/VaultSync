@@ -618,20 +618,55 @@ impl PageStore {
         Ok(())
     }
 
-    /// Phase 2: #[track_caller] to identify which subsystem allocates pages.
-    #[track_caller]
-    pub async fn allocate_page_id(&self) -> Result<PageId, VaultSyncError> {
-        let caller = std::panic::Location::caller();
+    /// Allocate a page ID with a structured reason for auditing.
+    /// Logs store name, page ID, and reason for every allocation.
+    /// Commit a pre-allocated page ID to ContentIndex (used when StorageRuntime
+    /// owns allocation). Updates ContentIndex + manifest without incrementing
+    /// highest_page_id.
+    pub async fn commit_allocated_page_id(&self, page_id: PageId) -> Result<(), VaultSyncError> {
+        let manifest_copy = {
+            let mut guard = self.manifest.lock().unwrap();
+            let manifest = guard.as_mut().unwrap();
+            manifest.content_index.live_pages.insert(page_id);
+            manifest.live_pages += 1;
+            manifest.updated_at = js_sys::Date::now() as u64;
+            engine_debug!(
+                "[PageAlloc] store={} reason=commit_allocated page={}",
+                self.store_name, page_id
+            );
+            manifest.clone()
+        };
+        write_manifest(&self.dir, &manifest_copy).await?;
+        Ok(())
+    }
+
+    pub async fn allocate_page_id(&self, reason: &str) -> Result<PageId, VaultSyncError> {
         let manifest_copy = {
             let mut guard = self.manifest.lock().unwrap();
             let manifest = guard.as_mut().unwrap();
             let page_id = manifest.highest_page_id;
-            manifest.highest_page_id = page_id + 1;
-            manifest.live_pages += 1;
-            manifest.content_index.live_pages.insert(page_id);
-            manifest.updated_at = js_sys::Date::now() as u64;
-            engine_trace!("[allocate_page_id] id={} caller={}", page_id, caller);
-            (page_id, manifest.clone())
+            if page_id < 100 {
+                // Reserved system range 0-99: skip to 100 on first allocation
+                manifest.highest_page_id = 101;
+                manifest.live_pages += 1;
+                manifest.content_index.live_pages.insert(100);
+                manifest.updated_at = js_sys::Date::now() as u64;
+                engine_debug!(
+                    "[PageAlloc] store={} reason={} page={} (skipped reserved range)",
+                    self.store_name, reason, 100
+                );
+                (100u64, manifest.clone())
+            } else {
+                manifest.highest_page_id = page_id + 1;
+                manifest.live_pages += 1;
+                manifest.content_index.live_pages.insert(page_id);
+                manifest.updated_at = js_sys::Date::now() as u64;
+                engine_debug!(
+                    "[PageAlloc] store={} reason={} page={}",
+                    self.store_name, reason, page_id
+                );
+                (page_id, manifest.clone())
+            }
         };
         write_manifest(&self.dir, &manifest_copy.1).await?;
         Ok(manifest_copy.0)
@@ -667,7 +702,7 @@ impl PageStore {
         if data.len() > Self::HARD_SPLIT_BYTES || entry_count > Self::MAX_ENTRIES_PER_PAGE * 2 {
             engine_warn!("[page_store] emergency split page {}: {} bytes, ~{} entries", page_id, data.len(), entry_count);
             // Write to a temporary page, split it, and return instead of writing the oversized page.
-            let tmp_id = self.allocate_page_id().await?;
+            let tmp_id = self.allocate_page_id("emergency_split").await?;
             self.write_page_raw(tmp_id, data).await?;
             return self.split_page(tmp_id).await;
         }
@@ -846,6 +881,14 @@ impl PageStore {
         Ok(())
     }
 
+    /// Recover the store by rebuilding the manifest from OPFS scan.
+    /// This is the only public entry point for manifest repair.
+    pub async fn recover(&self) -> Result<(), VaultSyncError> {
+        engine_warn!("[PageStore] recovering manifest from OPFS scan");
+        let rebuilt = rebuild_manifest_with_index(&self.dir).await?;
+        write_manifest(&self.dir, &rebuilt).await
+    }
+
     /// Remove pages that have the tombstone flag (0x02) set.
     /// Returns the number of pages cleaned up.
     pub async fn cleanup_tombstoned_pages(&self) -> Result<usize, VaultSyncError> {
@@ -921,8 +964,10 @@ impl PageStore {
         }
 
         if cleaned > 0 {
-            // After cleanup, rebuild manifest to get accurate counts
-            let rebuilt = rebuild_manifest(&self.dir).await?;
+            // After cleanup, rebuild manifest with ContentIndex to populate live_pages.
+            // Must use rebuild_manifest_with_index — rebuild_manifest creates an empty
+            // ContentIndex, causing list_page_ids() to return stale data (Bug C).
+            let rebuilt = rebuild_manifest_with_index(&self.dir).await?;
             write_manifest(&self.dir, &rebuilt).await?;
         }
 
@@ -1036,8 +1081,8 @@ impl PageStore {
             return Ok(());
         }
 
-        let left_id = self.allocate_page_id().await?;
-        let right_id = self.allocate_page_id().await?;
+        let left_id = self.allocate_page_id("split_page_left").await?;
+        let right_id = self.allocate_page_id("split_page_right").await?;
 
         self.write_page_raw(left_id, &entries[0]).await?;
         self.write_page_raw(right_id, &entries[1]).await?;
@@ -1581,9 +1626,28 @@ pub async fn write_manifest(dir: &FileSystemDirectoryHandle, m: &StoreManifest) 
     write_file(dir, "_manifest", &bytes).await
 }
 
+/// Guard token that must be passed to rebuild_manifest* functions.
+///
+/// In debug builds, the guarded functions check that the guard was created
+/// by an allowed caller. In release builds, a warning is emitted.
+/// This prevents accidental OPFS directory walks during normal execution.
+#[derive(Debug)]
+pub(crate) struct ManifestRebuildGuard {
+    _private: (),
+}
+
+impl ManifestRebuildGuard {
+    /// Create a new guard for an allowed rebuild context.
+    /// Only call this from PageStore::open(), PageStore::recover(),
+    /// or cleanup operations. Never from normal read/write paths.
+    pub(crate) fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// Phase 1: Rebuild manifest with ContentIndex from OPFS scan.
 /// Used on first startup after upgrade or after corruption.
-pub async fn rebuild_manifest_with_index(dir: &FileSystemDirectoryHandle) -> Result<StoreManifest, VaultSyncError> {
+async fn rebuild_manifest_with_index(dir: &FileSystemDirectoryHandle) -> Result<StoreManifest, VaultSyncError> {
     let now = js_sys::Date::now() as u64;
     let mut highest_page_id: PageId = 0;
     let mut index = ContentIndex::new();

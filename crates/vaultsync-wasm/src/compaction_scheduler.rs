@@ -1,9 +1,10 @@
-use crate::runtime::Runtime;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use vaultsync_core::storage::compaction::{CompactionDecision, CompactionEngine, CompactionReason};
 use vaultsync_core::storage::manager::StorageManager;
 use wasm_bindgen::prelude::JsValue;
+
+use crate::runtime::Runtime;
 
 /// Phase 6: CompactionScheduler — Runtime-owned compaction with auto-trigger conditions.
 ///
@@ -51,7 +52,7 @@ impl CompactionScheduler {
     }
 
     /// Check if compaction should run based on trigger conditions.
-    pub fn should_compact(&self) -> CompactionDecision {
+    pub async fn should_compact(&self) -> CompactionDecision {
         // Condition 1: Must be idle (no pending uploads)
         if self.runtime.upload_scheduler.pending_count() > 0 {
             return CompactionDecision {
@@ -70,14 +71,10 @@ impl CompactionScheduler {
             };
         }
 
-        // Condition 3: Check page count and tombstone ratio via StoreManifest
-        if let Some(ref pages) = *self.runtime.pages.lock().unwrap() {
-            let m = pages.doc_data.manifest.lock().unwrap();
-            let (live_count, tombstone_count) = match m.as_ref() {
-                Some(manifest) => (manifest.live_pages as u64, manifest.tombstoned_pages as u64),
-                None => (0, 0),
-            };
-            drop(m);
+        // Condition 3: Check page count and tombstone ratio via StorageManager stats
+        if let Ok(stats) = self.storage_manager.stats().await {
+            let live_count = stats.total_pages.saturating_sub(stats.tombstone_pages) as u64;
+            let tombstone_count = stats.tombstone_pages as u64;
 
             if live_count > self.max_page_count {
                 return CompactionDecision {
@@ -133,7 +130,7 @@ impl CompactionScheduler {
     /// Called periodically (e.g., from RuntimeScheduler's Compaction task).
     /// Checks conditions and runs compaction if needed.
     pub async fn try_compact(&self) -> Option<String> {
-        let decision = self.should_compact();
+        let decision = self.should_compact().await;
         if !decision.should_run {
             return None;
         }

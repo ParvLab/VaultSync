@@ -100,12 +100,14 @@ impl RecoveryManager {
     }
 
     /// Repair ContentIndex by rebuilding from OPFS scan
+    /// Uses PageStore::recover() — the only public entry point for manifest repair.
     pub async fn repair_content_index(&self, store: &PageStore) -> Result<(), VaultSyncError> {
-        engine_warn!("[recovery] rebuilding ContentIndex from OPFS scan");
-        let rebuilt = crate::page_store::rebuild_manifest_with_index(store.dir()).await?;
-        crate::page_store::write_manifest(store.dir(), &rebuilt).await?;
+        store.recover().await?;
         self.metrics.manifest_rebuilds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        engine_info!("[recovery] ContentIndex rebuilt: {} pages, {} entries", rebuilt.live_pages, rebuilt.content_index.entries.len());
+        let m = crate::page_store::read_manifest(store.dir()).await;
+        if let Some(m) = m {
+            engine_info!("[recovery] ContentIndex rebuilt: {} pages, {} entries", m.live_pages, m.content_index.entries.len());
+        }
         Ok(())
     }
 

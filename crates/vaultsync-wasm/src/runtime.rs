@@ -335,8 +335,6 @@ pub struct Runtime {
     /// Phase 5: UploadScheduler — single entry point for uploads
     pub upload_scheduler: UploadScheduler,
     pub start_time: js_sys::Date,
-    /// Phase 3: PageStore instances owned by Runtime — shared with all subsystems
-    pub pages: std::sync::Mutex<Option<PagesDir>>,
 }
 
 impl Runtime {
@@ -353,7 +351,6 @@ impl Runtime {
             wal: std::sync::Mutex::new(WriteAheadLog::new(100)),
             upload_scheduler: UploadScheduler::new(200),
             start_time: js_sys::Date::new_0(),
-            pages: std::sync::Mutex::new(None),
         });
 
         // Schedule periodic tasks
@@ -361,11 +358,6 @@ impl Runtime {
         runtime.scheduler.schedule(Task::new(TaskType::GarbageCollect).with_deadline(60_000));
 
         runtime
-    }
-
-    /// Phase 3: Set the PagesDir after construction (storage may not be ready at new() time).
-    pub fn set_pages(&self, pages: PagesDir) {
-        *self.pages.lock().unwrap() = Some(pages);
     }
 
     pub fn set_field(&self, doc_id: &str, record_id: &str, field: &str, value: CrdtValue) {

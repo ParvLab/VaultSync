@@ -3,7 +3,9 @@ use crate::metrics::RuntimeMetrics;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use async_trait::async_trait;
 use vaultsync_core::crdt::types::CrdtValue;
+use vaultsync_core::runtime_state::RuntimeLifecycle;
 use wasm_bindgen::prelude::*;
 
 /// Phase 5: DocumentRuntime — owns all document lifecycle state.
@@ -287,5 +289,17 @@ impl DocumentRuntime {
         counts.clear();
         let mut subs = self.subscriptions.lock().unwrap();
         subs.clear();
+    }
+}
+
+#[async_trait]
+impl RuntimeLifecycle for DocumentRuntime {
+    async fn boot(&self) -> Result<(), String> { Ok(()) }
+    async fn ready(&self) -> Result<(), String> { Ok(()) }
+    async fn warm(&self) -> Result<(), String> { Ok(()) }
+    async fn idle(&self) -> Result<(), String> { Ok(()) }
+    async fn shutdown(&self) -> Result<(), String> {
+        self.clear();
+        Ok(())
     }
 }
