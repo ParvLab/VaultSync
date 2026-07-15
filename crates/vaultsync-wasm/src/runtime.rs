@@ -39,6 +39,19 @@ pub enum RuntimeStatus {
     Recovering,
 }
 
+impl RuntimeStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Leader => "Leader",
+            Self::Follower => "Mirror",
+            Self::Recovering => "Recovering",
+            Self::Initializing => "Connecting",
+            Self::Ready => "Connecting",
+            Self::Offline => "Offline",
+        }
+    }
+}
+
 impl Default for RuntimeStatus {
     fn default() -> Self { Self::Initializing }
 }

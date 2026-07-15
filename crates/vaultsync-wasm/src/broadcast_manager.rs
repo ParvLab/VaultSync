@@ -8,24 +8,24 @@ pub struct BroadcastManager {
     runtime: Arc<Runtime>,
     pub(crate) channel: Arc<WasmIPC>,
     metrics: Arc<RuntimeMetrics>,
+    tab_id: String,
 }
 
 impl BroadcastManager {
-    pub fn new(runtime: Arc<Runtime>, channel: Arc<WasmIPC>, metrics: Arc<RuntimeMetrics>) -> Self {
+    pub fn new(runtime: Arc<Runtime>, channel: Arc<WasmIPC>, metrics: Arc<RuntimeMetrics>, tab_id: String) -> Self {
         Self {
             runtime,
             channel,
             metrics,
+            tab_id,
         }
     }
 
-    /// Broadcast a structured mutation: MUTATION|<bus_gen>|<doc_id>|<record_id>|<fields_json>
+    /// Broadcast a structured mutation: MUTATION|<tab_id>|<doc_id>|<record_id>|<fields_json>
+    /// Uses tab_id (not bus_gen) in field 1 so the WASM BC handler can detect
+    /// self-broadcasts via `from_tab != tab_id` and skip redundant processing.
     pub fn broadcast_mutation(&self, doc_id: &str, record_id: &str, fields_json: &str) {
-        let mut bus_gen = self.runtime.metadata_store.lock().unwrap().bus_gen;
-        bus_gen = BusGeneration(bus_gen.0 + 1);
-        self.runtime.metadata_store.lock().unwrap().bus_gen = bus_gen;
-
-        let msg = format!("MUTATION|{}|{}|{}|{}", bus_gen.0, doc_id, record_id, fields_json);
+        let msg = format!("MUTATION|{}|{}|{}|{}", self.tab_id, doc_id, record_id, fields_json);
         if self.channel.send(&msg).is_ok() {
             self.metrics.mutations_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.metrics.bytes_sent.fetch_add(msg.len() as u64, std::sync::atomic::Ordering::Relaxed);

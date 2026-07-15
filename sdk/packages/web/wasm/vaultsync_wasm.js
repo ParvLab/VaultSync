@@ -1,5 +1,5 @@
 /* @ts-self-types="./vaultsync_wasm.d.ts" */
-import { acquire_web_lock, release_web_lock } from './snippets/vaultsync-core-569f5a5e15e207ef/inline0.js';
+import { acquire_lock_immediate, acquire_web_lock, release_web_lock } from './snippets/vaultsync-core-569f5a5e15e207ef/inline0.js';
 
 
 /**
@@ -157,6 +157,13 @@ export class ReplicationNamespace {
 }
 if (Symbol.dispose) ReplicationNamespace.prototype[Symbol.dispose] = ReplicationNamespace.prototype.free;
 
+/**
+ * SyncStateStore that reads/writes cursor+generation in memory AND persists
+ * every write through the MetadataStore-backed Storage trait.
+ * Legacy PersistentSyncStateStore is replaced by InMemorySyncStateStore.
+ * Cursor and generation are persisted via MetadataRuntime on checkpoint,
+ * not on every cursor update. This eliminates 2 OPFS writes per mutation.
+ */
 export class VaultSyncRuntime {
     static __wrap(ptr) {
         const obj = Object.create(VaultSyncRuntime.prototype);
@@ -208,6 +215,7 @@ export class VaultSyncRuntime {
     /**
      * Phase 4f: Check if mirror should promote to leader (leader heartbeat timeout).
      * Returns true if leader is gone and JS should reinitialize with new_with_coordinator().
+     * Legacy — prefer waitForPromotion() for event-driven usage.
      * @returns {boolean}
      */
     checkMirrorPromotion() {
@@ -249,6 +257,17 @@ export class VaultSyncRuntime {
         const ptr1 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
         const ret = wasm.vaultsyncruntime_delete(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * Force-demote this tab to Follower when LEADER_ELECTED is received from another tab.
+     * Creates a new MirrorRuntime + BC handler + LeaderElection so the tab can
+     * continue processing mutations and detect when to re-promote.
+     * Called from JS BC handler. Safe to call even if not currently leader (no-op in that case).
+     * @returns {Promise<void>}
+     */
+    demote() {
+        const ret = wasm.vaultsyncruntime_demote(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -462,6 +481,32 @@ export class VaultSyncRuntime {
         return ret === 0 ? undefined : PresenceManager.__wrap(ret);
     }
     /**
+     * Phase 4b: Promote this follower tab to leader in-process (6-phase pipeline).
+     * Called by JS when waitForPromotion() resolves.
+     * Phases: Acquire → Construct → Restore → Writable → Install → Announce.
+     * Each phase populates PromoteCtx fields; the pipeline guarantees ordering.
+     * @param {string} namespace
+     * @param {string} coordinator_url
+     * @param {string | null} [auth_token]
+     * @param {string | null} [db_name]
+     * @param {string | null} [storage_backend]
+     * @returns {Promise<void>}
+     */
+    promote(namespace, coordinator_url, auth_token, db_name, storage_backend) {
+        const ptr0 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(coordinator_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        var ptr2 = isLikeNone(auth_token) ? 0 : passStringToWasm0(auth_token, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len2 = WASM_VECTOR_LEN;
+        var ptr3 = isLikeNone(db_name) ? 0 : passStringToWasm0(db_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len3 = WASM_VECTOR_LEN;
+        var ptr4 = isLikeNone(storage_backend) ? 0 : passStringToWasm0(storage_backend, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len4 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_promote(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+        return ret;
+    }
+    /**
      * @param {number} keep_versions
      */
     prune_key_versions(keep_versions) {
@@ -504,6 +549,24 @@ export class VaultSyncRuntime {
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.vaultsyncruntime_runLifecycle(this.__wbg_ptr, ptr0, len0);
         return ret;
+    }
+    /**
+     * Returns the current runtime status as a string.
+     * Sprint D: Enhanced runtime status with health, namespace, lag, and leader identity.
+     * Possible values for "mode": "Leader", "Mirror", "Promoting", "Recovering", "Connecting", "Offline"
+     * @returns {string}
+     */
+    runtimeStatus() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.vaultsyncruntime_runtimeStatus(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
     }
     /**
      * Engine V2: expose Runtime + PersistenceEngine health stats to JS
@@ -583,6 +646,16 @@ export class VaultSyncRuntime {
         const ptr2 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len2 = WASM_VECTOR_LEN;
         const ret = wasm.vaultsyncruntime_update(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+        return ret;
+    }
+    /**
+     * Step 4: Wait for promotion signal via oneshot channel (event-driven, no polling).
+     * Resolves when LeaderEvent::Acquired fires (Web Lock granted to this follower).
+     * JS await this, then calls promote(). Returns immediately if already signaled.
+     * @returns {Promise<void>}
+     */
+    waitForPromotion() {
+        const ret = wasm.vaultsyncruntime_waitForPromotion(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -1008,9 +1081,16 @@ function __wbg_get_imports() {
         __wbg__wbg_cb_unref_3fa391f3fcdb55f8: function(arg0) {
             arg0._wbg_cb_unref();
         },
+        __wbg_acquire_lock_immediate_71820c0d3c8f1071: function(arg0, arg1, arg2, arg3, arg4, arg5) {
+            const ret = acquire_lock_immediate(getStringFromWasm0(arg0, arg1), getStringFromWasm0(arg2, arg3), arg4, arg5);
+            return ret;
+        },
         __wbg_acquire_web_lock_25fd29220bdfc055: function(arg0, arg1, arg2, arg3, arg4, arg5) {
             acquire_web_lock(getStringFromWasm0(arg0, arg1), getStringFromWasm0(arg2, arg3), arg4, arg5);
         },
+        __wbg_addEventListener_aedacff123afaebd: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            arg0.addEventListener(getStringFromWasm0(arg1, arg2), arg3);
+        }, arguments); },
         __wbg_addIceCandidate_8c940af93aa89e1b: function(arg0, arg1) {
             const ret = arg0.addIceCandidate(arg1);
             return ret;
@@ -1545,6 +1625,10 @@ function __wbg_get_imports() {
             const ret = arg0.then(arg1, arg2);
             return ret;
         },
+        __wbg_then_bd927500e8905df2: function(arg0, arg1, arg2) {
+            const ret = arg0.then(arg1, arg2);
+            return ret;
+        },
         __wbg_trace_822dbcb10dfd03eb: function(arg0, arg1) {
             console.trace(getStringFromWasm0(arg0, arg1));
         },
@@ -1568,47 +1652,47 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1169, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1306, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 598, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 702, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 596, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 700, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 598, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_3);
-            return ret;
-        },
-        __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 933, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 1061, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0);
             return ret;
         },
+        __wbindgen_cast_0000000000000005: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 702, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4);
+            return ret;
+        },
         __wbindgen_cast_0000000000000006: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 933, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 1061, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_5);
             return ret;
         },
         __wbindgen_cast_0000000000000007: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 933, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 1061, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_6);
             return ret;
         },
         __wbindgen_cast_0000000000000008: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1051, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1229, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h5a816e701a8600f2);
             return ret;
         },
         __wbindgen_cast_0000000000000009: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1053, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1231, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hd15eeae72bcd25a2);
             return ret;
         },
@@ -1659,12 +1743,12 @@ function wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778(arg0, arg
     wasm.wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_3(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_3(arg0, arg1, arg2);
-}
-
 function wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0(arg0, arg1, arg2) {
     wasm.wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0(arg0, arg1, arg2);
+}
+
+function wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4(arg0, arg1, arg2);
 }
 
 function wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_5(arg0, arg1, arg2) {

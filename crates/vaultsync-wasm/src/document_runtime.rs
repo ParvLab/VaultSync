@@ -1,5 +1,6 @@
 use crate::memory::SegmentedLruCache;
 use crate::metrics::RuntimeMetrics;
+use crate::subscription_index::SubscriptionIndex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,8 +23,8 @@ use wasm_bindgen::prelude::*;
 pub struct DocumentRuntime {
     /// In-memory document store: doc_id → record_id → field → CrdtValue
     pub store: Arc<Mutex<DocumentStore>>,
-    /// Subscriptions: doc_id → Vec<(sub_id, record_id, callback)>
-    pub subscriptions: Arc<Mutex<HashMap<String, Vec<(u64, String, js_sys::Function)>>>>,
+    /// Subscriptions via shared SubscriptionIndex
+    pub subscription_index: Arc<SubscriptionIndex>,
     /// Document cache (SegmentedLRU)
     pub cache: Arc<Mutex<SegmentedLruCache<String, HashMap<String, CrdtValue>>>>,
     /// Metrics
@@ -107,7 +108,7 @@ impl DocumentRuntime {
     pub fn new(metrics: Arc<RuntimeMetrics>) -> Arc<Self> {
         Arc::new(Self {
             store: Arc::new(Mutex::new(DocumentStore::new())),
-            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            subscription_index: SubscriptionIndex::new(),
             cache: Arc::new(Mutex::new(SegmentedLruCache::new(
                 Self::CACHE_CAPACITY,
                 Self::CACHE_HOT_FRACTION,
@@ -212,42 +213,21 @@ impl DocumentRuntime {
     // ── Subscription operations ──
 
     pub fn subscribe(&self, doc_id: &str, record_id: &str, callback: js_sys::Function) -> u64 {
-        static SUB_ID: AtomicU64 = AtomicU64::new(1);
-        let id = SUB_ID.fetch_add(1, Ordering::Relaxed);
-        let mut subs = self.subscriptions.lock().unwrap();
-        subs.entry(doc_id.to_string()).or_default().push((id, record_id.to_string(), callback));
-        id
+        self.subscription_index.subscribe(doc_id, record_id, callback)
     }
 
-    pub fn unsubscribe(&self, doc_id: &str, sub_id: u64) {
-        let mut subs = self.subscriptions.lock().unwrap();
-        if let Some(callbacks) = subs.get_mut(doc_id) {
-            callbacks.retain(|(id, _, _)| *id != sub_id);
-        }
+    pub fn unsubscribe(&self, handle_id: u64) {
+        self.subscription_index.unsubscribe(handle_id);
     }
 
     pub fn fire_subscription(&self, doc_id: &str, record_id: &str) {
-        let callbacks = {
-            let subs = self.subscriptions.lock().unwrap();
-            subs.get(doc_id).cloned().unwrap_or_default()
-        };
-        if callbacks.is_empty() {
-            return;
-        }
-
-        // Get current fields
-        let record = {
+        // Get current fields from store
+        let fields = {
             let store = self.store.lock().unwrap();
             store.get_record(doc_id, record_id).cloned()
         };
-
-        if let Some(fields) = record {
-            let json_str = crate::client::fields_to_json_string(&fields).unwrap_or_else(|_| "{}".to_string());
-            let record_id_js = JsValue::from_str(record_id);
-            let json_js = JsValue::from_str(&json_str);
-            for (_id, _rec_id, cb) in &callbacks {
-                let _ = cb.call2(&JsValue::NULL, &record_id_js, &json_js);
-            }
+        if let Some(ref f) = fields {
+            self.subscription_index.fire(doc_id, record_id, f);
         }
     }
 
@@ -287,8 +267,7 @@ impl DocumentRuntime {
         cache.clear();
         let mut counts = self.access_counts.lock().unwrap();
         counts.clear();
-        let mut subs = self.subscriptions.lock().unwrap();
-        subs.clear();
+        // SubscriptionIndex has no clear() — rely on GC for old entries
     }
 }
 

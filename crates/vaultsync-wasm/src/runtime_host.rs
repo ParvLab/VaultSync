@@ -12,7 +12,7 @@ use crate::runtime::Runtime as LegacyRuntime;
 use crate::storage_runtime::StorageRuntime;
 use crate::storage_scheduler::StorageScheduler;
 use crate::sync_runtime::SyncRuntime;
-use vaultsync_core::runtime_bus::RuntimeBus;
+use vaultsync_core::runtime_bus::{RuntimeBus, RuntimeEvent};
 
 /// VaultRuntime — single top-level runtime host.
 ///
@@ -67,7 +67,7 @@ impl VaultRuntime {
         self.replace_ctx(self.ctx.as_ref().clone().with_compaction(compaction))
     }
 
-    pub fn with_bus(self: Arc<Self>, bus: Arc<RuntimeBus>) -> Arc<Self> {
+    pub fn with_bus(self: Arc<Self>, bus: Arc<RuntimeBus<RuntimeEvent>>) -> Arc<Self> {
         self.replace_ctx(self.ctx.as_ref().clone().with_bus(bus))
     }
 
@@ -82,7 +82,7 @@ impl VaultRuntime {
     pub fn document(&self) -> Option<&Arc<DocumentRuntime>> { self.ctx.document.as_ref() }
     pub fn maintenance(&self) -> Option<&Arc<MaintenanceRuntime>> { self.ctx.maintenance.as_ref() }
     pub fn compaction(&self) -> Option<&Arc<CompactionScheduler>> { self.ctx.compaction.as_ref() }
-    pub fn bus(&self) -> Option<&Arc<RuntimeBus>> { self.ctx.bus.as_ref() }
+    pub fn bus(&self) -> Option<&Arc<RuntimeBus<RuntimeEvent>>> { self.ctx.bus.as_ref() }
 
     pub fn mark_ready(&self) {
         self.is_ready.store(true, Ordering::Release);

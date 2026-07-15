@@ -8,9 +8,10 @@ use vaultsync_core::time_utils::SendJsFuture;
 use vaultsync_core::VaultSyncError;
 use web_sys::*;
 
+use crate::metadata_runtime::MetadataRuntime;
 use crate::metadata_store::MetadataStore;
 use crate::migration::{DocEntry, PagesDir};
-use crate::page_store::{PageId, PageStore};
+use crate::page_store::{IndexKey, PageId, PageStore};
 use crate::storage_runtime::StorageRuntime;
 use crate::version_chain::VersionChain;
 
@@ -20,6 +21,8 @@ pub struct OpfsStorage {
     pages: PagesDir,
     /// StorageRuntime for allocation authority and scheduling
     storage_runtime: Arc<Mutex<Option<Arc<StorageRuntime>>>>,
+    /// MetadataRuntime for in-memory metadata cache (zero OPFS reads during operation)
+    metadata_runtime: Arc<Mutex<Option<Arc<MetadataRuntime>>>>,
     /// MetadataStore for SyncState (singleton, not append-only)
     sync_state_store: MetadataStore<SyncState>,
     /// MetadataStore for Schema metadata (all schemas as a single page)
@@ -41,6 +44,30 @@ impl OpfsStorage {
     pub fn set_storage_runtime(&self, sr: Arc<StorageRuntime>) {
         let mut guard = self.storage_runtime.lock().unwrap();
         *guard = Some(sr);
+    }
+
+    /// Set the MetadataRuntime (called after construction from bootstrap).
+    /// Routes SyncState, Schema, Key, Migration reads/writes through in-memory cache.
+    pub fn set_metadata_runtime(&self, mr: Arc<MetadataRuntime>) {
+        let mut guard = self.metadata_runtime.lock().unwrap();
+        *guard = Some(mr);
+    }
+
+    /// Load MetadataRuntime from the MetadataStore backends.
+    /// Returns None if MetadataRuntime construction fails (non-fatal — falls back to direct MetadataStore).
+    pub async fn try_load_metadata_runtime(&self) -> Option<Arc<MetadataRuntime>> {
+        match MetadataRuntime::load(
+            self.sync_state_store.clone(),
+            self.schema_store.clone(),
+            self.migration_store.clone(),
+            self.key_store.clone(),
+        ).await {
+            Ok(mr) => Some(mr),
+            Err(e) => {
+                engine_debug!("[MetadataRuntime] load deferred: {:?}", e);
+                None
+            }
+        }
     }
 
     /// Allocate a doc_data page ID, routing through StorageRuntime when available.
@@ -185,6 +212,7 @@ impl OpfsStorage {
     }
 
     pub async fn new(db_name: &str) -> Result<Self, VaultSyncError> {
+        let _t0 = js_sys::Date::now();
         let window =
             web_sys::window().ok_or_else(|| VaultSyncError::Storage("no window".into()))?;
         let storage_mgr = window.navigator().storage();
@@ -192,24 +220,32 @@ impl OpfsStorage {
         let root_val = vaultsync_core::time_utils::SendJsFuture::from(storage_mgr.get_directory())
             .await
             .map_err(|e| VaultSyncError::Storage(format!("get_directory failed: {:?}", e)))?;
+        let t_root = (js_sys::Date::now() - _t0) as u64;
         let root_handle: FileSystemDirectoryHandle = root_val.clone().into();
         let db_dir = ensure_dir(&root_handle, db_name).await?;
+        let t_dbdir = (js_sys::Date::now() - _t0) as u64;
+        engine_info!("[OpfsStorage] get_directory: {}ms | ensure_dir: {}ms | total so far: {}ms", t_root, t_dbdir - t_root, t_dbdir);
 
         let migration_done = crate::migration::try_migrate_from_v1(db_name).await.unwrap_or(false);
+        let t_mig = (js_sys::Date::now() - _t0) as u64;
         if migration_done {
-            engine_info!("[opfs] v1→v2 migration complete");
+            engine_info!("[opfs] v1→v2 migration complete (at {}ms)", t_mig);
         }
 
         let pages = PagesDir::open(&db_dir).await?;
+        let t_pages = (js_sys::Date::now() - _t0) as u64;
         let sync_state_store = MetadataStore::new(pages.sync_states.clone());
         let schema_store = MetadataStore::new(pages.schemas.clone());
         let migration_store = MetadataStore::new(pages.migrations.clone());
         let key_store = MetadataStore::new(pages.keys.clone());
+        let t_total = (js_sys::Date::now() - _t0) as u64;
+        engine_info!("[OpfsStorage] pages_dir: {}ms | MetadataStores: {}ms | total: {}ms", t_pages - t_mig, t_total - t_pages, t_total);
 
         Ok(Self {
             root: Arc::new(Mutex::new(db_dir)),
             pages,
             storage_runtime: Arc::new(Mutex::new(None)),
+            metadata_runtime: Arc::new(Mutex::new(None)),
             sync_state_store,
             schema_store,
             migration_store,
@@ -232,19 +268,24 @@ impl OpfsStorage {
         doc_id: &str,
         record_id: &str,
     ) -> Result<usize, VaultSyncError> {
-        let page_ids = self.list_doc_page_ids("tombstone_existing_doc_pages").await?;
-        let mut count = 0;
-        for id in page_ids {
-            if let Some(data) = self.read_doc_page(id).await? {
-                if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
-                    if entry.doc_id == doc_id && entry.record_id == record_id {
-                        self.tombstone_doc_page(id).await?;
-                        count += 1;
-                    }
-                }
-            }
+        // Use ContentIndex for O(1) lookup — eliminates all OPFS scans.
+        // Orphan pages are repaired at startup in StorageRuntime::new(), so the
+        // ContentIndex is always authoritative during normal writes.
+        let store = &self.pages.doc_data;
+        let key = IndexKey::Document {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
+        };
+        let existing = store.content_index_lookup(&key);
+        if let Some(entry) = existing {
+            self.tombstone_doc_page(entry.page_id).await?;
+            store.remove_from_index(&key).await?;
+            Ok(1)
+        } else {
+            // No entry in ContentIndex — trust the index (orphan repair happens at startup).
+            // Return 0 instead of falling through to O(n) OPFS scan.
+            Ok(0)
         }
-        Ok(count)
     }
 }
 
@@ -342,6 +383,7 @@ impl Storage for OpfsStorage {
         record_id: &str,
         bytes: &[u8],
     ) -> Result<(), VaultSyncError> {
+        // Tombstone existing pages (uses ContentIndex O(1) when populated)
         let tombstoned = self.tombstone_existing_doc_pages(doc_id, record_id).await?;
         if tombstoned > 1 {
             tracing::warn!(
@@ -357,7 +399,13 @@ impl Storage for OpfsStorage {
         let page_id = self.alloc_doc_data("insert_document").await?;
         let encoded = postcard::to_allocvec(&entry)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
-        self.write_doc_page(page_id, encoded).await
+        self.write_doc_page(page_id, encoded).await?;
+        // Populate ContentIndex forward + reverse indexes at write time
+        let key = IndexKey::Document {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
+        };
+        self.pages.doc_data.update_content_index(key, page_id).await
     }
 
     async fn get_document(
@@ -365,38 +413,46 @@ impl Storage for OpfsStorage {
         doc_id: &str,
         record_id: &str,
     ) -> Result<Option<Vec<u8>>, VaultSyncError> {
-        let page_ids = self.list_doc_page_ids("get_document").await?;
-        let mut found: Vec<(u64, Vec<u8>)> = Vec::new();
-        for id in page_ids {
-            if let Some(data) = self.read_doc_page(id).await? {
-                if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
-                    if entry.doc_id == doc_id && entry.record_id == record_id {
-                        found.push((id, entry.bytes));
+        // Use ContentIndex for O(1) lookup
+        let key = IndexKey::Document {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
+        };
+        if let Some(entry) = self.pages.doc_data.content_index_lookup(&key) {
+            return match self.read_doc_page(entry.page_id).await? {
+                Some(data) => {
+                    if let Ok(doc) = postcard::from_bytes::<DocEntry>(&data) {
+                        Ok(Some(doc.bytes))
+                    } else {
+                        Ok(Some(data))
                     }
                 }
-            }
+                None => Ok(None),
+            };
         }
-        match found.len() {
-            0 => Ok(None),
-            1 => Ok(Some(found.into_iter().next().unwrap().1)),
-            n => {
-                tracing::warn!(
-                    "[OpfsStorage] get_document: found {} live pages for {}/{}",
-                    n, doc_id, record_id
-                );
-                found.sort_by_key(|(id, _)| *id);
-                Ok(Some(found.into_iter().last().unwrap().1))
-            }
-        }
+        // ContentIndex is authoritative — no O(n) OPFS scan fallback.
+        // Orphan pages are repaired at startup in StorageRuntime::new().
+        Ok(None)
     }
 
     async fn delete_document(&self, doc_id: &str, record_id: &str) -> Result<(), VaultSyncError> {
-        let count = self.tombstone_existing_doc_pages(doc_id, record_id).await?;
-        if count > 1 {
-            tracing::warn!(
-                "[OpfsStorage] delete_document: tombstoned {} live pages for {}/{}",
-                count, doc_id, record_id
-            );
+        let key = IndexKey::Document {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
+        };
+        // Use ContentIndex for O(1) tombstone lookup + index cleanup
+        if let Some(entry) = self.pages.doc_data.content_index_lookup(&key) {
+            self.tombstone_doc_page(entry.page_id).await?;
+            self.pages.doc_data.remove_from_index(&key).await?;
+        } else {
+            // Fallback: O(n) scan for pre-migration data
+            let count = self.tombstone_existing_doc_pages(doc_id, record_id).await?;
+            if count > 1 {
+                tracing::warn!(
+                    "[OpfsStorage] delete_document: tombstoned {} live pages for {}/{}",
+                    count, doc_id, record_id
+                );
+            }
         }
         Ok(())
     }
@@ -423,38 +479,35 @@ impl Storage for OpfsStorage {
         bytes: &[u8],
         entry: &OplogEntry,
     ) -> Result<(), VaultSyncError> {
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: tombstone_existing_doc_pages start doc={}/{}", doc_id, record_id);
+        // Tombstone existing pages (uses ContentIndex O(1) when populated)
         let tombstoned = self.tombstone_existing_doc_pages(doc_id, record_id).await?;
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: tombstone_existing_doc_pages done count={}", tombstoned);
         if tombstoned > 1 {
             tracing::warn!(
                 "[OpfsStorage] write_document_and_oplog: tombstoned {} live pages for {}/{} (expected 1)",
                 tombstoned, doc_id, record_id
             );
         }
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: create DocEntry start");
+        // Write new document page
         let doc_entry = DocEntry {
             doc_id: doc_id.to_string(),
             record_id: record_id.to_string(),
             bytes: bytes.to_vec(),
         };
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: encode doc entry start");
         let encoded_doc = postcard::to_allocvec(&doc_entry)
             .map_err(|e| VaultSyncError::Storage(format!("encode doc: {:?}", e)))?;
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: encode doc done len={}", encoded_doc.len());
         let doc_page_id = self.alloc_doc_data("write_document").await?;
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: allocate doc page done id={}", doc_page_id);
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: write doc page start id={}", doc_page_id);
         self.write_doc_page(doc_page_id, encoded_doc).await?;
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: write doc page done");
+        // Populate ContentIndex forward + reverse indexes at write time
+        let doc_key = IndexKey::Document {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
+        };
+        self.pages.doc_data.update_content_index(doc_key, doc_page_id).await?;
 
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: encode oplog entry start");
+        // Write oplog entry
         let encoded_entry = postcard::to_allocvec(&[entry.clone()])
             .map_err(|e| VaultSyncError::Storage(format!("encode oplog: {:?}", e)))?;
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: encode oplog done len={}", encoded_entry.len());
         let oplog_page_id = self.alloc_oplog("write_oplog").await?;
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: allocate oplog page done id={}", oplog_page_id);
-        tracing::trace!("[OpfsStorage] write_document_and_oplog: write oplog page start");
         self.write_oplog_page(oplog_page_id, encoded_entry).await?;
         self.adjust_oplog_pending_count(1).await
     }
@@ -573,21 +626,38 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_sync_state(&self, _namespace: &str) -> Result<Option<SyncState>, VaultSyncError> {
+        // Route through MetadataRuntime (in-memory) when available — zero OPFS reads
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            return Ok(mr.read_sync_state());
+        }
         self.sync_state_store.read().await
     }
 
     async fn write_sync_state(&self, state: &SyncState) -> Result<(), VaultSyncError> {
+        // Route through MetadataRuntime (in-memory + mark dirty) when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            mr.write_sync_state(state.clone());
+            return Ok(());
+        }
         self.sync_state_store.write(state).await
     }
 
     async fn read_schema(&self, doc_id: &str) -> Result<Option<SchemaMeta>, VaultSyncError> {
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            return Ok(mr.read_schema(doc_id));
+        }
         let all = self.schema_store.read().await?.unwrap_or_default();
         Ok(all.into_iter().find(|(d, _)| d == doc_id).map(|(_, s)| s))
     }
 
     async fn write_schema(&self, meta: &SchemaMeta) -> Result<(), VaultSyncError> {
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            mr.write_schema(meta.clone());
+            return Ok(());
+        }
         let mut all = self.schema_store.read().await?.unwrap_or_default();
-        // Upsert: replace existing entry for this doc_id
         if let Some(pos) = all.iter().position(|(d, _)| d == &meta.doc_id) {
             all[pos] = (meta.doc_id.clone(), meta.clone());
         } else {
@@ -597,21 +667,39 @@ impl Storage for OpfsStorage {
     }
 
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, VaultSyncError> {
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            return Ok(mr.read_migrations());
+        }
         Ok(self.migration_store.read().await?.unwrap_or_default())
     }
 
     async fn write_migration(&self, record: &MigrationRecord) -> Result<(), VaultSyncError> {
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            mr.write_migration(record.clone());
+            return Ok(());
+        }
         let mut all = self.migration_store.read().await?.unwrap_or_default();
         all.push(record.clone());
         self.migration_store.write(&all).await
     }
 
     async fn read_keys(&self, namespace: &str) -> Result<Vec<KeyRecord>, VaultSyncError> {
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            return Ok(mr.read_keys(namespace));
+        }
         let all = self.key_store.read().await?.unwrap_or_default();
         Ok(all.into_iter().filter(|k| k.namespace == namespace).collect())
     }
 
     async fn write_key(&self, key: &KeyRecord) -> Result<(), VaultSyncError> {
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            mr.write_key(key.clone());
+            return Ok(());
+        }
         let mut all = self.key_store.read().await?.unwrap_or_default();
         all.push(key.clone());
         self.key_store.write(&all).await

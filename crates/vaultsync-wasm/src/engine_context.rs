@@ -10,7 +10,7 @@ use crate::runtime::Runtime as LegacyRuntime;
 use crate::storage_runtime::StorageRuntime;
 use crate::storage_scheduler::StorageScheduler;
 use crate::sync_runtime::SyncRuntime;
-use vaultsync_core::runtime_bus::RuntimeBus;
+use vaultsync_core::runtime_bus::{RuntimeBus, RuntimeEvent};
 
 /// EngineContext — single container for all shared runtime references.
 ///
@@ -30,7 +30,7 @@ pub struct EngineContext {
     pub document: Option<Arc<DocumentRuntime>>,
     pub maintenance: Option<Arc<MaintenanceRuntime>>,
     pub compaction: Option<Arc<CompactionScheduler>>,
-    pub bus: Option<Arc<RuntimeBus>>,
+    pub bus: Option<Arc<RuntimeBus<RuntimeEvent>>>,
 
     // ── Namespace management ──
     pub workspace: Arc<WorkspaceRuntime>,
@@ -80,7 +80,7 @@ impl EngineContext {
         self
     }
 
-    pub fn with_bus(mut self, bus: Arc<RuntimeBus>) -> Self {
+    pub fn with_bus(mut self, bus: Arc<RuntimeBus<RuntimeEvent>>) -> Self {
         self.bus = Some(bus);
         self
     }

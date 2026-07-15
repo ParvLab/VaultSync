@@ -1,126 +1,181 @@
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
-/// Runtime event — all subsystem communication flows through this bus.
+use super::runtime_state::RuntimeState;
+
+pub type SubscriberId = u64;
+
+/// LeaderEvent — emitted by LeaderElection when leadership state changes.
 ///
-/// No subsystem talks to another directly. Every interaction is an event
-/// published on RuntimeBus and dispatched to all subscribers.
+/// All leadership transitions flow through this event type.
+/// VaultRuntime subscribes to drive RuntimeState transitions.
+#[derive(Debug, Clone)]
+pub enum LeaderEvent {
+    /// Lock acquired — this tab is now the leader.
+    Acquired { timestamp_ms: f64 },
+    /// Acquire(Immediate) returned false — another tab holds the lock.
+    Waiting,
+    /// This tab released the lock (graceful demotion).
+    Released,
+    /// Lock unexpectedly lost (browser API error, tab crash, etc.).
+    Lost,
+    /// Acquisition failed with an error.
+    Failed(String),
+}
+
+/// High-level runtime event — backward compatible with existing users.
+///
+/// This is the event type used by subsystems that currently reference
+/// RuntimeBus. As new typed buses are introduced (LeaderEvent,
+/// SessionEvent, etc.), subsystems will migrate to their specific bus.
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
-    /// A document changed (source: Storage, target: UI/Mirror)
     DocumentInvalidated {
         doc_id: String,
         record_id: String,
     },
-    /// Runtime reached a new state (source: Runtime, target: all)
     StateChanged {
-        from: super::runtime_state::RuntimeState,
-        to: super::runtime_state::RuntimeState,
+        from: RuntimeState,
+        to: RuntimeState,
     },
-    /// A follower attached (source: BroadcastAdapter, target: RuntimeCoordinator)
-    FollowerAttached {
-        tab_id: String,
-        generation: u64,
-    },
-    /// Leadership was acquired (source: WebLock, target: Runtime)
     LeadershipAcquired {
         tab_id: String,
     },
-    /// Leadership was lost (source: WebLock, target: Runtime)
     LeadershipLost {
         tab_id: String,
     },
-    /// A push mutation arrived (source: Coordinator, target: Reconciler)
     MutationReceived {
         doc_id: String,
         record_id: String,
         fields_json: String,
     },
-    /// Runtime snapshot requested (source: MirrorRuntime, target: RuntimeCoordinator)
-    SnapshotRequested {
-        tab_id: String,
-        reason: String,
-    },
-    /// Shutdown signal (source: beforeunload, target: all)
     Shutdown,
 }
 
-/// Subscriber trait — any subsystem can subscribe to RuntimeBus events.
-pub trait RuntimeSubscriber: Send + 'static {
-    fn on_event(&mut self, event: &RuntimeEvent);
-}
-
-/// Simple pub/sub event bus.
+/// Generic typed event bus.
 ///
-/// Not mpsc — multiple subscribers, synchronous dispatch.
-/// Async queues are the caller's responsibility (schedule work, don't do it inline).
-pub struct RuntimeBus {
-    subscribers: Mutex<Vec<Box<dyn RuntimeSubscriber>>>,
+/// All runtime events flow through this same abstraction:
+///   RuntimeBus<LeaderEvent>
+///   RuntimeBus<SessionEvent>
+///   RuntimeBus<StorageEvent>
+///   RuntimeBus<MaintenanceEvent>
+///
+/// Subsystems subscribe to specific bus instances rather than
+/// communicating directly with each other.
+pub struct RuntimeBus<E> {
+    subscribers: RwLock<HashMap<SubscriberId, Box<dyn Fn(&E) + Send + Sync>>>,
+    next_id: AtomicU64,
 }
 
-impl RuntimeBus {
+impl<E: Send + 'static> RuntimeBus<E> {
     pub fn new() -> Self {
         Self {
-            subscribers: Mutex::new(Vec::new()),
+            subscribers: RwLock::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
         }
     }
 
-    pub fn subscribe(&self, subscriber: Box<dyn RuntimeSubscriber>) {
-        self.subscribers.lock().unwrap().push(subscriber);
+    pub fn subscribe<F>(&self, handler: F) -> SubscriberId
+    where
+        F: Fn(&E) + Send + Sync + 'static,
+    {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut subs) = self.subscribers.write() {
+            subs.insert(id, Box::new(handler));
+        }
+        id
     }
 
-    /// Dispatch event to all subscribers. Runs synchronously — subscribers
-    /// should schedule heavy work, not execute it inline.
-    pub fn dispatch(&self, event: &RuntimeEvent) {
-        let mut subs = self.subscribers.lock().unwrap();
-        for sub in subs.iter_mut() {
-            sub.on_event(event);
+    pub fn unsubscribe(&self, id: SubscriberId) {
+        if let Ok(mut subs) = self.subscribers.write() {
+            subs.remove(&id);
         }
+    }
+
+    pub fn publish(&self, event: &E) {
+        if let Ok(subs) = self.subscribers.read() {
+            for handler in subs.values() {
+                handler(event);
+            }
+        }
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers.read().map(|s| s.len()).unwrap_or(0)
+    }
+}
+
+impl<E: Send + 'static> Default for RuntimeBus<E> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-    struct TestSubscriber {
-        count: Arc<AtomicUsize>,
-        name: &'static str,
-    }
+    #[test]
+    fn test_generic_bus_leader_event() {
+        let bus = RuntimeBus::<LeaderEvent>::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
 
-    impl RuntimeSubscriber for TestSubscriber {
-        fn on_event(&mut self, _event: &RuntimeEvent) {
-            self.count.fetch_add(1, Ordering::Relaxed);
-        }
+        bus.subscribe(move |_event: &LeaderEvent| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        bus.publish(&LeaderEvent::Waiting);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn test_dispatch_to_multiple_subscribers() {
-        let bus = RuntimeBus::new();
-        let c1 = Arc::new(AtomicUsize::new(0));
-        let c2 = Arc::new(AtomicUsize::new(0));
-
-        bus.subscribe(Box::new(TestSubscriber { count: c1.clone(), name: "a" }));
-        bus.subscribe(Box::new(TestSubscriber { count: c2.clone(), name: "b" }));
-
-        bus.dispatch(&RuntimeEvent::Shutdown);
-
-        assert_eq!(c1.load(Ordering::Relaxed), 1);
-        assert_eq!(c2.load(Ordering::Relaxed), 1);
+    fn test_generic_bus_runtime_event() {
+        let bus = RuntimeBus::<RuntimeEvent>::new();
+        // No subscribers — no crash
+        bus.publish(&RuntimeEvent::Shutdown);
+        bus.publish(&RuntimeEvent::Shutdown);
     }
 
     #[test]
-    fn test_multiple_events() {
-        let bus = RuntimeBus::new();
-        let c = Arc::new(AtomicUsize::new(0));
+    fn test_multiple_subscribers() {
+        let bus = RuntimeBus::<RuntimeEvent>::new();
+        let count = Arc::new(AtomicUsize::new(0));
 
-        bus.subscribe(Box::new(TestSubscriber { count: c.clone(), name: "a" }));
-
-        for _ in 0..5 {
-            bus.dispatch(&RuntimeEvent::Shutdown);
+        for _ in 0..3 {
+            let c = count.clone();
+            bus.subscribe(move |_event: &RuntimeEvent| {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
         }
 
-        assert_eq!(c.load(Ordering::Relaxed), 5);
+        assert_eq!(bus.subscriber_count(), 3);
+        bus.publish(&RuntimeEvent::Shutdown);
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_unsubscribe() {
+        let bus = RuntimeBus::<RuntimeEvent>::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+
+        let id = bus.subscribe(move |_event: &RuntimeEvent| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        assert_eq!(bus.subscriber_count(), 1);
+
+        bus.publish(&RuntimeEvent::Shutdown);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        bus.unsubscribe(id);
+        assert_eq!(bus.subscriber_count(), 0);
+
+        bus.publish(&RuntimeEvent::Shutdown);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

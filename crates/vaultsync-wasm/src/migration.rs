@@ -188,14 +188,30 @@ pub struct PagesDir {
 
 impl PagesDir {
     pub async fn open(db_dir: &FileSystemDirectoryHandle) -> Result<Self, VaultSyncError> {
+        let _t0 = js_sys::Date::now();
         let pages_root = ensure_dir(db_dir, "_pages").await?;
+        let t_root = (js_sys::Date::now() - _t0) as u64;
+        let doc_data = PageStore::open(&pages_root, "doc_data").await?;
+        let t_dd = (js_sys::Date::now() - _t0) as u64;
+        let oplog = PageStore::open(&pages_root, "oplog").await?;
+        let t_ol = (js_sys::Date::now() - _t0) as u64;
+        let sync_states = PageStore::open(&pages_root, "sync_states").await?;
+        let t_ss = (js_sys::Date::now() - _t0) as u64;
+        let schemas = PageStore::open(&pages_root, "schemas").await?;
+        let t_sc = (js_sys::Date::now() - _t0) as u64;
+        let migrations = PageStore::open(&pages_root, "migrations").await?;
+        let t_mi = (js_sys::Date::now() - _t0) as u64;
+        let keys = PageStore::open(&pages_root, "keys").await?;
+        let t_done = (js_sys::Date::now() - _t0) as u64;
+        engine_info!("[PagesDir] _pages root: {}ms | doc_data: {}ms | oplog: {}ms | sync_states: {}ms | schemas: {}ms | migrations: {}ms | keys: {}ms | total: {}ms",
+            t_root, t_dd - t_root, t_ol - t_dd, t_ss - t_ol, t_sc - t_ss, t_mi - t_sc, t_done - t_mi, t_done);
         Ok(Self {
-            doc_data: PageStore::open(&pages_root, "doc_data").await?,
-            oplog: PageStore::open(&pages_root, "oplog").await?,
-            sync_states: PageStore::open(&pages_root, "sync_states").await?,
-            schemas: PageStore::open(&pages_root, "schemas").await?,
-            migrations: PageStore::open(&pages_root, "migrations").await?,
-            keys: PageStore::open(&pages_root, "keys").await?,
+            doc_data,
+            oplog,
+            sync_states,
+            schemas,
+            migrations,
+            keys,
         })
     }
 }

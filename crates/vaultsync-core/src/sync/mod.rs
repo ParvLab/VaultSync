@@ -5,4 +5,5 @@ pub mod reconciler;
 pub mod retry;
 pub mod state;
 pub mod state_manager;
+pub mod sync_state_store;
 pub mod upload;

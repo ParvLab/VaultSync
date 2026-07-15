@@ -45,6 +45,13 @@ export class ReplicationNamespace {
     predictNext(limit: number): string;
 }
 
+/**
+ * SyncStateStore that reads/writes cursor+generation in memory AND persists
+ * every write through the MetadataStore-backed Storage trait.
+ * Legacy PersistentSyncStateStore is replaced by InMemorySyncStateStore.
+ * Cursor and generation are persisted via MetadataRuntime on checkpoint,
+ * not on every cursor update. This eliminates 2 OPFS writes per mutation.
+ */
 export class VaultSyncRuntime {
     private constructor();
     free(): void;
@@ -61,6 +68,7 @@ export class VaultSyncRuntime {
     /**
      * Phase 4f: Check if mirror should promote to leader (leader heartbeat timeout).
      * Returns true if leader is gone and JS should reinitialize with new_with_coordinator().
+     * Legacy — prefer waitForPromotion() for event-driven usage.
      */
     checkMirrorPromotion(): boolean;
     /**
@@ -69,6 +77,13 @@ export class VaultSyncRuntime {
     compactNamespace(namespace: string): Promise<string>;
     define_schema(doc_id: string, schema_json: string): Promise<void>;
     delete(doc_id: string, record_id: string): Promise<void>;
+    /**
+     * Force-demote this tab to Follower when LEADER_ELECTED is received from another tab.
+     * Creates a new MirrorRuntime + BC handler + LeaderElection so the tab can
+     * continue processing mutations and detect when to re-promote.
+     * Called from JS BC handler. Safe to call even if not currently leader (no-op in that case).
+     */
+    demote(): Promise<void>;
     /**
      * Returns the event bus for publishing/subscribing to engine events.
      */
@@ -115,6 +130,13 @@ export class VaultSyncRuntime {
      * Returns a clone of the PresenceManager if available.
      */
     presence(): PresenceManager | undefined;
+    /**
+     * Phase 4b: Promote this follower tab to leader in-process (6-phase pipeline).
+     * Called by JS when waitForPromotion() resolves.
+     * Phases: Acquire → Construct → Restore → Writable → Install → Announce.
+     * Each phase populates PromoteCtx fields; the pipeline guarantees ordering.
+     */
+    promote(namespace: string, coordinator_url: string, auth_token?: string | null, db_name?: string | null, storage_backend?: string | null): Promise<void>;
     prune_key_versions(keep_versions: number): void;
     /**
      * Returns the replication namespace proxy.
@@ -130,6 +152,12 @@ export class VaultSyncRuntime {
      * Runs lifecycle (tombstone cleanup) on the given namespace, returns JSON stats.
      */
     runLifecycle(namespace: string): Promise<string>;
+    /**
+     * Returns the current runtime status as a string.
+     * Sprint D: Enhanced runtime status with health, namespace, lag, and leader identity.
+     * Possible values for "mode": "Leader", "Mirror", "Promoting", "Recovering", "Connecting", "Offline"
+     */
+    runtimeStatus(): string;
     /**
      * Engine V2: expose Runtime + PersistenceEngine health stats to JS
      */
@@ -149,6 +177,12 @@ export class VaultSyncRuntime {
     tryCompact(): Promise<any>;
     unsubscribe(handle: WasmSubscriptionHandle): void;
     update(doc_id: string, record_id: string, json: string): Promise<void>;
+    /**
+     * Step 4: Wait for promotion signal via oneshot channel (event-driven, no polling).
+     * Resolves when LeaderEvent::Acquired fires (Web Lock granted to this follower).
+     * JS await this, then calls promote(). Returns immediately if already signaled.
+     */
+    waitForPromotion(): Promise<void>;
     /**
      * Returns the working sets namespace proxy for CRUD operations.
      */
@@ -215,6 +249,8 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly init: () => void;
+    readonly set_log_level_from_str: (a: number, b: number) => void;
     readonly __wbg_eventbusproxy_free: (a: number, b: number) => void;
     readonly __wbg_replicationnamespace_free: (a: number, b: number) => void;
     readonly __wbg_vaultsyncruntime_free: (a: number, b: number) => void;
@@ -232,6 +268,7 @@ export interface InitOutput {
     readonly vaultsyncruntime_compactNamespace: (a: number, b: number, c: number) => any;
     readonly vaultsyncruntime_define_schema: (a: number, b: number, c: number, d: number, e: number) => any;
     readonly vaultsyncruntime_delete: (a: number, b: number, c: number, d: number, e: number) => any;
+    readonly vaultsyncruntime_demote: (a: number) => any;
     readonly vaultsyncruntime_events: (a: number) => number;
     readonly vaultsyncruntime_find: (a: number, b: number, c: number) => any;
     readonly vaultsyncruntime_fire_subscription: (a: number, b: number, c: number, d: number, e: number) => any;
@@ -249,11 +286,13 @@ export interface InitOutput {
     readonly vaultsyncruntime_new_with_coordinator: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => any;
     readonly vaultsyncruntime_on_event: (a: number, b: any) => void;
     readonly vaultsyncruntime_presence: (a: number) => number;
+    readonly vaultsyncruntime_promote: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => any;
     readonly vaultsyncruntime_prune_key_versions: (a: number, b: number) => [number, number];
     readonly vaultsyncruntime_replication: (a: number) => number;
     readonly vaultsyncruntime_resourceSweep: (a: number) => any;
     readonly vaultsyncruntime_rotate_keys: (a: number) => any;
     readonly vaultsyncruntime_runLifecycle: (a: number, b: number, c: number) => any;
+    readonly vaultsyncruntime_runtimeStatus: (a: number) => [number, number];
     readonly vaultsyncruntime_runtime_storage_stats: (a: number) => [number, number, number];
     readonly vaultsyncruntime_shutdown: (a: number) => any;
     readonly vaultsyncruntime_storageStats: (a: number) => any;
@@ -262,6 +301,7 @@ export interface InitOutput {
     readonly vaultsyncruntime_tryCompact: (a: number) => any;
     readonly vaultsyncruntime_unsubscribe: (a: number, b: number) => [number, number];
     readonly vaultsyncruntime_update: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => any;
+    readonly vaultsyncruntime_waitForPromotion: (a: number) => any;
     readonly vaultsyncruntime_workingSets: (a: number) => number;
     readonly vaultsyncruntime_workspace: (a: number) => number;
     readonly wasmsubscriptionhandle_cancel: (a: number, b: number) => [number, number];
@@ -276,26 +316,24 @@ export interface InitOutput {
     readonly workspacenamespace_get: (a: number, b: bigint) => [number, number, number, number];
     readonly workspacenamespace_list: (a: number) => [number, number, number, number];
     readonly workspacenamespace_update: (a: number, b: bigint, c: number, d: number, e: number, f: number) => [number, number, number];
-    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
     readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
-    readonly init: () => void;
-    readonly presencemanager_activePeers: (a: number) => [number, number];
-    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
-    readonly presencemanager_peer_count: (a: number) => number;
-    readonly set_log_level_from_str: (a: number, b: number) => void;
     readonly __wbg_wasmipc_free: (a: number, b: number) => void;
     readonly wasmipc_new: (a: number, b: number) => [number, number, number];
     readonly wasmipc_new_with_channel: (a: any) => number;
     readonly wasmipc_on_message: (a: number, b: any) => void;
     readonly wasmipc_receive: (a: number) => [number, number];
     readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
+    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
+    readonly presencemanager_activePeers: (a: number) => [number, number];
+    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly presencemanager_peer_count: (a: number) => number;
     readonly wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h6742839cb717cdad: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_3: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_5: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_6: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h5a816e701a8600f2: (a: number, b: number) => void;

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 
 use crate::metrics::RuntimeMetrics;
 use crate::storage_runtime::StorageRuntime;
+use crate::subscription_index::SubscriptionIndex;
 use crate::sync_runtime::SyncRuntime;
 use vaultsync_core::runtime_state::RuntimeLifecycle;
 
@@ -18,6 +19,7 @@ pub struct NamespaceRuntime {
     pub name: String,
     pub storage: Arc<StorageRuntime>,
     pub sync: Arc<SyncRuntime>,
+    pub subscription_index: Arc<SubscriptionIndex>,
     active: AtomicBool,
     created_at: AtomicU64,
 }
@@ -36,11 +38,13 @@ impl NamespaceRuntime {
         name: String,
         storage: Arc<StorageRuntime>,
         sync: Arc<SyncRuntime>,
+        subscription_index: Arc<SubscriptionIndex>,
     ) -> Arc<Self> {
         Arc::new(Self {
             name,
             storage,
             sync,
+            subscription_index,
             active: AtomicBool::new(true),
             created_at: AtomicU64::new(js_sys::Date::now() as u64),
         })

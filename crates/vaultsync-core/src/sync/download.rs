@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use crate::sync::sync_state_store::SyncStateStore;
+
 /// Result of processing a single push mutation.
 /// Used by the download worker to decide whether to backfill via pull.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +50,7 @@ impl Default for DownloadConfig {
 pub struct DownloadQueue {
     coordinator: Arc<dyn Coordinator>,
     storage: Arc<dyn crate::storage::traits::Storage>,
+    sync_state_store: Arc<dyn SyncStateStore>,
     namespace: String,
     last_sequence: std::sync::atomic::AtomicU64,
     config: DownloadConfig,
@@ -79,6 +82,7 @@ impl DownloadQueue {
         Self {
             coordinator,
             storage,
+            sync_state_store: Arc::new(crate::sync::sync_state_store::InMemorySyncStateStore::with_cursor(last_sequence)),
             namespace: namespace.to_string(),
             last_sequence: std::sync::atomic::AtomicU64::new(last_sequence),
             config,
@@ -91,6 +95,13 @@ impl DownloadQueue {
             replay_changed_docs: Mutex::new(HashSet::new()),
             stale_skip_count: AtomicU32::new(0),
         }
+    }
+
+    /// Attach a SyncStateStore for in-memory cursor/generation reads.
+    /// When set, cursor reads bypass OPFS entirely.
+    pub fn with_sync_state_store(mut self, store: Arc<dyn SyncStateStore>) -> Self {
+        self.sync_state_store = store;
+        self
     }
 
     pub fn set_replay_mode(&self, active: bool) {
@@ -263,46 +274,20 @@ impl DownloadQueue {
                 if let Some(last) = mutations.last() {
                     let new_seq = last.sequence;
 
-                    // Persist cursor to storage FIRST
-                    let mut state = match self.storage.read_sync_state(&self.namespace).await? {
-                        Some(s) => s,
-                        None => {
-                            tracing::warn!(
-                                "[download_queue] read_sync_state=None namespace={} caller=process_batch cursor_before={}",
-                                self.namespace,
-                                after,
-                            );
-                            let mut s = crate::sync::state::SyncState::new(
-                                self.namespace.clone(),
-                                self.fallback_generation_id().await,
-                            );
-                            s.last_synced_sequence = new_seq;
-                            s
-                        },
-                    };
-                    state.last_synced_sequence = new_seq;
-                    let now_ms = crate::time_utils::system_time_now_ms();
-                    state.last_sync_at = Some(now_ms);
-                    self.storage.write_sync_state(&state).await?;
+                    // Persist cursor — always in-memory via SyncStateStore (no OPFS)
+                    self.sync_state_store.set_cursor(new_seq).await?;
                     tracing::trace!(
-                        "[download_queue] write_sync_state cursor={} gen={} (from process_batch pull)",
-                        state.last_synced_sequence,
-                        state.generation_id
+                        "[download_queue] sync_state_store set_cursor={} (from process_batch pull)",
+                        new_seq,
                     );
 
                     // THEN advance in-memory cursor (only after persistence succeeds)
-                    self.last_sequence
-                        .store(new_seq, std::sync::atomic::Ordering::SeqCst);
+                    let prev = self.last_sequence.swap(new_seq, std::sync::atomic::Ordering::SeqCst);
                     tracing::trace!(
-                        "[download_queue] cursor advanced to {}",
+                        "[download_queue] cursor advanced {} -> {}",
+                        prev,
                         new_seq
                     );
-
-                    // Record sync lag using last mutation's timestamp
-                    let lag = now_ms.saturating_sub(last.timestamp);
-                    self.metrics.record_sync_lag(lag as f64);
-                    self.metrics
-                        .record_download_lag(&self.namespace, lag as f64);
                 }
                 if count > 0 {
                     self.metrics.record_download(count);
@@ -492,31 +477,11 @@ impl DownloadQueue {
             snapshot_count, after, max_seq, snapshot_elapsed
         );
 
-        // Advance cursor past the max snapshot sequence
-        let mut state = match self.storage.read_sync_state(&self.namespace).await? {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    "[download_queue] read_sync_state=None namespace={} caller=try_fetch_snapshot cursor_before={}",
-                    self.namespace,
-                    after,
-                );
-                let mut s = crate::sync::state::SyncState::new(
-                    self.namespace.clone(),
-                    self.fallback_generation_id().await,
-                );
-                s.last_synced_sequence = max_seq;
-                s
-            },
-        };
-        state.last_synced_sequence = max_seq;
-        let now_ms = crate::time_utils::system_time_now_ms();
-        state.last_sync_at = Some(now_ms);
-        self.storage.write_sync_state(&state).await?;
+        // Advance cursor past the max snapshot sequence — always in-memory via SyncStateStore
+        self.sync_state_store.set_cursor(max_seq).await?;
         tracing::trace!(
-            "[download_queue] write_sync_state cursor={} gen={} (from snapshot catch-up)",
-            state.last_synced_sequence,
-            state.generation_id
+            "[download_queue] sync_state_store set_cursor={} (from snapshot catch-up)",
+            max_seq,
         );
         let old = self.last_sequence.swap(max_seq, std::sync::atomic::Ordering::SeqCst);
         tracing::trace!(
@@ -636,36 +601,17 @@ impl DownloadQueue {
         }
         self.metrics.record_push_received();
 
-        // Advance cursor to the pushed mutation's sequence (monotonic: never go backwards)
+        // Advance cursor to the pushed mutation's sequence — always in-memory via SyncStateStore
         let new_seq = m.sequence;
-        let mut state = match self.storage.read_sync_state(&self.namespace).await? {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    "[download_queue] read_sync_state=None namespace={} caller=process_push_mutation cursor_before={}",
-                    self.namespace,
-                    cursor_before,
-                );
-                let mut s = crate::sync::state::SyncState::new(
-                    self.namespace.clone(),
-                    self.fallback_generation_id().await,
-                );
-                s.last_synced_sequence = new_seq;
-                s
-            },
-        };
         let now_ms = crate::time_utils::system_time_now_ms();
-        state.last_synced_sequence = new_seq;
-        state.last_sync_at = Some(now_ms);
-        self.storage.write_sync_state(&state).await?;
+        self.sync_state_store.set_cursor(new_seq).await?;
         tracing::trace!(
-            "[download_queue] write_sync_state cursor={} gen={} (from push mutation)",
-            state.last_synced_sequence,
-            state.generation_id
+            "[download_queue] sync_state_store set_cursor={} (from push mutation)",
+            new_seq,
         );
 
         // Only advance in-memory cursor after persistence succeeds
-        self.last_sequence.store(new_seq, std::sync::atomic::Ordering::SeqCst);
+        let prev = self.last_sequence.swap(new_seq, std::sync::atomic::Ordering::SeqCst);
         tracing::trace!(
             "[download_queue] push cursor advanced {} -> {} (mutation={})",
             cursor_before,
@@ -690,8 +636,7 @@ impl DownloadQueue {
 
         let lag = now_ms.saturating_sub(m.timestamp);
         self.metrics.record_sync_lag(lag as f64);
-        self.metrics
-            .record_download_lag(&self.namespace, lag as f64);
+        self.metrics.record_download_lag(&self.namespace, lag as f64);
 
         Ok(outcome)
     }

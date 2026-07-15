@@ -56,27 +56,27 @@ Pages (physical storage)
 ```
 Application starts
     ↓
-HELLO sent via BroadcastChannel
+Boot → Storage → Health → Discovery (Web Lock ifAvailable)
     ↓
-Wait for DISCOVER (100ms event-driven)
-    ↓
-Leader found? → MirrorRuntime fast-path (<200ms)
-    ↓
-No leader? → Full init path:
-    ├── Storage opens (PageManager)
-    ├── Metadata/checkpoint loads
-    ├── LeaderElection (Web Lock) acquires
-    ├── Workspace loads
-    ├── Working Sets restore
-    ├── Replication Planner initializes
-    ├── Coordinator connects
-    ├── Recovery runs
-    ├── Announce READY via BC
-    |
+Lock acquired? → I'm leader
+    │                 ├── Storage opens (PageManager)
+    │                 ├── Metadata/checkpoint loads
+    │                 ├── Workspace loads
+    │                 ├── Working Sets restore
+    │                 ├── Coordinator connects
+    │                 ├── Recovery runs
+    │                 ├── Announce LEADER_READY via BC
+    │                 └── Ready
+    │
+    └── Lock held? → MirrorRuntime
+                        ├── Listen for LEADER_READY
+                        ├── Request initial sync via SYNC
+                        ├── Receive MUTATION stream → DONE
+                        └── Ready
     ↓
 Query executes
     ↓
-ContentIndex lookup (O(1), no OPFS scan)
+React → QueryCache → WASM → WorkingSet → ContentIndex lookup (O(1))
     ↓
 Page read (from cache or OPFS)
     ↓
@@ -91,28 +91,29 @@ Planner observes access
 Prefetch scheduled
 ```
 
-### Startup Phases (Boot → Ready → Warm → Idle)
+### Startup Phases (Boot → Storage → Health → Discovery → Leadership → Sync → Ready → Warm → Maintenance)
 ```
-Time (ms)
-0      100     300     1500+   3000+
-│       │       │       │       │
-Boot───►Ready──►Warm──►Idle──►...
-│       │       │       │
-│ Init  │ UI    │ Back- │ Steady
-│ stor‐ │ live  │ ground│ state
-│ age   │       │ recov │
-│       │       │ ery   │
-│ read_ │     ──│ replay│
-│ manifest│    │ │ snaph│
-│ vali‐ │       │ │ shot │
-│ date  │       │ │      │
-└───────┴───────┴───────┴───────
-Blocking  Blocking  Non-blocking  Non-blocking
+Phase          Entry              Exit              Timeout   Metrics
+─────          ─────              ────              ───────   ───────
+Boot           Init begins        Storage open      N/A       boot_ms
+Storage        OPFS manifest      CRC validated     500ms     storage_ms
+Health         Classify health    Healthy/Needs*    200ms     health_status
+Discovery      Web Lock request   Leader/Mirror     200ms     discovery_ms
+Leadership     Acquire/confirm    Leading/Follower  500ms     leader_ms
+Sync           Pull mutations     Cursor matched    5s        sync_ms
+Ready          UI interactive     Background tasks  300ms     ready_ms
+Warm           Replay/buffer      Queue drained     30s       warm_ms
+Maintenance    GC/compaction      Tick complete     N/A       maintenance_ms
 ```
-- **Boot** (~100ms): Read manifests, CRC validate, load ContentIndex. No OPFS directory walks.
-- **Ready** (~300ms): UI interactive. Leader election, coordinator connect (leader) or MirrorRuntime (follower).
+- **Boot**: WASM init, create BC channel, instantiate storage root handle.
+- **Storage**: Read manifests for all stores, CRC validate, load ContentIndex into memory.
+- **Health**: Classify as Healthy/Degraded/NeedsRepair/ReadOnly/Corrupt. Skip expensive work if Healthy.
+- **Discovery**: `navigator.locks.request(name, {ifAvailable: true})` — immediate. If lock acquired → leader. If null → mirror.
+- **Leadership** (leader): Leader election confirmed, coordinator connect begins.
+- **Sync** (leader): Register with coordinator, subscribe, pull missed mutations.
+- **Ready**: UI interactive at ~300ms.
 - **Warm** (background): Download replay, snapshot catch-up, pending queue process.
-- **Idle** (background): Compaction, GC, health probes, metrics aggregation.
+- **Maintenance** (background): Compaction, GC, health probes, metrics aggregation.
 
 That's how people understand systems — not by reading modules, but by following a request.
 
@@ -123,6 +124,18 @@ That's how people understand systems — not by reading modules, but by followin
 - Compaction methods must use `js_sys::Date::now()` for timestamps (not `crate::time_utils`)
 
 ## Progress
+### Done (Session 3 — FSM + StorageHealth + Sprint A)
+- **Sprint A — Correctness (Storage Transaction Model)**: Fixed Bug C root cause — every page write now atomically updates ALL ContentIndex indexes including `page_by_id`. `write_page_raw` is now a pure OPFS writer (no manifest updates). `commit_page_write()` replaces `bump_manifest_live_page()` and updates `live_pages` + `page_by_id` + (optionally) `entries`/`page_by_document`/`page_by_sequence`. `allocate_page_id()` and `commit_allocated_page_id()` add stub `page_by_id` entries so `repair_orphans()` no longer tombstones legitimate delta pages. `remove_by_page_id()` handles stub entries correctly. `split_page()` uses `write_page_tx` + `commit_tx` for atomic ContentIndex updates. `commit_tx()` Write ops with `None` key properly track pages in all indexes instead of tombstoning them.
+- All 3 builds pass (`cargo check --workspace`, `wasm-pack build --target web`, `npx tsc --noEmit`).
+
+### Done (Session 3 — FSM + StorageHealth)
+- **Phase 5a — Demote mirror recreation**: `demote()` now async, fully recreates MirrorRuntime + BC handler + LeaderElection(Waitt) instead of setting a flag. Fixes limbo state where demoted tab had `Capability=Follower` but `mirror=None`.
+- **Phase 5b — LeaderElection identity fix**: `promote()` releases old Wait-mode instance before creating new client. Rust BC handler's synchronous `cm.set(Follower)` removed — only JS async `demote()` path fires, ensuring full mirror recreation runs.
+- **Phase 5c — Broadcast ordering**: `BC_MSG_SEQ` static counter in `session_protocol.rs`. 6-field MUTATION format (`MUTATION|bc_seq|tab|doc_id|record_id|payload`) with backward-compatible parser. bc_seq included in MUTATION, SYNC_BEGIN, SYNC_DONE, LEADER_READY messages.
+- **Phase 6 — FSM**: `transition_to_leader()` (24 params + cm) and `transition_to_follower()` (mirror + leader_election) encapsulate all unsafe field swaps, capability/coordinator state set, `log_state()`, and 4 `debug_assert!` invariants. `promote()`/`demote()` refactored to use them. All 3 constructors have invariant assertions.
+- **StorageHealth threshold fix**: Raised Degraded to `> 10` and NeedsRepair to `> 50` (was `> 0`/`> 10`). Normal GC lag (1-10 orphans) is now Healthy, skipping unnecessary startup repair. `storage_runtime.rs:240-248`.
+- All 3 builds pass (`cargo check --workspace`, `wasm-pack build --target web`, `npx tsc --noEmit`).
+
 ### Done
 - **Phase A — Storage Engine V2**: Created `Storage` trait (`traits.rs`) with read/write/delete/list/scan, `InMemoryStorage` and `SqliteStorage` implementations, `CompactionEngine`/`LifecycleEngine`/`StorageManager` layered architecture. WASM `OpfsStorage` uses `page_store.rs` (OPFS-backed page store). V2 layout uses flat `_pages/{store}/{id}.page` storage.
 - **Phase B — Segment lifecycle + compaction**: Created `compaction.rs` (`CompactionEngine`, `CompactionPolicy`, `CompactionDecision`), `lifecycle.rs` (`LifecycleEngine`, `SegmentState`), `manager.rs` (`StorageManager` trait + `DefaultStorageManager` with compact_namespace/run_lifecycle). Created `WasmStorageManager` adapter in WASM crate. `cargo check --workspace` passes.
@@ -243,53 +256,122 @@ That's how people understand systems — not by reading modules, but by followin
 
 ```
 Browser Tab
-
-└── VaultRuntime
-    ├── StorageRuntime
-    │   ├── MetadataRuntime      ← SyncState, Keys, SchemaMeta, Migration (in-memory + MetadataStore<T>)
-    │   ├── PageManager          ← free list, GC watermark, tombstone tracker, fragmentation
-    │   ├── ContentIndex         ← forward (doc→page) + reverse (page→doc), authoritative
-    │   ├── PageStore            ← single instance per store (6 stores)
-    │   └── StorageTransaction   ← ONLY mutation path (atomically commits page + index + manifest)
     │
-    ├── SyncRuntime
-    │   ├── CursorStore/SyncStateStore  ← cursor, generation in memory
-    │   ├── PendingIndex         ← BTreeMap + doc_id index for cancellation
-    │   └── MirrorRuntime        ← lightweight follower, no storage/recovery
-    │
-    ├── NamespaceManager
-    │   ├── HashMap<NamespaceId, NamespaceRuntime>
-    │   ├── LRU eviction
-    │   └── Lazy loading
-    │
-    ├── SchedulerRuntime
-    │   ├── StorageQueue
-    │   ├── UploadQueue
-    │   ├── DownloadQueue
-    │   ├── MaintenanceQueue
-    │   └── RetryQueue
-    │
-    ├── MaintenanceRuntime
-    │   ├── GC                   ← calls storage.cleanup()
-    │   ├── Compaction           ← calls storage.compact()
-    │   ├── Checkpoints          ← periodic metadata flush
-    │   ├── Repair               ← calls storage.verify() → storage.recover()
-    │   └── Health monitoring    ← periodic StorageHealth probe
-    │
-    ├── DocumentRuntime
-    │   ├── DocumentStore        ← SegmentedLruCache-backed
-    │   ├── DocumentSubscriber   ← JS subscriptions
-    │   └── HotDocTracker        ← recency-based active doc set
-    │
-    ├── RuntimeCoordinator
-    │   ├── DiscoveryProtocol    ← HELLO/DISCOVER (startup-only)
-    │   ├── BC message routing   ← permanent after discovery
-    │   └── LeaderElection       ← Web Lock based
-    │
-    ├── RuntimeBus               ← sync dispatch, inline subscribers
-    │
-    └── MetricsService           ← startup_ms, hydrate_ms, page_count, ...
+    └── React → QueryCache (JS, ephemeral view cache)
+                     │
+                     └── WASM VaultRuntime
+                              │
+                              ├── NamespaceManager
+                              │      │
+                              │      ├── NamespaceRuntime (HR)
+                              │      │      ├── WorkingSet        ← loaded docs, pinned, LRU, dirty, subscribed
+                              │      │      ├── SubscriptionIndex ← HashMap<doc_id, subscriber_ids>
+                              │      │      ├── SyncRuntime
+                              │      │      │      ├── CursorStore/SyncStateStore
+                              │      │      │      ├── PendingIndex
+                              │      │      │      └── MirrorRuntime
+                              │      │      │
+                              │      │      └── StorageRuntime    ← database engine per namespace
+                              │      │             ├── TransactionManager  ← ONLY mutation path
+                              │      │             ├── ContentIndex        ← ALL lookups (see below)
+                              │      │             ├── ManifestManager     ← authoritative after startup
+                              │      │             ├── MetadataRuntime     ← in-memory singletons
+                              │      │             ├── PageManager         ← free list, GC watermark
+                              │      │             ├── CompactionManager   ← sealed segment lifecycle
+                              │      │             └── OPFS               ← persistence layer only
+                              │      │
+                              │      ├── NamespaceRuntime (Projects)
+                              │      ├── NamespaceRuntime (CRM)
+                              │      └── NamespaceRuntime (...)
+                              │
+                              ├── SchedulerRuntime
+                              │      ├── StorageQueue
+                              │      ├── UploadQueue
+                              │      ├── DownloadQueue
+                              │      ├── MaintenanceQueue
+                              │      └── RetryQueue
+                              │
+                              ├── MaintenanceRuntime
+                              │      ├── GC
+                              │      ├── Compaction
+                              │      ├── Checkpoints
+                              │      ├── Repair
+                              │      └── Health monitoring
+                              │
+                              ├── RuntimeCoordinator
+                              │      ├── DiscoveryProtocol  ← PROTO v1 (Web Lock ifAvailable + BC)
+                              │      ├── BC message routing ← 6 message types, stable
+                              │      └── LeaderElection     ← Web Lock lifecycle
+                              │
+                              ├── RuntimeBus
+                              │
+                              └── MetricsService
 ```
+
+### ContentIndex (authoritative lookup, expanded)
+
+```
+ContentIndex
+│
+├── page_by_document:   HashMap<(doc_id, record_id), PageId>    ← O(1) forward lookup
+├── page_by_id:         HashMap<PageId, IndexKey>               ← O(1) reverse lookup
+├── live_pages:         BTreeSet<PageId>                        ← all currently live pages
+├── tombstoned_pages:   BTreeSet<PageId>                        ← garbage-collectable pages
+├── document_versions:  HashMap<IndexKey, u64>                  ← version per document
+├── namespace_versions: BTreeMap<u64, HashSet<PageId>>          ← version→pages for sync
+├── generation:         u64                                     ← manifest generation counter
+├── last_compaction:    u64                                     ← timestamp of last compaction
+└── crc:                u64                                     ← integrity check
+```
+
+All lookups go through ContentIndex. OPFS is a persistence layer only.
+
+### SubscriptionIndex (beside WorkingSet)
+
+```
+SubscriptionIndex
+│
+├── by_document: HashMap<DocumentId, Vec<HandleId>>           ← O(1) doc→subscribers
+├── by_handle:   HashMap<HandleId, (DocumentId, Callback)>    ← O(1) handle→subscription
+└── by_namespace: HashMap<NamespaceId, Vec<HandleId>>         ← O(1) namespace→subscribers
+```
+
+Mutation dispatch: `by_document.get(doc_id)` → iterate only listeners for that doc.
+
+### Namespace Lifecycle
+
+```
+Closed
+    ↓
+Opening ──► Loading ──► Ready ──► Idle ──► Evicting ──► Closed
+    │                                                    ↑
+    └──────────────── Error ─────────────────────────────┘
+```
+
+- **Closed**: Not loaded, no memory, no OPFS handles.
+- **Opening**: Allocating resources, loading manifest.
+- **Loading**: ContentIndex hydrate, metadata load.
+- **Ready**: Accepting queries.
+- **Idle**: No active subscribers; eligible for eviction.
+- **Evicting**: Flush dirty pages, release handles.
+- **Error**: Failed to open; resources cleaned up.
+
+NamespaceManager owns: `HashMap<NamespaceId, NamespaceRuntime>` with LRU eviction, lazy loading.
+
+### PROTO v1 — BroadcastChannel Protocol
+
+Stable 6-message protocol. Never add new message types without bumping version.
+
+| Message | Direction | Payload | Purpose |
+|---------|-----------|---------|---------|
+| `HELLO\|replica_id` | Follower → BC | replica_id | Follower announces presence |
+| `LEADER\|{tab_id,boot_id,gen,cursor}` | Leader → BC | JSON | Leader announces readiness |
+| `MUTATION\|gen\|doc_id\|record_id\|fields_json` | Leader → BC | pipe-delimited | Real-time mutation broadcast |
+| `SYNC\|cursor` | Follower → BC | cursor | Follower requests catch-up sync |
+| `LEFT\|tab_id` | Any → BC | tab_id | Tab is closing |
+| `PING\|replica_id` | Any → BC | replica_id | Liveness check (optional) |
+
+No `HEARTBEAT`, no `BUILDING`, no `DISCOVER`, no `RUNTIME_SNAPSHOT`, no `LEADER_TRANSFER`. Six messages, stable.
 
 ### Key Architectural Changes
 
@@ -352,57 +434,51 @@ Browser Tab
 - Fixed WASM build errors: `RecoveryState` Copy removal, LockManager API, cache capacity
 - **All 3 builds pass**: `cargo check --workspace`, `wasm-pack build --target web`, `npm run build`
 
-### Next (StorageAuthority v1.0) — 6-Sprint Roadmap
+### Next (StorageAuthority v1.0) — 4-Sprint Roadmap (replaces old 6-sprint)
 
-#### Sprint 1 — Storage Transaction Model
+#### Sprint A — Correctness (Storage Transaction Model)
 *Enforce: "A document can never have >1 live page after a committed transaction."*
 
-1. **Complete ContentIndex** with forward (`page_by_document`) + reverse (`page_by_id`) indexes, `live_pages`, `tombstoned_pages`, `generation`, `last_compaction`, `crc`. All fields updated atomically on every write.
+1. **Complete ContentIndex** with forward (`page_by_document`) + reverse (`page_by_id`) indexes, `live_pages`, `tombstoned_pages`, `document_versions`, `namespace_versions`, `generation`, `last_compaction`, `crc`. All fields updated atomically on every write.
 2. **StorageTransaction as the only write API**. Remove public `PageStore.write()`, `PageStore.allocate()`, `PageStore.tombstone()`. Expose only `StorageRuntime.begin_transaction()` with `tx.write_document()`, `tx.write_metadata()`, `tx.delete()`, `tx.commit()`. No bypass paths.
 3. **Replace O(n) doc scan** — `tombstone_existing_doc_pages()` uses `page_by_document.get()` (O(1)) instead of iterating all live pages and reading every header.
 4. **Atomic document writes** — tombstone old page + allocate new page + write new page + update both ContentIndex indexes + bump manifest, all inside a single `StorageTransaction`.
 5. **ManifestRebuildGuard** — `debug_assert!` in debug, `engine_warn!` in release if rebuild finds >1 live page per key.
 6. **Invariant**: Every storage mutation produces exactly one index mutation. They happen together or not at all.
+7. **Fix MUTATION parsing in `handle_mirror_bc_message`**: `parts[1/2/3]` → `parts[2/3/4]`.
+8. **RuntimeStore → view cache over WASM**: `useQuery()` calls WASM `find()` as fallback when RuntimeStore is empty. RuntimeStore becomes write-through + read-cache, not source of truth.
 
-#### Sprint 2 — Runtime Ownership
+#### Sprint B — Ownership (Runtime Separation)
 *Enforce: "DownloadQueue never accesses storage metadata directly."*
 
 1. **SyncStateStore trait** in core crate: `cursor()`, `set_cursor()`, `generation()`, `set_generation()`, plus future fields (`last_snapshot`, `pending`, `replica_id`).
 2. **Implementors**: `SyncRuntime` (WASM) delegates to `AtomicU64` + `RwLock<String>`. `AtomicSyncStateStore` (native). `MockSyncStateStore` (tests).
 3. **DownloadQueue decoupled**: Accepts `Arc<dyn SyncStateStore>` instead of `Arc<dyn Storage>`. All `read_sync_state()` calls become in-memory reads. No OPFS for cursor/generation after boot.
-4. **MetadataRuntime** — mini metadata database over `MetadataStore<T>`. Owns `SyncState`, `Keys`, `SchemaMeta`, `MigrationRecord` as in-memory values behind `RwLock`, persisted via `MetadataStore<T>`. Adding `PresenceMetadata`, `WorkspaceMetadata`, `EncryptionMetadata` is trivial.
+4. **MetadataRuntime** — mini metadata database over `MetadataStore<T>`. Owns `SyncState`, `Keys`, `SchemaMeta`, `MigrationRecord` as in-memory values behind `RwLock`, persisted via `MetadataStore<T>`.
 5. **StorageRuntime authority**: Only `StorageRuntime` touches OPFS. All `PageStore` access goes through it.
+6. **Follower initial sync via replication**: New protocol: HELLO → LEADER_READY → SYNC(cursor) → MUTATION stream → DONE. Leader reads from storage, streams mutations to follower. No RuntimeSnapshot serialization.
+7. **Leader lifecycle events**: Leader sends `LEADER_READY` at startup, `LEFT` via `beforeunload`. Follower tracks via these events, not periodic heartbeats.
 
-#### Sprint 3 — Runtime Separation
+#### Sprint C — Startup (Health Classification + Web Lock Discovery)
 *Enforce: "Boot never performs repair work. It classifies health, then delegates."*
 
-1. **StorageHealth** (5 variants): `Healthy` | `Degraded` | `NeedsRepair` | `ReadOnly` | `Corrupt`. Determined at boot before any expensive operations.
-2. **Boot path when Healthy**: Load manifests → CRC validate → `Health::Healthy` → skip all cleanup/rebuild/repair → go to Ready (~100ms).
-3. **MaintenanceRuntime** — owns GC, compaction, checkpoints, manifest repair, index verification, health monitoring. `StorageRuntime` exposes `compact()`, `cleanup()`, `verify()` — MaintenanceRuntime schedules them. Never blocks startup.
-4. **SchedulerRuntime** — unified priority system over `StorageQueue`, `UploadQueue`, `DownloadQueue`, `MaintenanceQueue`, `RetryQueue`.
-5. **Deferred cleanup**: `cleanup_tombstoned_pages()` moved to Warm/Idle phase via `MaintenanceRuntime` tick.
+1. **Web Lock `ifAvailable` discovery** — replace `wait_for_leader(2500)` with `navigator.locks.request(name, {ifAvailable: true})`. Lock acquired → leader. Null → mirror. Short timer fallback (200ms) for browser edge cases.
+2. **StorageHealth** (5 variants): `Healthy` | `Degraded` | `NeedsRepair` | `ReadOnly` | `Corrupt`. Determined at boot before any expensive operations.
+3. **Boot path when Healthy**: Load manifests → CRC validate → `Health::Healthy` → skip all cleanup/rebuild/repair → go to Ready (~100ms).
+4. **MaintenanceRuntime** — owns GC, compaction, checkpoints, manifest repair, index verification, health monitoring. `StorageRuntime` exposes `compact()`, `cleanup()`, `verify()` — MaintenanceRuntime schedules them. Never blocks startup.
+5. **SchedulerRuntime** — unified priority system over `StorageQueue`, `UploadQueue`, `DownloadQueue`, `MaintenanceQueue`, `RetryQueue`.
+6. **Deferred cleanup**: `cleanup_tombstoned_pages()` moved to Warm/Idle phase via `MaintenanceRuntime` tick.
 
-#### Sprint 4 — Namespace Architecture
+#### Sprint D — Namespace Architecture + UX
 *Enforce: "Each namespace is an isolated database. Unopened namespaces are never loaded."*
 
-1. **NamespaceManager** — `HashMap<NamespaceId, NamespaceRuntime>` with LRU eviction, lazy loading, namespace lifecycle management.
-2. **NamespaceRuntime** — owns `StorageRuntime`, `SyncRuntime`, `Coordinator`, `Subscriptions`, `Metrics`, `Compaction`.
-3. **Lazy loading**: Namespace opened on user click. Startup only opens namespaces with active subscriptions.
-4. **Namespace isolation**: No runtime can access another namespace's internal state. Communication only through public APIs or `RuntimeBus` events.
-
-#### Sprint 5 — Runtime Observability
-*Enforce: "All subsystems are observable through RuntimeStatus without touching production code."*
-
-1. **RuntimeStatus** (not just mode): `{ mode: Leader|Mirror|Promoting|Recovering|Offline, health: Healthy|Degraded|NeedsRepair|ReadOnly|Corrupt, namespace, lag_ms, leader_id }`.
-2. **UI reads `RuntimeStatus`** instead of WebSocket `readyState`. Mirror + healthy BC heartbeat → `mode: Mirror` (badge shows "Mirror", not "Offline").
-3. **Diagnostics**: Per-runtime health probes, latency tracking, startup phase logging.
-
-#### Sprint 6 — Storage Evolution
-*Postponed until storage model stabilizes. After Sprints 1-4, the format will have stabilized enough to version.*
-
-1. **StorageVersion** in `StoreManifest` header.
-2. **UpgradePlanner** reads current version, queues upgrades.
-3. **Migration framework**: Boot reads version → `current == expected` → continue. No migration overhead on steady-state.
+1. **NamespaceManager** — `HashMap<NamespaceId, NamespaceRuntime>` with LRU eviction, lazy loading, namespace lifecycle management. Namespace lifecycle: Closed → Opening → Loading → Ready → Idle → Evicting → Closed.
+2. **NamespaceRuntime** — owns `WorkingSet`, `SubscriptionIndex`, `StorageRuntime`, `SyncRuntime`, `Metrics`. Each namespace is an isolated mini-database.
+3. **WorkingSet** — first-class runtime: loaded docs, pinned docs, LRU eviction, dirty docs, subscribed docs. Only 20/500k docs in memory.
+4. **SubscriptionIndex** — `HashMap<doc_id, Vec<handle_id>>` beside WorkingSet. Mutation dispatches only to docs that have listeners.
+5. **RuntimeStatus** — `{ mode: Leader|Mirror|Promoting|Recovering|Offline, health, namespace, lag_ms, leader_id }`. UI reads this instead of WebSocket `readyState`.
+6. **Batch BC notifications** — `RuntimeStore.applySetFieldBatch()` applies all fields silently, notifies once. No per-field re-render cascade.
+7. **Leader handoff via Web Lock waiter** — When leader tab closes, browser releases Web Lock. Follower's pending lock request fires → promotion. No polling, no setInterval.
 
 ### Critical Fixes (from runtime testing)
 - **DiscoveryProtocol timing fix**: The HELLO/DISCOVER protocol had a fundamental race condition — the BC handler that responds to HELLO lives in RuntimeCoordinator, which only exists AFTER the engine is built (2.5s). Every other tab starting during that window also became "leader." Fixed by registering a lightweight BC handler IMMEDIATELY after BC creation, before send_hello(), that:
@@ -462,7 +538,7 @@ Log levels map to audience:
 ## Critical Context
 - **Bug A (OPFS race) — FIXED**: Cross-tab OPFS race eliminated by per-tab storage paths. Upload pipeline health confirmed by consistent `PUSH_ACK sequences=[N]`, `AFTER_MARK_SYNCED pending=0`, `BATCH_DONE success=1`.
 - **Bug B (Focus guard loop) — FIXED**: One-way replication caused by `document.activeElement` check blocking external merges on the follower tab. Fixed with edit-timestamp cooldown. Both directions now confirmed working.
-- **Bug C (upload loop) — ROOT CAUSE IDENTIFIED**: `content_index.live_pages` (BTreeSet) is never updated for the oplog store at runtime. `allocate_page_id()` increments a counter but doesn't add to the set. `bump_manifest_live_page()` also doesn't add. `list_page_ids()` returns a stale snapshot from the last OPFS scan. Delta pages from `mark_synced` are invisible, so base pages still show `Pending`, and the upload repeats forever. Fix: Phase 1.
+- **Bug C (upload loop) — FIXED**: Every page write now atomically updates ALL ContentIndex indexes including `page_by_id`. `write_page_raw` is a pure OPFS writer. `commit_page_write()`, `commit_tx()`, `allocate_page_id()`, and `commit_allocated_page_id()` all add `page_by_id` stub entries so `repair_orphans()` no longer tombstones legitimate delta pages from `mark_synced` on restart.
 - **Bug D (page ID 0 corruption) — ROOT CAUSE IDENTIFIED**: `WAL_CHECKPOINT_PAGE = 0` conflicts with `allocate_page_id()` starting at 0. `checkpoint_wal()` writes JSON to `_pages/oplog/0.page`, overwriting real oplog data. Fix: Phase 2 (system directory).
 - **Bug E (dual PageStore instances) — ROOT CAUSE IDENTIFIED**: `OpfsStorage.pages.oplog` and `OpfsStorageEngine.oplog` are separate Rust objects pointing to the same `_pages/oplog/` directory. Each has an independent `Manifest` behind separate `Arc<Mutex<...>>` instances. Writes via one are invisible to the other. Fix: Phase 2 (single PageStore).
 - **Architectural issue — follower boots the full engine**: The follower builds BrowserStorage, reads OPFS, connects to coordinator, runs recovery, and only then discovers it's a follower. Should use BC heartbeat check first, then skip directly to MirrorRuntime. Fix: Phase 4.
@@ -571,3 +647,28 @@ After integration work is complete, spend time on:
 - `crates/vaultsync-core/src/runtime_state.rs`: `RuntimeState` enum + `RuntimeCapabilities` bitflags + transition logic (V4 v2)
 - `crates/vaultsync-core/src/runtime_bus.rs`: `RuntimeEvent` enum + `RuntimeSubscriber` trait + `RuntimeBus` sync dispatch (V4 v2)
 - `crates/vaultsync-wasm/src/runtime_coordinator.rs`: Replaces HeartbeatManager — state machine, HELLO/DISCOVER protocol, BC routing (V4 v2)
+
+## Known Issues
+
+### StorageHealth Degraded at startup
+**Status**: Tracked, not blocking today
+
+Runtime logs show `StorageHealth=Degraded` on every startup due to orphan page repair (logs: `CRC mismatch`, `orphans repaired`). The orphan pages are from normal operation (tombstoned pages that GC hasn't cleaned yet), not corruption. The Degraded classification triggers unnecessary startup overhead.
+
+**Root cause**: `StorageRuntime::new()` at `storage_runtime.rs:216-232` runs `repair_orphans()` unconditionally and classifies any orphan count > 0 as Degraded. Orphans are expected between compaction cycles — a zero-orphan threshold is too strict for normal steady-state operation.
+
+**Fix**: Raised Degraded threshold to `> 10` and NeedsRepair threshold to `> 50` at `storage_runtime.rs:240-248`. Orphans 0-10 → Healthy, 11-50 → Degraded, >50 → NeedsRepair. Startup now skips expensive repair for normal steady-state orphan counts.
+
+### Bug 1 — Leader bootstrap incomplete cache (FIXED)
+WASM `find()` at `client.rs:1338-1356` previously short-circuited to the Runtime in-memory document_store when it had ANY entries. If BC MUTATION messages populated even 2 records during startup, `find()` returned only those 2 instead of falling through to OPFS (authoritative source with all 14+ records).
+
+**Fix**: Removed the Runtime cache shortcut on the leader path. WASM `find()` now always delegates to `self.client.find()` (OPFS) when a client is available. Runtime cache is only used as fallback when no client exists (mirror/follower modes already handled by separate mirror path).
+
+### Bug 5 — Duplicate React keys from id/record_id mismatch (FIXED)
+`useQuery.ts` used `fields.id` as the RuntimeStore key, while Core CRDT stores records under `record_id` internally. When the same logical record arrived through both a `find()` result and a BC MUTATION with different key fields, RuntimeStore created two separate Map entries — one keyed by `id` and another by `record_id`. React rendered both, causing duplicate key warnings.
+
+**Fix**: 
+1. `useQuery.ts` now uses `fields.record_id ?? fields.id` consistently for the storage key
+2. `RuntimeStore.applySetFieldBatch` normalizes `fields.id` to the effective `record_id` and merges duplicate entries
+3. `RuntimeStore.applySetField` migrates records when the `id` field is set to a value different from the current key
+

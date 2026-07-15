@@ -1,7 +1,7 @@
 use crate::config::VaultSyncConfig;
 #[cfg(feature = "async-runtime")]
 use crate::coordinator::memory::InMemoryCoordinator;
-use crate::coordinator::traits::{Coordinator, PendingMutation, ReplicaInfo};
+use crate::coordinator::traits::{Coordinator, CursorValidation, PendingMutation, ReplicaInfo};
 use crate::crdt::document::CRDTDocument;
 use crate::crdt::types::CrdtValue;
 use crate::e2ee::keyring::{E2eeDecryptor, E2eeEncryptor, KeyRing};
@@ -19,6 +19,7 @@ use crate::subscription::filter::Filter;
 use crate::sync::download::DownloadQueue;
 use crate::sync::reconciler::Reconciler;
 use crate::sync::state::SyncState;
+use crate::sync::sync_state_store::SyncStateStore;
 use crate::sync::upload::UploadQueue;
 use crate::telemetry::log_data;
 use crate::telemetry::tracing::VaultSyncTelemetry;
@@ -127,6 +128,7 @@ pub struct VaultSyncClient {
     pub schema_version: u64,
     pub shared_memory: Arc<crate::ipc::shared_memory::SharedMemory>,
     pub events: crate::sync::events::SyncEvents,
+    pub sync_state_store: Option<Arc<dyn SyncStateStore>>,
     initialized: std::sync::atomic::AtomicBool,
     clock: crate::clock::HybridLogicalClock,
     pending_count_cache: Arc<std::sync::atomic::AtomicUsize>,
@@ -270,6 +272,7 @@ impl VaultSyncClient {
         storage: Arc<dyn Storage>,
         migrations: Vec<Arc<crate::schema::migration::MigrationDefinition>>,
         auto_initialize: bool,
+        sync_state_store: Option<Arc<dyn SyncStateStore>>,
     ) -> Result<Self, VaultSyncError> {
         let _t_mig = crate::time_utils::system_time_now_ms();
         tracing::info!("[client.new] migration start");
@@ -416,7 +419,7 @@ impl VaultSyncClient {
             metrics.clone(),
         ));
 
-        let download_queue = Arc::new(DownloadQueue::new(
+        let mut download_queue = DownloadQueue::new(
             coordinator.clone(),
             storage.clone(),
             &config.namespace,
@@ -427,7 +430,11 @@ impl VaultSyncClient {
             metrics.clone(),
             config.max_clock_skew,
             config.replica_id.clone(),
-        ));
+        );
+        if let Some(ref sss) = sync_state_store {
+            download_queue = download_queue.with_sync_state_store(sss.clone());
+        }
+        let download_queue = Arc::new(download_queue);
         tracing::info!("[client.new] queue init done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         let _t = crate::time_utils::system_time_now_ms();
@@ -571,6 +578,7 @@ impl VaultSyncClient {
             schema_version,
             shared_memory,
             events,
+            sync_state_store,
             initialized: std::sync::atomic::AtomicBool::new(false),
             clock: crate::clock::HybridLogicalClock::new(),
             pending_count_cache: pending_cache.clone(),
@@ -648,21 +656,22 @@ impl VaultSyncClient {
                             // Either no pending entries OR coordinator unavailable.
                             // Distinguish by checking pending count.
                             if let Ok(count) = uq.pending_count().await {
-                                if count > 0 && !offline {
+                                let safe_count = if count > 1_000_000 { 0 } else { count };
+                                if safe_count > 0 && !offline {
                                     tracing::warn!(
                                         "[upload_worker] OFFLINE_ENTER pending={} backoff=1s",
-                                        count
+                                        safe_count
                                     );
                                     offline = true;
                                     backoff_ms = 1000;
-                                } else if count > 0 {
+                                } else if safe_count > 0 {
                                     // Still offline after retry; increase backoff
                                     backoff_ms = std::cmp::min(backoff_ms * 2, 30000);
                                     tracing::debug!(
                                         "[upload_worker] OFFLINE_RETRY pending={} backoff={}ms",
-                                        count, backoff_ms,
+                                        safe_count, backoff_ms,
                                     );
-                                } else if count == 0 && offline {
+                                } else if safe_count == 0 && offline {
                                     // All pending cleared — return to online
                                     tracing::info!("[upload_worker] ONLINE pending=0");
                                     offline = false;
@@ -689,14 +698,21 @@ impl VaultSyncClient {
 
                 // Update pending count cache
                 if let Ok(count) = uq.pending_count().await {
-                    tracing::debug!("[pending] worker_loop count={}", count);
-                    pc_cache.store(count, std::sync::atomic::Ordering::Relaxed);
-                    tracing::trace!("[pending] cache_store count={}", count);
-                    let channel_ok = pc_tx.unbounded_send(count).is_ok();
-                    tracing::trace!("[pending] channel_send count={} ok={}", count, channel_ok);
+                    let max_reasonable = 1_000_000usize;
+                    let safe_count = if count > max_reasonable {
+                        tracing::warn!("[pending] count={} exceeds max_reasonable={} — capping to 0", count, max_reasonable);
+                        0
+                    } else {
+                        count
+                    };
+                    tracing::debug!("[pending] worker_loop count={}", safe_count);
+                    pc_cache.store(safe_count, std::sync::atomic::Ordering::Relaxed);
+                    tracing::trace!("[pending] cache_store count={}", safe_count);
+                    let channel_ok = pc_tx.unbounded_send(safe_count).is_ok();
+                    tracing::trace!("[pending] channel_send count={} ok={}", safe_count, channel_ok);
                     tracing::info!(
                         "[upload_cycle] cycle_done pending_cache_before={} pending_manifest_after={} pending_cache_after={}",
-                        cache_before, count, pc_cache.load(std::sync::atomic::Ordering::Relaxed),
+                        cache_before, safe_count, pc_cache.load(std::sync::atomic::Ordering::Relaxed),
                     );
                 } else {
                     tracing::info!(
@@ -719,7 +735,7 @@ impl VaultSyncClient {
             loop {
                 crate::time_utils::sleep(sync_interval).await;
                 // Leader uploads pending mutations
-                if bg_le.try_acquire().unwrap_or(false) {
+                if bg_le.is_leader() {
                     let _ = bg_uq.process_batch().await;
                 }
                 // All tabs download
@@ -752,7 +768,7 @@ impl VaultSyncClient {
                     last_compaction = crate::time_utils::PlatformInstant::now();
                 }
                 // Snapshot compaction runs only on the leader (re-writes docs)
-                if le.try_acquire().unwrap_or(false)
+                if le.is_leader()
                     && last_snapshot.elapsed() >= std::time::Duration::from_secs(900)
                 {
                     match compaction_engine.run_snapshot_compaction(&ns).await {
@@ -810,7 +826,29 @@ impl VaultSyncClient {
         storage: Arc<dyn Storage>,
         migrations: Vec<Arc<crate::schema::migration::MigrationDefinition>>,
     ) -> Result<Self, VaultSyncError> {
-        Self::build_client(config, coordinator, keyring, storage, migrations, true).await
+        Self::build_client(config, coordinator, keyring, storage, migrations, true, None).await
+    }
+
+    /// Create a client with an explicit SyncStateStore for in-memory cursor/generation reads.
+    /// When provided, the DownloadQueue will bypass OPFS reads for cursor and generation,
+    /// using the SyncStateStore instead (O(1), no I/O).
+    pub async fn new_with_sync_state_store(
+        config: VaultSyncConfig,
+        coordinator: Arc<dyn Coordinator>,
+        keyring: Arc<KeyRing>,
+        storage: Arc<dyn Storage>,
+        sync_state_store: Arc<dyn SyncStateStore>,
+    ) -> Result<Self, VaultSyncError> {
+        Self::build_client(
+            config,
+            coordinator,
+            keyring,
+            storage,
+            crate::schema::migration::get_global_migrations(),
+            true,
+            Some(sync_state_store),
+        )
+        .await
     }
 
     /// Like `new_with_storage`, but does NOT call `initialize()` internally.
@@ -830,6 +868,30 @@ impl VaultSyncClient {
             storage,
             crate::schema::migration::get_global_migrations(),
             false,
+            None,
+        )
+        .await
+    }
+
+    /// Like `new_with_sync_state_store`, but does NOT call `initialize()` internally.
+    /// The caller MUST call `initialize()` before using the client.
+    /// Use this when you need to wire event channels + provide a SyncStateStore
+    /// before the WebSocket background processor starts.
+    pub async fn new_with_sync_state_store_skip_init(
+        config: VaultSyncConfig,
+        coordinator: Arc<dyn Coordinator>,
+        keyring: Arc<KeyRing>,
+        storage: Arc<dyn Storage>,
+        sync_state_store: Arc<dyn SyncStateStore>,
+    ) -> Result<Self, VaultSyncError> {
+        Self::build_client(
+            config,
+            coordinator,
+            keyring,
+            storage,
+            crate::schema::migration::get_global_migrations(),
+            false,
+            Some(sync_state_store),
         )
         .await
     }
@@ -894,72 +956,62 @@ impl VaultSyncClient {
                                     gen_elapsed,
                                 );
                             } else {
-                                // history_preserved=false: server lost data, must re-register and replay.
-                                state.generation_id = server_gen.clone();
-                                let now_ms = crate::time_utils::system_time_now_ms();
-                                state.last_sync_at = Some(now_ms);
-                                // Preserve cursor in sync state (don't reset to 0)
-                                self.storage.write_sync_state(&state).await?;
+                                // history_preserved=false: server may have lost data.
+                                // First, check cursor validation using the coordinator's
+                                // max_sequence (already returned by the first REGISTER_ACK —
+                                // no reconnect needed for this check).
+                                let cursor_validation = self.coordinator.cursor_validation(cursor_was).await;
                                 let gen_elapsed = gen_t0.elapsed().as_millis();
                                 tracing::info!(
-                                    "[Recovery] gen mismatch: cursor={} gen={} gen_check={}ms (will validate)",
+                                    "[Recovery] gen mismatch: cursor={} gen={} validation={:?} gen_check={}ms",
                                     cursor_was,
                                     state.generation_id,
+                                    cursor_validation,
                                     gen_elapsed,
                                 );
 
                                 self.download_queue.set_replay_mode(true);
-                                let reconnect_t0 = crate::time_utils::PlatformInstant::now();
-                                let _ = self.coordinator.disconnect().await;
-                                match self.coordinator
-                                    .register(&self.config.namespace, replica_info.clone(), cursor_was)
-                                    .await
-                            {
-                                Ok(()) => {
-                                    let reconnect_elapsed = reconnect_t0.elapsed().as_millis();
-                                    tracing::info!("[Recovery] re-registered cursor={} reconnect={}ms", cursor_was, reconnect_elapsed);
-                                    // Evidence-based cursor validation
-                                    let cursor_t0 = crate::time_utils::PlatformInstant::now();
-                                    let server_max = self.coordinator.max_sequence().await;
-                                    if server_max == 0 {
+
+                                match cursor_validation {
+                                    CursorValidation::Unknown | CursorValidation::Valid => {
+                                        // Keep cursor — no reconnect needed
+                                        let now_ms = crate::time_utils::system_time_now_ms();
+                                        state.last_sync_at = Some(now_ms);
+                                        self.storage.write_sync_state(&state).await?;
                                         tracing::info!(
-                                            "[Recovery] cursor validation unavailable (server_max=0), keeping cursor={} cursor_check={}ms",
+                                            "[Recovery] cursor valid or unknown (validation={:?}) — keeping cursor={} (no reconnect)",
+                                            cursor_validation,
                                             cursor_was,
-                                            cursor_t0.elapsed().as_millis(),
                                         );
-                                    } else if server_max >= cursor_was {
+                                    }
+                                    CursorValidation::Invalid => {
+                                        // Cursor truly stale — must reconnect with cursor=0
                                         tracing::info!(
-                                            "[Recovery] cursor valid: server_max={} >= cursor={} cursor_check={}ms",
-                                            server_max, cursor_was,
-                                            cursor_t0.elapsed().as_millis(),
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            "[Recovery] cursor INVALID: server_max={} < cursor={} -> resetting to 0",
-                                            server_max, cursor_was
+                                            "[Recovery] cursor INVALID — resetting cursor to 0 for full replay"
                                         );
                                         state.last_synced_sequence = 0;
+                                        state.generation_id = server_gen.clone();
+                                        let now_ms = crate::time_utils::system_time_now_ms();
+                                        state.last_sync_at = Some(now_ms);
                                         self.storage.write_sync_state(&state).await?;
                                         self.download_queue.reset_cursor(0);
+                                        let reconnect_t0 = crate::time_utils::PlatformInstant::now();
                                         let _ = self.coordinator.disconnect().await;
                                         match self.coordinator
                                             .register(&self.config.namespace, replica_info.clone(), 0)
                                             .await
                                         {
                                             Ok(()) => {
-                                                tracing::info!("[Recovery] re-registered cursor=0 (full replay)");
+                                                let reconnect_elapsed = reconnect_t0.elapsed().as_millis();
+                                                tracing::info!("[Recovery] re-registered cursor=0 reconnect={}ms", reconnect_elapsed);
                                             }
                                             Err(e) => {
-                                                tracing::warn!("Re-register failed at cursor=0: {:?}", e);
+                                                tracing::warn!("Re-register failed after cursor reset: {:?}", e);
                                             }
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!("Re-register failed after gen change: {:?}", e);
-                                }
                             }
-                        }
                     } else {
                         let gen_elapsed = gen_t0.elapsed().as_millis();
                         tracing::info!("[Recovery] generation OK gen={} gen_check={}ms", server_gen, gen_elapsed);
@@ -1751,17 +1803,9 @@ impl VaultSyncClient {
         Ok(self.pending_count_cache.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    /// Attempt to acquire the leader lock. Returns true if this instance is now leader.
-    /// This is a synchronous lock attempt using the filesystem/advisory lock.
-    /// Use `sync_status()` to check the current status if no acquisition is needed.
-    pub fn try_acquire_leader(&self) -> Result<bool, VaultSyncError> {
-        self.leader_election.try_acquire()
-    }
-
-    /// Release the leader lock. Called when voluntarily stepping down.
-    /// Note: the lock is also released when all Arcs to the leader election are dropped.
-    pub fn release_leader(&self) {
-        self.leader_election.release();
+    /// Check if this instance holds the leader lock.
+    pub fn is_leader(&self) -> bool {
+        self.leader_election.is_leader()
     }
 
     /// Take the pending-count receiver for event-driven status updates.

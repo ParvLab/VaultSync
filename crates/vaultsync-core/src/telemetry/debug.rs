@@ -398,8 +398,9 @@ impl DebugApi {
                     Err(resp) => return resp,
                 };
 
-                leader_election.release();
-                match leader_election.try_acquire() {
+                // Release is automatic when Lease is dropped.
+                // Use sync try_acquire for debug endpoint compatibility.
+                match leader_election.try_acquire_immediate_sync() {
                     Ok(acquired) => Json(json!({
                         "status": "success",
                         "action": "released and re-tried lock",

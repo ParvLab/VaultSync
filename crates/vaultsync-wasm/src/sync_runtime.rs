@@ -4,8 +4,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use async_trait::async_trait;
 
 use crate::follower::MirrorRuntime;
+use crate::metadata_runtime::MetadataRuntime;
 use crate::metrics::RuntimeMetrics;
 use vaultsync_core::runtime_state::RuntimeLifecycle;
+use vaultsync_core::sync::state::SyncState;
+use vaultsync_core::sync::sync_state_store::SyncStateStore;
+use vaultsync_core::VaultSyncError;
 
 /// PendingIndex — tracks un-uploaded mutations by seq, doc_id, record_id.
 ///
@@ -127,6 +131,12 @@ pub struct SyncRuntime {
     pub recovery: Mutex<RecoveryState>,
     pub mirror: Mutex<Option<Arc<MirrorRuntime>>>,
     pub coord_connected: AtomicU64,
+    /// Optional MetadataRuntime for checkpoint persistence.
+    /// When set, set_cursor/gen also mark MetadataRuntime dirty so
+    /// MaintenanceRuntime.checkpoint() persists them to OPFS.
+    metadata_runtime: Mutex<Option<Arc<MetadataRuntime>>>,
+    /// The namespace this SyncRuntime belongs to (for SyncState).
+    namespace: RwLock<String>,
 }
 
 impl SyncRuntime {
@@ -138,7 +148,15 @@ impl SyncRuntime {
             recovery: Mutex::new(RecoveryState::NotStarted),
             mirror: Mutex::new(None),
             coord_connected: AtomicU64::new(0),
+            metadata_runtime: Mutex::new(None),
+            namespace: RwLock::new(String::new()),
         })
+    }
+
+    pub fn with_metadata(self: &Arc<Self>, mr: Arc<MetadataRuntime>, ns: &str) -> &Arc<Self> {
+        *self.metadata_runtime.lock().unwrap() = Some(mr);
+        *self.namespace.write().unwrap() = ns.to_string();
+        self
     }
 
     // ── Cursor operations ──
@@ -149,6 +167,19 @@ impl SyncRuntime {
 
     pub fn set_cursor(&self, seq: u64) {
         self.cursor.store(seq, Ordering::Release);
+        // Forward to MetadataRuntime for checkpoint persistence (B3)
+        if let Some(ref mr) = *self.metadata_runtime.lock().unwrap() {
+            let ns = self.namespace.read().unwrap();
+            let mut state = mr.read_sync_state().unwrap_or_else(|| {
+                let mut s = SyncState::new(ns.clone(), self.generation());
+                s.last_synced_sequence = seq;
+                s
+            });
+            state.last_synced_sequence = seq;
+            let now_ms = js_sys::Date::now() as u64;
+            state.last_sync_at = Some(now_ms);
+            mr.write_sync_state(state);
+        }
     }
 
     pub fn advance_cursor(&self) -> u64 {
@@ -162,7 +193,17 @@ impl SyncRuntime {
     }
 
     pub fn set_generation(&self, gen: String) {
+        let gen_for_meta = gen.clone();
         *self.generation.write().unwrap() = gen;
+        // Forward to MetadataRuntime for checkpoint persistence (B3)
+        if let Some(ref mr) = *self.metadata_runtime.lock().unwrap() {
+            let ns = self.namespace.read().unwrap();
+            let mut state = mr.read_sync_state().unwrap_or_else(|| {
+                SyncState::new(ns.clone(), gen_for_meta.clone())
+            });
+            state.generation_id = gen_for_meta;
+            mr.write_sync_state(state);
+        }
     }
 
     // ── Pending operations ──
@@ -215,6 +256,27 @@ impl SyncRuntime {
 
     pub fn mark_coord_connected(&self) {
         self.coord_connected.store(js_sys::Date::now() as u64, Ordering::Release);
+    }
+}
+
+#[async_trait]
+impl SyncStateStore for SyncRuntime {
+    async fn cursor(&self) -> Result<u64, VaultSyncError> {
+        Ok(self.cursor())
+    }
+
+    async fn set_cursor(&self, seq: u64) -> Result<(), VaultSyncError> {
+        self.set_cursor(seq);
+        Ok(())
+    }
+
+    async fn generation(&self) -> Result<String, VaultSyncError> {
+        Ok(self.generation())
+    }
+
+    async fn set_generation(&self, gen: &str) -> Result<(), VaultSyncError> {
+        self.set_generation(gen.to_string());
+        Ok(())
     }
 }
 

@@ -123,6 +123,7 @@ pub fn init() {
 
 #[cfg(target_arch = "wasm32")]
 pub mod log;
+pub mod util;
 #[cfg(target_arch = "wasm32")]
 pub mod client;
 #[cfg(target_arch = "wasm32")]
@@ -169,6 +170,7 @@ pub mod access_tracker;
 pub mod broadcast_manager;
 #[cfg(target_arch = "wasm32")]
 pub mod discovery_protocol;
+pub mod session_protocol;
 #[cfg(target_arch = "wasm32")]
 pub mod runtime_coordinator;
 #[cfg(target_arch = "wasm32")]
@@ -186,6 +188,8 @@ pub mod metadata_store;
 #[cfg(target_arch = "wasm32")]
 pub mod storage_scheduler;
 #[cfg(target_arch = "wasm32")]
+pub mod subscription_index;
+#[cfg(target_arch = "wasm32")]
 pub mod storage_runtime;
 #[cfg(target_arch = "wasm32")]
 pub mod runtime_host;
@@ -201,6 +205,10 @@ pub mod engine_context;
 pub mod cache_runtime;
 #[cfg(target_arch = "wasm32")]
 pub mod namespace_runtime;
+#[cfg(target_arch = "wasm32")]
+pub mod replay_engine;
+#[cfg(target_arch = "wasm32")]
+pub mod metadata_runtime;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]

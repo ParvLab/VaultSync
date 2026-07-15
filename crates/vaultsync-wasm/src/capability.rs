@@ -23,6 +23,17 @@ impl RuntimeCapability {
         }
     }
 
+    /// Returns the JS-compatible mode string (matches old RuntimeStatus::as_str() format).
+    /// Used by runtime_status() to maintain backward compatibility with UI badge checks.
+    pub fn mode_str(&self) -> &'static str {
+        match self {
+            RuntimeCapability::Leader => "Leader",
+            RuntimeCapability::Follower => "Mirror",
+            RuntimeCapability::ReadonlyWarm => "Connecting",
+            RuntimeCapability::Offline => "Offline",
+        }
+    }
+
     pub fn can_write(&self) -> bool {
         matches!(self, RuntimeCapability::Leader | RuntimeCapability::Offline | RuntimeCapability::Follower)
     }

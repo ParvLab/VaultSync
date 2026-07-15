@@ -1,9 +1,9 @@
 use crate::broadcast_manager::BroadcastManager;
 use crate::metrics::RuntimeMetrics;
 use crate::runtime::Runtime;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use vaultsync_core::runtime_state::{RuntimeCapabilities, RuntimeState};
+use vaultsync_core::runtime_state::RuntimeState;
 
 /// Phase 4 v2: RuntimeCoordinator — manages RuntimeState transitions
 /// and routes BC messages to handlers.
@@ -16,8 +16,6 @@ pub struct RuntimeCoordinator {
     metrics: Arc<RuntimeMetrics>,
     tab_id: String,
     state: std::sync::Mutex<RuntimeState>,
-    capabilities: std::sync::Mutex<RuntimeCapabilities>,
-    is_leader: AtomicBool,
     boot_id: String,
 }
 
@@ -34,9 +32,7 @@ impl RuntimeCoordinator {
             broadcast,
             metrics,
             tab_id,
-            state: std::sync::Mutex::new(RuntimeState::Unknown),
-            capabilities: std::sync::Mutex::new(RuntimeCapabilities::empty()),
-            is_leader: AtomicBool::new(false),
+            state: std::sync::Mutex::new(RuntimeState::Starting),
             boot_id,
         }
     }
@@ -54,17 +50,7 @@ impl RuntimeCoordinator {
         let mut s = self.state.lock().unwrap();
         let old = *s;
         *s = new;
-        *self.capabilities.lock().unwrap() = new.default_capabilities();
-        self.is_leader.store(new == RuntimeState::Leading, Ordering::Release);
         engine_debug!("[coordinator] state: {:?} → {:?}", old, new);
-    }
-
-    pub fn capabilities(&self) -> RuntimeCapabilities {
-        *self.capabilities.lock().unwrap()
-    }
-
-    pub fn is_leader(&self) -> bool {
-        self.is_leader.load(Ordering::Acquire)
     }
 
     // ── BC message routing ──
@@ -96,14 +82,10 @@ impl RuntimeCoordinator {
             return true;
         }
 
-        // For non-HELLO messages, skip self-messages when from_tab is set.
         // Note: from_tab passed by spawn_bc_message_handler is the receiver's own
-        // tab ID (not the sender's) — this is a known bug inherited from V4 v2.
-        // For now, let all non-PROTO messages through; the heartbeat/follower
-        // tracking may use the receiver's tab ID as a coarse approximation.
-        if !from_tab.is_empty() && from_tab == self.tab_id {
-            return true;
-        }
+        // tab ID (not the sender's) — removed the self-message guard here because
+        // it incorrectly swallowed all BC messages. Every downstream handler does
+        // its own self-message filtering independently.
 
         let parts: Vec<&str> = msg.splitn(2, '|').collect();
         if parts.len() < 1 {
@@ -132,6 +114,28 @@ impl RuntimeCoordinator {
             "FOLLOWER_DETACH" => {
                 self.metrics.follower_detaches.fetch_add(1, Ordering::Relaxed);
                 self.runtime.presence_store.lock().unwrap().remove_follower(from_tab);
+                true
+            }
+            "PROTO|LEFT" => {
+                let parts: Vec<&str> = msg.splitn(3, '|').collect();
+                if parts.len() >= 2 {
+                    let leaver = parts[1];
+                    if leaver != self.tab_id {
+                        engine_info!("[coordinator] tab LEFT: {}", leaver);
+                        self.runtime.presence_store.lock().unwrap().remove_follower(leaver);
+                    }
+                } else {
+                    engine_debug!("[coordinator] PROTO|LEFT from tab={}", from_tab);
+                    self.runtime.presence_store.lock().unwrap().remove_follower(from_tab);
+                }
+                true
+            }
+            "PROTO|READY" => {
+                engine_debug!("[coordinator] PROTO|READY from tab={} (startup complete)", from_tab);
+                true
+            }
+            "PROTO|BUILDING" => {
+                engine_debug!("[coordinator] PROTO|BUILDING from tab={} (engine building)", from_tab);
                 true
             }
             _ => false,

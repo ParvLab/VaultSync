@@ -6,6 +6,9 @@ export { useSyncStatus } from './useSyncStatus.js';
 export { useVaultSyncOne } from './useVaultSyncOne.js';
 export { useVaultSyncMutations } from './useVaultSyncMutations.js';
 export { SyncIndicator } from './SyncIndicator.js';
+export { BootstrapProvider } from './BootstrapProvider.js';
+export type { RuntimeLifecycleStatus, RuntimeLifecycleState, BootstrapProviderProps } from './BootstrapProvider.js';
+export { useRuntimeLifecycle } from './useRuntimeLifecycle.js';
 
 // Plan compatibility aliases
 export * from './provider.js';

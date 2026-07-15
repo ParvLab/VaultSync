@@ -205,8 +205,13 @@ async fn test_chaos_leader_crash() {
     config1.sync_interval = Duration::from_millis(40);
     let client1 = VaultSyncClient::new(config1).await.unwrap();
     // Try to acquire leader lock — should succeed since this is the first client
-    assert!(client1.try_acquire_leader().unwrap(), "Client 1 should acquire leader lock");
-    assert!(client1.sync_status().await.unwrap().leader_status.unwrap(), "Client 1 should report leader");
+    use vaultsync_core::ipc::leader_election::{AcquireMode, AcquireResult};
+    // Client 1 acquires and HOLDS the lease
+    let lease1 = match client1.leader_election.acquire(AcquireMode::Immediate).await.unwrap() {
+        AcquireResult::Acquired(lease) => lease,
+        _ => panic!("Client 1 should acquire leader lock"),
+    };
+    assert!(client1.is_leader(), "Client 1 should report leader");
 
     // Reader client (Client 2)
     let mut config2 = VaultSyncConfig::default();
@@ -217,22 +222,23 @@ async fn test_chaos_leader_crash() {
     };
     config2.sync_interval = Duration::from_millis(40);
     let client2 = VaultSyncClient::new(config2).await.unwrap();
-    // Should NOT be able to acquire leader lock (Client 1 holds it)
-    assert!(!client2.try_acquire_leader().unwrap(), "Client 2 should NOT acquire leader lock");
-    assert!(!client2.sync_status().await.unwrap().leader_status.unwrap(), "Client 2 should report follower");
+    // Should NOT be able to acquire leader lock (Client 1 holds the lease)
+    let result2 = client2.leader_election.acquire(AcquireMode::Immediate).await.unwrap();
+    assert!(matches!(result2, AcquireResult::Waiting), "Client 2 should NOT acquire leader lock");
+    assert!(!client2.is_leader(), "Client 2 should report follower");
 
     // Simulate leader crash by dropping/shutting down Client 1
-    // Note: we explicitly release the leader lock because the compaction task
-    // holds an Arc reference to LeaderElection, preventing Drop from being called.
-    client1.release_leader();
+    drop(lease1);
     client1.shutdown().await.unwrap();
     drop(client1);
 
     // After Client 1 crash, Client 2 should be able to acquire the leader lock
-    assert!(
-        client2.try_acquire_leader().unwrap(),
-        "Client 2 should promote to leader after Client 1 crashes"
-    );
+    let lease2 = match client2.leader_election.acquire(AcquireMode::Immediate).await.unwrap() {
+        AcquireResult::Acquired(lease) => lease,
+        _ => panic!("Client 2 should promote to leader after Client 1 crashes"),
+    };
+    assert!(client2.is_leader(), "Client 2 should report leader after crash");
+    drop(lease2);
     assert!(
         client2.sync_status().await.unwrap().leader_status.unwrap(),
         "Client 2 should report leader after crash"
