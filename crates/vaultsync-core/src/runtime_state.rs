@@ -13,6 +13,11 @@ pub enum RuntimeState {
     /// Initial state — runtime created, no leadership decision yet.
     #[default]
     Starting,
+    /// Loading durable state into RuntimeStore. Queries block until Ready.
+    /// Entered on startup (before first sync completes), promotion
+    /// (after lock acquired, before RuntimeStore populated), and demotion
+    /// (after role swap, before SYNC data arrives).
+    Hydrating,
     /// Acquire(Immediate) returned Waiting — another tab holds the lock.
     /// This tab is a follower, running MirrorSession.
     Mirroring,
@@ -46,16 +51,24 @@ impl RuntimeState {
     /// returns Err for the caller to log and handle.
     pub fn transition(&self, target: RuntimeState) -> Result<RuntimeState, String> {
         let result = match (*self, &target) {
-            // Starting → Leading | Mirroring | ShuttingDown
+            // Starting → Hydrating | Leading | Mirroring | ShuttingDown
+            (RuntimeState::Starting, RuntimeState::Hydrating) => Ok(target),
             (RuntimeState::Starting, RuntimeState::Leading) => Ok(target),
             (RuntimeState::Starting, RuntimeState::Mirroring) => Ok(target),
             (RuntimeState::Starting, RuntimeState::ShuttingDown) => Ok(target),
 
-            // Mirroring → Promoting | ShuttingDown
+            // Hydrating → Leading | Mirroring | ShuttingDown
+            (RuntimeState::Hydrating, RuntimeState::Leading) => Ok(target),
+            (RuntimeState::Hydrating, RuntimeState::Mirroring) => Ok(target),
+            (RuntimeState::Hydrating, RuntimeState::ShuttingDown) => Ok(target),
+
+            // Mirroring → Promoting | Hydrating (demote then rehydrate) | ShuttingDown
             (RuntimeState::Mirroring, RuntimeState::Promoting) => Ok(target),
+            (RuntimeState::Mirroring, RuntimeState::Hydrating) => Ok(target),
             (RuntimeState::Mirroring, RuntimeState::ShuttingDown) => Ok(target),
 
-            // Promoting → Leading | Mirroring (session swap failed) | ShuttingDown
+            // Promoting → Hydrating | Leading | Mirroring (session swap failed) | ShuttingDown
+            (RuntimeState::Promoting, RuntimeState::Hydrating) => Ok(target),
             (RuntimeState::Promoting, RuntimeState::Leading) => Ok(target),
             (RuntimeState::Promoting, RuntimeState::Mirroring) => Ok(target),
             (RuntimeState::Promoting, RuntimeState::ShuttingDown) => Ok(target),
@@ -100,6 +113,10 @@ impl RuntimeState {
         )
     }
 
+    pub fn is_hydrating(&self) -> bool {
+        matches!(self, RuntimeState::Hydrating)
+    }
+
     pub fn can_write(&self) -> bool {
         matches!(self, RuntimeState::Leading)
     }
@@ -110,6 +127,7 @@ impl RuntimeState {
             RuntimeState::Degraded { .. } => RuntimeCapabilities::all(),
             RuntimeState::Mirroring => RuntimeCapabilities::STORAGE,
             RuntimeState::Promoting => RuntimeCapabilities::STORAGE,
+            RuntimeState::Hydrating => RuntimeCapabilities::STORAGE,
             RuntimeState::Starting | RuntimeState::ShuttingDown => RuntimeCapabilities::empty(),
         }
     }
@@ -134,6 +152,7 @@ impl RuntimeState {
             Self::Leading => ConnectionState::Leader,
             Self::Mirroring => ConnectionState::Mirror,
             Self::Promoting => ConnectionState::Promoting,
+            Self::Hydrating => ConnectionState::Connecting,
             Self::Degraded { .. } => ConnectionState::Leader,
             Self::Starting => ConnectionState::Connecting,
             Self::ShuttingDown => ConnectionState::Offline,
@@ -207,7 +226,7 @@ mod tests {
     #[test]
     fn test_legal_transitions_from_starting() {
         let s = RuntimeState::Starting;
-        assert!(s.transition(RuntimeState::Leading).is_ok());
+        assert!(s.transition(RuntimeState::Hydrating).is_ok());
         assert!(s.transition(RuntimeState::Mirroring).is_ok());
         assert!(s.transition(RuntimeState::ShuttingDown).is_ok());
     }
@@ -230,6 +249,14 @@ mod tests {
     }
 
     #[test]
+    fn test_hydrating_transitions() {
+        let s = RuntimeState::Hydrating;
+        assert!(s.transition(RuntimeState::Leading).is_ok());
+        assert!(s.transition(RuntimeState::Mirroring).is_ok());
+        assert!(s.transition(RuntimeState::ShuttingDown).is_ok());
+    }
+
+    #[test]
     fn test_mirroring_transitions() {
         let s = RuntimeState::Mirroring;
         assert!(s.transition(RuntimeState::Promoting).is_ok());
@@ -239,6 +266,7 @@ mod tests {
     #[test]
     fn test_promoting_transitions() {
         let s = RuntimeState::Promoting;
+        assert!(s.transition(RuntimeState::Hydrating).is_ok());
         assert!(s.transition(RuntimeState::Leading).is_ok());
         assert!(s.transition(RuntimeState::Mirroring).is_ok()); // promotion failed
         assert!(s.transition(RuntimeState::ShuttingDown).is_ok());
@@ -267,6 +295,9 @@ mod tests {
                 let _ = s.transition(RuntimeState::Starting);
             })).is_err());
             assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = s.transition(RuntimeState::Hydrating);
+            })).is_err());
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = s.transition(RuntimeState::Leading);
             })).is_err());
             assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -276,9 +307,15 @@ mod tests {
         #[cfg(not(debug_assertions))]
         {
             assert!(s.transition(RuntimeState::Starting).is_err());
+            assert!(s.transition(RuntimeState::Hydrating).is_err());
             assert!(s.transition(RuntimeState::Leading).is_err());
             assert!(s.transition(RuntimeState::Mirroring).is_err());
         }
+    }
+
+    #[test]
+    fn test_connection_state_mapping_hydrating() {
+        assert_eq!(RuntimeState::Hydrating.to_connection_state(), ConnectionState::Connecting);
     }
 
     #[test]

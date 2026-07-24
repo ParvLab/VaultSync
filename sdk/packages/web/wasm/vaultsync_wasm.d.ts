@@ -58,6 +58,10 @@ export class VaultSyncRuntime {
     [Symbol.dispose](): void;
     active_key_version(): bigint;
     /**
+     * Begin hydration phase. Must be paired with markReady().
+     */
+    beginHydration(): void;
+    /**
      * Check if cache eviction is needed.
      */
     cacheNeedsEviction(): boolean;
@@ -119,6 +123,11 @@ export class VaultSyncRuntime {
      */
     maintenanceTick(): number;
     /**
+     * Mark hydration complete. Unblocks any waiting find()/get() calls.
+     * Leader broadcasts LEADER_READY when marked ready.
+     */
+    markReady(): void;
+    /**
      * Returns a JSON snapshot of all metrics counters.
      * Phase 4: Returns mirror metrics in follower mode.
      */
@@ -166,6 +175,7 @@ export class VaultSyncRuntime {
      * Runs lifecycle (tombstone cleanup) on the given namespace, returns JSON stats.
      */
     runLifecycle(namespace: string): Promise<string>;
+    runtimeState(): string;
     /**
      * Returns the current runtime status as a string.
      * Sprint D: Enhanced runtime status with health, namespace, lag, and leader identity.
@@ -263,12 +273,20 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly init: () => void;
+    readonly set_log_level_from_str: (a: number, b: number) => void;
+    readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly __wbg_wasmipc_free: (a: number, b: number) => void;
     readonly wasmipc_new: (a: number, b: number) => [number, number, number];
     readonly wasmipc_new_with_channel: (a: any) => number;
     readonly wasmipc_on_message: (a: number, b: any) => void;
     readonly wasmipc_receive: (a: number) => [number, number];
     readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
+    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
+    readonly presencemanager_activePeers: (a: number) => [number, number];
+    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly presencemanager_peer_count: (a: number) => number;
     readonly __wbg_eventbusproxy_free: (a: number, b: number) => void;
     readonly __wbg_replicationnamespace_free: (a: number, b: number) => void;
     readonly __wbg_vaultsyncruntime_free: (a: number, b: number) => void;
@@ -280,6 +298,7 @@ export interface InitOutput {
     readonly replicationnamespace_pendingCount: (a: number) => number;
     readonly replicationnamespace_predictNext: (a: number, b: number) => [number, number, number, number];
     readonly vaultsyncruntime_active_key_version: (a: number) => bigint;
+    readonly vaultsyncruntime_beginHydration: (a: number) => void;
     readonly vaultsyncruntime_cacheNeedsEviction: (a: number) => number;
     readonly vaultsyncruntime_cacheStats: (a: number) => [number, number];
     readonly vaultsyncruntime_checkMirrorPromotion: (a: number) => number;
@@ -299,6 +318,7 @@ export interface InitOutput {
     readonly vaultsyncruntime_listNamespaces: (a: number) => [number, number];
     readonly vaultsyncruntime_list_key_versions: (a: number) => [number, number, number];
     readonly vaultsyncruntime_maintenanceTick: (a: number) => number;
+    readonly vaultsyncruntime_markReady: (a: number) => void;
     readonly vaultsyncruntime_metricsSnapshot: (a: number) => [number, number];
     readonly vaultsyncruntime_mirrorState: (a: number) => [number, number, number];
     readonly vaultsyncruntime_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => any;
@@ -313,6 +333,7 @@ export interface InitOutput {
     readonly vaultsyncruntime_resumeMirror: (a: number) => [number, number];
     readonly vaultsyncruntime_rotate_keys: (a: number) => any;
     readonly vaultsyncruntime_runLifecycle: (a: number, b: number, c: number) => any;
+    readonly vaultsyncruntime_runtimeState: (a: number) => [number, number];
     readonly vaultsyncruntime_runtimeStatus: (a: number) => [number, number];
     readonly vaultsyncruntime_runtime_storage_stats: (a: number) => [number, number, number];
     readonly vaultsyncruntime_shutdown: (a: number) => any;
@@ -337,20 +358,12 @@ export interface InitOutput {
     readonly workspacenamespace_get: (a: number, b: bigint) => [number, number, number, number];
     readonly workspacenamespace_list: (a: number) => [number, number, number, number];
     readonly workspacenamespace_update: (a: number, b: bigint, c: number, d: number, e: number, f: number) => [number, number, number];
-    readonly init: () => void;
-    readonly set_log_level_from_str: (a: number, b: number) => void;
-    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
-    readonly presencemanager_activePeers: (a: number) => [number, number];
-    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
-    readonly presencemanager_peer_count: (a: number) => number;
-    readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
-    readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h6742839cb717cdad: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_3: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_5: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_6: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h5a816e701a8600f2: (a: number, b: number) => void;

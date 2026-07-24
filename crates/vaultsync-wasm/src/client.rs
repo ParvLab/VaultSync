@@ -11,8 +11,8 @@ use crate::persistence_engine::{OpfsPersistenceEngine, PersistenceEngine};
 use crate::session_protocol::BC_MSG_SEQ;
 use crate::upload_scheduler::{PendingUpload, UploadAction};
 use crate::compaction_scheduler::CompactionScheduler;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -106,6 +106,10 @@ pub struct VaultSyncRuntime {
     saved_auth_token: Mutex<Option<String>>,
     saved_db_name: Mutex<Option<String>>,
     saved_storage_backend: Mutex<Option<String>>,
+    /// Phase 2: Runtime lifecycle state (Starting / Hydrating / Mirroring / Promoting / Leading).
+    runtime_state: AtomicU8,
+    /// Phase 2: Waiters blocked on hydration. Resolved when markReady() fires.
+    ready_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
 }
 
 /// Step 8: Promotion pipeline context — each field populated by exactly one phase.
@@ -134,6 +138,53 @@ struct PromoteCtx {
     saved_auth: Option<String>,
     saved_db: Option<String>,
     saved_backend: Option<String>,
+}
+
+// ── Runtime lifecycle state helpers (non-wasm-bindgen) ──
+impl VaultSyncRuntime {
+    const RS_STARTING: u8 = 0;
+    const RS_HYDRATING: u8 = 1;
+    const RS_MIRRORING: u8 = 2;
+    const RS_PROMOTING: u8 = 3;
+    const RS_LEADING: u8 = 4;
+
+    fn set_runtime_state(&self, state: u8) {
+        let prev = self.runtime_state.swap(state, Ordering::SeqCst);
+        let name = |s: u8| -> &'static str {
+            match s {
+                Self::RS_STARTING => "Starting",
+                Self::RS_HYDRATING => "Hydrating",
+                Self::RS_MIRRORING => "Mirroring",
+                Self::RS_PROMOTING => "Promoting",
+                Self::RS_LEADING => "Leading",
+                _ => "Unknown",
+            }
+        };
+        engine_info!("[LIFECYCLE] state: {} → {}", name(prev), name(state));
+    }
+
+    fn rs_state(&self) -> u8 {
+        self.runtime_state.load(Ordering::Acquire)
+    }
+
+    fn is_hydrating(&self) -> bool {
+        self.rs_state() == Self::RS_HYDRATING
+    }
+
+    /// Wait until runtime state is Ready (Leading or Mirroring).
+    /// Used by find()/get() to block queries during hydration.
+    async fn wait_until_ready(&self) {
+        if !self.is_hydrating() {
+            return;
+        }
+        let (tx, rx) = oneshot::channel::<()>();
+        self.ready_waiters.lock().unwrap().push(tx);
+        // Re-check after adding to waiter to avoid race with concurrent markReady
+        if !self.is_hydrating() {
+            return;
+        }
+        let _ = rx.await;
+    }
 }
 
 #[wasm_bindgen]
@@ -375,6 +426,8 @@ impl VaultSyncRuntime {
             saved_auth_token: Mutex::new(None),
             saved_db_name: Mutex::new(Some(final_db_name.clone())),
             saved_storage_backend: Mutex::new(None),
+            runtime_state: AtomicU8::new(Self::RS_STARTING),
+            ready_waiters: Arc::new(Mutex::new(Vec::new())),
         };
 
         // Phase II: new leader announces via BC
@@ -444,6 +497,8 @@ impl VaultSyncRuntime {
             saved_auth_token: Mutex::new(mirror.promote_auth.lock().unwrap().clone()),
             saved_db_name: Mutex::new(mirror.promote_db.lock().unwrap().clone()),
             saved_storage_backend: Mutex::new(mirror.promote_backend.lock().unwrap().clone()),
+            runtime_state: AtomicU8::new(Self::RS_STARTING),
+            ready_waiters: Arc::new(Mutex::new(Vec::new())),
         };
 
         // Phase 5: Register beforeunload handler for follower tab
@@ -933,6 +988,8 @@ impl VaultSyncRuntime {
                 saved_auth_token: Mutex::new(saved_auth),
                 saved_db_name: Mutex::new(Some(final_db_name.clone())),
                 saved_storage_backend: Mutex::new(storage_backend),
+                runtime_state: AtomicU8::new(Self::RS_STARTING),
+                ready_waiters: Arc::new(Mutex::new(Vec::new())),
             };
 
             // Announce READY via BC
@@ -943,7 +1000,8 @@ impl VaultSyncRuntime {
                     replica_id.to_string(),
                 );
                 protocol.send_sync_begin(namespace, 0, cursor);
-                engine_debug!("[Leader] announced READY cursor={}", cursor);
+                protocol.send_sync_done(cursor);
+                engine_info!("[Leader] announced READY cursor={} — sync_begin+done", cursor);
             }
 
             Self::spawn_pending_listener(&result);
@@ -972,6 +1030,9 @@ impl VaultSyncRuntime {
                 "new_with_coordinator leader invariant: must have client, no mirror or leader_election",
             );
 
+            // Hydrating — client.initialize() completed but RuntimeStore not yet populated.
+            // JS calls bootstrap() then markReady() to reach Leading.
+            result.set_runtime_state(VaultSyncRuntime::RS_HYDRATING);
             result.log_state("init_leader");
             Ok(result)
         } else {
@@ -1639,7 +1700,7 @@ impl VaultSyncRuntime {
             let coord = this.runtime_coordinator.clone();
             let replay_engine = this.replay_engine.clone();
 
-            let replay_in_progress = Arc::new(AtomicBool::new(false));
+            let replay_state: Arc<Mutex<(bool, VecDeque<u64>)>> = Arc::new(Mutex::new((false, VecDeque::new())));
             let bc_clone = bc.clone();
             let onmsg = Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
                 if let Some(msg_str) = e.data().as_string() {
@@ -1654,41 +1715,58 @@ impl VaultSyncRuntime {
                     if msg_str.starts_with("SYNC|") {
                         let sync_info = crate::session_protocol::SessionProtocol::parse_sync(&msg_str);
                         if let Some((_ver, _caps, _ns, cursor, _gen)) = sync_info {
-                            // Guard: only one active replay at a time
-                            let replay_flag = replay_in_progress.clone();
-                            if replay_flag.swap(true, Ordering::SeqCst) {
-                                engine_info!("[Session] ← SYNC SKIPPED from tab={}: cursor={} — replay already in progress", tab_id, cursor);
+                            // Queue-based guard: push cursor to queue; if no replay is running,
+                            // start one. The async loop processes entries sequentially, ensuring
+                            // every follower gets a dedicated replay session.
+                            let mut state = replay_state.lock().unwrap();
+                            if state.0 {
+                                state.1.push_back(cursor);
+                                engine_info!("[Session] ← SYNC QUEUED tab={}: cursor={} queue_size={}", tab_id, cursor, state.1.len());
                                 return;
                             }
-                            let replay_id = REPLAY_ID.fetch_add(1, Ordering::Relaxed);
-                            let bc_seq = BC_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
-                            engine_info!("[Session] ← SYNC from tab={}: cursor={} — sending initial state (replay={} bc_seq={})", tab_id, cursor, replay_id, bc_seq);
-                            let msg_begin = format!("SYNC_BEGIN|{}|{}|{}|{}|replay={}|bc_seq={}", 1u8, "default", cursor, cursor, replay_id, bc_seq);
-                            let _ = bc_clone.post_message(&JsValue::from_str(&msg_begin));
+                            state.0 = true;
+                            state.1.push_back(cursor);
+                            drop(state);
+
+                            engine_info!("[Session] ← SYNC from tab={}: cursor={} — starting replay session", tab_id, cursor);
                             // Phase 3: Replay via ReplayEngine — reads from persisted storage
                             if let Some(ref engine) = replay_engine {
                                 let bc_for_replay = bc_clone.clone();
                                 let tab_id_for_replay = tab_id.clone();
                                 let rt_for_cursor = rt.clone();
                                 let engine_clone = engine.clone();
-                                let replay_flag = replay_flag.clone();
+                                let replay_state_for_loop = replay_state.clone();
                                 wasm_bindgen_futures::spawn_local(async move {
                                     let sink = BcMutationSink::new(bc_for_replay, tab_id_for_replay);
-                                    let ctx = ReplayContext::new("default", cursor);
-                                    let report = engine_clone.replay_since(&ctx, &sink).await;
-                                    replay_flag.store(false, Ordering::SeqCst);
-                                    // Read the authoritative cursor from metadata_store
-                                    let current_cursor = match rt_for_cursor {
-                                        Some(ref r) => r.metadata_store.lock().unwrap().cursor,
-                                        None => report.requested_cursor,
-                                    };
-                                    // Send SYNC_DONE with the real cursor and replay_id
-                                    let replay_id = REPLAY_ID.fetch_add(1, Ordering::Relaxed);
-                                    let bc_seq = BC_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
-                                    let msg_done = format!("SYNC_DONE|{}|{}|replay={}|bc_seq={}", 1u8, current_cursor, replay_id, bc_seq);
-                                    let _ = sink.bc().post_message(&JsValue::from_str(&msg_done));
-                                    let (send_fails, serialize_fails) = sink.reset_fail_counts();
-                                    engine_info!("[Session] → SYNC_DONE cursor={} replay={} bc_seq={} — sent={} send_fails={} serialize_fails={} report={}", current_cursor, replay_id, bc_seq, report.emitted, send_fails, serialize_fails, report.summary());
+                                    loop {
+                                        let cursor = {
+                                            let mut state = replay_state_for_loop.lock().unwrap();
+                                            match state.1.pop_front() {
+                                                Some(c) => c,
+                                                None => {
+                                                    state.0 = false;
+                                                    break;
+                                                }
+                                            }
+                                        };
+                                        let replay_id = REPLAY_ID.fetch_add(1, Ordering::Relaxed);
+                                        let bc_seq = BC_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+                                        engine_info!("[Session] ← SYNC processing cursor={} replay={} bc_seq={}", cursor, replay_id, bc_seq);
+                                        let msg_begin = format!("SYNC_BEGIN|{}|{}|{}|{}|replay={}|bc_seq={}", 1u8, "default", cursor, cursor, replay_id, bc_seq);
+                                        let _ = sink.bc().post_message(&JsValue::from_str(&msg_begin));
+                                        let ctx = ReplayContext::new("default", cursor);
+                                        let report = engine_clone.replay_since(&ctx, &sink).await;
+                                        let current_cursor = match rt_for_cursor {
+                                            Some(ref r) => r.metadata_store.lock().unwrap().cursor,
+                                            None => report.requested_cursor,
+                                        };
+                                        let replay_id = REPLAY_ID.fetch_add(1, Ordering::Relaxed);
+                                        let bc_seq = BC_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+                                        let msg_done = format!("SYNC_DONE|{}|{}|replay={}|bc_seq={}", 1u8, current_cursor, replay_id, bc_seq);
+                                        let _ = sink.bc().post_message(&JsValue::from_str(&msg_done));
+                                        let (send_fails, serialize_fails) = sink.reset_fail_counts();
+                                        engine_info!("[Session] → SYNC_DONE cursor={} replay={} bc_seq={} — sent={} send_fails={} serialize_fails={} report={}", current_cursor, replay_id, bc_seq, report.emitted, send_fails, serialize_fails, report.summary());
+                                    }
                                 });
                             }
                         }
@@ -2363,17 +2441,8 @@ impl VaultSyncRuntime {
         Self::spawn_pending_listener(self);
         Self::spawn_bc_message_handler(self);
 
-        // ── Phase 6: Announce — broadcast LEADER_READY via BC ──
-        // NOTE: handler registration (above) MUST precede broadcast to avoid a race
-        // where the demoted tab's SYNC arrives before the WASM handler is installed.
-        if let Some(ref bc) = self.cross_tab_channel {
-            let cursor = runtime.metadata_store.lock().unwrap().cursor;
-            let bc_seq = BC_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
-            engine_info!("[promotion] step=announce_readying cursor={} bc_seq={}", cursor, bc_seq);
-            let announce = format!("LEADER_READY|{}|{}|bc_seq={}", self.tab_id, cursor, bc_seq);
-            let _ = bc.post_message(&JsValue::from_str(&announce));
-            engine_info!("[promotion] announced LEADER_READY cursor={}", cursor);
-        }
+        // NOTE: LEADER_READY broadcast is now deferred to markReady()
+        //       after JS hydration completes. Do not broadcast here.
 
         // Register beforeunload handler
         if let Some(ref bc) = self.cross_tab_channel {
@@ -2515,6 +2584,9 @@ impl VaultSyncRuntime {
             engine_info!("[demote] SYNC sent to new leader ns={}", ns);
         }
 
+        // Set Hydrating state — queries block until BC SYNC data arrives
+        self.set_runtime_state(Self::RS_HYDRATING);
+
         // ── 5. Acquire Web Lock in Wait mode for future promotion ──
         let le = Arc::new(
             vaultsync_core::ipc::leader_election::LeaderElection::new(
@@ -2634,6 +2706,55 @@ impl VaultSyncRuntime {
             "[state] {} ENGINE={} LOCK={} HEARTBEAT={} MIRROR={} BADGE={} CURSOR={}",
             tag, cap, lock, heartbeat, mirror, badge, cursor,
         );
+    }
+
+    // ── JS-accessible lifecycle exports ──
+
+    /// Begin hydration phase. Must be paired with markReady().
+    #[wasm_bindgen(js_name = beginHydration)]
+    pub fn begin_hydration(&self) {
+        self.set_runtime_state(Self::RS_HYDRATING);
+    }
+
+    /// Mark hydration complete. Unblocks any waiting find()/get() calls.
+    /// Leader broadcasts LEADER_READY when marked ready.
+    #[wasm_bindgen(js_name = markReady)]
+    pub fn mark_ready(&self) {
+        let state = self.rs_state();
+        let is_leader = self.capability_manager.as_ref().map(|cm| cm.is_leader()).unwrap_or(false);
+        let target = if is_leader { Self::RS_LEADING } else { Self::RS_MIRRORING };
+        if state == target {
+            return; // Already ready
+        }
+        self.set_runtime_state(target);
+        // Unblock waiters
+        for tx in self.ready_waiters.lock().unwrap().drain(..) {
+            let _ = tx.send(());
+        }
+        // Broadcast LEADER_READY now that we're truly ready
+        if is_leader {
+            if let Some(ref bc) = self.cross_tab_channel {
+                let cursor = self.runtime.as_ref()
+                    .map(|r| r.metadata_store.lock().unwrap().cursor)
+                    .unwrap_or(0);
+                let bc_seq = BC_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+                let announce = format!("LEADER_READY|{}|{}|bc_seq={}", self.tab_id, cursor, bc_seq);
+                let _ = bc.post_message(&JsValue::from_str(&announce));
+                engine_info!("[LIFECYCLE] LEADER_READY broadcast after hydration cursor={} bc_seq={}", cursor, bc_seq);
+            }
+        }
+    }
+
+    #[wasm_bindgen(js_name = runtimeState)]
+    pub fn runtime_state_str(&self) -> String {
+        match self.rs_state() {
+            Self::RS_STARTING => "Starting".to_string(),
+            Self::RS_HYDRATING => "Hydrating".to_string(),
+            Self::RS_MIRRORING => "Mirroring".to_string(),
+            Self::RS_PROMOTING => "Promoting".to_string(),
+            Self::RS_LEADING => "Leading".to_string(),
+            _ => "Unknown".to_string(),
+        }
     }
 
     /// Phase 6: Atomic transition to Leader role.
@@ -3222,15 +3343,9 @@ impl vaultsync_core::storage::traits::MutationSink for BcMutationSink {
     }
 
     fn send_sync_done(&self, _cursor: u64, count: u64) {
-        // Note: actual cursor value is passed through the ReplayReport,
-        // but the BC protocol expects it here too. We use 0 as a placeholder
-        // since the real cursor comes from ReplayReport.
-        engine_warn!("[BcMutationSink] send_sync_done CALLED — expected dead code (emitted={})", count);
-        let replay_id = REPLAY_ID.fetch_add(1, Ordering::Relaxed);
-        let bc_seq = BC_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
-        let msg = format!("SYNC_DONE|{}|{}|replay={}|bc_seq={}", 1u8, 0, replay_id, bc_seq);
-        let _ = self.bc.post_message(&JsValue::from_str(&msg));
-        engine_warn!("[BcMutationSink] SYNC_DONE sent replay={} bc_seq={} (emitted={})", replay_id, bc_seq, count);
+        // Dead code — ReplayEngine never calls send_sync_done.
+        // The explicit SYNC_DONE is sent by the caller after replay_since() returns.
+        let _ = count;
     }
 }
 

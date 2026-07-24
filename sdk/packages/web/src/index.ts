@@ -70,12 +70,16 @@ export class VaultSyncClient {
 
   /** Current runtime status object with mode, leader_alive, cursor, etc.
    *  Legacy string comparison (=== "Leader") still works via toString(). */
-  get runtimeStatus(): { mode: string; leader_alive?: boolean; cursor?: number; pending_count?: number; promotion_ready?: boolean; leader_left?: boolean; } {
+  get runtimeStatus(): { mode: string; state: string; leader_alive?: boolean; cursor?: number; pending_count?: number; promotion_ready?: boolean; leader_left?: boolean; } {
     const raw: string = this.inner.runtimeStatus();
     try {
-      return JSON.parse(raw);
+      const parsed = JSON.parse(raw);
+      if (!parsed.state) {
+        parsed.state = this.inner.runtimeState();
+      }
+      return parsed;
     } catch {
-      return { mode: raw };
+      return { mode: raw, state: this.inner.runtimeState() };
     }
   }
 
@@ -312,6 +316,10 @@ export class VaultSyncClient {
           const replayMatch = e.data.match(/replay=(\d+)/);
           const replayId = replayMatch ? parseInt(replayMatch[1], 10) : 0;
           const prevDepth = this.replayDepth;
+          if (this.replayDepth <= 0) {
+            console.warn('[SYNC] SYNC_DONE without matching SYNC_BEGIN depth=%d — ignoring', this.replayDepth);
+            return;
+          }
           this.replayDepth--;
           this._bcCounts.done++;
           const bufLen = this.replayBuffer.length;
@@ -342,6 +350,10 @@ export class VaultSyncClient {
           if (this._hydrationResolve) {
             this._hydrationResolve();
             this._hydrationResolve = null;
+          }
+          // If we were in Hydrating state (e.g., after demotion), transition to ready
+          if (this.inner.runtimeState() === 'Hydrating') {
+            this.inner.markReady();
           }
           console.log('[BC_SUMMARY]', JSON.stringify({
             ...this._bcCounts, buffered: bufLen, deleted: deletedCount,
@@ -574,12 +586,23 @@ export class VaultSyncClient {
   }
 
   async get(docId: string, recordId: string): Promise<RecordFields | null> {
+    await this._waitForReady();
     const jsonStr = await this.inner.get(docId, recordId);
     if (!jsonStr) return null;
     return JSON.parse(jsonStr);
   }
 
+  /** Wait until runtime is ready (not Hydrating/Starting). Polls every 50ms. */
+  private async _waitForReady(): Promise<void> {
+    while (true) {
+      const s = this.inner.runtimeState();
+      if (s !== 'Hydrating' && s !== 'Starting') break;
+      await new Promise(r => setTimeout(r, 50));
+    }
+  }
+
   async find(docId: string): Promise<RecordFields[]> {
+    await this._waitForReady();
     const arr = await this.inner.find(docId);
     const result: RecordFields[] = [];
     for (let i = 0; i < arr.length; i++) {
@@ -676,6 +699,9 @@ export class VaultSyncClient {
           }
         }
       }
+      // Phase 2: Mark runtime as ready — unblocks find()/get() queries
+      this.inner.markReady();
+      console.log('[LIFECYCLE] leader hydrated — state=Ready');
     } else {
       // Mirror/follower: wait for initial replay hydration, then fall back to WASM.
       // This replaces the no-op path that relied entirely on the replay pipeline
@@ -722,6 +748,9 @@ export class VaultSyncClient {
           }
         }
       }
+      // Phase 2: Mark runtime as ready — unblocks find()/get() queries
+      this.inner.markReady();
+      console.log('[LIFECYCLE] follower hydrated — state=Mirroring');
       // Always reset hydration state for next bootstrap call
       this._hydrationResolve = null;
       this._hydrationPromise = null;
