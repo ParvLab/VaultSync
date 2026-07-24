@@ -15,6 +15,7 @@ use vaultsync_core::storage::manager::StorageManager;
 /// Phase-agnostic tick() that JS SDK calls periodically via setInterval.
 /// Never blocks startup. Driven externally.
 pub struct MaintenanceRuntime {
+    pub id: u64,
     storage_runtime: Arc<StorageRuntime>,
     _storage_manager: Arc<dyn StorageManager>,
     _runtime: Arc<Runtime>,
@@ -51,7 +52,10 @@ impl MaintenanceRuntime {
         metrics: Arc<RuntimeMetrics>,
         metadata_runtime: Option<Arc<MetadataRuntime>>,
     ) -> Arc<Self> {
+        let id = crate::runtime::next_runtime_id();
+        engine_info!("[MaintenanceRuntime#{}] new with StorageRuntime#{}", id, storage_runtime.id);
         Arc::new(Self {
+            id,
             storage_runtime,
             _storage_manager: storage_manager,
             _runtime: runtime,
@@ -137,7 +141,7 @@ impl MaintenanceRuntime {
         if now.saturating_sub(last_checkpoint) >= self.checkpoint_interval_ms.load(Ordering::Acquire) {
             if let Some(ref mr) = self.metadata_runtime {
                 if mr.is_dirty() {
-                    engine_trace!("[maintenance] checkpoint due (dirty)");
+                    engine_info!("[maintenance#{}] checkpoint due (dirty, cursor={:?})", self.id, mr.read_sync_state().map(|s| s.last_synced_sequence));
                 }
             }
             self.last_checkpoint_ms.store(now, Ordering::Release);
@@ -174,9 +178,12 @@ impl MaintenanceRuntime {
         if now.saturating_sub(last_checkpoint) < self.checkpoint_interval_ms.load(Ordering::Acquire) {
             if let Some(ref mr) = self.metadata_runtime {
                 if mr.is_dirty() {
+                    engine_info!("[maintenance#{}] run_deferred: flushing checkpoint", self.id);
                     if let Err(e) = mr.checkpoint().await {
-                        engine_warn!("[maintenance] checkpoint failed: {:?}", e);
+                        engine_warn!("[maintenance#{}] checkpoint failed: {:?}", self.id, e);
                     }
+                } else {
+                    engine_trace!("[maintenance#{}] run_deferred: checkpoint skipped (not dirty)", self.id);
                 }
             }
         }
@@ -214,5 +221,11 @@ impl RuntimeLifecycle for MaintenanceRuntime {
         }
         self.stop();
         Ok(())
+    }
+}
+
+impl Drop for MaintenanceRuntime {
+    fn drop(&mut self) {
+        engine_info!("[MaintenanceRuntime#{}] dropped (last Arc reference released)", self.id);
     }
 }

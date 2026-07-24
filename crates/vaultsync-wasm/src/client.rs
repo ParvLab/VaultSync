@@ -95,6 +95,8 @@ pub struct VaultSyncRuntime {
     /// never released. When the tab demotes, this field is set to None and the
     /// Lease is dropped, releasing the lock to the next waiting follower.
     leader_lease: Option<vaultsync_core::ipc::leader_election::Lease>,
+    /// Phase 3: LifecycleManager — single background tick loop for maintenance.
+    lifecycle_manager: Option<Arc<crate::lifecycle_manager::LifecycleManager>>,
     /// Step 4: oneshot receiver for event-driven promotion notification.
     /// Resolved when LeaderEvent::Acquired fires (Web Lock granted) or LEFT received.
     promotion_rx: Mutex<Option<oneshot::Receiver<()>>>,
@@ -337,6 +339,13 @@ impl VaultSyncRuntime {
             vault_runtime = Some(vr.with_compaction(cs));
         }
 
+        // Phase 3: Start lifecycle manager for maintenance ticks
+        let lifecycle = crate::lifecycle_manager::LifecycleManager::new(5000);
+        if let Some(ref mr) = vault_runtime.as_ref().and_then(|vr| vr.ctx.maintenance.clone()) {
+            lifecycle.register_maintenance(mr);
+        }
+        lifecycle.start();
+
         let result = Self {
             client: Some(client),
             storage_manager: Some(storage_manager),
@@ -360,6 +369,7 @@ impl VaultSyncRuntime {
             leader_election: None,
             leader_lease: None,
             promotion_rx: Mutex::new(None),
+            lifecycle_manager: Some(lifecycle),
             saved_namespace: Mutex::new(namespace.to_string()),
             saved_coordinator_url: Mutex::new(String::new()),
             saved_auth_token: Mutex::new(None),
@@ -428,6 +438,7 @@ impl VaultSyncRuntime {
             leader_election,
             leader_lease: None,
             promotion_rx: Mutex::new(promotion_rx),
+            lifecycle_manager: None,
             saved_namespace: Mutex::new(mirror.promote_ns.lock().unwrap().clone()),
             saved_coordinator_url: Mutex::new(mirror.promote_url.lock().unwrap().clone()),
             saved_auth_token: Mutex::new(mirror.promote_auth.lock().unwrap().clone()),
@@ -440,8 +451,10 @@ impl VaultSyncRuntime {
         let tab_id_unload = replica_id.to_string();
         if let Some(window) = web_sys::window() {
             let onunload = Closure::wrap(Box::new(move || {
+                // Best-effort: send LEFT via BC. OPFS checkpoint not possible here.
                 let msg = format!("PROTO|LEFT|{}|", tab_id_unload);
                 let _ = bc_unload.post_message(&JsValue::from_str(&msg));
+                engine_info!("[lifecycle] follower beforeunload: sent LEFT, no metadata to flush");
             }) as Box<dyn FnMut()>);
             window.set_onbeforeunload(Some(onunload.as_ref().unchecked_ref()));
             onunload.forget();
@@ -460,6 +473,12 @@ impl VaultSyncRuntime {
     /// Phase 4: Handle BC messages for MirrorRuntime (follower) mode.
     /// Processes HEARTBEAT, MUTATION, SYNC_BEGIN, SYNC_DONE, LEADER_ELECTED messages.
     fn handle_mirror_bc_message(mirror: &MirrorRuntime, msg_str: &str) {
+        // Phase 3: If paused for promotion, skip all mutations.
+        // The paused flag stays true until promotion completes.
+        if mirror.paused.load(Ordering::Acquire) {
+            return;
+        }
+
         if msg_str.starts_with("HEARTBEAT|") {
             let parts: Vec<&str> = msg_str.splitn(5, '|').collect();
             if parts.len() >= 5 {
@@ -477,14 +496,31 @@ impl VaultSyncRuntime {
                 crate::session_protocol::SessionProtocol::parse_mutation(msg_str)
             {
                 if let Ok(fields) = json_to_fields(&fields_str) {
-                    for (field, value) in &fields {
-                        mirror.apply_mutation(&doc_id, &record_id, field, value.clone());
+                    let is_delete = fields.get("__deleted__").or_else(|| fields.get("_deleted"))
+                        .and_then(|v| if let CrdtValue::Boolean(b) = v { Some(*b) } else { None })
+                        .unwrap_or(false);
+                    if is_delete {
+                        let before = mirror.query_doc(&doc_id).len();
+                        mirror.remove_record(&doc_id, &record_id);
+                        let after = mirror.query_doc(&doc_id).len();
+                        engine_info!("[mirror] DELETE doc={} record={} records={}->{}", doc_id, record_id, before, after);
+                        let mut delete_fields = std::collections::HashMap::new();
+                        delete_fields.insert("__deleted__".to_string(), CrdtValue::Boolean(true));
+                        mirror.fire_subscription(&doc_id, &record_id, &delete_fields);
+                    } else {
+                        for (field, value) in &fields {
+                            mirror.apply_mutation(&doc_id, &record_id, field, value.clone());
+                        }
+                        let fields_copy = fields;
+                        mirror.fire_subscription(&doc_id, &record_id, &fields_copy);
                     }
-                    let fields_copy = fields;
-                    mirror.fire_subscription(&doc_id, &record_id, &fields_copy);
+                } else {
+                    mirror.decode_fail_count.fetch_add(1, Ordering::Relaxed);
+                    engine_trace!("[mirror] MUTATION decode fail: doc={} record={} len={}", doc_id, record_id, fields_str.len());
                 }
                 mirror.replay_mutation_count.fetch_add(1, Ordering::Relaxed);
                 mirror.last_heartbeat.store(js_sys::Date::now() as u64, Ordering::Release);
+                mirror.drain_seq.fetch_add(1, Ordering::Release);
             }
             return;
         }
@@ -510,9 +546,12 @@ impl VaultSyncRuntime {
                 crate::session_protocol::SessionProtocol::parse_sync_done(msg_str)
             {
                 let count = mirror.replay_mutation_count.swap(0, Ordering::Relaxed);
+                let decode_fails = mirror.decode_fail_count.swap(0, Ordering::Relaxed);
+                let doc_count = mirror.cached_count();
                 mirror.cursor.store(cursor, Ordering::Release);
                 mirror.last_heartbeat.store(js_sys::Date::now() as u64, Ordering::Release);
-                engine_info!("[Session] ← SYNC_DONE cursor={} — replay complete: {} mutations applied", cursor, count);
+                engine_info!("[Session] ← SYNC_DONE cursor={} — total={} decode_fails={} applied={} docs_in_store={}",
+                    cursor, count, decode_fails, count.saturating_sub(decode_fails), doc_count);
             }
             return;
         }
@@ -719,6 +758,11 @@ impl VaultSyncRuntime {
             ));
             phase_log("coordinator ready");
 
+            // Create ConnectionManager and wire to coordinator (single source of truth for WS state)
+            let (cm, _conn_events) = vaultsync_core::connection_manager::ConnectionManager::new();
+            coordinator.set_connection_manager(cm.clone());
+            phase_log("connection_manager ready");
+
             // Clone the Arc BEFORE coercing to dyn Coordinator, so we keep a concrete reference
             let coordinator_for_client: Arc<dyn vaultsync_core::coordinator::traits::Coordinator> =
                 coordinator.clone();
@@ -748,6 +792,9 @@ impl VaultSyncRuntime {
                 }
             };
             phase_log("client built");
+
+            // Wire ConnectionManager to UploadQueue (authoritative offline check before push)
+            client.set_connection_manager(Some(cm));
 
             // Wire WS mutation push → download/upload notifications BEFORE initialize (no race)
             coordinator.set_download_notify(client.events.download_notify.clone());
@@ -850,6 +897,13 @@ impl VaultSyncRuntime {
                 Some(Arc::new(crate::replay_engine::ReplayEngine::new(reader)))
             });
 
+            // Phase 3: Start lifecycle manager for maintenance ticks
+            let lifecycle = crate::lifecycle_manager::LifecycleManager::new(5000);
+            if let Some(ref mr) = vault_runtime.as_ref().and_then(|vr| vr.ctx.maintenance.clone()) {
+                lifecycle.register_maintenance(mr);
+            }
+            lifecycle.start();
+
             let result = Self {
                 client: Some(client),
                 storage_manager: Some(storage_manager),
@@ -873,6 +927,7 @@ impl VaultSyncRuntime {
                 leader_election: None,
                 leader_lease, // Held for entire leader session — never dropped until demote
                 promotion_rx: Mutex::new(None),
+                lifecycle_manager: Some(lifecycle),
                 saved_namespace: Mutex::new(namespace.to_string()),
                 saved_coordinator_url: Mutex::new(coordinator_url.to_string()),
                 saved_auth_token: Mutex::new(saved_auth),
@@ -900,12 +955,16 @@ impl VaultSyncRuntime {
                 let tab_id_unload = replica_id.to_string();
                 let window = web_sys::window().unwrap_throw();
                 let onunload = Closure::wrap(Box::new(move || {
+                    // Best-effort: send LEFT via BC. Periodic checkpoint (every 60s)
+                    // is the real durability mechanism — beforeunload is not guaranteed
+                    // to complete async operations.
                     let msg = format!("PROTO|LEFT|{}|", tab_id_unload);
                     let _ = bc_unload.post_message(&JsValue::from_str(&msg));
+                    engine_info!("[lifecycle] leader beforeunload: sent LEFT — metadata persistence depends on last periodic checkpoint");
                 }) as Box<dyn FnMut()>);
                 window.set_onbeforeunload(Some(onunload.as_ref().unchecked_ref()));
                 onunload.forget();
-                engine_debug!("[lifecycle] beforeunload handler registered");
+                engine_info!("[lifecycle] beforeunload handler registered (leader)");
             }
 
             debug_assert!(
@@ -1243,6 +1302,12 @@ impl VaultSyncRuntime {
     }
 
     pub async fn delete(&self, doc_id: &str, record_id: &str) -> Result<(), JsValue> {
+        if doc_id.is_empty() || record_id.is_empty() {
+            return Err(JsValue::from_str(&format!(
+                "delete: doc_id and record_id must be non-empty (got doc={:?} record={:?})",
+                doc_id, record_id
+            )));
+        }
         // Phase 4: MirrorRuntime mode — send BC command to leader
         if self.mirror.is_some() {
             engine_debug!("[MirrorRuntime] delete doc={} record={}", doc_id, record_id);
@@ -1375,6 +1440,16 @@ impl VaultSyncRuntime {
     }
 
     pub async fn find(&self, doc_id: &str) -> Result<js_sys::Array, JsValue> {
+        // Log which path is taken
+        let path = if self.mirror.is_some() { "mirror" }
+            else if self.client.is_some() { "client" }
+            else if self.runtime.is_some() { "runtime_fallback" }
+            else { "none" };
+        engine_info!(
+            "[FIND] doc={} path={} has_mirror={} has_client={} has_runtime={}",
+            doc_id, path, self.mirror.is_some(), self.client.is_some(), self.runtime.is_some(),
+        );
+
         // MirrorRuntime mode — read from in-memory store (no OPFS available)
         if let Some(ref mirror) = self.mirror {
             let records = mirror.query_doc(doc_id);
@@ -1384,6 +1459,7 @@ impl VaultSyncRuntime {
                     .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))?;
                 arr.push(&JsValue::from_str(&json_str));
             }
+            engine_info!("[FIND] mirror_path doc={} records={}", doc_id, arr.length());
             return Ok(arr);
         }
 
@@ -1391,14 +1467,50 @@ impl VaultSyncRuntime {
         // in-memory cache over OPFS, as the cache may be partially populated from BC
         // mutations during startup, returning incomplete results.
         let records = if let Some(ref c) = self.client {
-            c.find(doc_id, None).await
+            let results = c.find(doc_id, None).await;
+            match &results {
+                Ok(recs) => {
+                    let total = recs.len();
+                    let mut deleted = 0usize;
+                    let mut ids: Vec<String> = Vec::new();
+                    for r in recs {
+                        let rid = r.get("record_id").or_else(|| r.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        let is_del = r.get("_deleted").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if is_del { deleted += 1; }
+                        ids.push(format!("{}(del={})", rid, is_del));
+                    }
+                    engine_info!("[FIND] client_path doc={} total={} deleted={} returned={} ids=[{}]",
+                        doc_id, total, deleted, total - deleted, ids.join(","));
+                }
+                Err(e) => {
+                    engine_info!("[FIND] client_path doc={} error={:?}", doc_id, e);
+                }
+            }
+            results
         } else if let Some(ref rt) = self.runtime {
             // No client available (promotion in-flight) — fall back to Runtime cache
             let store = rt.document_store.lock().unwrap();
             let results: Vec<HashMap<String, CrdtValue>> = store.query_doc(doc_id)
                 .into_iter().map(|r| r.clone()).collect();
+            let total = results.len();
+            let mut deleted = 0usize;
+            let mut ids: Vec<String> = Vec::new();
+            for r in &results {
+                let rid = r.get("record_id").or_else(|| r.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let is_del = r.get("_deleted").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || r.get("__deleted__").and_then(|v| v.as_bool()).unwrap_or(false);
+                if is_del { deleted += 1; }
+                ids.push(format!("{}(del={})", rid, is_del));
+            }
+            engine_info!("[FIND] runtime_fallback doc={} total={} deleted={} returned={} ids=[{}]",
+                doc_id, total, deleted, total - deleted, ids.join(","));
             Ok(results)
         } else {
+            engine_info!("[FIND] no_path doc={} records=0", doc_id);
             Ok(Vec::new())
         }
         .map_err(|e| JsValue::from_str(&format!("Find failed: {:?}", e)))?;
@@ -1566,7 +1678,8 @@ impl VaultSyncRuntime {
                                     let bc_seq = BC_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
                                     let msg_done = format!("SYNC_DONE|{}|{}|replay={}|bc_seq={}", 1u8, current_cursor, replay_id, bc_seq);
                                     let _ = sink.bc().post_message(&JsValue::from_str(&msg_done));
-                                    engine_info!("[Session] → SYNC_DONE cursor={} replay={} bc_seq={} — sent {} mutations (report: {})", current_cursor, replay_id, bc_seq, report.emitted, report.summary());
+                                    let (send_fails, serialize_fails) = sink.reset_fail_counts();
+                                    engine_info!("[Session] → SYNC_DONE cursor={} replay={} bc_seq={} — sent={} send_fails={} serialize_fails={} report={}", current_cursor, replay_id, bc_seq, report.emitted, send_fails, serialize_fails, report.summary());
                                 });
                             }
                         }
@@ -1840,6 +1953,51 @@ impl VaultSyncRuntime {
         }
     }
 
+    /// Phase 3: Pause mirror mutation processing for deterministic promotion snapshot.
+    /// After pause(), no BC mutations will be applied. Returns the current drain_seq
+    /// value so JS can verify the queue is quiescent.
+    #[wasm_bindgen(js_name = pauseMirror)]
+    pub fn pause_mirror(&self) -> Result<u64, JsValue> {
+        match self.mirror.as_ref() {
+            Some(m) => {
+                m.pause();
+                Ok(m.current_drain_seq())
+            }
+            None => Err(JsValue::from_str("not in mirror mode")),
+        }
+    }
+
+    /// Phase 3: Resume mirror mutation processing (abort promotion).
+    #[wasm_bindgen(js_name = resumeMirror)]
+    pub fn resume_mirror(&self) -> Result<(), JsValue> {
+        match self.mirror.as_ref() {
+            Some(m) => {
+                m.resume();
+                Ok(())
+            }
+            None => Err(JsValue::from_str("not in mirror mode")),
+        }
+    }
+
+    /// Phase 3: Check mirror paused state and drain_seq for promotion diagnostics.
+    #[wasm_bindgen(js_name = mirrorState)]
+    pub fn mirror_state(&self) -> Result<JsValue, JsValue> {
+        match self.mirror.as_ref() {
+            Some(m) => {
+                let state = serde_json::json!({
+                    "paused": m.is_paused(),
+                    "drain_seq": m.current_drain_seq(),
+                    "doc_count": m.cached_count(),
+                    "cursor": m.cursor.load(std::sync::atomic::Ordering::Acquire),
+                    "pending_count": m.pending_count.load(std::sync::atomic::Ordering::Acquire),
+                });
+                let json_str = serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string());
+                Ok(js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL))
+            }
+            None => Ok(JsValue::NULL),
+        }
+    }
+
     /// Phase 4f: Check if mirror should promote to leader (leader heartbeat timeout).
     /// Returns true if leader is gone and JS should reinitialize with new_with_coordinator().
     /// Legacy — prefer waitForPromotion() for event-driven usage.
@@ -1928,6 +2086,15 @@ impl VaultSyncRuntime {
             let metrics = Arc::new(crate::metrics::RuntimeMetrics::default());
             match crate::storage_runtime::StorageRuntime::new(pages, metrics.clone()).await {
                 Ok(storage_runtime) => {
+                    // Phase 1 invariant: compare mirror's in-memory state vs newly opened OPFS
+                    {
+                        let mirror_docs = mirror.cached_count();
+                        let mirror_cursor_val = mirror.cursor.load(Ordering::Acquire);
+                        let mirror_gen = mirror.runtime_gen.load(Ordering::Acquire);
+                        let summary = storage_runtime.manifest_summary();
+                        engine_info!("[promotion] mirror_vs_opfs: mirror_docs={} mirror_cursor={} mirror_gen={} | opfs=[{}]",
+                            mirror_docs, mirror_cursor_val, mirror_gen, summary);
+                    }
                     opfs.set_storage_runtime(storage_runtime.clone());
                     let sync_rt = crate::sync_runtime::SyncRuntime::new();
                     if let Some(mr) = opfs.try_load_metadata_runtime().await {
@@ -1997,6 +2164,7 @@ impl VaultSyncRuntime {
 
         // B3: Use SyncRuntime-backed SyncStateStore when available (forwards to MetadataRuntime)
         // Falls back to InMemorySyncStateStore with mirror's cursor when SyncRuntime is unavailable.
+        let promote_sync_store_ref = promote_sync_store.as_ref().map(|s| s.clone());
         let sync_store: Arc<dyn vaultsync_core::sync::sync_state_store::SyncStateStore> = promote_sync_store.unwrap_or_else(|| {
             Arc::new(vaultsync_core::sync::sync_state_store::InMemorySyncStateStore::with_cursor(mirror_cursor))
         });
@@ -2026,6 +2194,19 @@ impl VaultSyncRuntime {
             return Err(JsValue::from_str(&msg));
         }
         plog("client_initialized");
+        {
+            let sync_rt_info = promote_sync_store_ref.as_ref().map(|_| {
+                let sr = vault_runtime.as_ref().and_then(|vr| vr.sync());
+                match sr {
+                    Some(s) => format!("SyncRuntime#{} cursor={}", s.id, s.cursor()),
+                    None => "SyncRuntime not available".to_string(),
+                }
+            }).unwrap_or_else(|| "using InMemorySyncStateStore".to_string());
+            engine_info!(
+                "[promotion] post_init diagnostics: mirror_cursor={} sync_store={}",
+                mirror_cursor, sync_rt_info,
+            );
+        }
 
         if promote_lease.is_some() {
             client.leader_election.set_is_leader(true);
@@ -2039,9 +2220,12 @@ impl VaultSyncRuntime {
         let runtime = crate::runtime::Runtime::new(self.tab_id.clone());
         {
             let tmp_store = doc_store.lock().unwrap();
+            let tmp_docs = tmp_store.documents.len();
             let mut rt_store = runtime.document_store.lock().unwrap();
             rt_store.documents = tmp_store.documents.clone();
             rt_store.access_counts = tmp_store.access_counts.clone();
+            let rt_docs = rt_store.documents.len();
+            engine_info!("[promotion] document_copy: tmp_docs={} rt_docs={} DocumentStore#{}=Runtime#{}", tmp_docs, rt_docs, rt_store.id, runtime.id);
         }
         plog("runtime_drained");
 
@@ -2127,6 +2311,15 @@ impl VaultSyncRuntime {
         let replication_planner = Arc::new(ReplicationPlanner::new());
         let event_bus = Arc::new(EventBus::new());
 
+        // Phase 3: Start lifecycle manager for maintenance ticks
+        let lifecycle = crate::lifecycle_manager::LifecycleManager::new(5000);
+        if let Some(ref vr) = vault_runtime {
+            if let Some(ref mr) = vr.ctx.maintenance.clone() {
+                lifecycle.register_maintenance(mr);
+            }
+        }
+        lifecycle.start();
+
         // ── Phase 5: Install — atomically swap VaultSyncRuntime fields ──
         unsafe {
             self.transition_to_leader(
@@ -2146,6 +2339,7 @@ impl VaultSyncRuntime {
                 replay_engine,
                 None, // presence — not carried over from follower
                 promote_lease,
+                Some(lifecycle),
                 namespace.to_string(),
                 coordinator_url.to_string(),
                 saved_auth,
@@ -2180,10 +2374,12 @@ impl VaultSyncRuntime {
             let onunload = Closure::wrap(Box::new(move || {
                 let msg = format!("PROTO|LEFT|{}|", tab_id_unload);
                 let _ = bc_unload.post_message(&JsValue::from_str(&msg));
+                engine_info!("[lifecycle] promote beforeunload: sent LEFT — metadata persistence depends on last periodic checkpoint");
             }) as Box<dyn FnMut()>);
             window.set_onbeforeunload(Some(onunload.as_ref().unchecked_ref()));
             onunload.forget();
         }
+        engine_info!("[lifecycle] beforeunload handler registered (promote)");
         plog("beforeunload");
 
         self.log_state("promote");
@@ -2452,6 +2648,7 @@ impl VaultSyncRuntime {
         replay_engine: Option<Arc<crate::replay_engine::ReplayEngine>>,
         presence: Option<crate::presence::PresenceManager>,
         leader_lease: Option<vaultsync_core::ipc::leader_election::Lease>,
+        lifecycle_manager: Option<Arc<crate::lifecycle_manager::LifecycleManager>>,
         saved_namespace: String,
         saved_coordinator_url: String,
         saved_auth_token: Option<String>,
@@ -2478,6 +2675,7 @@ impl VaultSyncRuntime {
         (*this_ptr).leader_election = None;
         (*this_ptr).leader_lease = leader_lease;
         (*this_ptr).promotion_rx = Mutex::new(None);
+        (*this_ptr).lifecycle_manager = lifecycle_manager;
         (*this_ptr).saved_namespace = Mutex::new(saved_namespace);
         (*this_ptr).saved_coordinator_url = Mutex::new(saved_coordinator_url);
         (*this_ptr).saved_auth_token = Mutex::new(saved_auth_token);
@@ -2971,15 +3169,21 @@ pub(crate) use crate::util::fields_to_json_string;
 struct BcMutationSink {
     bc: web_sys::BroadcastChannel,
     tab_id: String,
+    send_fails: std::sync::atomic::AtomicU64,
+    serialize_fails: std::sync::atomic::AtomicU64,
 }
 
 impl BcMutationSink {
     fn new(bc: web_sys::BroadcastChannel, tab_id: String) -> Self {
-        Self { bc, tab_id }
+        Self { bc, tab_id, send_fails: std::sync::atomic::AtomicU64::new(0), serialize_fails: std::sync::atomic::AtomicU64::new(0) }
     }
 
     fn bc(&self) -> &web_sys::BroadcastChannel {
         &self.bc
+    }
+
+    fn reset_fail_counts(&self) -> (u64, u64) {
+        (self.send_fails.swap(0, Ordering::Relaxed), self.serialize_fails.swap(0, Ordering::Relaxed))
     }
 }
 
@@ -2998,7 +3202,13 @@ impl vaultsync_core::storage::traits::MutationSink for BcMutationSink {
                 trace_id, bc_seq, doc_id, record_id, json.len(),
             );
             let mutation = format!("MUTATION|{}|{}|{}|{}|{}", bc_seq, self.tab_id, doc_id, record_id, json);
-            let _ = self.bc.post_message(&JsValue::from_str(&mutation));
+            if let Err(e) = self.bc.post_message(&JsValue::from_str(&mutation)) {
+                self.send_fails.fetch_add(1, Ordering::Relaxed);
+                engine_warn!("[BcMutationSink] post_message FAILED: {:?}", e);
+            }
+        } else {
+            self.serialize_fails.fetch_add(1, Ordering::Relaxed);
+            engine_warn!("[BcMutationSink] fields_to_json_string FAILED: doc={} record={}", doc_id, record_id);
         }
     }
 

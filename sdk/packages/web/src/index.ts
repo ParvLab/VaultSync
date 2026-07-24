@@ -48,6 +48,7 @@ export class VaultSyncClient {
   private _bcInvokeCount = 0;
   /** performance.now() at start of each message handler invocation. */
   private _handlerStartTime = 0;
+  private _bcCounts = { received: 0, begin: 0, mutation: 0, done: 0 };
 
   private constructor(inner: any, namespace: string, replicaId: string) {
     this.inner = inner;
@@ -74,6 +75,21 @@ export class VaultSyncClient {
     }
   }
 
+  /** Check if mutation fields represent a delete. */
+  private isDeleteMutation(fields: Record<string, unknown>): boolean {
+    return fields._deleted === true || fields.__deleted__ === true;
+  }
+
+  /** Apply a mutation (set or delete) to the RuntimeStore. Returns "delete" if the record was removed. */
+  private applyMutation(mutation: { docId: string; recordId: string; fields: Record<string, unknown> }, caller?: string): "set" | "delete" {
+    if (this.isDeleteMutation(mutation.fields)) {
+      this.runtimeStore.applyDeleteDocument(mutation.docId, mutation.recordId, caller);
+      return "delete";
+    }
+    this.runtimeStore.applySetFieldBatch(mutation.docId, mutation.recordId, mutation.fields as Record<string, any>, caller);
+    return "set";
+  }
+
   /** Enable RuntimeStore-based cache reads. Call once after construction. */
   enableRuntimeStore(): void {
     const store = this.runtimeStore;
@@ -88,6 +104,8 @@ export class VaultSyncClient {
    *  this tab (in mirror mode) can acquire it. waitForPromotion() resolves
    *  when LeaderEvent::Acquired fires in Rust, then calls promote(). */
   private async setupPromotionListener(config: VaultSyncConfig): Promise<void> {
+    if (this.inner.is_leader()) return;
+    const promotionId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     try {
       await this.inner.waitForPromotion();
       // Skip promotion if we recently received LEADER_READY from a live leader
@@ -95,6 +113,30 @@ export class VaultSyncClient {
         this._leaderAlive = false;
         return;
       }
+
+      // Phase 3: Pause mirror mutation processing for deterministic snapshot.
+      // After pause(), no BC MUTATION frames will be applied to the in-memory store.
+      const beforeState = this.inner.mirrorState();
+      const drainSeq = this.inner.pauseMirror();
+      // Yield to event loop so any in-flight BC callback completes.
+      await new Promise(r => setTimeout(r, 0));
+      // Verify drain seq has not advanced (no mutations in flight).
+      const afterState = this.inner.mirrorState();
+      if (drainSeq !== afterState?.drain_seq && afterState?.drain_seq > 0) {
+        console.warn('[PROMO] pid=%s drain_seq advanced %d->%d — mutation in flight during pause',
+          promotionId, drainSeq, afterState?.drain_seq);
+      }
+
+      // Phase 3: Before promotion snapshot — RuntimeStore + Rust
+      const rs_b_notes = this.runtimeStore.query('notes');
+      const rust_b_raw = await this.inner.find('notes');
+      const rust_b_ids = rust_b_raw.map((j: string) => { const f = JSON.parse(j); return f.record_id ?? f.id; });
+      console.log('[PROMO_SNAPSHOT] phase=before doc=notes RuntimeStore=%d ids=[%s]',
+        rs_b_notes.length,
+        rs_b_notes.map((r: any) => `${r.record_id ?? r.id}(del=${r._deleted ?? r.__deleted__})`).join(','));
+      console.log('[PROMO_COMPARE] phase=before doc=notes Rust=%d ids=[%s]',
+        rust_b_ids.length, rust_b_ids.join(','));
+
       await this.inner.promote(
         this.namespace,
         config.coordinatorUrl || '',
@@ -102,6 +144,33 @@ export class VaultSyncClient {
         config.dbName || null,
         config.storageBackend || null,
       );
+
+      // Phase 3: After promotion snapshot — RuntimeStore + Rust + invariant
+      const rs_a_notes = this.runtimeStore.query('notes');
+      const rust_a_raw = await this.inner.find('notes');
+      const rust_a_ids = rust_a_raw.map((j: string) => { const f = JSON.parse(j); return f.record_id ?? f.id; });
+      console.log('[PROMO_SNAPSHOT] phase=after doc=notes RuntimeStore=%d ids=[%s]',
+        rs_a_notes.length,
+        rs_a_notes.map((r: any) => `${r.record_id ?? r.id}(del=${r._deleted ?? r.__deleted__})`).join(','));
+      console.log('[PROMO_COMPARE] phase=after doc=notes Rust=%d ids=[%s]',
+        rust_a_ids.length, rust_a_ids.join(','));
+
+      // Phase 3: Set-based comparison with rich diagnostics
+      const rs_set = new Set(rs_a_notes.map((r: any) => r.record_id ?? r.id));
+      const rust_set = new Set(rust_a_ids);
+      const rs_only = [...rs_set].filter(id => !rust_set.has(id));
+      const rust_only = [...rust_set].filter(id => !rs_set.has(id));
+      if (rs_only.length > 0 || rust_only.length > 0) {
+        console.warn(
+          '[PROMO_INVARIANT] MISMATCH pid=%s rs_only=[%s] rust_only=[%s] mirror=%s',
+          promotionId, rs_only.join(','), rust_only.join(','),
+          JSON.stringify(beforeState),
+        );
+      } else {
+        console.debug('[PROMO_INVARIANT] OK pid=%s count=%d mirror=%s',
+          promotionId, rs_set.size, JSON.stringify(beforeState));
+      }
+
       console.debug('[Promotion] complete — tab is now Leader');
       // Broadcast LEADER_ELECTED so other tabs demote
       this.channel?.postMessage(`LEADER_ELECTED|${this.tabId}`);
@@ -135,29 +204,33 @@ export class VaultSyncClient {
   private setupBroadcastChannel(namespace: string) {
     const channelName = `vaultsync-ipc-${namespace}`;
     this.handlerId = crypto.randomUUID();
-    console.debug('[BC] handler installed', JSON.stringify({ handlerId: this.handlerId, channel: channelName, timestamp: Date.now() }));
+    console.log('[BC_REGISTER]', JSON.stringify({ channel: channelName, handler: this.handlerId.slice(0, 8) }));
     this.channel = new BroadcastChannel(channelName);
     this.channel.addEventListener('message', (e) => {
       this._handlerStartTime = performance.now();
       const seq = ++this._bcInvokeCount;
       const raw = typeof e.data === 'string' ? e.data : JSON.stringify(e.data);
       const entryPrefix = typeof e.data === 'string' ? e.data.split('|', 1)[0] : '(non-string)';
+      if (typeof e.data === 'string') {
+        const allParts = e.data.split('|');
+        const senderId = entryPrefix === 'MUTATION' ? (allParts[2] || '?') :
+                         entryPrefix === 'LEADER_READY' ? (allParts[1] || '?') : '?';
+        this._bcCounts.received++;
+        console.log('[BC_RAW]', JSON.stringify({
+          from: senderId, to: this.tabId, prefix: entryPrefix, len: e.data.length,
+          replay: this.isReplaying, depth: this.replayDepth,
+        }));
+      }
       const logMeta = () => JSON.stringify({
         seq, handler: this.handlerId.slice(0, 8),
         replay: this.isReplaying, rDepth: this.replayDepth,
         elapsed: (performance.now() - this._handlerStartTime).toFixed(1) + 'ms',
       });
-      console.debug('[RX]', JSON.stringify({
-        seq, prefix: entryPrefix,
-        replay: this.isReplaying, rDepth: this.replayDepth,
-        len: typeof e.data === 'string' ? e.data.length : 0,
-        from: this.tabId, handler: this.handlerId.slice(0, 8),
-      }));
-
       if (typeof e.data === 'string') {
         // ── MUTATION: direct format — update RuntimeStore ──
         // Format: MUTATION|bc_seq|tab_id|doc_id|record_id|fields_json
         if (entryPrefix === 'MUTATION') {
+          this._bcCounts.mutation++;
           const p0 = 9;
           const p1 = e.data.indexOf('|', p0);
           if (p1 < 0) { console.warn('[RX] MUTATION malformed', logMeta()); return; }
@@ -174,20 +247,17 @@ export class VaultSyncClient {
             const fields = JSON.parse(fieldsJson);
             if (this.isReplaying) {
               this.replayBuffer.push({ docId, recordId, fields });
-              if (this.replayBuffer.length % 100 === 0) {
-                console.debug('[REPLAY] buffered', JSON.stringify({
-                  seq, bufSize: this.replayBuffer.length,
-                  elapsed: (performance.now() - this._handlerStartTime).toFixed(1) + 'ms',
-                }));
-              }
+              console.log('[REPLAY_BUFFER]', JSON.stringify({
+                before: this.replayBuffer.length - 1, after: this.replayBuffer.length,
+                record: recordId,
+              }));
               return;
             }
-            console.debug('[STORE] applySetFieldBatch', JSON.stringify({
-              seq, doc: docId, record: recordId,
-              fields: Object.keys(fields),
-              elapsed: (performance.now() - this._handlerStartTime).toFixed(1) + 'ms',
-            }));
-            this.runtimeStore.applySetFieldBatch(docId, recordId, fields);
+            if (this.isDeleteMutation(fields)) {
+              console.debug('[DELETE_MUTATION] source=live docId=%s recordId=%s fields=%s replayDepth=%d seq=%d',
+                docId, recordId, JSON.stringify(fields), this.replayDepth, seq);
+            }
+            this.applyMutation({ docId, recordId, fields }, 'BC_live');
           } catch (err) {
             console.error('[RX] MUTATION parse error', logMeta(), err);
           }
@@ -212,6 +282,7 @@ export class VaultSyncClient {
           const prevDepth = this.replayDepth;
           this.replayDepth++;
           this.replayBuffer = [];
+          this._bcCounts.begin++;
           console.log('[TIMELINE] T2: SYNC_BEGIN', JSON.stringify({
             depth: `${prevDepth}→${this.replayDepth}`,
             replay: replayId,
@@ -227,29 +298,35 @@ export class VaultSyncClient {
           const replayId = replayMatch ? parseInt(replayMatch[1], 10) : 0;
           const prevDepth = this.replayDepth;
           this.replayDepth--;
+          this._bcCounts.done++;
           const bufLen = this.replayBuffer.length;
           const buffer = this.replayBuffer;
           this.replayBuffer = [];
-          console.debug('[REPLAY]', JSON.stringify({
-            depth: `${prevDepth}→${this.replayDepth}`,
-            flushed: bufLen, replay: replayId, seq,
-            elapsed: (performance.now() - this._handlerStartTime).toFixed(1) + 'ms',
-          }));
           this.runtimeStore.beginBatch();
+          console.log('[BATCH_BEGIN]');
+          let deletedCount = 0;
+          const touchedDocs = new Set<string>();
           try {
             for (let i = 0; i < buffer.length; i++) {
-              const m = buffer[i];
-              if (i === 0) {
-                console.log('[TIMELINE] T3: First record inserted', JSON.stringify({
-                  doc: m.docId, record: m.recordId, seq,
-                  elapsed: (performance.now() - this._handlerStartTime).toFixed(1) + 'ms',
-                }));
+              const recsBefore = this.runtimeStore.getRecordCount(buffer[i].docId);
+              touchedDocs.add(buffer[i].docId);
+              if (this.applyMutation(buffer[i], 'replay_flush') === "delete") {
+                deletedCount++;
               }
-              this.runtimeStore.applySetFieldBatch(m.docId, m.recordId, m.fields);
+              const recsAfter = this.runtimeStore.getRecordCount(buffer[i].docId);
+              console.log('[REPLAY_APPLY]', JSON.stringify({
+                i, total: buffer.length, doc: buffer[i].docId, rec: buffer[i].recordId,
+                recsBefore, recsAfter,
+              }));
             }
           } finally {
+            console.log('[BATCH_END]');
             this.runtimeStore.endBatch();
           }
+          console.log('[BC_SUMMARY]', JSON.stringify({
+            ...this._bcCounts, buffered: bufLen, deleted: deletedCount,
+            runtime: this.runtimeStore.query('notes').length,
+          }));
           return;
         }
 
@@ -261,12 +338,33 @@ export class VaultSyncClient {
           const parts = e.data.split('|');
           const leaderTabId = parts[1];
           const cursor = parseInt(parts[2] || '0', 10);
+          console.debug('[LEADER_READY]', {
+            sender: leaderTabId,
+            thisTab: this.tabId,
+            mode: this.runtimeStatus.mode,
+            replayDepth: this.replayDepth,
+            isReplaying: this.isReplaying,
+          });
           // Always send SYNC if the message is from a different tab (regardless of mode).
-          // Fix: mode check (`this.inner.runtimeStatus().mode === 'Mirror'`) was incorrect
-          // because LEADER_READY can arrive before LEADER_ELECTED, meaning the demoted tab
-          // is still `Leader` mode and would miss its opportunity to request a sync.
+          // The leaderTabId === this.tabId guard prevents self-SYNC after promotion.
+          // A mode-based guard (`mode !== 'Mirror'`) was previously removed because
+          // LEADER_READY can arrive before LEADER_ELECTED — the demoted tab is still
+          // in 'Leader' mode and would miss its sync opportunity.
           if (leaderTabId && leaderTabId !== this.tabId) {
+            console.debug('[SYNC_REQUEST]', {
+              reason: 'leader_ready',
+              from: this.tabId,
+              leader: leaderTabId,
+              same: false,
+              cursor,
+            });
             this.channel?.postMessage(`SYNC|1|0|${this.namespace}|${cursor}|0`);
+          } else {
+            console.debug('[SYNC_REQUEST] skipped: same tab', {
+              leader: leaderTabId,
+              thisTab: this.tabId,
+              cursor,
+            });
           }
           return;
         }
@@ -410,7 +508,7 @@ export class VaultSyncClient {
         // Apply to RuntimeStore first for instant cache hit.
         // Use applySetFieldBatch (not per-field applySetField) to avoid
         // orphan records when fields include `id` or `record_id`.
-        this.runtimeStore.applySetFieldBatch(docId, recordId, fields);
+              this.runtimeStore.applySetFieldBatch(docId, recordId, fields, 'bootstrap');
         await this.inner.insert(docId, recordId, JSON.stringify(fields));
       });
     }
@@ -420,7 +518,7 @@ export class VaultSyncClient {
   async update(docId: string, recordId: string, fields: RecordFields): Promise<void> {
     if (this.inner.is_leader()) {
       return this.enqueueMutation(async () => {
-        this.runtimeStore.applySetFieldBatch(docId, recordId, fields);
+        this.runtimeStore.applySetFieldBatch(docId, recordId, fields, 'local_update');
         await this.inner.update(docId, recordId, JSON.stringify(fields));
       });
     }
@@ -428,9 +526,13 @@ export class VaultSyncClient {
   }
 
   async delete(docId: string, recordId: string): Promise<void> {
+    if (!docId || !recordId) {
+      console.warn('[VaultSync] delete skipped: missing docId/recordId', { docId, recordId });
+      return;
+    }
     if (this.inner.is_leader()) {
       return this.enqueueMutation(async () => {
-        this.runtimeStore.applyDeleteDocument(docId, recordId);
+        this.runtimeStore.applyDeleteDocument(docId, recordId, 'local_delete');
         await this.inner.delete(docId, recordId);
       });
     }
@@ -520,19 +622,29 @@ export class VaultSyncClient {
       if (docIds && docIds.length > 0) {
         for (const docId of docIds) {
           try {
+            const before = this.runtimeStore.query(docId).length;
             const arr = await this.inner.find(docId);
+            const records: Array<{ recordId: string; deleted: boolean }> = [];
             for (const json of arr) {
               const fields = JSON.parse(json);
               const recordId = (fields.record_id ?? fields.id) as string;
-              this.runtimeStore.applySetFieldBatch(docId, recordId, fields);
+              const isDel = fields._deleted === true || fields.__deleted__ === true;
+              records.push({ recordId, deleted: isDel });
+        this.runtimeStore.applySetFieldBatch(docId, recordId, fields, 'local_insert');
             }
+            const after = this.runtimeStore.query(docId).length;
+            const deletedRecords = records.filter(r => r.deleted).length;
+            console.debug('[BOOTSTRAP] doc=%s path=find mode=%s before=%d records_found=%d deleted=%d after=%d ids=[%s]',
+              docId, mode, before, records.length, deletedRecords, after,
+              records.map(r => `${r.recordId}(del=${r.deleted})`).join(','));
           } catch (err) {
             console.warn(`[BOOTSTRAP] Failed to load doc "${docId}":`, err);
           }
         }
       }
+    } else {
+      console.debug('[BOOTSTRAP] doc=%s path=replay mode=%s', docIds?.join(','), mode);
     }
-    // Mirror/Follower: nothing needed — replay pipeline populates RuntimeStore
   }
 
   async shutdown(): Promise<void> {

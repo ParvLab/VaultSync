@@ -39,6 +39,16 @@ pub struct MirrorRuntime {
     pub promote_backend: Mutex<Option<String>>,
     /// Guard against double promotion.
     pub is_promoting: AtomicBool,
+    /// Count of MUTATION frames that failed json_to_fields decode.
+    /// Reset on SYNC_BEGIN, logged at SYNC_DONE.
+    pub decode_fail_count: std::sync::atomic::AtomicU64,
+    /// Phase 3: Pause flag for deterministic promotion.
+    /// When true, handle_mirror_bc_message skips all mutation processing.
+    /// Set by pause(), cleared by resume() or promote().
+    pub paused: AtomicBool,
+    /// Monotonic drain counter. Incremented by handle_mirror_bc_message on every
+    /// processed mutation. Read by drain() to verify no mutations are in-flight.
+    pub drain_seq: AtomicU64,
 }
 
 impl fmt::Debug for MirrorRuntime {
@@ -78,6 +88,9 @@ impl MirrorRuntime {
             promote_db: Mutex::new(None),
             promote_backend: Mutex::new(None),
             is_promoting: AtomicBool::new(false),
+            decode_fail_count: std::sync::atomic::AtomicU64::new(0),
+            paused: AtomicBool::new(false),
+            drain_seq: AtomicU64::new(0),
         })
     }
 
@@ -100,14 +113,21 @@ impl MirrorRuntime {
             doc_id, record_id, field,
         );
         let mut store = self.document_store.lock().unwrap();
-        store.set_field(doc_id, record_id, field, value);
+        let created = store.set_field(doc_id, record_id, field, value);
+        if created {
+            engine_info!("[DOC_CREATE] caller=MirrorRuntime::apply_mutation doc={} record={} field={}", doc_id, record_id, field);
+        }
     }
 
     /// Set an entire record in the shared DocumentStore.
     pub fn set_record(&self, doc_id: &str, record_id: &str, fields: HashMap<String, CrdtValue>) {
         let mut store = self.document_store.lock().unwrap();
+        let already_exists = store.documents.get(doc_id).map_or(false, |d| d.contains_key(record_id));
         for (field, value) in fields {
             store.set_field(doc_id, record_id, &field, value);
+        }
+        if !already_exists {
+            engine_info!("[DOC_CREATE] caller=MirrorRuntime::set_record doc={} record={}", doc_id, record_id);
         }
     }
 
@@ -138,17 +158,48 @@ impl MirrorRuntime {
     /// during follower→leader promotion so no data is lost.
     pub fn drain_into(&self, target: &Arc<std::sync::Mutex<DocumentStore>>) {
         let mut src = self.document_store.lock().unwrap();
+        let src_count = src.documents.len();
         let mut dst = target.lock().unwrap();
+        let dst_before = dst.documents.len();
+        let mut drained_docs = 0u64;
         for (doc_id, records) in src.documents.drain() {
             for (record_id, fields) in records {
                 for (field, value) in fields {
                     dst.set_field(&doc_id, &record_id, &field, value);
                 }
             }
+            drained_docs += 1;
         }
         for (doc_id, (count, last_decay)) in src.access_counts.drain() {
             dst.access_counts.insert(doc_id, (count, last_decay));
         }
+        let dst_after = dst.documents.len();
+        engine_info!("[drain_into] src_docs={} drained={} dst_docs={}->{}", src_count, drained_docs, dst_before, dst_after);
+    }
+
+    /// Phase 3: Pause mutation processing for deterministic promotion.
+    /// After pause(), no new BC mutations will be applied. The current
+    /// in-memory state is frozen for snapshot comparison.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+        engine_info!("[MirrorRuntime] paused for promotion — mutations blocked");
+    }
+
+    /// Phase 3: Resume mutation processing after promotion (or abort).
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+        engine_info!("[MirrorRuntime] resumed — mutations unblocked");
+    }
+
+    /// Phase 3: Check if paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Phase 3: Read the current drain sequence counter.
+    /// Incremented on every processed mutation.
+    pub fn current_drain_seq(&self) -> u64 {
+        self.drain_seq.load(Ordering::Acquire)
     }
 
     /// Sprint B: Set when PROTO|LEFT is received from leader.

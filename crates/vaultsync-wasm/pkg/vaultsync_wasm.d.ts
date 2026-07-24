@@ -123,9 +123,19 @@ export class VaultSyncRuntime {
      * Phase 4: Returns mirror metrics in follower mode.
      */
     metricsSnapshot(): string;
+    /**
+     * Phase 3: Check mirror paused state and drain_seq for promotion diagnostics.
+     */
+    mirrorState(): any;
     static new(namespace: string, replica_id: string, db_name?: string | null, storage_backend?: string | null): Promise<VaultSyncRuntime>;
     static new_with_coordinator(namespace: string, replica_id: string, coordinator_url: string, auth_token?: string | null, db_name?: string | null, storage_backend?: string | null): Promise<VaultSyncRuntime>;
     on_event(callback: Function): void;
+    /**
+     * Phase 3: Pause mirror mutation processing for deterministic promotion snapshot.
+     * After pause(), no BC mutations will be applied. Returns the current drain_seq
+     * value so JS can verify the queue is quiescent.
+     */
+    pauseMirror(): bigint;
     /**
      * Returns a clone of the PresenceManager if available.
      */
@@ -147,6 +157,10 @@ export class VaultSyncRuntime {
      * Returns JSON with tier byte counts, promotions, demotions, eviction candidates.
      */
     resourceSweep(): Promise<string>;
+    /**
+     * Phase 3: Resume mirror mutation processing (abort promotion).
+     */
+    resumeMirror(): void;
     rotate_keys(): Promise<any>;
     /**
      * Runs lifecycle (tombstone cleanup) on the given namespace, returns JSON stats.
@@ -249,8 +263,20 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly init: () => void;
     readonly set_log_level_from_str: (a: number, b: number) => void;
+    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
+    readonly presencemanager_activePeers: (a: number) => [number, number];
+    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly presencemanager_peer_count: (a: number) => number;
+    readonly __wbg_wasmipc_free: (a: number, b: number) => void;
+    readonly wasmipc_new: (a: number, b: number) => [number, number, number];
+    readonly wasmipc_new_with_channel: (a: any) => number;
+    readonly wasmipc_on_message: (a: number, b: any) => void;
+    readonly wasmipc_receive: (a: number) => [number, number];
+    readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
     readonly __wbg_eventbusproxy_free: (a: number, b: number) => void;
     readonly __wbg_replicationnamespace_free: (a: number, b: number) => void;
     readonly __wbg_vaultsyncruntime_free: (a: number, b: number) => void;
@@ -282,14 +308,17 @@ export interface InitOutput {
     readonly vaultsyncruntime_list_key_versions: (a: number) => [number, number, number];
     readonly vaultsyncruntime_maintenanceTick: (a: number) => number;
     readonly vaultsyncruntime_metricsSnapshot: (a: number) => [number, number];
+    readonly vaultsyncruntime_mirrorState: (a: number) => [number, number, number];
     readonly vaultsyncruntime_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => any;
     readonly vaultsyncruntime_new_with_coordinator: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => any;
     readonly vaultsyncruntime_on_event: (a: number, b: any) => void;
+    readonly vaultsyncruntime_pauseMirror: (a: number) => [bigint, number, number];
     readonly vaultsyncruntime_presence: (a: number) => number;
     readonly vaultsyncruntime_promote: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => any;
     readonly vaultsyncruntime_prune_key_versions: (a: number, b: number) => [number, number];
     readonly vaultsyncruntime_replication: (a: number) => number;
     readonly vaultsyncruntime_resourceSweep: (a: number) => any;
+    readonly vaultsyncruntime_resumeMirror: (a: number) => [number, number];
     readonly vaultsyncruntime_rotate_keys: (a: number) => any;
     readonly vaultsyncruntime_runLifecycle: (a: number, b: number, c: number) => any;
     readonly vaultsyncruntime_runtimeStatus: (a: number) => [number, number];
@@ -316,24 +345,12 @@ export interface InitOutput {
     readonly workspacenamespace_get: (a: number, b: bigint) => [number, number, number, number];
     readonly workspacenamespace_list: (a: number) => [number, number, number, number];
     readonly workspacenamespace_update: (a: number, b: bigint, c: number, d: number, e: number, f: number) => [number, number, number];
-    readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
-    readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
-    readonly __wbg_wasmipc_free: (a: number, b: number) => void;
-    readonly wasmipc_new: (a: number, b: number) => [number, number, number];
-    readonly wasmipc_new_with_channel: (a: any) => number;
-    readonly wasmipc_on_message: (a: number, b: any) => void;
-    readonly wasmipc_receive: (a: number) => [number, number];
-    readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
-    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
-    readonly presencemanager_activePeers: (a: number) => [number, number];
-    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
-    readonly presencemanager_peer_count: (a: number) => number;
     readonly wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h6742839cb717cdad: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_3: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_5: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_6: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h5a816e701a8600f2: (a: number, b: number) => void;

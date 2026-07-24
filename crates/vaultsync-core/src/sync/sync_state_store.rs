@@ -12,7 +12,7 @@ use crate::VaultSyncError;
 #[async_trait]
 pub trait SyncStateStore: Send + Sync + std::fmt::Debug {
     async fn cursor(&self) -> Result<u64, VaultSyncError>;
-    async fn set_cursor(&self, seq: u64) -> Result<(), VaultSyncError>;
+    async fn set_cursor(&self, seq: u64, caller: &'static str) -> Result<(), VaultSyncError>;
     async fn generation(&self) -> Result<String, VaultSyncError>;
     async fn set_generation(&self, gen: &str) -> Result<(), VaultSyncError>;
 }
@@ -60,8 +60,12 @@ impl SyncStateStore for InMemorySyncStateStore {
         Ok(self.cursor.load(Ordering::SeqCst))
     }
 
-    async fn set_cursor(&self, seq: u64) -> Result<(), VaultSyncError> {
-        self.cursor.store(seq, Ordering::SeqCst);
+    async fn set_cursor(&self, seq: u64, _caller: &'static str) -> Result<(), VaultSyncError> {
+        let old = self.cursor.swap(seq, Ordering::SeqCst);
+        tracing::trace!(
+            "[InMemorySyncStateStore] SET_CURSOR caller={} old={} new={}",
+            _caller, old, seq,
+        );
         Ok(())
     }
 

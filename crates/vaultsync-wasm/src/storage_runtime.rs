@@ -164,6 +164,7 @@ impl PageManager {
 /// No cursor, no generation, no pending count — those belong to SyncRuntime.
 #[derive(Debug)]
 pub struct StorageRuntime {
+    pub id: u64,
     pub pages: PagesDir,
     pub page_managers: Mutex<Vec<PageManager>>,
     pub scheduler: Arc<StorageScheduler>,
@@ -247,7 +248,7 @@ impl StorageRuntime {
                         manifest.tombstoned_pages = manifest.content_index.tombstoned_pages.len();
                         manifest.updated_at = js_sys::Date::now() as u64;
                         let cloned = manifest.clone();
-                        if let Err(e) = crate::page_store::write_manifest(store.dir(), &cloned).await {
+                        if let Err(e) = crate::page_store::write_manifest(store.dir(), store.store_name(), "repair_orphans", &cloned).await {
                             engine_warn!("[StorageRuntime] failed to persist repaired manifest: {:?}", e);
                         }
                     }
@@ -279,7 +280,9 @@ impl StorageRuntime {
             engine_info!("{}", report);
         }
 
+        let id = crate::runtime::next_runtime_id();
         let rt = Arc::new(Self {
+            id,
             pages,
             page_managers: Mutex::new(managers),
             scheduler,
@@ -291,7 +294,7 @@ impl StorageRuntime {
         });
 
         let t_total = (js_sys::Date::now() - _t0) as u64;
-        engine_info!("[StorageRuntime] new() total: {}ms (health={})", t_total, health);
+        engine_info!("[StorageRuntime#{}] new() total: {}ms (health={})", id, t_total, health);
         Ok(rt)
     }
 
@@ -461,9 +464,10 @@ impl StorageRuntime {
         self.get_store(store).read_page(page_id).await
     }
 
-    /// Delegate: adjust pending count on a PageStore.
+    /// Delegate: adjust pending count on a PageStore (in-memory only).
     pub async fn adjust_pending_count(&self, store: &str, delta: i32) -> Result<(), vaultsync_core::VaultSyncError> {
-        self.get_store(store).adjust_pending_count(delta).await
+        self.get_store(store).adjust_pending_count(delta);
+        Ok(())
     }
 
     /// Delegate: schedule GC on a PageStore.
@@ -478,15 +482,35 @@ impl StorageRuntime {
         ps.run_pending_gc().await
     }
 
-    /// Delegate: set pending count on a PageStore.
+    /// Delegate: set pending count on a PageStore (in-memory only).
     pub async fn set_pending_count(&self, store: &str, count: usize) -> Result<(), vaultsync_core::VaultSyncError> {
-        self.get_store(store).set_pending_count(count).await
+        self.get_store(store).set_pending_count(count);
+        Ok(())
     }
 
     /// Delegate: set current page on a PageStore.
     pub async fn set_current_page(&self, store: &str, page_id: PageId) -> Result<(), vaultsync_core::VaultSyncError> {
         let ps = self.get_store(store);
         ps.set_current_page(page_id).await
+    }
+
+    /// Return a structured summary of all 6 store manifests for diagnostic logging.
+    /// Used during promotion to compare mirror state vs newly opened storage.
+    pub fn manifest_summary(&self) -> String {
+        let mut parts = Vec::new();
+        for (name, store) in [("doc_data", &self.pages.doc_data as &PageStore), ("oplog", &self.pages.oplog), ("sync_states", &self.pages.sync_states), ("schemas", &self.pages.schemas), ("migrations", &self.pages.migrations), ("keys", &self.pages.keys)] {
+            let guard = store.manifest.lock().unwrap();
+            if let Some(ref m) = *guard {
+                let docs = m.content_index.page_by_document.len();
+                let seqs = m.content_index.page_by_sequence.len();
+                parts.push(format!("{}: gen={} live={} tomb={} pages={} docs={} seqs={}",
+                    name, m.generation.0, m.content_index.live_pages.len(), m.content_index.tombstoned_pages.len(),
+                    m.content_index.page_by_id.len(), docs, seqs));
+            } else {
+                parts.push(format!("{}: no_manifest", name));
+            }
+        }
+        parts.join(" | ")
     }
 
     /// Get page count metrics from all page managers.
@@ -496,6 +520,123 @@ impl StorageRuntime {
         let total_tombstones: u64 = managers.iter().map(|m| m.tombstone_count()).sum();
         let total_allocated: u64 = managers.iter().map(|m| m.total_allocated()).sum();
         (total_live, total_tombstones, total_allocated)
+    }
+
+    /// Verify engine invariants. Returns a report of all checks and any violations.
+    /// Called at startup, after recovery, and on explicit request.
+    /// Expensive checks (OPFS scans) are debug-only.
+    pub async fn verify_engine_invariants(&self) -> InvariantReport {
+        let mut violations = Vec::new();
+
+        // Check each store's invariants
+        for store_name in &["doc_data", "oplog", "sync_states", "schemas", "migrations", "keys"] {
+            let store = self.get_store(store_name);
+            let _cached = store.pending_count();
+            let guard = store.manifest.lock().unwrap();
+            let manifest = match *guard {
+                Some(ref m) => m.clone(),
+                None => continue,
+            };
+            drop(guard);
+
+            // 1. pending_count: compare cached vs OPFS scan (debug only)
+            #[cfg(debug_assertions)]
+            self.verify_pending_count(store_name, store, cached, &manifest, &mut violations).await;
+
+            // 2. ContentIndex consistency: every page_by_id entry must be in live_pages or tombstoned_pages
+            for (page_id, _key) in &manifest.content_index.page_by_id {
+                if !manifest.content_index.live_pages.contains(page_id)
+                    && !manifest.content_index.tombstoned_pages.contains(page_id)
+                {
+                    violations.push(InvariantViolation {
+                        store: store_name.to_string(),
+                        check: "page_by_id_orphan".to_string(),
+                        detail: format!("page_id={} not in live_pages or tombstoned_pages", page_id),
+                    });
+                }
+            }
+
+            // 3. live_pages count matches page_by_id count (they should be close)
+            let live_count = manifest.content_index.live_pages.len();
+            let index_count = manifest.content_index.page_by_id.len();
+            if live_count != index_count {
+                violations.push(InvariantViolation {
+                    store: store_name.to_string(),
+                    check: "live_vs_index_count".to_string(),
+                    detail: format!("live_pages={} page_by_id={}", live_count, index_count),
+                });
+            }
+        }
+
+        InvariantReport {
+            passed: violations.is_empty(),
+            total_checks: 3, // per store, but we just report overall
+            violations,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    async fn verify_pending_count(
+        &self,
+        store_name: &str,
+        store: &PageStore,
+        cached: usize,
+        manifest: &StoreManifest,
+        violations: &mut Vec<InvariantViolation>,
+    ) {
+        if store_name != &"oplog" {
+            return; // Only oplog has meaningful pending_count
+        }
+        // Read all entries from OPFS via direct page reads
+        let all_ids = store.list_page_ids("verify_pending_count").await.unwrap_or_default();
+        if all_ids.is_empty() {
+            if cached != 0 {
+                violations.push(InvariantViolation {
+                    store: store_name.to_string(),
+                    check: "pending_count_nonzero_empty_store".to_string(),
+                    detail: format!("cached={} but store has 0 pages", cached),
+                });
+            }
+            return;
+        }
+        // Read all pages and decode entries
+        let mut resolved: std::collections::HashMap<String, vaultsync_core::oplog::entry::OplogEntry> = std::collections::HashMap::new();
+        for page_id in &all_ids {
+            if let Ok(Some(data)) = store.read_page(*page_id).await {
+                if let Ok(entries) = postcard::from_bytes::<Vec<vaultsync_core::oplog::entry::OplogEntry>>(&data) {
+                    for e in entries {
+                        resolved.insert(e.id.clone(), e);
+                    }
+                }
+            }
+        }
+        let actual = resolved.values().filter(|e| e.sync_status.is_uploadable()).count();
+        if cached != actual {
+            violations.push(InvariantViolation {
+                store: store_name.to_string(),
+                check: "pending_count_mismatch".to_string(),
+                detail: format!("cached={} actual_from_opfs={}", cached, actual),
+            });
+        }
+    }
+
+    /// Debug assertion: panic on any violation (debug builds) or log error (release).
+    pub async fn assert_engine_invariants(&self) {
+        let report = self.verify_engine_invariants().await;
+        if !report.passed {
+            for v in &report.violations {
+                let msg = format!("[INVARIANT] VIOLATION store={} check={} detail={}", v.store, v.check, v.detail);
+                #[cfg(debug_assertions)]
+                {
+                    engine_error!("{}", msg);
+                    debug_assert!(false, "Engine invariant violated: {}", msg);
+                }
+                #[cfg(not(debug_assertions))]
+                engine_error!("{}", msg);
+            }
+        } else {
+            engine_info!("[INVARIANT] All checks passed ({} checks)", report.total_checks);
+        }
     }
 
     /// Sprint B: Physically remove tombstoned page files from all stores.
@@ -510,6 +651,22 @@ impl StorageRuntime {
         total += self.pages.keys.cleanup_tombstoned_pages().await?;
         Ok(total)
     }
+}
+
+/// Result of an invariant verification run.
+#[derive(Debug, Clone)]
+pub struct InvariantReport {
+    pub passed: bool,
+    pub total_checks: usize,
+    pub violations: Vec<InvariantViolation>,
+}
+
+/// A single invariant violation.
+#[derive(Debug, Clone)]
+pub struct InvariantViolation {
+    pub store: String,
+    pub check: String,
+    pub detail: String,
 }
 
 #[async_trait]
@@ -540,5 +697,11 @@ impl RuntimeLifecycle for StorageRuntime {
         self.scheduler.clear();
         engine_info!("[storage_runtime] shutdown: scheduler cleared");
         Ok(())
+    }
+}
+
+impl Drop for StorageRuntime {
+    fn drop(&mut self) {
+        engine_info!("[StorageRuntime#{}] dropped (last Arc reference released)", self.id);
     }
 }

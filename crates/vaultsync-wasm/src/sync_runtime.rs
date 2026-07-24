@@ -125,6 +125,7 @@ impl Default for RecoveryState {
 /// - mirror: MirrorRuntime for follower mode (optional)
 #[derive(Debug)]
 pub struct SyncRuntime {
+    pub id: u64,
     pub cursor: AtomicU64,
     pub generation: RwLock<String>,
     pub pending_index: Mutex<PendingIndex>,
@@ -141,7 +142,10 @@ pub struct SyncRuntime {
 
 impl SyncRuntime {
     pub fn new() -> Arc<Self> {
+        let id = crate::runtime::next_runtime_id();
+        engine_info!("[SyncRuntime#{}] new", id);
         Arc::new(Self {
+            id,
             cursor: AtomicU64::new(0),
             generation: RwLock::new(String::new()),
             pending_index: Mutex::new(PendingIndex::new()),
@@ -154,6 +158,14 @@ impl SyncRuntime {
     }
 
     pub fn with_metadata(self: &Arc<Self>, mr: Arc<MetadataRuntime>, ns: &str) -> &Arc<Self> {
+        // Restore cursor from persisted MetadataRuntime
+        let persisted_cursor = mr.read_sync_state().map(|s| s.last_synced_sequence).unwrap_or(0);
+        if persisted_cursor > 0 {
+            self.cursor.store(persisted_cursor, Ordering::Release);
+            engine_info!("[SyncRuntime#{}] with_metadata: restored cursor={} from MetadataRuntime#{}", self.id, persisted_cursor, mr.id);
+        } else {
+            engine_info!("[SyncRuntime#{}] with_metadata: no persisted cursor (cursor=0) MetadataRuntime#{}", self.id, mr.id);
+        }
         *self.metadata_runtime.lock().unwrap() = Some(mr);
         *self.namespace.write().unwrap() = ns.to_string();
         self
@@ -162,11 +174,14 @@ impl SyncRuntime {
     // ── Cursor operations ──
 
     pub fn cursor(&self) -> u64 {
-        self.cursor.load(Ordering::Acquire)
+        let val = self.cursor.load(Ordering::Acquire);
+        engine_trace!("[SyncRuntime] GET_CURSOR returned={}", val);
+        val
     }
 
-    pub fn set_cursor(&self, seq: u64) {
-        self.cursor.store(seq, Ordering::Release);
+    pub fn set_cursor(&self, caller: &'static str, seq: u64) {
+        let old = self.cursor.swap(seq, Ordering::Release);
+        engine_info!("[SyncRuntime#{}] SET_CURSOR caller={} old={} new={} MetadataRuntime={}", self.id, caller, old, seq, self.metadata_runtime.lock().unwrap().is_some());
         // Forward to MetadataRuntime for checkpoint persistence (B3)
         if let Some(ref mr) = *self.metadata_runtime.lock().unwrap() {
             let ns = self.namespace.read().unwrap();
@@ -179,11 +194,16 @@ impl SyncRuntime {
             let now_ms = js_sys::Date::now() as u64;
             state.last_sync_at = Some(now_ms);
             mr.write_sync_state(state);
+            engine_trace!("[SyncRuntime] SET_CURSOR forwarded cursor={} to MetadataRuntime (ns={})", seq, ns);
+        } else {
+            engine_trace!("[SyncRuntime] SET_CURSOR seq={} NO MetadataRuntime attached", seq);
         }
     }
 
-    pub fn advance_cursor(&self) -> u64 {
-        self.cursor.fetch_add(1, Ordering::AcqRel)
+    pub fn advance_cursor(&self, caller: &'static str) -> u64 {
+        let old = self.cursor.fetch_add(1, Ordering::AcqRel);
+        engine_trace!("[SyncRuntime#{}] ADVANCE_CURSOR caller={} old={} new={}", self.id, caller, old, old + 1);
+        old
     }
 
     // ── Generation operations ──
@@ -265,8 +285,8 @@ impl SyncStateStore for SyncRuntime {
         Ok(self.cursor())
     }
 
-    async fn set_cursor(&self, seq: u64) -> Result<(), VaultSyncError> {
-        self.set_cursor(seq);
+    async fn set_cursor(&self, seq: u64, caller: &'static str) -> Result<(), VaultSyncError> {
+        self.set_cursor(caller, seq);
         Ok(())
     }
 
@@ -292,5 +312,11 @@ impl RuntimeLifecycle for SyncRuntime {
     async fn shutdown(&self) -> Result<(), String> {
         self.pending_index.lock().unwrap().drain_all();
         Ok(())
+    }
+}
+
+impl Drop for SyncRuntime {
+    fn drop(&mut self) {
+        engine_info!("[SyncRuntime#{}] dropped (last Arc reference released)", self.id);
     }
 }

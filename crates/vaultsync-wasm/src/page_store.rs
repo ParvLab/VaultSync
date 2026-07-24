@@ -1,7 +1,7 @@
 use js_sys::Uint8Array;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -571,6 +571,10 @@ pub struct PageStore {
     split_pending: Arc<AtomicBool>,
     pub(crate) manifest: Arc<StdMutex<Option<StoreManifest>>>,
     page_cache: Arc<StdMutex<PageCache>>,
+    cached_pending_count: Arc<AtomicUsize>,
+    /// Serializes manifest writes through async mutex.
+    /// Prevents TOCTOU races: only one persist_manifest() runs at a time.
+    manifest_write_lock: Arc<futures::lock::Mutex<()>>,
     #[cfg(debug_assertions)]
     metrics: Arc<StorageMetrics>,
 }
@@ -584,6 +588,8 @@ impl Clone for PageStore {
             split_pending: Arc::clone(&self.split_pending),
             manifest: Arc::clone(&self.manifest),
             page_cache: Arc::clone(&self.page_cache),
+            cached_pending_count: Arc::clone(&self.cached_pending_count),
+            manifest_write_lock: Arc::clone(&self.manifest_write_lock),
             #[cfg(debug_assertions)]
             metrics: Arc::clone(&self.metrics),
         }
@@ -601,15 +607,41 @@ impl PageStore {
         let (manifest, did_rebuild) = match read_manifest_with_diagnostics(&dir, store_name).await {
             Some(m) if m.verify() => {
                 let t_read = (js_sys::Date::now() - _t0) as u64;
-                engine_info!("[PageStore::open] {}: read_manifest {}ms (valid)", store_name, t_read);
+                engine_info!(
+                    "[PageStore::open] {}: read_manifest {}ms (valid) current_page={} gen={} live={} tombstoned={}",
+                    store_name, t_read, m.current_page, m.generation.0,
+                    m.content_index.live_pages.len(), m.content_index.tombstoned_pages.len(),
+                );
                 (m, false)
             }
-            _ => {
-                // Phase 1: rebuild with ContentIndex from scan
-                let rebuilt = rebuild_manifest_with_index(&dir).await?;
-                write_manifest(&dir, &rebuilt).await?;
+            Some(m) => {
+                // Manifest loaded but verify() failed
+                let t_read = (js_sys::Date::now() - _t0) as u64;
+                engine_warn!(
+                    "[PageStore::open] {}: manifest VERIFY FAILED (t={}ms) current_page={} gen={} checksum=0x{:08X} live={} tombstoned={} — rebuilding",
+                    store_name, t_read, m.current_page, m.generation.0, m.checksum,
+                    m.content_index.live_pages.len(), m.content_index.tombstoned_pages.len(),
+                );
+                let rebuilt = rebuild_manifest_with_index(&dir, store_name).await?;
+                write_manifest(&dir, store_name, "open_verify_failed", &rebuilt).await?;
                 let t_rebuild = (js_sys::Date::now() - _t0) as u64;
-                engine_info!("[PageStore::open] {}: rebuild_manifest {}ms", store_name, t_rebuild);
+                engine_info!(
+                    "[PageStore::open] {}: rebuild_manifest {}ms (after verify fail) current_page=0 gen={}",
+                    store_name, t_rebuild, rebuilt.generation.0,
+                );
+                (rebuilt, true)
+            }
+            None => {
+                // No manifest at all (first boot or missing file)
+                let t_read = (js_sys::Date::now() - _t0) as u64;
+                engine_info!("[PageStore::open] {}: no manifest found (t={}ms) — rebuilding", store_name, t_read);
+                let rebuilt = rebuild_manifest_with_index(&dir, store_name).await?;
+                write_manifest(&dir, store_name, "open_fresh", &rebuilt).await?;
+                let t_rebuild = (js_sys::Date::now() - _t0) as u64;
+                engine_info!(
+                    "[PageStore::open] {}: rebuild_manifest {}ms (fresh) current_page=0 gen={}",
+                    store_name, t_rebuild, rebuilt.generation.0,
+                );
                 (rebuilt, true)
             }
         };
@@ -618,6 +650,7 @@ impl PageStore {
             engine_info!("[PageStore::open] {}: total {}ms (ensure_dir={}ms, rebuild={})", store_name, total_t, t_ensure, did_rebuild);
         }
         let cache = PageCache::new(500, 20 * 1024 * 1024);
+        let initial_pending = manifest.pending_count;
         Ok(Self {
             dir: Arc::new(dir),
             store_name: Arc::new(store_name.to_string()),
@@ -625,6 +658,8 @@ impl PageStore {
             split_pending: Arc::new(AtomicBool::new(false)),
             manifest: Arc::new(StdMutex::new(Some(manifest))),
             page_cache: Arc::new(StdMutex::new(cache)),
+            cached_pending_count: Arc::new(AtomicUsize::new(initial_pending)),
+            manifest_write_lock: Arc::new(futures::lock::Mutex::new(())),
             #[cfg(debug_assertions)]
             metrics: Arc::new(StorageMetrics::default()),
         })
@@ -633,6 +668,11 @@ impl PageStore {
     /// Expose directory handle for recovery rebuild
     pub fn dir(&self) -> &FileSystemDirectoryHandle {
         &self.dir
+    }
+
+    /// Return the store name (e.g. "sync_states", "schemas", "oplog").
+    pub fn store_name(&self) -> &str {
+        &self.store_name
     }
 
     /// Return page cache usage stats: (current_entries, current_bytes)
@@ -696,7 +736,7 @@ impl PageStore {
             }
         };
         if let Some(ref m) = cloned {
-            write_manifest(&self.dir, m).await?;
+            write_manifest(&self.dir, &self.store_name, "mark_document_written", m).await?;
         }
         Ok(())
     }
@@ -719,7 +759,7 @@ impl PageStore {
             }
         };
         if let Some(ref m) = cloned {
-            write_manifest(&self.dir, m).await?;
+            write_manifest(&self.dir, &self.store_name, "mark_index_dirty", m).await?;
         }
         Ok(())
     }
@@ -740,7 +780,7 @@ impl PageStore {
             }
         };
         if let Some(ref m) = cloned {
-            write_manifest(&self.dir, m).await?;
+            write_manifest(&self.dir, &self.store_name, "mark_index_clean", m).await?;
         }
         Ok(())
     }
@@ -769,7 +809,7 @@ impl PageStore {
             }
         };
         if let Some(ref m) = cloned {
-            write_manifest(&self.dir, m).await?;
+            write_manifest(&self.dir, &self.store_name, "remove_from_index", m).await?;
         }
         Ok(())
     }
@@ -795,7 +835,7 @@ impl PageStore {
             );
             manifest.clone()
         };
-        write_manifest(&self.dir, &manifest_copy).await?;
+        write_manifest(&self.dir, &self.store_name, "commit_allocated_page_id", &manifest_copy).await?;
         Ok(())
     }
 
@@ -831,7 +871,7 @@ impl PageStore {
                 (page_id, manifest.clone())
             }
         };
-        write_manifest(&self.dir, &manifest_copy.1).await?;
+        write_manifest(&self.dir, &self.store_name, "allocate_page_id", &manifest_copy.1).await?;
         Ok(manifest_copy.0)
     }
 
@@ -973,7 +1013,7 @@ impl PageStore {
             }
         };
         if let Some(ref m) = cloned {
-            write_manifest(&self.dir, m).await?;
+            write_manifest(&self.dir, &self.store_name, "delete_page", m).await?;
         }
         Ok(())
     }
@@ -1025,7 +1065,7 @@ impl PageStore {
             }
         };
         if let Some(ref m) = cloned {
-            write_manifest(&self.dir, m).await?;
+            write_manifest(&self.dir, &self.store_name, "remove_from_manifest_index", m).await?;
         }
         Ok(())
     }
@@ -1066,7 +1106,7 @@ impl PageStore {
             }
         };
         if let Some(ref m) = cloned {
-            write_manifest(&self.dir, m).await?;
+            write_manifest(&self.dir, &self.store_name, "commit_page_write", m).await?;
         }
         Ok(())
     }
@@ -1075,14 +1115,26 @@ impl PageStore {
     /// This is the only public entry point for manifest repair.
     pub async fn recover(&self) -> Result<(), VaultSyncError> {
         engine_warn!("[PageStore] recovering manifest from OPFS scan");
-        let rebuilt = rebuild_manifest_with_index(&self.dir).await?;
-        write_manifest(&self.dir, &rebuilt).await
+        let rebuilt = rebuild_manifest_with_index(&self.dir, &self.store_name).await?;
+        write_manifest(&self.dir, &self.store_name, "recover", &rebuilt).await
     }
 
     /// Remove pages that have the tombstone flag (0x02) set.
     /// Returns the number of pages cleaned up.
     pub async fn cleanup_tombstoned_pages(&self) -> Result<usize, VaultSyncError> {
         let mut cleaned = 0usize;
+        let old_current = {
+            let guard = self.manifest.lock().unwrap();
+            guard.as_ref().map(|m| m.current_page).unwrap_or(0)
+        };
+        let old_live = {
+            let guard = self.manifest.lock().unwrap();
+            guard.as_ref().map(|m| m.live_pages).unwrap_or(0)
+        };
+        engine_info!(
+            "[cleanup] store={} old_current_page={} old_live_pages={}",
+            self.store_name, old_current, old_live,
+        );
         let iter = self.dir.entries();
 
         loop {
@@ -1163,8 +1215,16 @@ impl PageStore {
             // After cleanup, rebuild manifest with ContentIndex to populate live_pages.
             // Must use rebuild_manifest_with_index — rebuild_manifest creates an empty
             // ContentIndex, causing list_page_ids() to return stale data (Bug C).
-            let rebuilt = rebuild_manifest_with_index(&self.dir).await?;
-            write_manifest(&self.dir, &rebuilt).await?;
+            let old_current_for_rebuild = old_current;
+            let rebuilt = rebuild_manifest_with_index(&self.dir, &self.store_name).await?;
+            engine_info!(
+                "[cleanup] store={} cleaned={} old_current_page={} rebuilt_current_page={} rebuilt_live={} rebuilt_highest_page={}",
+                self.store_name, cleaned, old_current_for_rebuild,
+                rebuilt.current_page, rebuilt.live_pages, rebuilt.highest_page_id,
+            );
+            self.persist_manifest("cleanup_tombstoned_pages", &rebuilt).await?;
+        } else {
+            engine_info!("[cleanup] store={} cleaned=0 (no action)", self.store_name);
         }
 
         Ok(cleaned)
@@ -1173,40 +1233,142 @@ impl PageStore {
     /// Set the current full-state page ID in the manifest.
     /// Signals that this page represents the complete store state.
     pub async fn set_current_page(&self, page_id: PageId) -> Result<(), VaultSyncError> {
-        let manifest = read_manifest(&self.dir).await;
-        let mut m = match manifest {
-            Some(m) if m.verify() => m,
-            _ => StoreManifest::new(),
+        let old = {
+            let guard = self.manifest.lock().unwrap();
+            guard.as_ref().map(|m| m.current_page).unwrap_or(0)
+        };
+        let mut m = {
+            let guard = self.manifest.lock().unwrap();
+            guard.clone().unwrap_or_else(StoreManifest::new)
         };
         m.current_page = page_id;
         m.updated_at = js_sys::Date::now() as u64;
-        write_manifest(&self.dir, &m).await
+        let result = self.persist_manifest("set_current_page", &m).await;
+        engine_debug!(
+            "[set_current_page] store={} old={} new={} gen={}",
+            self.store_name,
+            old,
+            page_id,
+            m.generation.0,
+        );
+        result
+    }
+
+    /// Allocate a new page, set current_page to it, and tombstone the old current_page
+    /// in ContentIndex — all under a single manifest lock + single OPFS write.
+    /// Returns (new_page_id, old_page_id).
+    /// The caller must still write page data to OPFS via write_page_raw_data and
+    /// tombstone the old page file via tombstone_page_file_only.
+    pub async fn allocate_and_rotate(&self, reason: &str) -> Result<(PageId, PageId), VaultSyncError> {
+        let cloned = {
+            let mut guard = self.manifest.lock().unwrap();
+            let manifest = guard.as_mut().unwrap();
+            let old_page = manifest.current_page;
+
+            // Allocate new page ID
+            let new_page = if manifest.highest_page_id < 100 {
+                manifest.highest_page_id = 101;
+                100u64
+            } else {
+                let pid = manifest.highest_page_id;
+                manifest.highest_page_id = pid + 1;
+                pid
+            };
+
+            manifest.content_index.live_pages.insert(new_page);
+            if !manifest.content_index.page_by_id.contains_key(&new_page) {
+                manifest.content_index.page_by_id.insert(new_page, IndexKey::Sequence(new_page));
+            }
+            manifest.current_page = new_page;
+
+            // Tombstone old page in ContentIndex (not OPFS — caller does that)
+            if old_page > 0 && old_page != new_page {
+                manifest.content_index.remove_by_page_id(old_page);
+            }
+
+            manifest.live_pages = manifest.content_index.live_pages.len();
+            manifest.tombstoned_pages = manifest.content_index.tombstoned_pages.len();
+            manifest.updated_at = js_sys::Date::now() as u64;
+
+            engine_info!(
+                "[PageAlloc] allocate_and_rotate store={} this=0x{:x} manifest_arc=0x{:x} reason={} old_current={} new_current={} live={} tombstoned={} gen={}",
+                self.store_name,
+                self as *const _ as u64,
+                Arc::as_ptr(&self.manifest) as u64,
+                reason, old_page, new_page,
+                manifest.live_pages, manifest.tombstoned_pages,
+                manifest.generation.0,
+            );
+
+            (new_page, old_page, manifest.clone())
+        };
+        self.persist_manifest("allocate_and_rotate", &cloned.2).await?;
+        Ok((cloned.0, cloned.1))
+    }
+
+    /// Write page data to OPFS without any manifest/ContentIndex updates.
+    /// Caller must have already set up ContentIndex entries (e.g., via allocate_and_rotate).
+    pub(crate) async fn write_page_raw_data(&self, page_id: PageId, data: &[u8]) -> Result<(), VaultSyncError> {
+        self.write_page_raw(page_id, data).await
+    }
+
+    /// Tombstone a page file in OPFS without updating ContentIndex.
+    /// Caller must have already updated ContentIndex (e.g., via allocate_and_rotate).
+    pub(crate) async fn tombstone_page_file_only(&self, page_id: PageId) -> Result<(), VaultSyncError> {
+        let name = page_filename(page_id);
+        // Remove from cache
+        {
+            let mut cache = self.page_cache.lock().unwrap();
+            cache.remove(page_id);
+        }
+        let existing = match read_all_bytes(&self.dir, &name).await {
+            Ok(b) => b,
+            Err(e) if is_not_found(&e) || is_not_readable(&e) => {
+                engine_debug!("[page_store] tombstone_page_file_only {}: already removed", page_id);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let data = extract_page_data(&existing)?;
+        let buf = encode_v3_page(&data, 0x02)?;
+        write_file(&self.dir, &name, &buf).await
     }
 
     /// Get the current full-state page ID from the manifest.
     /// Returns 0 if no current page is set (legacy store).
     pub async fn current_page(&self) -> PageId {
-        read_manifest(&self.dir)
+        let disk_val = read_manifest(&self.dir)
             .await
             .map(|m| m.current_page)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let mem_val = {
+            let guard = self.manifest.lock().unwrap();
+            guard.as_ref().map(|m| m.current_page).unwrap_or(0)
+        };
+        engine_trace!(
+            "[PageStore::current_page] store={} mem={} disk={}",
+            self.store_name,
+            mem_val,
+            disk_val,
+        );
+        disk_val
     }
 
-    /// Track last sequence number and pending count in the manifest.
+    /// Track last sequence number in the manifest. pending_count is no longer
+    /// persisted — it's maintained in cached_pending_count (AtomicUsize) and
+    /// injected into the manifest struct at persist time.
     pub async fn set_manifest_meta(
         &self,
         last_sequence: u64,
-        pending_count: usize,
+        _pending_count: usize,
     ) -> Result<(), VaultSyncError> {
-        let manifest = read_manifest(&self.dir).await;
-        let mut m = match manifest {
-            Some(m) if m.verify() => m,
-            _ => StoreManifest::new(),
+        let mut m = {
+            let guard = self.manifest.lock().unwrap();
+            guard.clone().unwrap_or_else(StoreManifest::new)
         };
         m.last_sequence = last_sequence;
-        m.pending_count = pending_count;
         m.updated_at = js_sys::Date::now() as u64;
-        write_manifest(&self.dir, &m).await
+        self.persist_manifest("set_manifest_meta", &m).await
     }
 
     /// Mark that GC is needed (called after a full-state rewrite).
@@ -1325,51 +1487,28 @@ impl PageStore {
         self.split_pending.swap(false, Ordering::Acquire)
     }
 
-    /// Get pending count from manifest.
-    pub async fn pending_count(&self) -> usize {
-        let max_reasonable = 1_000_000usize;
-        let manifest = read_manifest(&self.dir).await;
-        let count = manifest.as_ref().map(|m| m.pending_count).unwrap_or(0);
-        if count > max_reasonable {
-            engine_warn!("[pending] manifest pending_count={} exceeds max_reasonable={} — resetting to 0", count, max_reasonable);
-            if let Err(e) = self.set_pending_count(0).await {
-                engine_warn!("[pending] failed to reset manifest pending_count: {:?}", e);
-            }
-            return 0;
-        }
-        engine_trace!("[pending] manifest pending_count={}", count);
-        count
+    /// Get pending count from in-memory cache (no OPFS read).
+    pub fn pending_count(&self) -> usize {
+        self.cached_pending_count.load(Ordering::Acquire)
     }
 
-    /// Set pending count in manifest atomically.
-    pub async fn set_pending_count(&self, count: usize) -> Result<(), VaultSyncError> {
-        let manifest = read_manifest(&self.dir).await;
-        let mut m = match manifest {
-            Some(m) if m.verify() => m,
-            _ => StoreManifest::new(),
-        };
-        m.pending_count = count;
-        m.updated_at = js_sys::Date::now() as u64;
-        write_manifest(&self.dir, &m).await
+    /// Set pending count in in-memory cache only (no OPFS write).
+    /// The persisted manifest's pending_count is best-effort; it's set on
+    /// next manifest persist but never read on startup (we recompute from OPFS).
+    pub fn set_pending_count(&self, count: usize) {
+        self.cached_pending_count.store(count, Ordering::Release);
     }
 
-    /// Adjust pending count by a delta (positive or negative).
-    pub async fn adjust_pending_count(&self, delta: i32) -> Result<(), VaultSyncError> {
-        let manifest = read_manifest(&self.dir).await;
-        let before = manifest.as_ref().map(|m| m.pending_count).unwrap_or(0);
-        let mut m = match manifest {
-            Some(m) if m.verify() => m,
-            _ => StoreManifest::new(),
-        };
-        m.pending_count = if delta >= 0 {
-            m.pending_count.saturating_add(delta as usize)
+    /// Adjust pending count by a delta (positive or negative) in-memory only.
+    pub fn adjust_pending_count(&self, delta: i32) {
+        let before = self.cached_pending_count.load(Ordering::Acquire);
+        let after = if delta >= 0 {
+            before.saturating_add(delta as usize)
         } else {
-            m.pending_count.saturating_sub(delta.unsigned_abs() as usize)
+            before.saturating_sub(delta.unsigned_abs() as usize)
         };
-        m.updated_at = js_sys::Date::now() as u64;
-        write_manifest(&self.dir, &m).await?;
-        engine_trace!("[pending] manifest_write before={} delta={} after={}", before, delta, m.pending_count);
-        Ok(())
+        self.cached_pending_count.store(after, Ordering::Release);
+        engine_trace!("[pending] cache_update before={} delta={} after={}", before, delta, after);
     }
 
     // ── Transactional writes (Phase 2) ──
@@ -1471,7 +1610,7 @@ impl PageStore {
             }
         };
         if let Some(ref m) = cloned {
-            write_manifest(&self.dir, m).await?;
+            write_manifest(&self.dir, &self.store_name, "commit_tx", m).await?;
         }
         let elapsed = (js_sys::Date::now() as u64).saturating_sub(tx.started_at);
         engine_trace!("[page_store] commit_tx: {} ops in {}ms", tx.ops.len(), elapsed);
@@ -1547,15 +1686,94 @@ impl PageStore {
             // Rebuild manifest with full ContentIndex to reflect deleted pages.
             // Must use rebuild_manifest_with_index to populate content_index.live_pages
             // (the BTreeSet that list_page_ids reads from).
-            let rebuilt = rebuild_manifest_with_index(&self.dir).await?;
+            let rebuilt = rebuild_manifest_with_index(&self.dir, &self.store_name).await?;
             let mut final_manifest = rebuilt;
             final_manifest.current_page = current;
             final_manifest.updated_at = js_sys::Date::now() as u64;
-            write_manifest(&self.dir, &final_manifest).await?;
+            self.persist_manifest("run_pending_gc", &final_manifest).await?;
         }
 
         self.gc_needed.store(false, Ordering::Release);
         Ok(deleted)
+    }
+
+    /// Write manifest to OPFS AND update in-memory cache atomically.
+    /// This is the ONLY function that should persist manifests — prevents
+    /// cache/disk divergence (the root cause of stale page references in
+    /// VersionChain and repeated repair_if_diverged cycles).
+    async fn persist_manifest(&self, caller: &'static str, m: &StoreManifest) -> Result<(), VaultSyncError> {
+        // Phase 5: Serialize manifest writes through an async mutex.
+        // This prevents concurrent writers from racing on the OPFS manifest file.
+        // Only one persist_manifest() runs at a time per PageStore.
+        let _guard = self.manifest_write_lock.lock().await;
+
+        let mut m = m.clone();
+        // Inject in-memory cached pending count into the persisted manifest.
+        // pending_count is no longer authoritative from disk — it's best-effort
+        // for backward compat with other tabs that may read this manifest.
+        m.pending_count = self.cached_pending_count.load(Ordering::Relaxed);
+        write_manifest(&self.dir, &self.store_name, caller, &m).await?;
+        let mut guard = self.manifest.lock().unwrap();
+        *guard = Some(m);
+        Ok(())
+    }
+
+    /// Persist the current in-memory manifest to disk.
+    /// Used by repair mechanisms to make corrections durable.
+    pub(crate) async fn persist_current_manifest(&self, caller: &'static str) -> Result<(), VaultSyncError> {
+        let m = {
+            let guard = self.manifest.lock().unwrap();
+            guard.clone()
+        };
+        if let Some(m) = m {
+            self.persist_manifest(caller, &m).await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Assert that the in-memory manifest cache matches the disk copy.
+    /// Catches cache/disk divergence that would cause stale page references.
+    /// Only active in debug builds — call after cleanup, GC, compaction, or in tests.
+    #[cfg(debug_assertions)]
+    pub async fn validate_manifest_cache(&self) {
+        let disk = read_manifest(&self.dir).await;
+        let cache = {
+            let guard = self.manifest.lock().unwrap();
+            guard.clone()
+        };
+        if let (Some(ref disk_m), Some(ref cache_m)) = (disk, cache) {
+            if disk_m.content_index.live_pages != cache_m.content_index.live_pages {
+                engine_warn!(
+                    "[validate_manifest_cache] CACHE/DISK DIVERGENCE store={}: cache live_pages={} disk live_pages={}",
+                    self.store_name,
+                    cache_m.content_index.live_pages.len(),
+                    disk_m.content_index.live_pages.len(),
+                );
+                engine_warn!(
+                    "[validate_manifest_cache] cache={:?} disk={:?}",
+                    cache_m.content_index.live_pages.iter().copied().collect::<Vec<_>>(),
+                    disk_m.content_index.live_pages.iter().copied().collect::<Vec<_>>(),
+                );
+            }
+            if disk_m.content_index.page_by_id != cache_m.content_index.page_by_id {
+                engine_warn!(
+                    "[validate_manifest_cache] CACHE/DISK PAGE_BY_ID DIVERGENCE store={}",
+                    self.store_name,
+                );
+            }
+            if disk_m.current_page != cache_m.current_page {
+                engine_warn!(
+                    "[validate_manifest_cache] CACHE/DISK CURRENT_PAGE DIVERGENCE store={}: cache={} disk={}",
+                    self.store_name, cache_m.current_page, disk_m.current_page,
+                );
+            }
+        } else if disk.is_some() != cache.is_some() {
+            engine_warn!(
+                "[validate_manifest_cache] CACHE/DISK EXISTENCE DIVERGENCE store={}: cache_exists={} disk_exists={}",
+                self.store_name, cache.is_some(), disk.is_some(),
+            );
+        }
     }
 }
 
@@ -1899,7 +2117,7 @@ pub async fn read_manifest_with_diagnostics(
         let seq_count = manifest.content_index.page_by_sequence.len();
         let page_by_id_count = manifest.content_index.page_by_id.len();
         engine_info!(
-            "[ManifestReport] store={} loaded=true version={} serialization_version={} live_pages={} tombstoned={} page_by_doc={} page_by_seq={} page_by_id={} gen={} bytes={}",
+            "[ManifestReport] store={} loaded=true version={} serialization_version={} live_pages={} tombstoned={} page_by_doc={} page_by_seq={} page_by_id={} gen={} current_page={} bytes={}",
             store_name,
             manifest.version,
             manifest.serialization_version,
@@ -1909,6 +2127,7 @@ pub async fn read_manifest_with_diagnostics(
             seq_count,
             page_by_id_count,
             manifest.generation.0,
+            manifest.current_page,
             bytes.len(),
         );
         Some(manifest)
@@ -1928,7 +2147,7 @@ pub async fn read_manifest_with_diagnostics(
             return None;
         }
         engine_warn!(
-            "[ManifestReport] store={} loaded=false reason=CRCMismatch stored_crc=0x{:08X} computed_crc=0x{:08X} serialization_version={} bytes={} live_pages={} page_by_id={}",
+            "[ManifestReport] store={} loaded=false reason=CRCMismatch stored_crc=0x{:08X} computed_crc=0x{:08X} serialization_version={} bytes={} live_pages={} page_by_id={} current_page={} gen={}",
             store_name,
             manifest.checksum,
             computed,
@@ -1936,18 +2155,32 @@ pub async fn read_manifest_with_diagnostics(
             bytes.len(),
             manifest.content_index.live_pages.len(),
             manifest.content_index.page_by_id.len(),
+            manifest.current_page,
+            manifest.generation.0,
         );
         None
     }
 }
 
-pub async fn write_manifest(dir: &FileSystemDirectoryHandle, m: &StoreManifest) -> Result<(), VaultSyncError> {
+pub async fn write_manifest(dir: &FileSystemDirectoryHandle, store: &str, caller: &str, m: &StoreManifest) -> Result<(), VaultSyncError> {
+    let current_page = m.current_page;
+    let gen = m.generation.0;
+    let live = m.live_pages;
+    let tombstoned = m.tombstoned_pages;
+    let pending = m.pending_count;
     let mut copy = m.clone();
     copy.checksum = 0;
-    copy.checksum = copy.compute_checksum();
+    let checksum = copy.compute_checksum();
+    copy.checksum = checksum;
     let bytes = postcard::to_allocvec(&copy)
         .map_err(|e| VaultSyncError::Storage(format!("manifest encode: {:?}", e)))?;
-    write_file(dir, "_manifest", &bytes).await
+    let result = write_file(dir, "_manifest", &bytes).await;
+    engine_info!(
+        "[write_manifest] store={} caller={} current_page={} gen={} live={} tombstoned={} pending={} checksum=0x{:08X} bytes={} ok={}",
+        store, caller, current_page, gen, live, tombstoned, pending, checksum, bytes.len(),
+        result.is_ok(),
+    );
+    result
 }
 
 /// Guard token that must be passed to rebuild_manifest* functions.
@@ -1971,7 +2204,7 @@ impl ManifestRebuildGuard {
 
 /// Phase 1: Rebuild manifest with ContentIndex from OPFS scan.
 /// Used on first startup after upgrade or after corruption.
-async fn rebuild_manifest_with_index(dir: &FileSystemDirectoryHandle) -> Result<StoreManifest, VaultSyncError> {
+async fn rebuild_manifest_with_index(dir: &FileSystemDirectoryHandle, store: &str) -> Result<StoreManifest, VaultSyncError> {
     let now = js_sys::Date::now() as u64;
     let mut highest_page_id: PageId = 0;
     let mut index = ContentIndex::new();
@@ -2055,7 +2288,14 @@ async fn rebuild_manifest_with_index(dir: &FileSystemDirectoryHandle) -> Result<
         }
     }
 
-    check_manifest_rebuild_duplicates(&index, "store");
+    check_manifest_rebuild_duplicates(&index, store);
+
+    engine_info!(
+        "[rebuild_manifest_with_index] store={} highest_page_id={} live={} tombstoned={} current_page=0 gen=0 — rebuild from OPFS scan",
+        store, highest_page_id,
+        index.live_pages.len(),
+        index.tombstoned_pages.len(),
+    );
 
     let mut m = StoreManifest {
         version: 2,
@@ -2143,6 +2383,11 @@ async fn rebuild_manifest(dir: &FileSystemDirectoryHandle) -> Result<StoreManife
             }
         }
     }
+
+    engine_info!(
+        "[rebuild_manifest] highest_page_id={} live={} tombstoned={} current_page=0 gen=0 — legacy rebuild from OPFS scan",
+        highest_page_id, live_pages, tombstoned_pages,
+    );
 
     let mut m = StoreManifest {
         version: 1,

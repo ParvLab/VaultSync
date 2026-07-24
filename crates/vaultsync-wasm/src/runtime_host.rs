@@ -21,6 +21,7 @@ use vaultsync_core::runtime_bus::{RuntimeBus, RuntimeEvent};
 pub struct VaultRuntime {
     /// Shared container for all runtime references
     pub ctx: Arc<EngineContext>,
+    pub id: u64,
 
     // ── Lifecycle ──
     pub start_time: js_sys::Date,
@@ -34,9 +35,12 @@ impl VaultRuntime {
         scheduler: Arc<StorageScheduler>,
         metrics: Arc<RuntimeMetrics>,
     ) -> Arc<Self> {
-        let ctx = Arc::new(EngineContext::new(runtime, storage, scheduler, metrics));
+        let id = crate::runtime::next_runtime_id();
+        let ctx = Arc::new(EngineContext::new(runtime.clone(), storage.clone(), scheduler, metrics));
+        engine_info!("[VaultRuntime#{}] new with Runtime#{} StorageRuntime#{}", id, runtime.id, storage.id);
         Arc::new(Self {
             ctx,
+            id,
             start_time: js_sys::Date::new_0(),
             is_ready: AtomicBool::new(false),
         })
@@ -46,6 +50,7 @@ impl VaultRuntime {
         // Single-threaded WASM: safe to create a new Arc with cloned fields + new ctx.
         Arc::new(VaultRuntime {
             ctx: Arc::new(ctx),
+            id: self.id,
             start_time: js_sys::Date::new_0(),
             is_ready: AtomicBool::new(false),
         })

@@ -47,13 +47,15 @@ impl DocumentStore {
         Self { documents: HashMap::new() }
     }
 
-    pub fn set_field(&mut self, doc_id: &str, record_id: &str, field: &str, value: CrdtValue) {
+    pub fn set_field(&mut self, doc_id: &str, record_id: &str, field: &str, value: CrdtValue) -> bool {
+        let is_new = !self.documents.get(doc_id).map_or(false, |d| d.contains_key(record_id));
         self.documents
             .entry(doc_id.to_string())
             .or_default()
             .entry(record_id.to_string())
             .or_default()
             .insert(field.to_string(), value);
+        is_new
     }
 
     pub fn set_record(&mut self, doc_id: &str, record_id: &str, fields: HashMap<String, CrdtValue>) {
@@ -82,10 +84,28 @@ impl DocumentStore {
     }
 
     pub fn query_doc(&self, doc_id: &str) -> Vec<&HashMap<String, CrdtValue>> {
-        self.documents
+        let result: Vec<&HashMap<String, CrdtValue>> = self.documents
             .get(doc_id)
             .map(|recs| recs.values().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let total = result.len();
+        let mut deleted_count = 0usize;
+        let mut id_info: Vec<String> = Vec::new();
+        for fields in &result {
+            let rid = fields.get("record_id")
+                .or_else(|| fields.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let is_del = fields.get("_deleted").and_then(|v| v.as_bool()).unwrap_or(false)
+                || fields.get("__deleted__").and_then(|v| v.as_bool()).unwrap_or(false);
+            if is_del { deleted_count += 1; }
+            id_info.push(format!("{}(del={})", rid, is_del));
+        }
+        engine_info!(
+            "[QUERY_DOC] doc={} stored={} deleted={} visible={} records=[{}]",
+            doc_id, total, deleted_count, total - deleted_count, id_info.join(","),
+        );
+        result
     }
 
     pub fn has_doc(&self, doc_id: &str) -> bool {
@@ -148,7 +168,10 @@ impl DocumentRuntime {
 
     pub fn set_field(&self, doc_id: &str, record_id: &str, field: &str, value: CrdtValue) {
         let mut store = self.store.lock().unwrap();
-        store.set_field(doc_id, record_id, field, value.clone());
+        let created = store.set_field(doc_id, record_id, field, value.clone());
+        if created {
+            engine_info!("[DOC_CREATE] caller=DocumentRuntime::set_field doc={} record={} field={}", doc_id, record_id, field);
+        }
         self.record_access(doc_id);
 
         // Update cache
@@ -280,5 +303,11 @@ impl RuntimeLifecycle for DocumentRuntime {
     async fn shutdown(&self) -> Result<(), String> {
         self.clear();
         Ok(())
+    }
+}
+
+impl Drop for DocumentRuntime {
+    fn drop(&mut self) {
+        engine_info!("[DocumentRuntime] dropped (last Arc reference released)");
     }
 }

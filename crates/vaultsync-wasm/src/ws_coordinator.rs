@@ -7,6 +7,7 @@ use futures::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use vaultsync_core::connection_manager::ConnectionManager;
 use vaultsync_core::coordinator::traits::{
     Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId,
 };
@@ -34,6 +35,7 @@ struct ConnectionState {
 struct WasmWsCoordinatorInner {
     url: String,
     auth_token: Option<String>,
+    connection_manager: Mutex<Option<Arc<ConnectionManager>>>,
     replica_id: Mutex<String>,
     connection: Mutex<ConnectionState>,
     pending_requests: Mutex<HashMap<String, oneshot::Sender<Vec<u8>>>>,
@@ -67,6 +69,7 @@ impl WasmWsCoordinator {
             inner: Arc::new(WasmWsCoordinatorInner {
                 url: url.to_string(),
                 auth_token,
+                connection_manager: Mutex::new(None),
                 replica_id: Mutex::new(String::new()),
                 connection: Mutex::new(ConnectionState {
                     ws: None,
@@ -86,6 +89,11 @@ impl WasmWsCoordinator {
                 received_snapshots: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    pub fn set_connection_manager(&self, cm: Arc<ConnectionManager>) {
+        *self.inner.connection_manager.lock().unwrap() = Some(cm);
+        engine_debug!("[WasmWs] connection_manager registered");
     }
 
     pub fn set_download_notify(&self, tx: mpsc::UnboundedSender<Option<PendingMutation>>) {
@@ -205,6 +213,7 @@ impl WasmWsCoordinator {
         let dc_t0 = js_sys::Date::now();
         let ws_url = get_ws_url(&self.inner.url, namespace);
         engine_debug!("[reconnect] state=Connecting url={}", ws_url);
+        engine_info!("[CONN][T0] CONNECTING url={}", ws_url);
         let ws = WebSocket::new(&ws_url).map_err(|e| {
             CoordinatorError::Internal(format!("Failed to create WebSocket: {:?}", e))
         })?;
@@ -215,6 +224,7 @@ impl WasmWsCoordinator {
             let (open_tx, open_rx) = oneshot::channel::<()>();
             let open_tx_cell = std::cell::RefCell::new(Some(open_tx));
             let open_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
+                engine_info!("[CONN][T1] OPEN");
                 if let Some(tx) = open_tx_cell.borrow_mut().take() {
                     let _ = tx.send(());
                 }
@@ -227,10 +237,19 @@ impl WasmWsCoordinator {
             let close_tx_cell = std::cell::RefCell::new(Some(close_tx));
             let inner_close_clone = self.inner.clone();
             let close_callback = Closure::wrap(Box::new(move |e: web_sys::Event| {
+                let reason = e
+                    .target()
+                    .and_then(|t| t.dyn_into::<web_sys::WebSocket>().ok())
+                    .map(|ws| ws.ready_state())
+                    .unwrap_or(99);
+                engine_warn!("[CONN][T8] CLOSED ready_state={}", reason);
                 if let Some(tx) = close_tx_cell.borrow_mut().take() {
                     let _ = tx.send(());
                 }
                 inner_close_clone.connection.lock().unwrap().ws = None;
+                if let Some(ref cm) = *inner_close_clone.connection_manager.lock().unwrap() {
+                    cm.transition(vaultsync_core::connection_manager::ConnectionState::Closed);
+                }
             }) as Box<dyn Fn(web_sys::Event)>);
             ws.set_onclose(Some(close_callback.as_ref().unchecked_ref()));
             close_callback.forget();
@@ -242,8 +261,12 @@ impl WasmWsCoordinator {
             _ = open_rx.fuse() => {
                 let ws_open_elapsed = (js_sys::Date::now() - dc_t0) as u64;
                 engine_info!("[ws] ws_open elapsed={}ms", ws_open_elapsed);
+                if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+                    cm.transition(vaultsync_core::connection_manager::ConnectionState::Authenticating);
+                }
             }
             _ = close_rx.fuse() => {
+                engine_warn!("[CONN][T8] CLOSED (handshake_failed)");
                 engine_info!("[WasmWs] WebSocket closed/failed!");
                 return Err(CoordinatorError::NotAvailable);
             }
@@ -285,6 +308,7 @@ impl WasmWsCoordinator {
             encode_frame(MSG_AUTH, &auth).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         ws.send_with_u8_array(&auth_frame)
             .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+        engine_debug!("[CONN][T2] AUTH_SENT");
 
         // Wait for AUTH_ACK with 5s timeout
         let auth_resp = recv_with_timeout(&mut msg_rx, 5).await?;
@@ -305,6 +329,10 @@ impl WasmWsCoordinator {
 
         let auth_ack: AuthAckPayload = serde_json::from_slice(payload)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        engine_info!("[CONN][T3] AUTH_OK status={}", auth_ack.status);
+        if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+            cm.transition(vaultsync_core::connection_manager::ConnectionState::Registering);
+        }
 
         if auth_ack.status != "ok" {
             engine_warn!("[WasmWs] auth ack status is not ok: {:?}", auth_ack.error);
@@ -328,6 +356,7 @@ impl WasmWsCoordinator {
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         ws.send_with_u8_array(&reg_frame)
             .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+        engine_debug!("[CONN][T4] REGISTER_SENT");
 
         // Wait for REGISTER_ACK with 5s timeout
         let reg_resp = recv_with_timeout(&mut msg_rx, 5).await?;
@@ -362,7 +391,10 @@ impl WasmWsCoordinator {
         }
 
         let reg_elapsed = (js_sys::Date::now() - reg_t0) as u64;
-        engine_info!("[ws] register elapsed={}ms", reg_elapsed);
+        engine_info!("[CONN][T5] REGISTER_OK elapsed={}ms", reg_elapsed);
+        if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+            cm.transition(vaultsync_core::connection_manager::ConnectionState::Online);
+        }
 
         // 3.5 Drain MSG_SNAPSHOT frames pushed by server after REGISTER_ACK
         let snap_t0 = js_sys::Date::now();
@@ -409,6 +441,7 @@ impl WasmWsCoordinator {
         // 4. Perform SUBSCRIBE (skipped when caller will subscribe separately after gen check)
         let sub_t0 = js_sys::Date::now();
         if !skip_subscribe {
+            engine_info!("[CONN][T6] SUBSCRIBING after={}", effective_after);
             engine_debug!("[VaultSync] subscribe after={} (after={} max_snapshot={})", effective_after, after, max_snap_seq);
             let sub = SubscribePayload {
                 request_id: uuid::Uuid::new_v4().to_string(),
@@ -629,6 +662,7 @@ impl WasmWsCoordinator {
             state.generation = generation;
         }
 
+        engine_info!("[CONN][T7] ONLINE gen={}", generation);
         Ok(())
     }
 
@@ -660,11 +694,18 @@ impl WasmWsCoordinator {
                         .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
                     tracing::trace!("[send_request] frame sent req={}", request_id);
                 } else {
-                    tracing::trace!("[send_request] NOT_AVAILABLE (ready_state={}) req={}", ws.ready_state(), request_id);
+                    engine_warn!("[CONN][ERR] NotAvailable ready_state={} ws_some=true req={}", ws.ready_state(), request_id);
+                    // Clear zombie WS reference so next attempt reconnects
+                    let mut state = self.inner.connection.lock().unwrap();
+                    if let Some(ref live_ws) = state.ws {
+                        if live_ws.ready_state() != 1 {
+                            state.ws = None;
+                        }
+                    }
                     return Err(CoordinatorError::NotAvailable);
                 }
             } else {
-                tracing::trace!("[send_request] NOT_AVAILABLE (no ws) req={}", request_id);
+                engine_warn!("[CONN][ERR] NotAvailable ws_some=false req={}", request_id);
                 return Err(CoordinatorError::NotAvailable);
             }
         }
@@ -732,6 +773,13 @@ impl Coordinator for WasmWsCoordinator {
         namespace: &str,
         mutations: Vec<EncryptedMutation>,
     ) -> Result<Vec<SequenceId>, CoordinatorError> {
+        // Fast path: skip if ConnectionManager says we're offline
+        if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+            if !cm.is_online() {
+                tracing::trace!("[WasmWs] push skipped: cm.state()={:?}", cm.state());
+                return Err(CoordinatorError::NotAvailable);
+            }
+        }
         let is_connected = {
             let state = self.inner.connection.lock().unwrap();
             state.ws.is_some()
@@ -794,6 +842,12 @@ impl Coordinator for WasmWsCoordinator {
         after: SequenceId,
         limit: usize,
     ) -> Result<Vec<PendingMutation>, CoordinatorError> {
+        if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+            if !cm.is_online() {
+                tracing::trace!("[WasmWs] pull skipped: cm.state()={:?}", cm.state());
+                return Err(CoordinatorError::NotAvailable);
+            }
+        }
         let is_connected = {
             let state = self.inner.connection.lock().unwrap();
             state.ws.is_some()
@@ -841,6 +895,12 @@ impl Coordinator for WasmWsCoordinator {
         namespace: &str,
         from_sequence: SequenceId,
     ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+        if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+            if !cm.is_online() {
+                tracing::trace!("[WasmWs] subscribe skipped: cm.state()={:?}", cm.state());
+                return Err(CoordinatorError::NotAvailable);
+            }
+        }
         let is_connected = {
             let state = self.inner.connection.lock().unwrap();
             state.ws.is_some()
@@ -985,6 +1045,7 @@ impl Coordinator for WasmWsCoordinator {
     }
 
     async fn disconnect(&self) -> Result<(), CoordinatorError> {
+        engine_debug!("[CONN][T10] CLOSING");
         engine_debug!("[WasmWs] disconnect requested");
         let mut state = self.inner.connection.lock().unwrap();
         if let Some(ws) = state.ws.take() {

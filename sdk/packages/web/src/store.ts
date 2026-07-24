@@ -55,6 +55,11 @@ export class RuntimeStore {
     }
   }
 
+  /** Diagnostic: count records for a doc (direct map access, no transformation). */
+  getRecordCount(docId: string): number {
+    return this.cache.get(docId)?.size ?? 0;
+  }
+
   /** Get a specific record. */
   get(docId: string, recordId: string): FieldMap | null {
     const doc = this.cache.get(docId);
@@ -67,12 +72,22 @@ export class RuntimeStore {
   query(docId: string): FieldMap[] {
     const doc = this.cache.get(docId);
     if (!doc) return [];
+    const result = Array.from(doc.entries()).map(([recordId, fields]) => {
+      const { id: _id, record_id: _rid, ...rest } = fields as Record<string, unknown>;
+      return { id: recordId, record_id: recordId, ...rest } as FieldMap;
+    });
+    const ids = result.map((v: FieldMap) => (v.record_id ?? v.id ?? '?') as string);
+    const deleted = result.filter((v: FieldMap) => v._deleted === true || v.__deleted__ === true).length;
+    console.debug('[RUNTIME_STORE] query doc=%s total=%d deleted=%d visible=%d ids=[%s]',
+      docId, result.length, deleted, result.length - deleted, ids.join(','));
     this.touchKey(docId);
-    return Array.from(doc.values());
+    return result;
   }
 
   /** Apply a set-field mutation from WASM/BC. */
   applySetField(docId: string, recordId: string, field: string, value: any): void {
+    console.debug('[RUNTIME_STORE] applySetField doc=%s rec=%s field=%s val=%s',
+      docId, recordId, field, typeof value === 'object' ? JSON.stringify(value).slice(0, 80) : String(value));
     let doc = this.cache.get(docId);
     if (!doc) {
       doc = new Map();
@@ -101,16 +116,25 @@ export class RuntimeStore {
 
   /** Apply multiple fields atomically with a single notification.
    *  Use this for BC MUTATION batches to avoid per-field re-render cascade. */
-  applySetFieldBatch(docId: string, recordId: string, fields: Record<string, any>): void {
-    const t0 = performance.now();
+  applySetFieldBatch(docId: string, recordId: string, fields: Record<string, any>, caller?: string): void {
+    const isDel = fields._deleted === true || fields.__deleted__ === true;
+    if (isDel) {
+      this.applyDeleteDocument(docId, recordId, caller);
+      return;
+    }
     let doc = this.cache.get(docId);
     if (!doc) {
       doc = new Map();
       this.cache.set(docId, doc);
     }
 
-    // Bug 5: Normalize: if fields.id differs from recordId param, check if
-    // there's an existing entry keyed by fields.id that should be merged.
+    const exists_before = doc.has(recordId);
+    const size_before = doc.size;
+    console.log('[RT_SET]', JSON.stringify({
+      doc: docId, rec: recordId, caller: caller ?? '?',
+      fieldCount: Object.keys(fields).length, exists: exists_before,
+    }));
+
     const effectiveRecordId = (fields.record_id ?? fields.id ?? recordId) as string;
 
     const merged = effectiveRecordId !== recordId;
@@ -121,6 +145,10 @@ export class RuntimeStore {
         doc.delete(recordId);
         this._revision++;
         this.notify(docId, effectiveRecordId);
+        if (!exists_before) {
+          console.debug('[RT_MUTATION] source=%s record=%s exists_before=%s action=CREATE doc_size=%d→%d',
+            caller ?? '?', recordId, exists_before, size_before, doc.size);
+        }
         return;
       }
       doc.set(effectiveRecordId, { ...(doc.get(effectiveRecordId) || {}), ...fields });
@@ -129,18 +157,20 @@ export class RuntimeStore {
       }
       this._revision++;
       this.notify(docId, effectiveRecordId);
+      if (!exists_before) {
+        console.debug('[RT_MUTATION] source=%s record=%s exists_before=%s action=CREATE doc_size=%d→%d',
+          caller ?? '?', recordId, exists_before, size_before, doc.size);
+      }
       return;
     }
 
     doc.set(recordId, { ...(doc.get(recordId) || {}), ...fields });
     this._revision++;
     this.notify(docId, recordId);
-    console.debug('[STORE] applySetFieldBatch done', JSON.stringify({
-      doc: docId, record: recordId,
-      merged: merged ? effectiveRecordId : null,
-      fields: Object.keys(fields).length,
-      elapsed: (performance.now() - t0).toFixed(2) + 'ms',
-    }));
+    if (!exists_before) {
+      console.debug('[RT_MUTATION] source=%s record=%s exists_before=%s action=CREATE doc_size=%d→%d',
+        caller ?? '?', recordId, exists_before, size_before, doc.size);
+    }
   }
 
   /** Apply a delete-field mutation. */
@@ -156,10 +186,16 @@ export class RuntimeStore {
   }
 
   /** Apply a delete-document mutation. */
-  applyDeleteDocument(docId: string, recordId: string): void {
+  applyDeleteDocument(docId: string, recordId: string, caller?: string): void {
     const doc = this.cache.get(docId);
-    if (!doc) return;
+    if (!doc) {
+      console.debug('[RUNTIME_STORE] applyDeleteDocument doc=%s rec=%s — no such doc (already deleted?)', docId, recordId);
+      return;
+    }
+    const had = doc.has(recordId);
     doc.delete(recordId);
+    console.debug('[RUNTIME_STORE] applyDeleteDocument doc=%s rec=%s existed=%s remaining=%d size=%d',
+      docId, recordId, String(had), doc.size, this.cache.size);
     if (doc.size === 0) {
       this.cache.delete(docId);
     }
@@ -167,45 +203,10 @@ export class RuntimeStore {
     this.notify(docId, recordId);
   }
 
-  /** Track subscriber identities per (docId, recordId, component) for duplicate detection. */
-  private _subIdentities = new Map<string, { docSubs: Set<number>; recSubs: Map<string, Set<number>> }>();
-
   /** Subscribe to changes. Returns unsubscribe function. */
-  subscribe(
-    docId: string,
-    recordId: string | null,
-    callback: NotifyCallback,
-    componentStack?: string,
-  ): () => void {
+  subscribe(docId: string, recordId: string | null, callback: NotifyCallback): () => void {
     const id = this.nextId++;
     this.subs.set(id, callback);
-
-    // Track subscriber identity for diagnostics
-    let identity = this._subIdentities.get(docId);
-    if (!identity) {
-      identity = { docSubs: new Set(), recSubs: new Map() };
-      this._subIdentities.set(docId, identity);
-    }
-    if (recordId) {
-      let recSet = identity.recSubs.get(recordId);
-      if (!recSet) { recSet = new Set(); identity.recSubs.set(recordId, recSet); }
-      recSet.add(id);
-    } else {
-      identity.docSubs.add(id);
-    }
-
-    // Warn when multiple distinct subscribers exist for the same doc
-    const docCount = identity.docSubs.size;
-    const recCountAll = Array.from(identity.recSubs.values()).reduce((sum, s) => sum + s.size, 0);
-    if (docCount + recCountAll > 1) {
-      console.warn('[STORE] subscriber joined', JSON.stringify({
-        doc: docId, record: recordId,
-        docSubscribers: docCount,
-        recordSubscribers: recCountAll,
-        subscriptionId: id,
-        stack: componentStack?.slice(0, 120),
-      }));
-    }
 
     if (recordId) {
       const key = `${docId}::${recordId}`;
@@ -227,11 +228,9 @@ export class RuntimeStore {
     return () => {
       this.subs.delete(id);
       if (recordId) {
-        identity.recSubs.get(recordId)?.delete(id);
         const key = `${docId}::${recordId}`;
         this.recDeps.get(key)?.delete(id);
       } else {
-        identity.docSubs.delete(id);
         this.docDeps.get(docId)?.delete(id);
       }
     };
@@ -243,14 +242,11 @@ export class RuntimeStore {
       this._pendingDocs.add(docId);
       return;
     }
-    const t0 = performance.now();
-    let totalFired = 0;
     if (recordId) {
       const deps = this.recDeps.get(`${docId}::${recordId}`);
       if (deps) {
         for (const id of deps) {
           this.subs.get(id)?.();
-          totalFired++;
         }
       }
     }
@@ -258,14 +254,7 @@ export class RuntimeStore {
     if (docDeps) {
       for (const id of docDeps) {
         this.subs.get(id)?.();
-        totalFired++;
       }
-    }
-    if (totalFired > 0) {
-      console.debug('[STORE] notify', JSON.stringify({
-        doc: docId, record: recordId, fired: totalFired,
-        elapsed: (performance.now() - t0).toFixed(2) + 'ms',
-      }));
     }
   }
 

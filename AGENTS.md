@@ -124,6 +124,33 @@ That's how people understand systems — not by reading modules, but by followin
 - Compaction methods must use `js_sys::Date::now()` for timestamps (not `crate::time_utils`)
 
 ## Progress
+### Done (Session 4 — Upload Queue Instrumentation + Write Verification)
+- **Phase 1 — Upload pipeline cursor advancement**: `upload.rs` now calls `sync_state_store.set_cursor(max_seq)` after MARK_DONE in the pipeline. Push handler (`process_push_mutation`) advances cursor for self-replica echoes in `download.rs`.
+- **Phase 2 — Full instrumentation**: `process_push_mutation`, `process_batch`, `sync_runtime.rs` cursor/set_cursor, `metadata_runtime.rs` checkpoint all instrumented at INFO level. Runtime logs now show exact cursor state transitions.
+- **Root cause identified — upload queue cache/disk divergence**: `pending_count()` reads in-memory manifest counter while `read_pending_oplog()` reads OPFS via VersionChain. When `VersionChain::resolve()` fails to reconstruct a page (incomplete chain), entries on disk differ from cached count.
+- **P1 — `adjust_oplog_pending_count` caller tagging**: All 4 callers now tagged with `caller: &'static str` ("write_document_and_oplog", "delete_document_and_oplog", "append_oplog", "mark_synced", "mark_failed").
+- **P2 — Write-then-read-back verification**: `verify_oplog_write()` added to `OpfsStorage` — writes data via `write_oplog_page`, reads back from OPFS, compares. Logs `[WRITE_VERIFY] MATCH` or `[WRITE_VERIFY] MISMATCH` per call site.
+- **P3 — Per-stage filtered logging in `read_pending_oplog`**: Logs pages count, resolved entries, namespace filter result, uploadable count, full lists of IDs/statuses at each filter stage.
+- **P4 — Pending count invariant check**: After every oplog write, asserts `pending_count == uploadable_entries_in_namespace`. Logs `[INVARIANT] OK` or `[INVARIANT] MISMATCH` with full status dump.
+- **Fixed cache/disk mismatch**: `adjust_pending_count` in `PageStore` now updates in-memory manifest cache atomically (not just OPFS).
+- **All 3 builds pass**: `cargo check --workspace` ✅, `wasm-pack build --target web` ✅, `npm run build` (SDK) ✅.
+
+### Current Bug — Malformed notes missing record_id/id in JS RuntimeStore
+**Status**: Fixed in `sdk/packages/web/src/store.ts:66-77`.
+
+**Root cause**: `RuntimeStore` stores records as `Map<recordId, FieldMap>` where the Map key is the identity, but `query()` returned `Array.from(doc.values())` which discards the key. The stored FieldMap values lack `record_id`/`id` because:
+1. `mutations.insert(id, {title, body})` at `App.tsx:37-40` passes fields without identifiers
+2. CRDT per-field BC mutations carry one field at a time, never `record_id`
+3. `mutations.update(noteId, {title, body})` also omits identifiers
+
+**Fix (Option C)**: `query()` now iterates `doc.entries()` and injects the Map key as `record_id`/`id`, stripping any stale `id`/`record_id` from stored fields via destructuring. This guarantees identity is reconstructed from the authoritative Map key on every read, regardless of how data was stored.
+
+**Symptoms explained**: React duplicate keys (all `key=undefined`), clicking always opens first note (`record_id` undefined matches every record), delete doesn't work (`delete(undefined)` no-op), malformed-object warnings.
+
+**Evidence**: `[NOTE_LIST] ids=[?,?]` showing `?` for every record, `[NoteList] malformed note without identifier {json: '{"title":"","body":""}'}` with only 2 keys. Rust `[DOC_CREATE]` logs confirmed valid IDs in storage — corruption was entirely in the JS query layer.
+
+**All 3 builds pass** after fix.
+
 ### Done (Session 3 — FSM + StorageHealth + Sprint A)
 - **Sprint A — Correctness (Storage Transaction Model)**: Fixed Bug C root cause — every page write now atomically updates ALL ContentIndex indexes including `page_by_id`. `write_page_raw` is now a pure OPFS writer (no manifest updates). `commit_page_write()` replaces `bump_manifest_live_page()` and updates `live_pages` + `page_by_id` + (optionally) `entries`/`page_by_document`/`page_by_sequence`. `allocate_page_id()` and `commit_allocated_page_id()` add stub `page_by_id` entries so `repair_orphans()` no longer tombstones legitimate delta pages. `remove_by_page_id()` handles stub entries correctly. `split_page()` uses `write_page_tx` + `commit_tx` for atomic ContentIndex updates. `commit_tx()` Write ops with `None` key properly track pages in all indexes instead of tombstoning them.
 - All 3 builds pass (`cargo check --workspace`, `wasm-pack build --target web`, `npx tsc --noEmit`).

@@ -217,22 +217,9 @@ impl Reconciler {
             doc_ptr_val, inner_doc_ptr_val,
         );
 
-        if !doc_advanced && redundant && !entry.yrs_update.is_empty() {
-            // Normal case: push is a duplicate of an already-applied mutation.
-            // Expected during steady-state sync — the server echoes mutations
-            // that were already pulled via batch or received via another path.
-            tracing::debug!(
-                "[reconciler] DUPLICATE_MUTATION source={} id={} doc={} record={} update_len={} redundant={} doc_advanced={} client_count_before={} client_count_after={} incoming={}",
-                source, entry.id, entry.doc_id, entry.record_id, entry.yrs_update.len(),
-                redundant, doc_advanced, old_entries.len(), new_entries.len(), content_hash,
-            );
-        }
         if !doc_advanced && !redundant && !entry.yrs_update.is_empty() {
-            // Suspicious: mutation was not redundant (claimed new state)
-            // yet document didn't advance. Indicates potential causal gap,
-            // clock skew, or CRDT merge issue.
-            tracing::warn!(
-                "[reconciler] BLIND_SPOT source={} id={} doc={} record={} update_len={} redundant={} doc_advanced={} client_count_before={} client_count_after={} incoming={}",
+            tracing::trace!(
+                "[reconciler] REMOTE_APPLY source={} id={} doc={} record={} update_len={} redundant={} doc_advanced={} client_count_before={} client_count_after={} incoming={}",
                 source, entry.id, entry.doc_id, entry.record_id, entry.yrs_update.len(),
                 redundant, doc_advanced, old_entries.len(), new_entries.len(), content_hash,
             );

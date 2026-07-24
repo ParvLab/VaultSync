@@ -96,6 +96,34 @@ macro_rules! engine_warn {
     };
 }
 
+/// Check an invariant and log ✓ PASS or ❌ FAIL with structured fields.
+/// Always logged at INFO level (invariants are always visible).
+/// Usage:
+///   engine_invariant!("DocumentStore count match", "store_docs", 3, "sidebar_docs", 3);
+#[macro_export]
+macro_rules! engine_invariant {
+    ($name:expr, $($key:expr => $val:expr),* $(,)?) => {
+        {
+            let mut parts = Vec::new();
+            $(
+                parts.push(format!("{}={:?}", $key, $val));
+            )*
+            let detail = parts.join(" ");
+            engine_info!("[INV] {} {} — {}", "\u{2713}", $name, detail);
+        }
+    };
+    (FAIL, $name:expr, $reason:expr, $($key:expr => $val:expr),* $(,)?) => {
+        {
+            let mut parts = Vec::new();
+            $(
+                parts.push(format!("{}={:?}", $key, $val));
+            )*
+            let detail = parts.join(" ");
+            engine_warn!("[INV] {} {} — {} — {}", "\u{2717}", $name, $reason, detail);
+        }
+    };
+}
+
 #[macro_export]
 macro_rules! engine_error {
     ($($arg:tt)*) => {
@@ -205,6 +233,8 @@ pub mod engine_context;
 pub mod cache_runtime;
 #[cfg(target_arch = "wasm32")]
 pub mod namespace_runtime;
+#[cfg(target_arch = "wasm32")]
+pub mod lifecycle_manager;
 #[cfg(target_arch = "wasm32")]
 pub mod replay_engine;
 #[cfg(target_arch = "wasm32")]

@@ -4,13 +4,14 @@ use crate::coordinator::ws_proto::*;
 use async_trait::async_trait;
 use futures::Stream;
 use futures::StreamExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::warn;
 
 #[cfg(not(target_arch = "wasm32"))]
 use futures::SinkExt;
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
@@ -61,6 +62,10 @@ pub struct MuxCoordinator {
 
     active_namespaces:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, ActiveNamespaceConfig>>>,
+
+    /// Cached max_sequence from server, updated on NamespaceAck.
+    /// Available on all platforms so NamespacedCoordinator can delegate without cfg gates.
+    max_sequence: Arc<AtomicU64>,
 }
 
 impl MuxCoordinator {
@@ -71,6 +76,7 @@ impl MuxCoordinator {
             #[cfg(not(target_arch = "wasm32"))]
             ws_client: Arc::new(tokio::sync::Mutex::new(None)),
             active_namespaces: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            max_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -186,6 +192,7 @@ impl MuxCoordinator {
             let self_weak = Arc::downgrade(&self_arc);
             let hp = handle.history_preserved.clone();
             let ms = handle.max_sequence.clone();
+            let mux_ms = self_arc.max_sequence.clone();
 
             crate::time_utils::spawn(async move {
                 use tokio_tungstenite::tungstenite::Message;
@@ -260,6 +267,7 @@ impl MuxCoordinator {
                                             hp.store(true, Ordering::SeqCst);
                                         }
                                         ms.store(ack.max_sequence, Ordering::SeqCst);
+                                        mux_ms.store(ack.max_sequence, Ordering::SeqCst);
                                         let mut reqs = pending_registers_clone.lock().await;
                                         if let Some(tx) = reqs.remove(&ack.namespace) {
                                             let _ = tx.send(ack);
@@ -502,14 +510,8 @@ impl MuxCoordinator {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub async fn max_sequence(&self) -> u64 {
-        let handle_opt = self.ws_client.lock().await.clone();
-        if let Some(handle) = handle_opt {
-            handle.max_sequence.load(Ordering::SeqCst)
-        } else {
-            0
-        }
+        self.max_sequence.load(Ordering::SeqCst)
     }
 
     async fn push(
@@ -1030,12 +1032,7 @@ impl Coordinator for NamespacedCoordinator {
     }
 
     async fn max_sequence(&self) -> u64 {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            return self.mux.max_sequence().await;
-        }
-        #[cfg(target_arch = "wasm32")]
-        0
+        self.mux.max_sequence().await
     }
 }
 

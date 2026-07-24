@@ -140,23 +140,26 @@ impl StorageTransaction for OpfsTransaction {
         // Write all changes as a single delta page
         let encoded = postcard::to_allocvec(&delta_entries)
             .map_err(|e| VaultSyncError::Storage(format!("tx encode: {:?}", e)))?;
-        let pending_count = self
-            .pending_entries
-            .iter()
-            .filter(|e| e.sync_status.is_uploadable())
-            .count();
         if let Some(ref sr) = self.storage_runtime {
             // Route through StorageRuntime for allocation + scheduling
             let page_id = sr.allocate_page_id("oplog", "tx_commit");
             self.store.commit_allocated_page_id(page_id).await?;
             sr.enqueue_write_page("oplog", page_id, encoded).await?;
+            // Re-read from OPFS after write to compute authoritative pending count.
+            // Reading before the write would include about-to-be-synced entries
+            // as uploadable, causing cache/disk divergence.
+            let after_entries = storage::read_all_oplog_entries(&self.store).await?;
+            let pending_count = after_entries.iter().filter(|e| e.sync_status.is_uploadable()).count();
             sr.set_pending_count("oplog", pending_count).await?;
             sr.schedule_gc("oplog");
         } else {
             // Fallback: direct allocation + write (no StorageRuntime)
             let page_id = self.store.allocate_page_id("tx_commit").await?;
             self.store.write_page(page_id, &encoded).await?;
-            self.store.set_pending_count(pending_count).await?;
+            // Re-read from OPFS after write to compute authoritative pending count.
+            let after_entries = storage::read_all_oplog_entries(&self.store).await?;
+            let pending_count = after_entries.iter().filter(|e| e.sync_status.is_uploadable()).count();
+            self.store.set_pending_count(pending_count);
             self.store.schedule_gc();
         }
 

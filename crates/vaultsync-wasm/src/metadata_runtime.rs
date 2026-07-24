@@ -14,6 +14,7 @@ use crate::metadata_store::MetadataStore;
 /// during normal operation — they only touch OPFS at boot (load) and on checkpoint.
 #[derive(Debug)]
 pub struct MetadataRuntime {
+    pub id: u64,
     inner: RwLock<MetadataCache>,
     dirty: std::sync::atomic::AtomicBool,
     // MetadataStore persistence backends (OPFS-backed)
@@ -59,7 +60,9 @@ impl MetadataRuntime {
             keys: keys.len(),
         });
 
+        let id = crate::runtime::next_runtime_id();
         let rt = Arc::new(Self {
+            id,
             inner: RwLock::new(MetadataCache {
                 sync_state,
                 schemas,
@@ -73,9 +76,9 @@ impl MetadataRuntime {
             key_store,
         });
 
-        engine_debug!(
-            "[MetadataRuntime] loaded: sync_state={}, schemas={}, migrations={}, keys={}",
-            info.has_sync_state,
+        engine_info!(
+            "[MetadataRuntime#{}] loaded: sync_state={}, schemas={}, migrations={}, keys={}",
+            id, info.has_sync_state,
             info.schemas,
             info.migrations,
             info.keys,
@@ -170,8 +173,22 @@ impl MetadataRuntime {
             (cache.sync_state.clone(), cache.schemas.clone(), cache.migrations.clone(), cache.keys.clone())
         };
 
+        let cursor_val = sync_state.as_ref().map(|s| s.last_synced_sequence).unwrap_or(0);
+        let has_sync_state = sync_state.is_some();
+        engine_info!(
+            "[MetadataRuntime#{}] checkpoint START: cursor={} sync_state={} schemas={} migrations={} keys={}",
+            self.id, cursor_val, has_sync_state, schemas.len(), migrations.len(), keys.len(),
+        );
+
         if let Some(ref state) = sync_state {
+            let page_before = self.sync_state_store.current_page().await;
             self.sync_state_store.write(state).await?;
+            let page_after = self.sync_state_store.current_page().await;
+            engine_info!(
+                "[MetadataRuntime#{}] checkpoint wrote sync_state: cursor={} generation={} page={}->{} last_sync_at={:?}",
+                self.id, state.last_synced_sequence, state.generation_id,
+                page_before, page_after, state.last_sync_at,
+            );
         }
         if !schemas.is_empty() {
             self.schema_store.write(&schemas).await?;
@@ -183,13 +200,21 @@ impl MetadataRuntime {
             self.key_store.write(&keys).await?;
         }
 
+        let final_page = self.sync_state_store.current_page().await;
         self.dirty.store(false, std::sync::atomic::Ordering::SeqCst);
-        engine_trace!("[MetadataRuntime] checkpoint complete");
+        engine_info!("[MetadataRuntime#{}] checkpoint COMPLETE cursor={} current_page={}", self.id, cursor_val, final_page);
         Ok(())
     }
 
     /// Returns true if there are unpresisted changes.
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for MetadataRuntime {
+    fn drop(&mut self) {
+        let dirty = self.dirty.load(std::sync::atomic::Ordering::SeqCst);
+        engine_info!("[MetadataRuntime#{}] dropped (dirty={})", self.id, dirty);
     }
 }

@@ -4,8 +4,17 @@ use crate::migration::PagesDir;
 use crate::scheduler::{RuntimeScheduler, Task, TaskType};
 use crate::upload_scheduler::{UploadAction, UploadScheduler};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use vaultsync_core::crdt::types::CrdtValue;
+
+/// Global runtime ID counter — every runtime gets a unique ID for debugging identity.
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Returns a globally unique runtime ID for identity instrumentation.
+pub fn next_runtime_id() -> u64 {
+    NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Phase 2: Runtime generations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -67,6 +76,7 @@ pub struct FollowerRecord {
 /// Phase 2: DocumentStore — in-memory document state (source of truth)
 #[derive(Debug)]
 pub struct DocumentStore {
+    pub id: u64,
     // doc_id → record_id → field_name → CrdtValue
     pub documents: HashMap<String, HashMap<String, HashMap<String, CrdtValue>>>,
     /// Access counter for hot-document tracking (LFU with decay)
@@ -75,21 +85,31 @@ pub struct DocumentStore {
 
 impl DocumentStore {
     pub fn new() -> Self {
+        let id = next_runtime_id();
         Self {
+            id,
             documents: HashMap::new(),
             access_counts: HashMap::new(),
         }
     }
 
-    pub fn set_field(&mut self, doc_id: &str, record_id: &str, field: &str, value: CrdtValue) {
+    pub fn set_field(&mut self, doc_id: &str, record_id: &str, field: &str, value: CrdtValue) -> bool {
+        let before = self.documents.len();
+        let was_new = !self.documents.contains_key(doc_id);
         let doc = self
             .documents
             .entry(doc_id.to_string())
             .or_default();
+        let is_new_record = !doc.contains_key(record_id);
         let rec = doc
             .entry(record_id.to_string())
             .or_default();
         rec.insert(field.to_string(), value);
+        let after = self.documents.len();
+        if was_new || after != before {
+            engine_info!("[DocumentStore#{}] SET doc={} record={} field={} docs={}->{}", self.id, doc_id, record_id, field, before, after);
+        }
+        is_new_record
     }
 
     pub fn delete_field(&mut self, doc_id: &str, record_id: &str, field: &str) {
@@ -101,8 +121,13 @@ impl DocumentStore {
     }
 
     pub fn delete_document(&mut self, doc_id: &str, record_id: &str) {
+        let before = self.documents.len();
         if let Some(doc) = self.documents.get_mut(doc_id) {
             doc.remove(record_id);
+        }
+        let after = self.documents.len();
+        if before != after {
+            engine_info!("[DocumentStore#{}] DELETE doc={} record={} docs={}->{}", self.id, doc_id, record_id, before, after);
         }
     }
 
@@ -337,6 +362,7 @@ impl WriteAheadLog {
 /// Phase 2: Main Runtime struct
 /// Phase 3: Runtime owns storage references — all reads go through Runtime, not OPFS directly.
 pub struct Runtime {
+    pub id: u64,
     pub scheduler: RuntimeScheduler,
     pub metrics: RuntimeMetrics,
     pub document_store: Arc<Mutex<DocumentStore>>,
@@ -352,19 +378,22 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(tab_id: String) -> Arc<Self> {
+        let id = next_runtime_id();
         let doc_store = Arc::new(Mutex::new(DocumentStore::new()));
         let runtime = Arc::new(Self {
+            id,
             scheduler: RuntimeScheduler::new(),
             metrics: RuntimeMetrics::default(),
             document_store: doc_store.clone(),
             metadata_store: std::sync::Mutex::new(MetadataStore::new()),
-            presence_store: std::sync::Mutex::new(PresenceStore::new(tab_id)),
+            presence_store: std::sync::Mutex::new(PresenceStore::new(tab_id.clone())),
             pending_store: std::sync::Mutex::new(PendingStore::new()),
             index_store: std::sync::Mutex::new(IndexStore::new()),
             wal: std::sync::Mutex::new(WriteAheadLog::new(100)),
             upload_scheduler: UploadScheduler::new(200),
             start_time: js_sys::Date::new_0(),
         });
+        engine_info!("[Runtime#{}] new DocumentStore#{} tab_id={}", id, doc_store.lock().unwrap().id, tab_id);
 
         // Schedule periodic tasks
         runtime.scheduler.schedule(Task::new(TaskType::Heartbeat).with_budget(1));
@@ -375,7 +404,10 @@ impl Runtime {
 
     pub fn set_field(&self, doc_id: &str, record_id: &str, field: &str, value: CrdtValue) {
         let mut store = self.document_store.lock().unwrap();
-        store.set_field(doc_id, record_id, field, value.clone());
+        let created = store.set_field(doc_id, record_id, field, value.clone());
+        if created {
+            engine_info!("[DOC_CREATE] caller=Runtime::set_field doc={} record={} field={}", doc_id, record_id, field);
+        }
         store.record_access(doc_id);
 
         // WAL-first: log mutation before anything else

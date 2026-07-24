@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use js_sys::Uint8Array;
+use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
+use vaultsync_core::crdt::document::CRDTDocument;
 use vaultsync_core::oplog::entry::{MutationType, OplogEntry, SyncStatus};
 use vaultsync_core::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use vaultsync_core::sync::state::SyncState;
@@ -333,12 +336,20 @@ impl OpfsStorage {
     }
 
     /// Route adjust_pending_count on oplog through StorageRuntime or directly.
-    async fn adjust_oplog_pending_count(&self, delta: i32) -> Result<(), VaultSyncError> {
-        if let Some(sr) = self.with_sr() {
+    async fn adjust_oplog_pending_count(&self, delta: i32, caller: &'static str) -> Result<(), VaultSyncError> {
+        let before = self.pages.oplog.pending_count();
+        let result = if let Some(sr) = self.with_sr() {
             sr.adjust_pending_count("oplog", delta).await
         } else {
-            self.pages.oplog.adjust_pending_count(delta).await
-        }
+            self.pages.oplog.adjust_pending_count(delta);
+            Ok(())
+        };
+        let after = self.pages.oplog.pending_count();
+        engine_info!(
+            "[PENDING_COUNT] caller={} delta={} before={} after={}",
+            caller, delta, before, after,
+        );
+        result
     }
 
     /// Route schedule_gc on oplog through StorageRuntime or directly.
@@ -366,6 +377,52 @@ impl OpfsStorage {
         } else {
             self.pages.oplog.set_current_page(page_id).await
         }
+    }
+
+    /// Verify an oplog page write: read back and check content, then run invariant.
+    /// On mismatch between manifest pending_count and actual uploadable entries,
+    /// repairs the counter by rebuilding it from OPFS (recovery, not prevention).
+    async fn verify_oplog_write(
+        &self,
+        caller: &'static str,
+        page_id: PageId,
+        expected_data: &[u8],
+        entries: &[OplogEntry],
+    ) -> Result<(), VaultSyncError> {
+        let read_back = self.pages.oplog.read_page(page_id).await?;
+        let match_ok = read_back.as_deref() == Some(expected_data);
+        if !match_ok {
+            engine_warn!(
+                "[WRITE_VERIFY] MISMATCH caller={} page={}: wrote {} bytes, read {} bytes",
+                caller, page_id, expected_data.len(),
+                read_back.as_ref().map(|d| d.len()).unwrap_or(0),
+            );
+        } else {
+            engine_trace!(
+                "[WRITE_VERIFY] MATCH caller={} page={} bytes={} entries={}",
+                caller, page_id, expected_data.len(), entries.len(),
+            );
+        }
+
+        if let Some(ns) = entries.first().map(|e| e.namespace.as_str()) {
+            let manifest_pending = self.pages.oplog.pending_count();
+            let all_entries = read_all_oplog_entries(&self.pages.oplog).await?;
+            let actual_uploadable = all_entries.iter()
+                .filter(|e| e.namespace == ns && e.sync_status.is_uploadable())
+                .count();
+            if manifest_pending != actual_uploadable {
+                engine_error!(
+                    "[INVARIANT VIOLATION] pending_count={} != actual_uploadable={} caller={} ns={} page={} — invariant violation, counter is poisoned",
+                    manifest_pending, actual_uploadable, caller, ns, page_id,
+                );
+            } else {
+                engine_trace!(
+                    "[INVARIANT] OK pending={} uploadable={} caller={} ns={}",
+                    manifest_pending, actual_uploadable, caller, ns,
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -464,6 +521,17 @@ impl Storage for OpfsStorage {
             if let Some(data) = self.read_doc_page(id).await? {
                 if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
                     if entry.doc_id == doc_id {
+                        // Diagnostic: check deleted status during enumeration
+                        if let Ok(doc) = CRDTDocument::from_snapshot(&entry.bytes) {
+                            let map = doc.to_map();
+                            if map.contains_key("_deleted") {
+                                tracing::trace!(
+                                    "[LIST_DOCS] record={} deleted={:?}",
+                                    entry.record_id,
+                                    map.get("_deleted"),
+                                );
+                            }
+                        }
                         latest.insert(entry.record_id, entry.bytes);
                     }
                 }
@@ -504,12 +572,27 @@ impl Storage for OpfsStorage {
         };
         self.pages.doc_data.update_content_index(doc_key, doc_page_id).await?;
 
+        // Diagnostic: verify _deleted field in written snapshot
+        if let Ok(doc) = CRDTDocument::from_snapshot(&doc_entry.bytes) {
+            let map = doc.to_map();
+            tracing::info!(
+                "[DELETE_VERIFY] doc={} record={} page={} has_deleted={} deleted_value={:?}",
+                doc_id, record_id, doc_page_id,
+                map.contains_key("_deleted"),
+                map.get("_deleted"),
+            );
+        }
+
         // Write oplog entry
         let encoded_entry = postcard::to_allocvec(&[entry.clone()])
             .map_err(|e| VaultSyncError::Storage(format!("encode oplog: {:?}", e)))?;
         let oplog_page_id = self.alloc_oplog("write_oplog").await?;
-        self.write_oplog_page(oplog_page_id, encoded_entry).await?;
-        self.adjust_oplog_pending_count(1).await
+        self.write_oplog_page(oplog_page_id, encoded_entry.clone()).await?;
+        if entry.sync_status.is_uploadable() {
+            self.adjust_oplog_pending_count(1, "write_document_and_oplog").await?;
+        }
+        self.verify_oplog_write("write_document", oplog_page_id, &encoded_entry, &[entry.clone()]).await?;
+        Ok(())
     }
 
     async fn delete_document_and_oplog(
@@ -522,20 +605,28 @@ impl Storage for OpfsStorage {
         let encoded = postcard::to_allocvec(&[entry.clone()])
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.alloc_oplog("delete_oplog").await?;
-        self.write_oplog_page(page_id, encoded).await?;
-        self.adjust_oplog_pending_count(1).await
+        self.write_oplog_page(page_id, encoded.clone()).await?;
+        if entry.sync_status.is_uploadable() {
+            self.adjust_oplog_pending_count(1, "delete_document_and_oplog").await?;
+        }
+        self.verify_oplog_write("delete_document", page_id, &encoded, &[entry.clone()]).await?;
+        Ok(())
     }
 
     async fn append_oplog(&self, entry: &OplogEntry) -> Result<(), VaultSyncError> {
         let encoded = postcard::to_allocvec(&[entry.clone()])
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.alloc_oplog("append_oplog").await?;
-        self.write_oplog_page(page_id, encoded).await?;
-        self.adjust_oplog_pending_count(1).await
+        self.write_oplog_page(page_id, encoded.clone()).await?;
+        if entry.sync_status.is_uploadable() {
+            self.adjust_oplog_pending_count(1, "append_oplog").await?;
+        }
+        self.verify_oplog_write("append_oplog", page_id, &encoded, &[entry.clone()]).await?;
+        Ok(())
     }
 
     async fn pending_count(&self, _namespace: &str) -> Result<usize, VaultSyncError> {
-        Ok(self.pages.oplog.pending_count().await)
+        Ok(self.pages.oplog.pending_count())
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn vaultsync_core::storage::transaction::StorageTransaction>, VaultSyncError> {
@@ -553,36 +644,125 @@ impl Storage for OpfsStorage {
         namespace: &str,
         limit: usize,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
+        let page_ids = self.pages.oplog.list_page_ids("read_pending_oplog").await.unwrap_or_default();
+        let page_count = page_ids.len();
         let entries = read_all_oplog_entries(&self.pages.oplog).await?;
-        let filtered: Vec<OplogEntry> = entries
-            .into_iter()
-            .filter(|e| e.namespace == namespace && e.sync_status.is_uploadable())
-            .take(limit)
-            .collect();
-        Ok(filtered)
+        let resolved_count = entries.len();
+
+        // Phase 4: Divergence detection — if pending_count > 0 but no uploadable
+        // entries exist in OPFS, the in-memory counter has diverged from reality.
+        // This is a BUG — treat it as such (debug_assert in debug, error log in release).
+        // Never auto-repair in the hot path. The counter is eventually corrected
+        // by the next mutation cycle or on next startup via verify_engine_invariants().
+        let any_uploadable = entries.iter().any(|e| e.sync_status.is_uploadable());
+        if page_count > 0 && !any_uploadable {
+            let cached = self.pages.oplog.pending_count();
+            if cached > 0 {
+                let statuses: Vec<String> = entries.iter()
+                    .map(|e| format!("{}={:?}", e.id, e.sync_status))
+                    .collect();
+                engine_error!(
+                    "[DIVERGENCE] pending_count={} but 0 uploadable entries in OPFS. ns={} statuses=[{}] — this is a bug",
+                    cached, namespace, statuses.join(","),
+                );
+                #[cfg(debug_assertions)]
+                debug_assert!(false, "pending_count={} but 0 uploadable entries in ns={}", cached, namespace);
+            }
+        }
+        let resolved_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+        let resolved_statuses: Vec<String> = entries.iter().map(|e| format!("{:?}", e.sync_status)).collect();
+
+        let ns_filtered: Vec<&OplogEntry> = entries.iter().filter(|e| e.namespace == namespace).collect();
+        let ns_count = ns_filtered.len();
+        let ns_ids: Vec<&str> = ns_filtered.iter().map(|e| e.id.as_str()).collect();
+        let ns_statuses: Vec<String> = ns_filtered.iter().map(|e| format!("{:?}", e.sync_status)).collect();
+
+        let uploadable: Vec<&OplogEntry> = ns_filtered.into_iter().filter(|e| e.sync_status.is_uploadable()).collect();
+        let uploadable_count = uploadable.len();
+        let uploadable_ids: Vec<&str> = uploadable.iter().map(|e| e.id.as_str()).collect();
+
+        engine_trace!(
+            "[READ_OPLOG] pages={} resolved={} ns={} uploadable={} caller_ns={} limit={}",
+            page_count, resolved_count, ns_count, uploadable_count, namespace, limit,
+        );
+
+        let take: Vec<OplogEntry> = uploadable.into_iter().take(limit).cloned().collect();
+        Ok(take)
     }
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), VaultSyncError> {
-        // Delta write: read only the entry to modify, write a small delta page.
+        let before_pending = self.pages.oplog.pending_count();
+
+        // LOOKUP: read all entries, check if target exists and its current status
         let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let total_before = entries.len();
+        let found = entries.iter().any(|e| e.id == id);
+        let before_status = entries.iter().find(|e| e.id == id).map(|e| format!("{:?}", e.sync_status));
+
+        engine_info!(
+            "[MARK_SYNCED] LOOKUP id={} seq={} found={} total_entries={} status={:?} pending_before={}",
+            id, sequence, found, total_before, before_status, before_pending,
+        );
+
         let mut updated: Vec<OplogEntry> = entries
             .into_iter()
             .filter(|e| e.id == id)
             .collect();
         if updated.is_empty() {
+            engine_warn!("[MARK_SYNCED] NOT_FOUND id={} seq={}", id, sequence);
             return Ok(());
         }
+
+        // UPDATE MEMORY: transition to Synced
         for e in &mut updated {
             e.sync_status = SyncStatus::Synced;
             e.sequence = Some(sequence);
         }
+
+        // WRITE PAGE: persist the delta page
         let encoded = postcard::to_allocvec(&updated)
             .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
         let page_id = self.alloc_oplog("mark_synced").await?;
+
+        engine_info!(
+            "[MARK_SYNCED] WRITE id={} seq={} page_id={}",
+            id, sequence, page_id,
+        );
+
         self.write_oplog_page(page_id, encoded).await?;
 
+        // RELOAD + VERIFY: read back and check status transition persisted
+        let reload_entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let reload_status = reload_entries.iter().find(|e| e.id == id).map(|e| format!("{:?}", e.sync_status));
+        let reload_verified = reload_entries.iter().any(|e| e.id == id && e.sync_status == SyncStatus::Synced);
+
+        engine_info!(
+            "[MARK_SYNCED] RELOAD id={} seq={} status={:?} verified={}",
+            id, sequence, reload_status, reload_verified,
+        );
+
         // Delta page — do NOT update current_page. The base page stays canonical.
-        self.adjust_oplog_pending_count(-1).await?;
+        self.adjust_oplog_pending_count(-1, "mark_synced").await?;
+        let after_pending = self.pages.oplog.pending_count();
+
+        engine_info!(
+            "[MARK_SYNCED] PENDING id={} seq={} before={} after={}",
+            id, sequence, before_pending, after_pending,
+        );
+
+        // Post-condition invariant: verify counter matches reality
+        // Uses already-loaded reload_entries (no extra OPFS scan)
+        if before_pending > 0 {
+            let actual_uploadable = reload_entries.iter().filter(|e| e.sync_status.is_uploadable()).count();
+            let expected = (before_pending - 1) as usize;
+            if after_pending as usize != expected || actual_uploadable != expected {
+                engine_error!(
+                    "[POST_SYNC INVARIANT] id={} seq={}: pending {}->{} expected={} actual_uploadable={} verified={}",
+                    id, sequence, before_pending, after_pending, expected, actual_uploadable, reload_verified,
+                );
+            }
+        }
+
         self.schedule_oplog_gc();
 
         Ok(())
@@ -606,7 +786,7 @@ impl Storage for OpfsStorage {
         let page_id = self.alloc_oplog("mark_failed").await?;
         self.write_oplog_page(page_id, encoded).await?;
 
-        self.adjust_oplog_pending_count(-1).await?;
+        self.adjust_oplog_pending_count(-1, "mark_failed").await?;
         self.schedule_oplog_gc();
 
         Ok(())
@@ -898,15 +1078,48 @@ impl Storage for OpfsStorage {
     }
 }
 
+impl OpfsStorage {
+    /// Repair diverged pending_count: if manifest says >0 but actual uploadable entries
+    /// from OPFS differ, reset manifest to match OPFS and persist the correction.
+    /// Called at startup (BrowserStorage::new) to reconcile persisted state with reality.
+    /// Also accessible as an explicit repair API for maintenance/debugging.
+    pub(crate) async fn repair_if_diverged(&self) -> Result<(), VaultSyncError> {
+        let manifest_pending = self.pages.oplog.pending_count();
+        engine_info!(
+            "[RECOVERY] repair_if_diverged entered: manifest_pending={}",
+            manifest_pending,
+        );
+        if manifest_pending == 0 {
+            return Ok(()); // Fast path: no divergence possible
+        }
+
+        let all_entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let actual_uploadable = all_entries.iter().filter(|e| e.sync_status.is_uploadable()).count();
+        if manifest_pending != actual_uploadable {
+            engine_info!(
+                "[RECOVERY] pending_count mismatch: manifest={} actual={} — repairing manifest",
+                manifest_pending, actual_uploadable,
+            );
+            self.pages.oplog.set_pending_count(actual_uploadable);
+            self.pages.oplog.persist_current_manifest("repair_if_diverged").await?;
+            engine_info!(
+                "[RECOVERY] pending_count repaired: {} -> {} (persisted)",
+                manifest_pending, actual_uploadable,
+            );
+        }
+        Ok(())
+    }
+}
+
 async fn read_all_entries<T: serde::de::DeserializeOwned + serde::Serialize>(
     store: &PageStore,
     caller: &str,
 ) -> Result<Vec<T>, VaultSyncError> {
-    engine_debug!("[storage] read_all_entries: reading current_page");
+    engine_trace!("[storage] read_all_entries: reading current_page");
     let current = store.current_page().await;
-    engine_debug!("[storage] read_all_entries: current_page={}", current);
+    engine_trace!("[storage] read_all_entries: current_page={}", current);
 
-    engine_debug!("[storage] read_all_entries: listing page_ids");
+    engine_trace!("[storage] read_all_entries: listing page_ids");
     let page_ids = match store.list_page_ids(caller).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -982,28 +1195,93 @@ pub async fn read_all_oplog_entries(
     store: &PageStore,
 ) -> Result<Vec<OplogEntry>, VaultSyncError> {
     let current = store.current_page().await;
+    let store_name = store.store_name();
     let mut page_ids = store.list_page_ids("read_all_oplog_entries").await.unwrap_or_default();
     page_ids.sort_unstable();
 
     if page_ids.is_empty() {
+        engine_trace!("[read_all_oplog_entries] store={} current_page={} page_ids=0 — empty store", store_name, current);
         return Ok(Vec::new());
     }
 
-    // When current_page is 0 (no full-state page yet), treat ALL pages as
-    // deltas with base_id=0. VersionChain deduplicates by entry ID — later
-    // pages (deltas written by mark_synced) override earlier ones, preventing
-    // stale Pending entries from causing upload loops (Bug C).
-    let (base_id, deltas): (PageId, Vec<PageId>) = if current > 0 {
-        (current, page_ids.into_iter().filter(|id| *id > current).collect())
+    engine_trace!(
+        "[read_all_oplog_entries] store={} current_page={} total_pages={} ids=[{}]",
+        store_name, current, page_ids.len(),
+        page_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","),
+    );
+
+    // Include orphan pages: pages with recycled IDs < current_page that were
+    // allocated from the free list after the last checkpoint. These are live
+    // pages with post-checkpoint data that must be visible to the upload
+    // pipeline and invariant checks. Bug fix: the old filter excluded them,
+    // causing pending_count divergence (page ID 117 < current_page 118).
+    let (base_id, deltas, orphans): (PageId, Vec<PageId>, Vec<PageId>) = if current > 0 {
+        let mut greater = Vec::new();
+        let mut lesser = Vec::new();
+        for id in page_ids {
+            if id == current {
+                // base page — skip
+            } else if id > current {
+                greater.push(id);
+            } else {
+                lesser.push(id); // orphan: recycled from free list, written after checkpoint
+            }
+        }
+        (current, greater, lesser)
     } else {
-        (0, page_ids)
+        (0, page_ids, vec![])
     };
+
+    engine_trace!(
+        "[read_all_oplog_entries] store={} base_id={} delta_count={} orphan_count={}",
+        store_name, base_id, deltas.len(), orphans.len(),
+    );
 
     let mut chain = VersionChain::new(base_id);
     for d in &deltas {
         chain.add_delta(*d);
     }
-    chain.resolve(store).await
+    for o in &orphans {
+        chain.add_orphan(*o);
+    }
+
+    // Pre-check: verify VersionChain references against OPFS reality
+    {
+        let all_ids = store.list_page_ids("versionchain_precheck").await.unwrap_or_default();
+        let all_set: std::collections::BTreeSet<u64> = all_ids.iter().copied().collect();
+        let mut stale = Vec::new();
+        if base_id > 0 && !all_set.contains(&base_id) {
+            stale.push(format!("base={}", base_id));
+        }
+        for d in &deltas {
+            if !all_set.contains(d) {
+                stale.push(format!("delta={}", d));
+            }
+        }
+        for o in &orphans {
+            if !all_set.contains(o) {
+                stale.push(format!("orphan={}", o));
+            }
+        }
+        if !stale.is_empty() {
+            engine_warn!(
+                "[VersionChain::precheck] store={} current_page={} — {} stale references: {}",
+                store_name, current, stale.len(), stale.join(","),
+            );
+        } else {
+            engine_trace!(
+                "[VersionChain::precheck] store={} current_page={} base={} deltas={} orphans={} — all {} pages on disk",
+                store_name, current, base_id, deltas.len(), orphans.len(), all_set.len(),
+            );
+        }
+    }
+
+    let result = chain.resolve(store).await?;
+    engine_trace!(
+        "[read_all_oplog_entries] store={} resolved_entries={}",
+        store_name, result.len(),
+    );
+    Ok(result)
 }
 
 use crate::indexeddb::IndexedDbStorage;
@@ -1030,6 +1308,7 @@ impl BrowserStorage {
         match backend {
             Some("opfs") => {
                 let opfs = OpfsStorage::new(db_name).await?;
+                opfs.repair_if_diverged().await?;
                 Ok(Self::Opfs(opfs))
             }
             Some("indexeddb") => {
@@ -1038,7 +1317,10 @@ impl BrowserStorage {
             }
             _ => {
                 match OpfsStorage::new(db_name).await {
-                    Ok(opfs) => Ok(Self::Opfs(opfs)),
+                    Ok(opfs) => {
+                        opfs.repair_if_diverged().await?;
+                        Ok(Self::Opfs(opfs))
+                    }
                     Err(e) => {
                         engine_info!("[Rust] OPFS unavailable, falling back to IndexedDB: {:?}", e);
                         let idb = IndexedDbStorage::new(db_name).await?;

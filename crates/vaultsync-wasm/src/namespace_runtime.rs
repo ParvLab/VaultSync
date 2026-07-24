@@ -16,6 +16,7 @@ use vaultsync_core::runtime_state::RuntimeLifecycle;
 /// - SyncRuntime (cursor, generation, pending queue)
 /// - Active flag (lazy-loaded, not loaded at startup)
 pub struct NamespaceRuntime {
+    pub id: u64,
     pub name: String,
     pub storage: Arc<StorageRuntime>,
     pub sync: Arc<SyncRuntime>,
@@ -40,7 +41,10 @@ impl NamespaceRuntime {
         sync: Arc<SyncRuntime>,
         subscription_index: Arc<SubscriptionIndex>,
     ) -> Arc<Self> {
+        let id = crate::runtime::next_runtime_id();
+        engine_info!("[NamespaceRuntime#{}] new ns={} StorageRuntime#{} SyncRuntime#{}", id, name, storage.id, sync.id);
         Arc::new(Self {
+            id,
             name,
             storage,
             sync,

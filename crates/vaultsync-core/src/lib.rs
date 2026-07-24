@@ -1,5 +1,7 @@
 pub mod clock;
+pub mod connection_manager;
 pub mod coordinator;
+pub mod materialization;
 pub mod crdt;
 pub mod e2ee;
 pub mod event_bus;

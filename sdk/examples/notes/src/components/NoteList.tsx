@@ -15,12 +15,29 @@ export function NoteList({ activeNoteId, onSelectNote, onCreateNote }: NoteListP
 
   const handleDelete = async (e: MouseEvent, id: string) => {
     e.stopPropagation();
+    if (!id) {
+      console.warn('[NoteList] delete with empty id — skipping', {
+        id,
+        type: typeof id,
+        keys: Object.keys(id || {}),
+      });
+      return;
+    }
     try {
       await mutations.delete(id);
     } catch (err) {
       console.error('Failed to delete note:', err);
     }
   };
+
+  // Instrument: log rendered notes
+  console.debug('[NOTE_LIST] rendering notes=%d ids=[%s]',
+    notes.length,
+    notes.map((n: any) => {
+      const id = (n.record_id ?? n.id ?? n.doc_id ?? '') as string;
+      const del = n._deleted === true || n.__deleted__ === true;
+      return `${id}(del=${del})`;
+    }).join(','));
 
   // Filter and sort notes
   const filteredNotes = notes
@@ -69,7 +86,15 @@ export function NoteList({ activeNoteId, onSelectNote, onCreateNote }: NoteListP
           </div>
         ) : (
           filteredNotes.map((note) => {
-            const id = (note.record_id || note.id) as string;
+            const id = (note.record_id ?? note.id ?? note.doc_id ?? '') as string;
+            if (!id) {
+              console.warn('[NoteList] malformed note without identifier', {
+                keys: Object.keys(note),
+                type: typeof note,
+                constructor: (note as any)?.constructor?.name,
+                json: JSON.stringify(note).slice(0, 200),
+              });
+            }
             const title = (note.title as string) || 'Untitled Note';
             const body = (note.body as string) || '';
             const preview = body.length > 60 ? `${body.substring(0, 60)}...` : body || 'Empty note';
