@@ -37,6 +37,10 @@ export class VaultSyncClient {
   private _promotionConfig: { coordinatorUrl: string; authToken: string | null; dbName: string | null; storageBackend: string | null } | null = null;
   private _promotionResolve: (() => void) | null = null;
   private _leaderAlive: boolean = false;
+  /** Hydration promise: resolves when the first SYNC_DONE applies data to RuntimeStore.
+   *  Used by mirror bootstrap to wait for replay data before declaring "empty". */
+  private _hydrationResolve: (() => void) | null = null;
+  private _hydrationPromise: Promise<void> | null = null;
   /** Replay batching: buffer mutations between SYNC_BEGIN and SYNC_DONE.
    *  isReplaying is a computed getter from replayDepth > 0. */
   private replayDepth = 0;
@@ -276,6 +280,17 @@ export class VaultSyncClient {
 
         // ── SYNC_BEGIN: replay session started ──
         if (entryPrefix === 'SYNC_BEGIN') {
+          // Guard: ignore nested SYNC_BEGIN if already replaying.
+          // The existing replay already captures the latest mutation stream.
+          // Without this guard, a cascade of SYNC_BEGIN→buffer-reset→replay
+          // can leave the tab stuck in "Promoting" with replayDepth > 0.
+          if (this.isReplaying) {
+            const replayMatch = e.data.match(/replay=(\d+)/);
+            const replayId = replayMatch ? parseInt(replayMatch[1], 10) : 0;
+            console.debug('[SYNC] ignoring nested SYNC_BEGIN depth=%d replay=%s',
+              this.replayDepth, replayId ? `replay=${replayId}` : '(no id)');
+            return;
+          }
           // Extract optional replay=N from trailing field
           const replayMatch = e.data.match(/replay=(\d+)/);
           const replayId = replayMatch ? parseInt(replayMatch[1], 10) : 0;
@@ -323,6 +338,11 @@ export class VaultSyncClient {
             console.log('[BATCH_END]');
             this.runtimeStore.endBatch();
           }
+          // Notify any bootstrap() caller waiting for initial hydration
+          if (this._hydrationResolve) {
+            this._hydrationResolve();
+            this._hydrationResolve = null;
+          }
           console.log('[BC_SUMMARY]', JSON.stringify({
             ...this._bcCounts, buffered: bufLen, deleted: deletedCount,
             runtime: this.runtimeStore.query('notes').length,
@@ -345,6 +365,20 @@ export class VaultSyncClient {
             replayDepth: this.replayDepth,
             isReplaying: this.isReplaying,
           });
+          // Guard: skip SYNC if already replaying — the existing replay already
+          // contains the latest mutation stream. Sending another SYNC during replay
+          // causes the leader to spawn a nested replay, creating a cascade that
+          // can leave this tab permanently stuck with replayDepth > 0.
+          if (this.isReplaying) {
+            console.debug('[SYNC_REQUEST] skipped: replaying', {
+              reason: 'leader_ready',
+              from: this.tabId,
+              leader: leaderTabId,
+              cursor,
+              depth: this.replayDepth,
+            });
+            return;
+          }
           // Always send SYNC if the message is from a different tab (regardless of mode).
           // The leaderTabId === this.tabId guard prevents self-SYNC after promotion.
           // A mode-based guard (`mode !== 'Mirror'`) was previously removed because
@@ -643,7 +677,54 @@ export class VaultSyncClient {
         }
       }
     } else {
-      console.debug('[BOOTSTRAP] doc=%s path=replay mode=%s', docIds?.join(','), mode);
+      // Mirror/follower: wait for initial replay hydration, then fall back to WASM.
+      // This replaces the no-op path that relied entirely on the replay pipeline
+      // and could leave the RuntimeStore empty if replay is delayed.
+      if (docIds && docIds.length > 0) {
+        // Create a hydration promise if one isn't already pending
+        if (!this._hydrationPromise) {
+          this._hydrationPromise = new Promise<void>(resolve => {
+            this._hydrationResolve = resolve;
+          });
+        }
+        // Wait for first SYNC_DONE or timeout (2s)
+        const hydrated = await Promise.race([
+          this._hydrationPromise.then(() => true),
+          new Promise<boolean>(r => setTimeout(() => r(false), 2000)),
+        ]);
+        if (!hydrated) {
+          console.debug('[BOOTSTRAP] replay timeout — falling back to WASM find()');
+        }
+        for (const docId of docIds) {
+          if (this.runtimeStore.query(docId).length > 0) {
+            console.debug('[BOOTSTRAP] doc=%s path=hydration mode=%s already_hydrated=%d',
+              docId, mode, this.runtimeStore.query(docId).length);
+            continue;
+          }
+          try {
+            const arr = await this.inner.find(docId);
+            const records: Array<{ recordId: string; deleted: boolean }> = [];
+            for (const json of arr) {
+              const fields = JSON.parse(json);
+              const recordId = (fields.record_id ?? fields.id) as string;
+              const isDel = fields._deleted === true || fields.__deleted__ === true;
+              records.push({ recordId, deleted: isDel });
+              this.runtimeStore.applySetFieldBatch(docId, recordId, fields, 'local_insert');
+            }
+            const after = this.runtimeStore.query(docId).length;
+            const deletedRecords = records.filter(r => r.deleted).length;
+            console.debug('[BOOTSTRAP] doc=%s path=%s mode=%s records_found=%d deleted=%d after=%d ids=[%s]',
+              docId, hydrated ? 'hydration' : 'find_fallback', mode,
+              records.length, deletedRecords, after,
+              records.map(r => `${r.recordId}(del=${r.deleted})`).join(','));
+          } catch (err) {
+            console.warn(`[BOOTSTRAP] Failed to load doc "${docId}":`, err);
+          }
+        }
+      }
+      // Always reset hydration state for next bootstrap call
+      this._hydrationResolve = null;
+      this._hydrationPromise = null;
     }
   }
 

@@ -12,7 +12,7 @@ use crate::session_protocol::BC_MSG_SEQ;
 use crate::upload_scheduler::{PendingUpload, UploadAction};
 use crate::compaction_scheduler::CompactionScheduler;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -1639,6 +1639,7 @@ impl VaultSyncRuntime {
             let coord = this.runtime_coordinator.clone();
             let replay_engine = this.replay_engine.clone();
 
+            let replay_in_progress = Arc::new(AtomicBool::new(false));
             let bc_clone = bc.clone();
             let onmsg = Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
                 if let Some(msg_str) = e.data().as_string() {
@@ -1653,6 +1654,12 @@ impl VaultSyncRuntime {
                     if msg_str.starts_with("SYNC|") {
                         let sync_info = crate::session_protocol::SessionProtocol::parse_sync(&msg_str);
                         if let Some((_ver, _caps, _ns, cursor, _gen)) = sync_info {
+                            // Guard: only one active replay at a time
+                            let replay_flag = replay_in_progress.clone();
+                            if replay_flag.swap(true, Ordering::SeqCst) {
+                                engine_info!("[Session] ← SYNC SKIPPED from tab={}: cursor={} — replay already in progress", tab_id, cursor);
+                                return;
+                            }
                             let replay_id = REPLAY_ID.fetch_add(1, Ordering::Relaxed);
                             let bc_seq = BC_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
                             engine_info!("[Session] ← SYNC from tab={}: cursor={} — sending initial state (replay={} bc_seq={})", tab_id, cursor, replay_id, bc_seq);
@@ -1663,11 +1670,13 @@ impl VaultSyncRuntime {
                                 let bc_for_replay = bc_clone.clone();
                                 let tab_id_for_replay = tab_id.clone();
                                 let rt_for_cursor = rt.clone();
-                                    let engine_clone = engine.clone();
+                                let engine_clone = engine.clone();
+                                let replay_flag = replay_flag.clone();
                                 wasm_bindgen_futures::spawn_local(async move {
                                     let sink = BcMutationSink::new(bc_for_replay, tab_id_for_replay);
                                     let ctx = ReplayContext::new("default", cursor);
                                     let report = engine_clone.replay_since(&ctx, &sink).await;
+                                    replay_flag.store(false, Ordering::SeqCst);
                                     // Read the authoritative cursor from metadata_store
                                     let current_cursor = match rt_for_cursor {
                                         Some(ref r) => r.metadata_store.lock().unwrap().cursor,

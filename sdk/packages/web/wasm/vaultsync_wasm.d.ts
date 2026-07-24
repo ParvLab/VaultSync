@@ -269,12 +269,6 @@ export interface InitOutput {
     readonly wasmipc_on_message: (a: number, b: any) => void;
     readonly wasmipc_receive: (a: number) => [number, number];
     readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
-    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
-    readonly presencemanager_activePeers: (a: number) => [number, number];
-    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
-    readonly presencemanager_peer_count: (a: number) => number;
-    readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
-    readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly __wbg_eventbusproxy_free: (a: number, b: number) => void;
     readonly __wbg_replicationnamespace_free: (a: number, b: number) => void;
     readonly __wbg_vaultsyncruntime_free: (a: number, b: number) => void;
@@ -345,6 +339,12 @@ export interface InitOutput {
     readonly workspacenamespace_update: (a: number, b: bigint, c: number, d: number, e: number, f: number) => [number, number, number];
     readonly init: () => void;
     readonly set_log_level_from_str: (a: number, b: number) => void;
+    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
+    readonly presencemanager_activePeers: (a: number) => [number, number];
+    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly presencemanager_peer_count: (a: number) => number;
+    readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h6742839cb717cdad: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df: (a: number, b: number, c: any) => void;
