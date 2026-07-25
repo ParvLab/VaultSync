@@ -2742,6 +2742,38 @@ impl VaultSyncRuntime {
             *mb = backend.clone();
         }
 
+        // ── 3.5: Transfer existing document data to mirror store ──
+        // When a leader is demoted, copy the in-memory document data from
+        // the Runtime's DocumentStore into the new MirrorRuntime's DocumentStore.
+        // This prevents the demoted tab from showing empty state while waiting
+        // for the new leader's SYNC reply or live mutations.
+        {
+            let existing = self.runtime.as_ref().map(|r| {
+                let store = r.document_store.lock().unwrap();
+                let docs: Vec<(String, HashMap<String, HashMap<String, CrdtValue>>)> = store.documents.iter()
+                    .map(|(doc_id, records)| (doc_id.clone(), records.clone()))
+                    .collect();
+                let access = store.access_counts.clone();
+                (docs, access)
+            });
+            if let Some((docs, access)) = existing {
+                let mut mirror_store = mirror.document_store.lock().unwrap();
+                let mut total_records = 0usize;
+                for (doc_id, records) in docs {
+                    let entry = mirror_store.documents.entry(doc_id).or_insert_with(HashMap::new);
+                    for (record_id, fields) in records {
+                        entry.entry(record_id).or_insert_with(HashMap::new).extend(fields);
+                        total_records += 1;
+                    }
+                }
+                mirror_store.access_counts = access;
+                let doc_count = mirror_store.documents.len();
+                engine_info!("[demote] transferred {} documents ({} records) from leader store to mirror", doc_count, total_records);
+            } else {
+                engine_debug!("[demote] no runtime store to transfer (fresh follower)");
+            }
+        }
+
         // ── 4. Attach BC message handler for MirrorRuntime ──
         if let Some(ref bc) = self.cross_tab_channel {
             let mirror_clone = mirror.clone();
@@ -2756,14 +2788,6 @@ impl VaultSyncRuntime {
             }
             mirror_handler.forget();
             engine_info!("[demote] BC mirror handler attached");
-
-            // ── 5. Send SYNC to new leader ──
-            let session = crate::session_protocol::SessionProtocol::new(
-                bc.clone(),
-                self.tab_id.clone(),
-            );
-            session.send_sync(&ns, 0, "");
-            engine_info!("[demote] SYNC sent to new leader ns={}", ns);
         }
 
         // Set Hydrating state — queries block until BC SYNC data arrives

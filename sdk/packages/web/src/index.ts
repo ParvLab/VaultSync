@@ -37,9 +37,13 @@ export class VaultSyncClient {
   private _promotionConfig: { coordinatorUrl: string; authToken: string | null; dbName: string | null; storageBackend: string | null } | null = null;
   private _promotionResolve: (() => void) | null = null;
   private _leaderAlive: boolean = false;
+  private _leaderTabId: string | undefined;
   /** Hydration promise: resolves when the first SYNC_DONE applies data to RuntimeStore.
    *  Used by mirror bootstrap to wait for replay data before declaring "empty". */
   private _hydrationResolve: (() => void) | null = null;
+  /** Flag set when SYNC_DONE has been processed — covers the race where SYNC_DONE
+   *  arrives before bootstrap() creates the hydration promise. */
+  private _hydrationDone: boolean = false;
   private _hydrationPromise: Promise<void> | null = null;
   /** Replay batching: buffer mutations between SYNC_BEGIN and SYNC_DONE.
    *  isReplaying is a computed getter from replayDepth > 0. */
@@ -116,11 +120,12 @@ export class VaultSyncClient {
     const promotionId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     try {
       await this.inner.waitForPromotion();
-      // Skip promotion if we recently received LEADER_READY from a live leader
-      if (this._leaderAlive) {
-        this._leaderAlive = false;
-        return;
-      }
+      // The Web Lock was acquired — no other leader holds it.
+      // Any _leaderAlive flag is stale (leader crashed or properly left).
+      // Always proceed with promotion; the coordinator handles duplicate
+      // leader detection if a new leader somehow appeared in the meantime.
+      this._leaderAlive = false;
+      this._leaderTabId = undefined;
 
       // Phase 3: Pause mirror mutation processing for deterministic snapshot.
       // After pause(), no BC MUTATION frames will be applied to the in-memory store.
@@ -183,6 +188,11 @@ export class VaultSyncClient {
       // Broadcast LEADER_ELECTED so other tabs demote
       this.channel?.postMessage(`LEADER_ELECTED|${this.tabId}`);
       console.debug('[Promotion] broadcast LEADER_ELECTED');
+      // Event-driven: broadcast LEADER_READY immediately so followers re-SYNC
+      // without waiting for a self-received SYNC_DONE (which may never happen
+      // if no follower sends SYNC before the demoted leader's timeout).
+      this.inner.markReady();
+      console.debug('[Promotion] markReady complete — LEADER_READY broadcast');
     } catch (err) {
       console.warn('[Promotion] wait/promote failed:', err);
     }
@@ -275,9 +285,14 @@ export class VaultSyncClient {
         // ── LEADER_ELECTED: another tab claimed leadership ──
         if (entryPrefix === 'LEADER_ELECTED') {
           const claimedTabId = e.data.slice(15);
-          if (claimedTabId && claimedTabId !== this.tabId && this.inner.is_leader()) {
-            console.log('[LEADER] demoting self from', claimedTabId, logMeta());
-            this.inner.demote();
+          if (claimedTabId && claimedTabId !== this.tabId) {
+            if (this.inner.is_leader()) {
+              console.log('[LEADER] demoting self from', claimedTabId, logMeta());
+              this.inner.demote();
+            }
+            // Event-driven: re-sync with new leader immediately (safety net for
+            // the race where the initial SYNC arrives before the leader's handler).
+            this.channel?.postMessage(`SYNC|1|0|${this.namespace}|0|0`);
           }
           return;
         }
@@ -347,6 +362,7 @@ export class VaultSyncClient {
             this.runtimeStore.endBatch();
           }
           // Notify any bootstrap() caller waiting for initial hydration
+          this._hydrationDone = true;
           if (this._hydrationResolve) {
             this._hydrationResolve();
             this._hydrationResolve = null;
@@ -394,6 +410,7 @@ export class VaultSyncClient {
           this._leaderAlive = true;
           const parts = e.data.split('|');
           const leaderTabId = parts[1];
+          if (leaderTabId) this._leaderTabId = leaderTabId;
           const cursor = parseInt(parts[2] || '0', 10);
           console.debug('[LEADER_READY]', {
             sender: leaderTabId,
@@ -436,6 +453,17 @@ export class VaultSyncClient {
               thisTab: this.tabId,
               cursor,
             });
+          }
+          return;
+        }
+
+        // ── PROTO|LEFT — leader or peer has left ──
+        if (entryPrefix === 'PROTO' && e.data.startsWith('PROTO|LEFT|')) {
+          const protoParts = e.data.split('|');
+          const leaver = protoParts[2];
+          if (leaver && leaver === this._leaderTabId) {
+            this._leaderAlive = false;
+            this._leaderTabId = undefined;
           }
           return;
         }
@@ -763,19 +791,26 @@ export class VaultSyncClient {
       if (docIds && docIds.length > 0) {
         // Create a hydration promise if one isn't already pending
         if (!this._hydrationPromise) {
-          this._hydrationPromise = new Promise<void>(resolve => {
-            this._hydrationResolve = resolve;
-          });
+          // If SYNC_DONE already arrived (resolve consumed before promise creation),
+          // use an already-resolved promise to avoid the 10s timeout.
+          if (this._hydrationDone) {
+            this._hydrationPromise = Promise.resolve();
+          } else {
+            this._hydrationPromise = new Promise<void>(resolve => {
+              this._hydrationResolve = resolve;
+            });
+          }
         }
-        // Wait for first SYNC_DONE or timeout (3s)
+        // Wait for first SYNC_DONE (event-driven — LEADER_READY triggers SYNC,
+        // leader responds with SYNC_DONE which resolves _hydrationPromise).
+        // The 10s safety net prevents infinite wait in catastrophic scenarios.
         const hydrated = await Promise.race([
           this._hydrationPromise.then(() => true),
-          new Promise<boolean>(r => setTimeout(() => r(false), 3000)),
+          new Promise<boolean>(r => setTimeout(() => {
+            console.warn('[BOOTSTRAP] hydration timeout (10s) — falling back to mirror snapshot');
+            r(false);
+          }, 10000)),
         ]);
-        if (!hydrated) {
-          // Fall back to mirror Documents for any docs that weren't hydrated
-          console.debug('[BOOTSTRAP] sync timeout — falling back to mirror snapshot');
-        }
         for (const docId of docIds) {
           if (this.runtimeStore.query(docId).length > 0) {
             console.debug('[BOOTSTRAP] doc=%s path=sync mode=%s already_hydrated=%d',
@@ -810,6 +845,7 @@ export class VaultSyncClient {
         role: 'Follower', runtimeStore: rsCount,
       }));
       // Reset hydration state for next bootstrap call
+      this._hydrationDone = false;
       this._hydrationResolve = null;
       this._hydrationPromise = null;
     }
