@@ -240,6 +240,32 @@ export class VaultSyncRuntime {
         return ret;
     }
     /**
+     * Returns the current sync cursor from the SyncRuntime.
+     * Used by JS bootstrap to wait for initial sync before populating DocumentStore.
+     * @returns {bigint}
+     */
+    currentCursor() {
+        const ret = wasm.vaultsyncruntime_currentCursor(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * Debug: dump full DocumentStore contents as JSON.
+     * Returns {"docs": {"doc_id": {"records": N, "record_ids": ["id1", ...]}}}
+     * @returns {string}
+     */
+    debugDocumentStore() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.vaultsyncruntime_debugDocumentStore(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * @param {string} doc_id
      * @param {string} schema_json
      * @returns {Promise<void>}
@@ -353,6 +379,20 @@ export class VaultSyncRuntime {
         return ret;
     }
     /**
+     * Direct hydration from the leader's DocumentStore to JS RuntimeStore.
+     * Bypasses find() and _waitForReady() — reads from the Rust in-memory store
+     * that was populated by new_with_coordinator() via OPFS.
+     * Returns JSON array of all records across all doc IDs, each injected with record_id.
+     * @returns {Array<any>}
+     */
+    hydrateRuntimeStore() {
+        const ret = wasm.vaultsyncruntime_hydrateRuntimeStore(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
+    /**
      * @param {string} doc_id
      * @param {string} record_id
      * @param {string} json
@@ -436,6 +476,22 @@ export class VaultSyncRuntime {
         }
     }
     /**
+     * Snapshot all records for a doc from the MirrorRuntime's DocumentStore.
+     * Each record includes `record_id` injected into the field map.
+     * Used by demotion SYNC_DONE handler to re-hydrate RuntimeStore.
+     * @param {string} doc_id
+     * @returns {Array<any>}
+     */
+    mirrorDocuments(doc_id) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_mirrorDocuments(this.__wbg_ptr, ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
+    /**
      * Phase 3: Check mirror paused state and drain_seq for promotion diagnostics.
      * @returns {any}
      */
@@ -508,6 +564,20 @@ export class VaultSyncRuntime {
             throw takeFromExternrefTable0(ret[1]);
         }
         return BigInt.asUintN(64, ret[0]);
+    }
+    /**
+     * Re-populate the Rust DocumentStore from OPFS after initial sync completes.
+     * Called by JS bootstrap() after _waitForReady() on the Leader path.
+     * This fixes the timing gap where Patch 1 hydrates before sync, leaving the
+     * DocumentStore empty on first startup even after data arrives in OPFS.
+     * @param {string} doc_id
+     * @returns {Promise<any>}
+     */
+    populateDocumentStore(doc_id) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_populateDocumentStore(this.__wbg_ptr, ptr0, len0);
+        return ret;
     }
     /**
      * Returns a clone of the PresenceManager if available.
@@ -707,6 +777,19 @@ export class VaultSyncRuntime {
         const ptr2 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len2 = WASM_VECTOR_LEN;
         const ret = wasm.vaultsyncruntime_update(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+        return ret;
+    }
+    /**
+     * Event-driven replacement for cursor polling in JS bootstrap.
+     * Awaits the `InitialSyncComplete` signal from the download worker,
+     * which fires when `process_batch() -> Ok(0)` for the first time.
+     * Falls back after a 10-second watchdog timeout (logs warning, returns false).
+     * Returns `true` if the signal was received, `false` on timeout.
+     * Safe to call multiple times — late callers resolve immediately from watch cache.
+     * @returns {Promise<boolean>}
+     */
+    waitForInitialSync() {
+        const ret = wasm.vaultsyncruntime_waitForInitialSync(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -1727,47 +1810,47 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1062, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df);
-            return ret;
-        },
-        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1353, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1371, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1);
             return ret;
         },
+        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 729, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df);
+            return ret;
+        },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 1060, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 727, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 1062, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_3);
-            return ret;
-        },
-        __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 1093, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 1113, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0);
             return ret;
         },
+        __wbindgen_cast_0000000000000005: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 729, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4);
+            return ret;
+        },
         __wbindgen_cast_0000000000000006: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 1093, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 1113, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_5);
             return ret;
         },
         __wbindgen_cast_0000000000000007: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 1093, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 1113, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_6);
             return ret;
         },
         __wbindgen_cast_0000000000000008: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1272, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1198, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h5a816e701a8600f2);
             return ret;
         },
         __wbindgen_cast_0000000000000009: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1274, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1200, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hd15eeae72bcd25a2);
             return ret;
         },
@@ -1818,12 +1901,12 @@ function wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778(arg0, arg
     wasm.wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_3(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_3(arg0, arg1, arg2);
-}
-
 function wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0(arg0, arg1, arg2) {
     wasm.wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0(arg0, arg1, arg2);
+}
+
+function wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4(arg0, arg1, arg2);
 }
 
 function wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_5(arg0, arg1, arg2) {

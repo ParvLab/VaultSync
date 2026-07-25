@@ -79,6 +79,16 @@ export class VaultSyncRuntime {
      * Runs compaction on the given namespace, returns JSON stats.
      */
     compactNamespace(namespace: string): Promise<string>;
+    /**
+     * Returns the current sync cursor from the SyncRuntime.
+     * Used by JS bootstrap to wait for initial sync before populating DocumentStore.
+     */
+    currentCursor(): bigint;
+    /**
+     * Debug: dump full DocumentStore contents as JSON.
+     * Returns {"docs": {"doc_id": {"records": N, "record_ids": ["id1", ...]}}}
+     */
+    debugDocumentStore(): string;
     define_schema(doc_id: string, schema_json: string): Promise<void>;
     delete(doc_id: string, record_id: string): Promise<void>;
     /**
@@ -107,6 +117,13 @@ export class VaultSyncRuntime {
      * VaultSyncClient pipeline, then broadcasts invalidation to all tabs.
      */
     handle_command(verb: string, doc_id: string, record_id: string, json: string): Promise<void>;
+    /**
+     * Direct hydration from the leader's DocumentStore to JS RuntimeStore.
+     * Bypasses find() and _waitForReady() — reads from the Rust in-memory store
+     * that was populated by new_with_coordinator() via OPFS.
+     * Returns JSON array of all records across all doc IDs, each injected with record_id.
+     */
+    hydrateRuntimeStore(): Array<any>;
     insert(doc_id: string, record_id: string, json: string): Promise<void>;
     is_leader(): boolean;
     /**
@@ -133,6 +150,12 @@ export class VaultSyncRuntime {
      */
     metricsSnapshot(): string;
     /**
+     * Snapshot all records for a doc from the MirrorRuntime's DocumentStore.
+     * Each record includes `record_id` injected into the field map.
+     * Used by demotion SYNC_DONE handler to re-hydrate RuntimeStore.
+     */
+    mirrorDocuments(doc_id: string): Array<any>;
+    /**
      * Phase 3: Check mirror paused state and drain_seq for promotion diagnostics.
      */
     mirrorState(): any;
@@ -145,6 +168,13 @@ export class VaultSyncRuntime {
      * value so JS can verify the queue is quiescent.
      */
     pauseMirror(): bigint;
+    /**
+     * Re-populate the Rust DocumentStore from OPFS after initial sync completes.
+     * Called by JS bootstrap() after _waitForReady() on the Leader path.
+     * This fixes the timing gap where Patch 1 hydrates before sync, leaving the
+     * DocumentStore empty on first startup even after data arrives in OPFS.
+     */
+    populateDocumentStore(doc_id: string): Promise<any>;
     /**
      * Returns a clone of the PresenceManager if available.
      */
@@ -201,6 +231,15 @@ export class VaultSyncRuntime {
     tryCompact(): Promise<any>;
     unsubscribe(handle: WasmSubscriptionHandle): void;
     update(doc_id: string, record_id: string, json: string): Promise<void>;
+    /**
+     * Event-driven replacement for cursor polling in JS bootstrap.
+     * Awaits the `InitialSyncComplete` signal from the download worker,
+     * which fires when `process_batch() -> Ok(0)` for the first time.
+     * Falls back after a 10-second watchdog timeout (logs warning, returns false).
+     * Returns `true` if the signal was received, `false` on timeout.
+     * Safe to call multiple times — late callers resolve immediately from watch cache.
+     */
+    waitForInitialSync(): Promise<boolean>;
     /**
      * Step 4: Wait for promotion signal via oneshot channel (event-driven, no polling).
      * Resolves when LeaderEvent::Acquired fires (Web Lock granted to this follower).
@@ -273,20 +312,8 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
-    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
-    readonly presencemanager_activePeers: (a: number) => [number, number];
-    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
-    readonly presencemanager_peer_count: (a: number) => number;
     readonly decrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly encrypt: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
-    readonly init: () => void;
-    readonly set_log_level_from_str: (a: number, b: number) => void;
-    readonly __wbg_wasmipc_free: (a: number, b: number) => void;
-    readonly wasmipc_new: (a: number, b: number) => [number, number, number];
-    readonly wasmipc_new_with_channel: (a: any) => number;
-    readonly wasmipc_on_message: (a: number, b: any) => void;
-    readonly wasmipc_receive: (a: number) => [number, number];
-    readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
     readonly __wbg_eventbusproxy_free: (a: number, b: number) => void;
     readonly __wbg_replicationnamespace_free: (a: number, b: number) => void;
     readonly __wbg_vaultsyncruntime_free: (a: number, b: number) => void;
@@ -303,6 +330,8 @@ export interface InitOutput {
     readonly vaultsyncruntime_cacheStats: (a: number) => [number, number];
     readonly vaultsyncruntime_checkMirrorPromotion: (a: number) => number;
     readonly vaultsyncruntime_compactNamespace: (a: number, b: number, c: number) => any;
+    readonly vaultsyncruntime_currentCursor: (a: number) => bigint;
+    readonly vaultsyncruntime_debugDocumentStore: (a: number) => [number, number];
     readonly vaultsyncruntime_define_schema: (a: number, b: number, c: number, d: number, e: number) => any;
     readonly vaultsyncruntime_delete: (a: number, b: number, c: number, d: number, e: number) => any;
     readonly vaultsyncruntime_demote: (a: number) => any;
@@ -312,6 +341,7 @@ export interface InitOutput {
     readonly vaultsyncruntime_flushPendingUploads: (a: number) => any;
     readonly vaultsyncruntime_get: (a: number, b: number, c: number, d: number, e: number) => any;
     readonly vaultsyncruntime_handle_command: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => any;
+    readonly vaultsyncruntime_hydrateRuntimeStore: (a: number) => [number, number, number];
     readonly vaultsyncruntime_insert: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => any;
     readonly vaultsyncruntime_is_leader: (a: number) => number;
     readonly vaultsyncruntime_lastCompactionMs: (a: number) => bigint;
@@ -320,11 +350,13 @@ export interface InitOutput {
     readonly vaultsyncruntime_maintenanceTick: (a: number) => number;
     readonly vaultsyncruntime_markReady: (a: number) => void;
     readonly vaultsyncruntime_metricsSnapshot: (a: number) => [number, number];
+    readonly vaultsyncruntime_mirrorDocuments: (a: number, b: number, c: number) => [number, number, number];
     readonly vaultsyncruntime_mirrorState: (a: number) => [number, number, number];
     readonly vaultsyncruntime_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => any;
     readonly vaultsyncruntime_new_with_coordinator: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => any;
     readonly vaultsyncruntime_on_event: (a: number, b: any) => void;
     readonly vaultsyncruntime_pauseMirror: (a: number) => [bigint, number, number];
+    readonly vaultsyncruntime_populateDocumentStore: (a: number, b: number, c: number) => any;
     readonly vaultsyncruntime_presence: (a: number) => number;
     readonly vaultsyncruntime_promote: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => any;
     readonly vaultsyncruntime_prune_key_versions: (a: number, b: number) => [number, number];
@@ -343,6 +375,7 @@ export interface InitOutput {
     readonly vaultsyncruntime_tryCompact: (a: number) => any;
     readonly vaultsyncruntime_unsubscribe: (a: number, b: number) => [number, number];
     readonly vaultsyncruntime_update: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => any;
+    readonly vaultsyncruntime_waitForInitialSync: (a: number) => any;
     readonly vaultsyncruntime_waitForPromotion: (a: number) => any;
     readonly vaultsyncruntime_workingSets: (a: number) => number;
     readonly vaultsyncruntime_workspace: (a: number) => number;
@@ -358,12 +391,24 @@ export interface InitOutput {
     readonly workspacenamespace_get: (a: number, b: bigint) => [number, number, number, number];
     readonly workspacenamespace_list: (a: number) => [number, number, number, number];
     readonly workspacenamespace_update: (a: number, b: bigint, c: number, d: number, e: number, f: number) => [number, number, number];
+    readonly init: () => void;
+    readonly set_log_level_from_str: (a: number, b: number) => void;
+    readonly __wbg_wasmipc_free: (a: number, b: number) => void;
+    readonly wasmipc_new: (a: number, b: number) => [number, number, number];
+    readonly wasmipc_new_with_channel: (a: any) => number;
+    readonly wasmipc_on_message: (a: number, b: any) => void;
+    readonly wasmipc_receive: (a: number) => [number, number];
+    readonly wasmipc_send: (a: number, b: number, c: number) => [number, number];
+    readonly __wbg_presencemanager_free: (a: number, b: number) => void;
+    readonly presencemanager_activePeers: (a: number) => [number, number];
+    readonly presencemanager_new: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly presencemanager_peer_count: (a: number) => number;
     readonly wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h6742839cb717cdad: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_3: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_5: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_6: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h5a816e701a8600f2: (a: number, b: number) => void;

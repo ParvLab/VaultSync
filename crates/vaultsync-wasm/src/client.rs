@@ -685,33 +685,15 @@ impl VaultSyncRuntime {
             if parts.len() >= 2 {
                 let leaver = parts[1];
                 if leaver != mirror.tab_id {
-                    engine_info!("[MirrorRuntime] tab LEFT: {} (triggering re-election)", leaver);
+                    engine_info!("[MirrorRuntime] tab LEFT: {} (leader departed, waiting for Web Lock)", leaver);
                     mirror.last_heartbeat.store(js_sys::Date::now() as u64, Ordering::Release);
                     mirror.leader_left.store(true, Ordering::Relaxed);
-                    // Fix 2: Trigger re-election via acquire(Immediate). If the leader
-                    // tab released its Web Lock (pagehide or normal drop), this
-                    // succeeds and LeaderEvent::Acquired fires, unblocking promote().
-                    if let Some(ref le) = *mirror.leader_election.lock().unwrap() {
-                        let le_clone = le.clone();
-                        vaultsync_core::time_utils::spawn(async move {
-                            match le_clone.acquire(
-                                vaultsync_core::ipc::leader_election::AcquireMode::Immediate,
-                            ).await {
-                                Ok(vaultsync_core::ipc::leader_election::AcquireResult::Acquired(lease)) => {
-                                    // Lease obtained — drop immediately. The event bus
-                                    // subscription already handles promotion signaling.
-                                    // Dropping the lease preserves the lock for the
-                                    // promote() path which re-acquires it.
-                                    drop(lease);
-                                    engine_info!("[re-election] acquire(Immediate) succeeded — lock was free, promotion will fire");
-                                }
-                                Ok(vaultsync_core::ipc::leader_election::AcquireResult::Waiting) => {
-                                    engine_info!("[re-election] acquire(Immediate) returned Waiting — lock still held elsewhere");
-                                }
-                                _ => {}
-                            }
-                        });
-                    }
+                    // No acquire(Immediate) here — the Wait-mode callback on this
+                    // LeaderElection already handles promotion when the old leader's
+                    // Web Lock is released (via pagehide or normal close). An explicit
+                    // acquire here would steal the lock handle from the Wait-mode
+                    // callback and drop it, prematurely releasing the lock and causing
+                    // a cascade where no tab can successfully promote.
                 }
             }
             return;
@@ -2285,17 +2267,33 @@ impl VaultSyncRuntime {
         plog("drain");
 
         let promote_lease = match self.leader_election.as_ref() {
-            Some(le) => match le.acquire(
-                vaultsync_core::ipc::leader_election::AcquireMode::Immediate,
-            ).await {
-                Ok(vaultsync_core::ipc::leader_election::AcquireResult::Acquired(lease)) => {
-                    engine_info!("[promotion] acquired Lease from follower's LeaderElection");
-                    debug_assert!(le.is_leader(), "promote() Lease must have is_leader=true");
-                    Some(lease)
+            Some(le) => {
+                let mut acquire_lease = None;
+                for attempt in 0..3 {
+                    match le.acquire(
+                        vaultsync_core::ipc::leader_election::AcquireMode::Immediate,
+                    ).await {
+                        Ok(vaultsync_core::ipc::leader_election::AcquireResult::Acquired(lease)) => {
+                            engine_info!("[promotion] acquired Lease (attempt {})", attempt + 1);
+                            debug_assert!(le.is_leader(), "promote() Lease must have is_leader=true");
+                            acquire_lease = Some(lease);
+                            break;
+                        }
+                        _ => {
+                            if attempt < 2 {
+                                engine_debug!("[promotion] acquire failed (attempt {}), retrying in 50ms", attempt + 1);
+                                vaultsync_core::time_utils::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
                 }
-                _ => {
-                    engine_warn!("[promotion] could not acquire Lease — Web Lock may not be held");
-                    None
+                match acquire_lease {
+                    Some(lease) => Some(lease),
+                    None => {
+                        let msg = "[promotion] could not acquire Lease after 3 attempts — aborting promotion".to_string();
+                        engine_error!("{}", msg);
+                        return Err(JsValue::from_str(&msg));
+                    }
                 }
             },
             None => None,
