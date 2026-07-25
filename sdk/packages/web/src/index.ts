@@ -351,9 +351,34 @@ export class VaultSyncClient {
             this._hydrationResolve();
             this._hydrationResolve = null;
           }
-          // If we were in Hydrating state (e.g., after demotion), transition to ready
-          if (this.inner.runtimeState() === 'Hydrating') {
+          // If we were in Hydrating state (e.g., after demotion), transition to ready.
+          // Always hydrate from mirror for non-Leader tabs to catch any gaps.
+          const syncState = this.inner.runtimeState();
+          if (syncState !== 'Leading') {
+            const safeDocs = ['notes'];
+            let totalHydrated = 0;
+            for (const safeDoc of safeDocs) {
+              try {
+                const arr = this.inner.mirrorDocuments(safeDoc);
+                if (arr.length > 0) {
+                  this.runtimeStore.beginBatch();
+                  for (let i = 0; i < arr.length; i++) {
+                    const fields = JSON.parse(arr[i]);
+                    const recordId = (fields.record_id ?? fields.id) as string;
+                    this.runtimeStore.applySetFieldBatch(safeDoc, recordId, fields, 'demotion_sync');
+                    totalHydrated++;
+                  }
+                  this.runtimeStore.endBatch();
+                }
+              } catch (err) {
+                console.warn('[HYDRATE] mirror snapshot failed for doc', safeDoc, err);
+              }
+            }
             this.inner.markReady();
+            console.log('[HYDRATION]', JSON.stringify({
+              source: 'SYNC_DONE', state: syncState, mirrorRecords: totalHydrated,
+              runtimeStore: this.runtimeStore.query('notes').length,
+            }));
           }
           console.log('[BC_SUMMARY]', JSON.stringify({
             ...this._bcCounts, buffered: bufLen, deleted: deletedCount,
@@ -676,59 +701,33 @@ export class VaultSyncClient {
   async bootstrap(docIds?: string[]): Promise<void> {
     const mode = this.runtimeStatus.mode;
     if (mode === 'Leader') {
+      // Wait for initial sync to write data to OPFS before populating DocumentStore.
+      // Uses event-driven `waitForInitialSync()` which awaits `InitialSyncComplete`
+      // from the download worker's `process_batch() -> Ok(0)` cycle.
+      // Replaces previous cursor polling (3s timer) with deterministic signal.
+      const synced = await this.inner.waitForInitialSync();
+      if (synced) {
+        console.debug('[BOOTSTRAP] initial sync complete');
+      } else {
+        console.warn('[BOOTSTRAP] waitForInitialSync timeout — proceeding without signal');
+      }
       if (docIds && docIds.length > 0) {
         for (const docId of docIds) {
           try {
             const before = this.runtimeStore.query(docId).length;
-            const arr = await this.inner.find(docId);
-            const records: Array<{ recordId: string; deleted: boolean }> = [];
-            for (const json of arr) {
-              const fields = JSON.parse(json);
-              const recordId = (fields.record_id ?? fields.id) as string;
-              const isDel = fields._deleted === true || fields.__deleted__ === true;
-              records.push({ recordId, deleted: isDel });
-        this.runtimeStore.applySetFieldBatch(docId, recordId, fields, 'local_insert');
-            }
-            const after = this.runtimeStore.query(docId).length;
-            const deletedRecords = records.filter(r => r.deleted).length;
-            console.debug('[BOOTSTRAP] doc=%s path=find mode=%s before=%d records_found=%d deleted=%d after=%d ids=[%s]',
-              docId, mode, before, records.length, deletedRecords, after,
-              records.map(r => `${r.recordId}(del=${r.deleted})`).join(','));
-          } catch (err) {
-            console.warn(`[BOOTSTRAP] Failed to load doc "${docId}":`, err);
-          }
-        }
-      }
-      // Phase 2: Mark runtime as ready — unblocks find()/get() queries
-      this.inner.markReady();
-      console.log('[LIFECYCLE] leader hydrated — state=Ready');
-    } else {
-      // Mirror/follower: wait for initial replay hydration, then fall back to WASM.
-      // This replaces the no-op path that relied entirely on the replay pipeline
-      // and could leave the RuntimeStore empty if replay is delayed.
-      if (docIds && docIds.length > 0) {
-        // Create a hydration promise if one isn't already pending
-        if (!this._hydrationPromise) {
-          this._hydrationPromise = new Promise<void>(resolve => {
-            this._hydrationResolve = resolve;
-          });
-        }
-        // Wait for first SYNC_DONE or timeout (2s)
-        const hydrated = await Promise.race([
-          this._hydrationPromise.then(() => true),
-          new Promise<boolean>(r => setTimeout(() => r(false), 2000)),
-        ]);
-        if (!hydrated) {
-          console.debug('[BOOTSTRAP] replay timeout — falling back to WASM find()');
-        }
-        for (const docId of docIds) {
-          if (this.runtimeStore.query(docId).length > 0) {
-            console.debug('[BOOTSTRAP] doc=%s path=hydration mode=%s already_hydrated=%d',
-              docId, mode, this.runtimeStore.query(docId).length);
-            continue;
-          }
-          try {
-            const arr = await this.inner.find(docId);
+            // Re-populate the Rust DocumentStore from OPFS now that initial sync
+            // has completed. Patch 1 hydrated during construction before any data
+            // arrived — this second pass catches data that sync'd in the meantime.
+            const populated = await this.inner.populateDocumentStore(docId);
+            // Direct hydration from Rust DocumentStore — bypasses find() and _waitForReady().
+            const arr = this.inner.hydrateRuntimeStore();
+            console.log('[BS_RAW]', JSON.stringify({
+                docId, arrLength: arr.length, populated,
+                records: (Array.from(arr) as string[]).map((json: string, i: number) => {
+                    const f = JSON.parse(json);
+                    return { i, recordId: f.record_id ?? f.id, fields: Object.keys(f) };
+                }),
+            }));
             const records: Array<{ recordId: string; deleted: boolean }> = [];
             for (const json of arr) {
               const fields = JSON.parse(json);
@@ -739,9 +738,8 @@ export class VaultSyncClient {
             }
             const after = this.runtimeStore.query(docId).length;
             const deletedRecords = records.filter(r => r.deleted).length;
-            console.debug('[BOOTSTRAP] doc=%s path=%s mode=%s records_found=%d deleted=%d after=%d ids=[%s]',
-              docId, hydrated ? 'hydration' : 'find_fallback', mode,
-              records.length, deletedRecords, after,
+            console.debug('[BOOTSTRAP] doc=%s path=hydrate mode=%s before=%d records_found=%d deleted=%d after=%d ids=[%s]',
+              docId, mode, before, records.length, deletedRecords, after,
               records.map(r => `${r.recordId}(del=${r.deleted})`).join(','));
           } catch (err) {
             console.warn(`[BOOTSTRAP] Failed to load doc "${docId}":`, err);
@@ -750,8 +748,68 @@ export class VaultSyncClient {
       }
       // Phase 2: Mark runtime as ready — unblocks find()/get() queries
       this.inner.markReady();
-      console.log('[LIFECYCLE] follower hydrated — state=Mirroring');
-      // Always reset hydration state for next bootstrap call
+      const rsCount = this.runtimeStore.query('notes').length;
+      const rustArr = this.inner.hydrateRuntimeStore();
+      console.log('[HYDRATION_INVARIANT]', JSON.stringify({
+        role: 'Leader', runtimeStore: rsCount, rustStore: rustArr.length,
+      }));
+      const docStoreDebug = this.inner.debugDocumentStore();
+      console.log('[DOCSTORE] leader after markReady:', docStoreDebug);
+      console.log('[LIFECYCLE] leader hydrated — state=Ready');
+    } else {
+      // Mirror/follower: set Hydrating state and wait for SYNC_DONE.
+      // The SYNC_DONE handler populates RuntimeStore from mirror and calls markReady().
+      this.inner.beginHydration();
+      if (docIds && docIds.length > 0) {
+        // Create a hydration promise if one isn't already pending
+        if (!this._hydrationPromise) {
+          this._hydrationPromise = new Promise<void>(resolve => {
+            this._hydrationResolve = resolve;
+          });
+        }
+        // Wait for first SYNC_DONE or timeout (3s)
+        const hydrated = await Promise.race([
+          this._hydrationPromise.then(() => true),
+          new Promise<boolean>(r => setTimeout(() => r(false), 3000)),
+        ]);
+        if (!hydrated) {
+          // Fall back to mirror Documents for any docs that weren't hydrated
+          console.debug('[BOOTSTRAP] sync timeout — falling back to mirror snapshot');
+        }
+        for (const docId of docIds) {
+          if (this.runtimeStore.query(docId).length > 0) {
+            console.debug('[BOOTSTRAP] doc=%s path=sync mode=%s already_hydrated=%d',
+              docId, mode, this.runtimeStore.query(docId).length);
+            continue;
+          }
+          try {
+            // Direct read from MirrorRuntime's DocumentStore (bypasses find())
+            const arr = this.inner.mirrorDocuments(docId);
+            const records: Array<{ recordId: string; deleted: boolean }> = [];
+            for (const json of arr) {
+              const fields = JSON.parse(json);
+              const recordId = (fields.record_id ?? fields.id) as string;
+              const isDel = fields._deleted === true || fields.__deleted__ === true;
+              records.push({ recordId, deleted: isDel });
+              this.runtimeStore.applySetFieldBatch(docId, recordId, fields, 'mirror_snapshot');
+            }
+            const after = this.runtimeStore.query(docId).length;
+            const deletedRecords = records.filter(r => r.deleted).length;
+            console.debug('[BOOTSTRAP] doc=%s path=mirror_snapshot mode=%s records_found=%d deleted=%d after=%d ids=[%s]',
+              docId, mode, records.length, deletedRecords, after,
+              records.map(r => `${r.recordId}(del=${r.deleted})`).join(','));
+          } catch (err) {
+            console.warn(`[BOOTSTRAP] Failed to load doc "${docId}" from mirror:`, err);
+          }
+        }
+      }
+      // Don't markReady here — delegate to SYNC_DONE handler which calls markReady()
+      // after applying replay buffer + mirror snapshot.
+      const rsCount = this.runtimeStore.query('notes').length;
+      console.log('[HYDRATION_INVARIANT]', JSON.stringify({
+        role: 'Follower', runtimeStore: rsCount,
+      }));
+      // Reset hydration state for next bootstrap call
       this._hydrationResolve = null;
       this._hydrationPromise = null;
     }

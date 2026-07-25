@@ -124,32 +124,34 @@ That's how people understand systems — not by reading modules, but by followin
 - Compaction methods must use `js_sys::Date::now()` for timestamps (not `crate::time_utils`)
 
 ## Progress
-### Done (Session 4 — Upload Queue Instrumentation + Write Verification)
-- **Phase 1 — Upload pipeline cursor advancement**: `upload.rs` now calls `sync_state_store.set_cursor(max_seq)` after MARK_DONE in the pipeline. Push handler (`process_push_mutation`) advances cursor for self-replica echoes in `download.rs`.
-- **Phase 2 — Full instrumentation**: `process_push_mutation`, `process_batch`, `sync_runtime.rs` cursor/set_cursor, `metadata_runtime.rs` checkpoint all instrumented at INFO level. Runtime logs now show exact cursor state transitions.
-- **Root cause identified — upload queue cache/disk divergence**: `pending_count()` reads in-memory manifest counter while `read_pending_oplog()` reads OPFS via VersionChain. When `VersionChain::resolve()` fails to reconstruct a page (incomplete chain), entries on disk differ from cached count.
-- **P1 — `adjust_oplog_pending_count` caller tagging**: All 4 callers now tagged with `caller: &'static str` ("write_document_and_oplog", "delete_document_and_oplog", "append_oplog", "mark_synced", "mark_failed").
-- **P2 — Write-then-read-back verification**: `verify_oplog_write()` added to `OpfsStorage` — writes data via `write_oplog_page`, reads back from OPFS, compares. Logs `[WRITE_VERIFY] MATCH` or `[WRITE_VERIFY] MISMATCH` per call site.
-- **P3 — Per-stage filtered logging in `read_pending_oplog`**: Logs pages count, resolved entries, namespace filter result, uploadable count, full lists of IDs/statuses at each filter stage.
-- **P4 — Pending count invariant check**: After every oplog write, asserts `pending_count == uploadable_entries_in_namespace`. Logs `[INVARIANT] OK` or `[INVARIANT] MISMATCH` with full status dump.
-- **Fixed cache/disk mismatch**: `adjust_pending_count` in `PageStore` now updates in-memory manifest cache atomically (not just OPFS).
-- **All 3 builds pass**: `cargo check --workspace` ✅, `wasm-pack build --target web` ✅, `npm run build` (SDK) ✅.
 
-### Current Bug — Malformed notes missing record_id/id in JS RuntimeStore
-**Status**: Fixed in `sdk/packages/web/src/store.ts:66-77`.
+### Active — Replay/Mirror Hydration Fix (Session 6)
+**Objective**: Fix lifecycle bugs causing leader data not to display until a follower triggers replay, promotion stuck at "Promoting...", and data loss after demotion.
 
-**Root cause**: `RuntimeStore` stores records as `Map<recordId, FieldMap>` where the Map key is the identity, but `query()` returned `Array.from(doc.values())` which discards the key. The stored FieldMap values lack `record_id`/`id` because:
-1. `mutations.insert(id, {title, body})` at `App.tsx:37-40` passes fields without identifiers
-2. CRDT per-field BC mutations carry one field at a time, never `record_id`
-3. `mutations.update(noteId, {title, body})` also omits identifiers
+**Root cause chain**:
+1. **SYNC_BEGIN without SYNC_DONE** (`client.rs:945` broadcasts SYNC_BEGIN but never SYNC_DONE) → JS replay buffer accumulates all MUTATIONs indefinitely → stale data in RuntimeStore.
+2. **Hydrating deadlock**: `_waitForReady()` barrier in `find()` blocks during Hydrating state, but `find()` is the only way to hydrate → circular dependency → RuntimeStore populated only via BC, never directly from OPFS.
+3. **Demotion RuntimeStore stale**: After demotion, SYNC_DONE handler was missing re-hydration from the mirror's DocumentStore → RuntimeStore kept stale leader data.
 
-**Fix (Option C)**: `query()` now iterates `doc.entries()` and injects the Map key as `record_id`/`id`, stripping any stale `id`/`record_id` from stored fields via destructuring. This guarantees identity is reconstructed from the authoritative Map key on every read, regardless of how data was stored.
+**Fix — 4 phases + 2 patches**:
 
-**Symptoms explained**: React duplicate keys (all `key=undefined`), clicking always opens first note (`record_id` undefined matches every record), delete doesn't work (`delete(undefined)` no-op), malformed-object warnings.
+**Phase 1 (SYNC_DONE)**: `client.rs` broadcasts SYNC_DONE after SYNC_BEGIN in leader READY announcement. Closes replay session so MUTATIONs apply live.
 
-**Evidence**: `[NOTE_LIST] ids=[?,?]` showing `?` for every record, `[NoteList] malformed note without identifier {json: '{"title":"","body":""}'}` with only 2 keys. Rust `[DOC_CREATE]` logs confirmed valid IDs in storage — corruption was entirely in the JS query layer.
+**Phase 2 (Hydrating state)**: `runtime_state.rs` — added `Hydrating` variant. Transitions: `Starting→Hydrating`, `Hydrating→Leading/Mirroring`, `Promoting→Hydrating`, `Mirroring→Hydrating`. Added `set_runtime_state()`, `wait_until_ready()` helpers.
 
-**All 3 builds pass** after fix.
+**Phase 3 (LEADER_READY deferral)**: `markReady()` now broadcasts LEADER_READY, not `promote()`. Ensures bc_seq ordering.
+
+**Phase 4 (demotion hydration)**: `demote()` sets `RS_HYDRATING` → SYNC_DONE handler calls `markReady()`. Demoted tab waits for BC data before becoming ready.
+
+**Patch 1 (leader hydrate from OPFS)**: `new_with_coordinator()` now reads records via `client.find()` after `client.initialize()`, populates DocumentStore's `set_field()` for each doc_id, then transitions directly to `RS_LEADING` — skips Hydrating deadlock entirely.
+
+**Patch 2 (demotion re-hydration)**: New `mirrorDocuments()` WASM export queries MirrorRuntime's DocumentStore (injects `record_id`). SYNC_DONE handler calls this to re-populate RuntimeStore before `markReady()`.
+
+**Patch 3 (direct leader hydration)**: New `hydrateRuntimeStore()` WASM method reads from Rust's DocumentStore (populated by Patch 1) and returns JSON directly to JS. Leader `bootstrap()` uses this instead of `find()` — no `_waitForReady()` barrier.
+
+**Patch 4 (follower lifecycle)**: Follower `bootstrap()` calls `beginHydration()` → sets `RS_HYDRATING`. No longer calls `markReady()`. SYNC_DONE handler hydrates from mirror and calls `markReady()` for ALL non-Leader tabs (not just Hydrating state), fixing the race condition where SYNC_DONE arrives before `beginHydration()`.
+
+**Builds**: `cargo check --workspace` ✅, `wasm-pack build --target web` ✅, `npm run build` (SDK) ✅.
 
 ### Done (Session 3 — FSM + StorageHealth + Sprint A)
 - **Sprint A — Correctness (Storage Transaction Model)**: Fixed Bug C root cause — every page write now atomically updates ALL ContentIndex indexes including `page_by_id`. `write_page_raw` is now a pure OPFS writer (no manifest updates). `commit_page_write()` replaces `bump_manifest_live_page()` and updates `live_pages` + `page_by_id` + (optionally) `entries`/`page_by_document`/`page_by_sequence`. `allocate_page_id()` and `commit_allocated_page_id()` add stub `page_by_id` entries so `repair_orphans()` no longer tombstones legitimate delta pages. `remove_by_page_id()` handles stub entries correctly. `split_page()` uses `write_page_tx` + `commit_tx` for atomic ContentIndex updates. `commit_tx()` Write ops with `None` key properly track pages in all indexes instead of tombstoning them.
@@ -674,6 +676,9 @@ After integration work is complete, spend time on:
 - `crates/vaultsync-core/src/runtime_state.rs`: `RuntimeState` enum + `RuntimeCapabilities` bitflags + transition logic (V4 v2)
 - `crates/vaultsync-core/src/runtime_bus.rs`: `RuntimeEvent` enum + `RuntimeSubscriber` trait + `RuntimeBus` sync dispatch (V4 v2)
 - `crates/vaultsync-wasm/src/runtime_coordinator.rs`: Replaces HeartbeatManager — state machine, HELLO/DISCOVER protocol, BC routing (V4 v2)
+- `crates/vaultsync-wasm/src/client.rs` (Session 6): SYNC_DONE broadcast, `runtime_state`/`ready_waiters` helpers, `mirror_documents()` export (Patch 2), `new_with_coordinator()` OPFS hydration (Patch 1), `hydrate_runtime_store()` direct bridge (Patch 3), `set_runtime_state()`, `mark_ready()`, `begin_hydration()`, `wait_until_ready()`
+- `crates/vaultsync-core/src/runtime_state.rs` (Session 6): `Hydrating` variant, transition rules (`Starting→Hydrating`, `Hydrating→Leading/Mirroring`, `Promoting→Hydrating`, `Mirroring→Hydrating`), 11 unit tests
+- `sdk/packages/web/src/index.ts` (Session 6): `bootstrap()` with `_waitForReady()` barrier, SYNC_DONE handler calls `mirrorDocuments()` for demotion re-hydration, `runtimeStatus` state field, `hydrateRuntimeStore()` for leader boot, `beginHydration()` + SYNC_DONE markReady for follower lifecycle
 
 ## Known Issues
 

@@ -22,6 +22,8 @@ use crate::sync::reconciler::Reconciler;
 use crate::sync::state::SyncState;
 use crate::sync::sync_state_store::SyncStateStore;
 use crate::sync::upload::UploadQueue;
+#[cfg(feature = "async-runtime")]
+use crate::sync::SyncLifecycle;
 use crate::telemetry::log_data;
 use crate::telemetry::tracing::VaultSyncTelemetry;
 use futures::StreamExt;
@@ -143,6 +145,10 @@ pub struct VaultSyncClient {
     /// after subscribe completes in `initialize()`.
     download_worker_rx:
         std::sync::Mutex<Option<futures::channel::mpsc::UnboundedReceiver<Option<PendingMutation>>>>,
+    /// Watch channel for initial sync lifecycle state.
+    /// JS bootstrap awaits `InitialSyncComplete` before populating DocumentStore.
+    #[cfg(feature = "async-runtime")]
+    sync_lifecycle_tx: tokio::sync::watch::Sender<SyncLifecycle>,
 }
 
 impl VaultSyncClient {
@@ -559,6 +565,9 @@ impl VaultSyncClient {
         let pending_count_tx = events.pending_count.clone();
         let pending_cache = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+        #[cfg(feature = "async-runtime")]
+        let (sync_lifecycle_tx, _sync_lifecycle_rx) = tokio::sync::watch::channel(SyncLifecycle::Connecting);
+
         let mut client = Self {
             config,
             storage,
@@ -594,6 +603,8 @@ impl VaultSyncClient {
             #[cfg(target_arch = "wasm32")]
             pending_count_rx: std::sync::Mutex::new(Some(pending_count_rx)),
             download_worker_rx: std::sync::Mutex::new(Some(download_event_rx)),
+            #[cfg(feature = "async-runtime")]
+            sync_lifecycle_tx,
             materializer: None,
         };
         tracing::info!("[client.new] construction done {} ms", crate::time_utils::system_time_now_ms() - _t);
@@ -1033,6 +1044,10 @@ impl VaultSyncClient {
             }
         }
 
+        // ── Signal that subscribe + materialization is done; data may start flowing ──
+        #[cfg(feature = "async-runtime")]
+        let _ = self.sync_lifecycle_tx.send(SyncLifecycle::Downloading);
+
         // ── Start download worker now that materialization is complete ──
         self.start_download_worker();
 
@@ -1061,6 +1076,11 @@ impl VaultSyncClient {
             return;
         };
         let dq = self.download_queue.clone();
+        #[cfg(feature = "async-runtime")]
+        let sync_lifecycle_tx = self.sync_lifecycle_tx.clone();
+        let initial_sync_fired_count = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let isfc = initial_sync_fired_count.clone();
+
         crate::time_utils::spawn(async move {
             // Drain stale wakeups accumulated before subscribe
             while let Ok(_) = download_rx.try_recv() {}
@@ -1099,6 +1119,12 @@ impl VaultSyncClient {
                                     push_elapsed,
                                 );
                                 needs_backfill = outcome == crate::sync::download::PushOutcome::GapDetected;
+                                // Force one backfill after first contiguous push to check for more data.
+                                // This ensures `process_batch() -> Ok(0)` fires the InitialSyncComplete
+                                // signal even when all mutations arrive as contiguous pushes.
+                                if !needs_backfill && isfc.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                                    needs_backfill = true;
+                                }
                                 if !needs_backfill && dq.is_replay_mode() {
                                     needs_backfill = true;
                                 }
@@ -1125,6 +1151,15 @@ impl VaultSyncClient {
                         match dq.process_batch().await {
                             Ok(0) => {
                                 tracing::trace!("[download_worker] process_batch -> 0");
+                                // Fire InitialSyncComplete on first process_batch -> Ok(0).
+                                // AtomicU8 prevents re-firing; 0→1 transition happens exactly once.
+                                if isfc.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                                    #[cfg(feature = "async-runtime")]
+                                    {
+                                        tracing::info!("[download_worker] initial sync complete — signaling waiters");
+                                        let _ = sync_lifecycle_tx.send(SyncLifecycle::InitialSyncComplete);
+                                    }
+                                }
                                 break;
                             }
                             Ok(count) => {
@@ -2059,5 +2094,13 @@ impl VaultSyncClient {
 
     pub fn health(&self) -> &Arc<crate::telemetry::health::HealthRegistry> {
         &self.health
+    }
+
+    /// Returns a watch receiver for the initial sync lifecycle state.
+    /// JS side uses this to await `InitialSyncComplete` before populating
+    /// the DocumentStore, replacing the previous cursor-polling approach.
+    #[cfg(feature = "async-runtime")]
+    pub fn sync_lifecycle(&self) -> tokio::sync::watch::Receiver<SyncLifecycle> {
+        self.sync_lifecycle_tx.subscribe()
     }
 }

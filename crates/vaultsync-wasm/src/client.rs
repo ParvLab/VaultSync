@@ -39,6 +39,9 @@ use vaultsync_core::workspace::WorkspaceManager;
 use vaultsync_core::working_set::WorkingSetManager;
 use vaultsync_core::replication::planner::ReplicationPlanner;
 use vaultsync_core::event_bus::EventBus;
+use vaultsync_core::ipc::leader_election::release_lock_by_id;
+use vaultsync_core::runtime_bus::SubscriberId;
+use vaultsync_core::sync::SyncLifecycle;
 use vaultsync_core::VaultSyncClient;
 use vaultsync_core::VaultSyncConfig;
 use vaultsync_core::VaultSyncError;
@@ -110,6 +113,12 @@ pub struct VaultSyncRuntime {
     runtime_state: AtomicU8,
     /// Phase 2: Waiters blocked on hydration. Resolved when markReady() fires.
     ready_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
+    /// Fix 1: Subscription handles for explicit lifecycle management.
+    subscriptions: RuntimeSubscriptions,
+    /// Fix 3: The lock_id extracted from the Lease. Used by the pagehide handler
+    /// to release the Web Lock when the page goes into bfcache. Only set on leader
+    /// paths. On follower paths, leader_election.release() is used instead.
+    leader_lock_id: Mutex<Option<String>>,
 }
 
 /// Step 8: Promotion pipeline context — each field populated by exactly one phase.
@@ -138,6 +147,22 @@ struct PromoteCtx {
     saved_auth: Option<String>,
     saved_db: Option<String>,
     saved_backend: Option<String>,
+}
+
+/// Fix 1: Structured subscription handles for explicit lifecycle management.
+/// Stores SubscriberId (u64) returned by RuntimeBus::subscribe().
+/// Currently tracks the promotion subscription. Extensible for future subscriptions.
+/// 0 means "no active subscription".
+struct RuntimeSubscriptions {
+    /// Subscription to LeaderEvent::Acquired on the follower's LeaderElection bus.
+    /// Fires when the Web Lock is granted (leader tab released it).
+    promotion_sub: SubscriberId,
+}
+
+impl RuntimeSubscriptions {
+    fn new() -> Self {
+        Self { promotion_sub: 0 }
+    }
 }
 
 // ── Runtime lifecycle state helpers (non-wasm-bindgen) ──
@@ -216,6 +241,8 @@ impl VaultSyncRuntime {
 
         // Phase 3: Wire StorageRuntime into bootstrap (offline path)
         // Phase 6: Register default namespace in WorkspaceRuntime
+        // B3: sync_store_for_client shared across Opfs/fallback paths
+        let mut sync_store_for_client: Option<Arc<dyn vaultsync_core::sync::sync_state_store::SyncStateStore>> = None;
         let mut vault_runtime: Option<Arc<VaultRuntime>> = if let BrowserStorage::Opfs(opfs) = &*storage_for_engine {
             let pages = opfs.pages().clone();
             let metrics = Arc::new(crate::metrics::RuntimeMetrics::default());
@@ -232,6 +259,10 @@ impl VaultSyncRuntime {
                     let runtime = Runtime::new(replica_id.to_string());
                     let scheduler = storage_runtime.scheduler.clone();
                     let vr = VaultRuntime::new(runtime, storage_runtime.clone(), scheduler, metrics);
+                    // Clone sync_rt before moving into NamespaceRuntime so we can
+                    // wire it into VaultRuntime for cursor access (populateDocumentStore).
+                    let sync_rt_for_vr = sync_rt.clone();
+                    sync_store_for_client = Some(sync_rt.clone());
                     let sub_index = crate::subscription_index::SubscriptionIndex::new();
                     let ns = crate::namespace_runtime::NamespaceRuntime::new(
                         "default".to_string(),
@@ -240,6 +271,7 @@ impl VaultSyncRuntime {
                         sub_index,
                     );
                     vr.workspace().register(ns);
+                    let vr = vr.clone().with_sync(sync_rt_for_vr);
                     Some(vr)
                 }
                 Err(e) => {
@@ -285,7 +317,10 @@ impl VaultSyncRuntime {
         let coordinator = Arc::new(InMemoryCoordinator::new());
         let keyring = Arc::new(KeyRing::generate());
 
-        let client = match VaultSyncClient::new_with_storage(config, coordinator, keyring, storage.clone()).await {
+        let sync_store: Arc<dyn vaultsync_core::sync::sync_state_store::SyncStateStore> = sync_store_for_client.unwrap_or_else(|| {
+            Arc::new(vaultsync_core::sync::sync_state_store::InMemorySyncStateStore::with_cursor(0))
+        });
+        let client = match VaultSyncClient::new_with_sync_state_store(config, coordinator, keyring, storage.clone(), sync_store).await {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 engine_error!("Offline client construction failed: {:?}", e);
@@ -428,6 +463,8 @@ impl VaultSyncRuntime {
             saved_storage_backend: Mutex::new(None),
             runtime_state: AtomicU8::new(Self::RS_STARTING),
             ready_waiters: Arc::new(Mutex::new(Vec::new())),
+            subscriptions: RuntimeSubscriptions::new(),
+            leader_lock_id: Mutex::new(None),
         };
 
         // Phase II: new leader announces via BC
@@ -468,6 +505,8 @@ impl VaultSyncRuntime {
         capability_manager.set(RuntimeCapability::Follower);
 
         let bc_for_unload = cross_tab_channel.clone();
+        // Clone leader_election BEFORE moving into struct (used by pagehide handler)
+        let le_for_unload = leader_election.clone();
         let result = Self {
             client: None,
             storage_manager: None,
@@ -499,20 +538,39 @@ impl VaultSyncRuntime {
             saved_storage_backend: Mutex::new(mirror.promote_backend.lock().unwrap().clone()),
             runtime_state: AtomicU8::new(Self::RS_STARTING),
             ready_waiters: Arc::new(Mutex::new(Vec::new())),
+            subscriptions: RuntimeSubscriptions::new(),
+            leader_lock_id: Mutex::new(None),
         };
 
-        // Phase 5: Register beforeunload handler for follower tab
-        let bc_unload = bc_for_unload;
-        let tab_id_unload = replica_id.to_string();
+        // Phase 5: Register beforeunload + pagehide handlers for follower tab
+        // Clone BEFORE closures (move semantics in closures consume values)
+        let bc_for_unload1 = bc_for_unload.clone();
+        let bc_for_unload2 = bc_for_unload;
+        let tab_id_unload1 = replica_id.to_string();
+        let tab_id_unload2 = tab_id_unload1.clone();
         if let Some(window) = web_sys::window() {
             let onunload = Closure::wrap(Box::new(move || {
                 // Best-effort: send LEFT via BC. OPFS checkpoint not possible here.
-                let msg = format!("PROTO|LEFT|{}|", tab_id_unload);
-                let _ = bc_unload.post_message(&JsValue::from_str(&msg));
+                let msg = format!("PROTO|LEFT|{}|", tab_id_unload1);
+                let _ = bc_for_unload1.post_message(&JsValue::from_str(&msg));
                 engine_info!("[lifecycle] follower beforeunload: sent LEFT, no metadata to flush");
             }) as Box<dyn FnMut()>);
             window.set_onbeforeunload(Some(onunload.as_ref().unchecked_ref()));
             onunload.forget();
+
+            // pagehide: fires for bfcache. Release Web Lock so waiting tabs can promote.
+            let onpagehide_f = Closure::wrap(Box::new(move || {
+                let msg = format!("PROTO|LEFT|{}|", tab_id_unload2);
+                let _ = bc_for_unload2.post_message(&JsValue::from_str(&msg));
+                if let Some(ref le) = le_for_unload {
+                    le.release();
+                    engine_info!("[lifecycle] follower pagehide: released Web Lock + sent LEFT (bfcache)");
+                } else {
+                    engine_info!("[lifecycle] follower pagehide: sent LEFT (no leader_election to release)");
+                }
+            }) as Box<dyn FnMut()>);
+            let _ = window.add_event_listener_with_callback("pagehide", onpagehide_f.as_ref().unchecked_ref());
+            onpagehide_f.forget();
         }
 
         result.log_state("init_follower");
@@ -627,9 +685,33 @@ impl VaultSyncRuntime {
             if parts.len() >= 2 {
                 let leaver = parts[1];
                 if leaver != mirror.tab_id {
-                    engine_info!("[MirrorRuntime] tab LEFT: {} (follower fast path)", leaver);
+                    engine_info!("[MirrorRuntime] tab LEFT: {} (triggering re-election)", leaver);
                     mirror.last_heartbeat.store(js_sys::Date::now() as u64, Ordering::Release);
                     mirror.leader_left.store(true, Ordering::Relaxed);
+                    // Fix 2: Trigger re-election via acquire(Immediate). If the leader
+                    // tab released its Web Lock (pagehide or normal drop), this
+                    // succeeds and LeaderEvent::Acquired fires, unblocking promote().
+                    if let Some(ref le) = *mirror.leader_election.lock().unwrap() {
+                        let le_clone = le.clone();
+                        vaultsync_core::time_utils::spawn(async move {
+                            match le_clone.acquire(
+                                vaultsync_core::ipc::leader_election::AcquireMode::Immediate,
+                            ).await {
+                                Ok(vaultsync_core::ipc::leader_election::AcquireResult::Acquired(lease)) => {
+                                    // Lease obtained — drop immediately. The event bus
+                                    // subscription already handles promotion signaling.
+                                    // Dropping the lease preserves the lock for the
+                                    // promote() path which re-acquires it.
+                                    drop(lease);
+                                    engine_info!("[re-election] acquire(Immediate) succeeded — lock was free, promotion will fire");
+                                }
+                                Ok(vaultsync_core::ipc::leader_election::AcquireResult::Waiting) => {
+                                    engine_info!("[re-election] acquire(Immediate) returned Waiting — lock still held elsewhere");
+                                }
+                                _ => {}
+                            }
+                        });
+                    }
                 }
             }
             return;
@@ -959,6 +1041,8 @@ impl VaultSyncRuntime {
             }
             lifecycle.start();
 
+            // Extract lock_id from lease BEFORE moving it into the struct
+            let leader_lock_id_val = leader_lease.as_ref().and_then(|l| l.lock_id().map(|s| s.to_string()));
             let result = Self {
                 client: Some(client),
                 storage_manager: Some(storage_manager),
@@ -990,6 +1074,8 @@ impl VaultSyncRuntime {
                 saved_storage_backend: Mutex::new(storage_backend),
                 runtime_state: AtomicU8::new(Self::RS_STARTING),
                 ready_waiters: Arc::new(Mutex::new(Vec::new())),
+                subscriptions: RuntimeSubscriptions::new(),
+                leader_lock_id: Mutex::new(leader_lock_id_val),
             };
 
             // Announce READY via BC
@@ -1007,22 +1093,39 @@ impl VaultSyncRuntime {
             Self::spawn_pending_listener(&result);
             Self::spawn_bc_message_handler(&result);
 
-            // Register beforeunload handler
+            // Register beforeunload + pagehide handlers
             if let Some(ref bc) = cross_tab_channel {
-                let bc_unload = bc.clone();
-                let tab_id_unload = replica_id.to_string();
+                let bc_unload1 = bc.clone();
+                let bc_unload2 = bc.clone();
+                let tab_id_unload1 = replica_id.to_string();
+                let tab_id_unload2 = tab_id_unload1.clone();
                 let window = web_sys::window().unwrap_throw();
+
+                // beforeunload: not guaranteed for bfcache, but fires for user-initiated navigation
                 let onunload = Closure::wrap(Box::new(move || {
-                    // Best-effort: send LEFT via BC. Periodic checkpoint (every 60s)
-                    // is the real durability mechanism — beforeunload is not guaranteed
-                    // to complete async operations.
-                    let msg = format!("PROTO|LEFT|{}|", tab_id_unload);
-                    let _ = bc_unload.post_message(&JsValue::from_str(&msg));
+                    let msg = format!("PROTO|LEFT|{}|", tab_id_unload1);
+                    let _ = bc_unload1.post_message(&JsValue::from_str(&msg));
                     engine_info!("[lifecycle] leader beforeunload: sent LEFT — metadata persistence depends on last periodic checkpoint");
                 }) as Box<dyn FnMut()>);
                 window.set_onbeforeunload(Some(onunload.as_ref().unchecked_ref()));
                 onunload.forget();
-                engine_info!("[lifecycle] beforeunload handler registered (leader)");
+
+                // pagehide: ALWAYS fires, including for bfcache. Release Web Lock so
+                // other tabs can acquire it immediately instead of being stuck as followers.
+                let lock_id = result.leader_lock_id.lock().unwrap().clone();
+                let onpagehide = Closure::wrap(Box::new(move || {
+                    let msg = format!("PROTO|LEFT|{}|", tab_id_unload2);
+                    let _ = bc_unload2.post_message(&JsValue::from_str(&msg));
+                    if let Some(ref lid) = lock_id {
+                        release_lock_by_id(lid);
+                        engine_info!("[lifecycle] leader pagehide: released Web Lock (bfcache)");
+                    } else {
+                        engine_info!("[lifecycle] leader pagehide: sent LEFT (no lock_id to release)");
+                    }
+                }) as Box<dyn FnMut()>);
+                let _ = window.add_event_listener_with_callback("pagehide", onpagehide.as_ref().unchecked_ref());
+                onpagehide.forget();
+                engine_info!("[lifecycle] beforeunload + pagehide handlers registered (leader)");
             }
 
             debug_assert!(
@@ -1030,9 +1133,59 @@ impl VaultSyncRuntime {
                 "new_with_coordinator leader invariant: must have client, no mirror or leader_election",
             );
 
-            // Hydrating — client.initialize() completed but RuntimeStore not yet populated.
-            // JS calls bootstrap() then markReady() to reach Leading.
-            result.set_runtime_state(VaultSyncRuntime::RS_HYDRATING);
+            // ── Hydrate DocumentStore from OPFS before marking Ready ──
+            let client = result.client.as_ref();
+            let runtime = result.runtime.as_ref();
+            if let (Some(c), Some(rt)) = (client, runtime) {
+                engine_info!("[HYDRATE_PATCH1] start runtime_ptr={:p} namespace={}",
+                    std::sync::Arc::as_ptr(rt), namespace);
+                let doc_ids = [namespace, "notes"];
+                let mut total_records = 0u32;
+                for doc_id in doc_ids {
+                    match c.find(doc_id, None).await {
+                        Ok(records) => {
+                            engine_info!("[HYDRATE_PATCH1] c.find({}) ok records={}", doc_id, records.len());
+                            if records.is_empty() { continue; }
+                            let mut store = rt.document_store.lock().unwrap();
+                            for (ri, record) in records.iter().enumerate() {
+                                let rid = record.get("record_id")
+                                    .or_else(|| record.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?")
+                                    .to_string();
+                                let field_names: Vec<&String> = record.keys().collect();
+                                let field_names_str: Vec<&str> = field_names.iter().map(|s| s.as_str()).collect();
+                                engine_info!("[HYDRATE_PATCH1]   [{}] record_id={} fields={}",
+                                    ri, rid, field_names_str.join(","));
+                                for (field, value) in record {
+                                    if field.starts_with('_') { continue; }
+                                    store.set_field(doc_id, &rid, field, value.clone());
+                                }
+                            }
+                            total_records += records.len() as u32;
+                            // Log DocumentStore state after populating this doc
+                            let doc_count = store.documents.get(doc_id)
+                                .map(|d| d.len()).unwrap_or(0);
+                            engine_info!("[HYDRATE_PATCH1] after populate: doc={} records_in_store={}",
+                                doc_id, doc_count);
+                        }
+                        Err(e) => {
+                            engine_warn!("[HYDRATE_PATCH1] c.find({}) failed: {:?}", doc_id, e);
+                        }
+                    }
+                }
+                // Final DocumentStore state across all docs
+                let store = rt.document_store.lock().unwrap();
+                let mut doc_summary: Vec<String> = Vec::new();
+                for (d_id, recs) in &store.documents {
+                    doc_summary.push(format!("{}={}", d_id, recs.len()));
+                }
+                engine_info!("[HYDRATE_PATCH1] complete total_records={} docs=[{}]",
+                    total_records, doc_summary.join(","));
+            }
+
+            // Ready — DocumentStore populated from OPFS. No Hydrating state needed.
+            result.set_runtime_state(VaultSyncRuntime::RS_LEADING);
             result.log_state("init_leader");
             Ok(result)
         } else {
@@ -1075,11 +1228,14 @@ impl VaultSyncRuntime {
                     &vaultsync_core::storage::traits::StorageConfig::Wasm,
                 ),
             );
+            // Fix 2: Store leader_election on MirrorRuntime so LEFT handler can trigger re-election
+            *mirror.leader_election.lock().unwrap() = Some(le_follower.clone());
+
             let le_events = le_follower.events();
             let mirror_sub = mirror.clone();
             let (promote_tx, promote_rx) = oneshot::channel::<()>();
             let promote_tx = Mutex::new(Some(promote_tx));
-            let _sub = le_events.subscribe(move |_event: &vaultsync_core::runtime_bus::LeaderEvent| {
+            let sub_id = le_events.subscribe(move |_event: &vaultsync_core::runtime_bus::LeaderEvent| {
                 mirror_sub.promotion_ready.store(true, Ordering::Release);
                 if let Some(tx) = promote_tx.lock().unwrap().take() {
                     let _ = tx.send(());
@@ -1101,7 +1257,9 @@ impl VaultSyncRuntime {
             engine_info!("[Session] → SYNC cursor=0 — requesting full state from leader");
 
             phase_log("mirror runtime ready");
-            let result = Self::new_follower(namespace, replica_id, bc, mirror, leader_election, Some(promote_rx)).await?;
+            let mut result = Self::new_follower(namespace, replica_id, bc, mirror, leader_election, Some(promote_rx)).await?;
+            // Fix 1: Store subscription handle on VaultSyncRuntime for lifecycle management
+            result.subscriptions.promotion_sub = sub_id;
 
             Ok(result)
         }
@@ -2407,6 +2565,9 @@ impl VaultSyncRuntime {
         }
         lifecycle.start();
 
+        // Extract lock_id from promote_lease BEFORE moving it into transition_to_leader
+        let promote_lock_id = promote_lease.as_ref().and_then(|l| l.lock_id()).map(|s| s.to_string());
+
         // ── Phase 5: Install — atomically swap VaultSyncRuntime fields ──
         unsafe {
             self.transition_to_leader(
@@ -2443,21 +2604,34 @@ impl VaultSyncRuntime {
 
         // NOTE: LEADER_READY broadcast is now deferred to markReady()
         //       after JS hydration completes. Do not broadcast here.
-
-        // Register beforeunload handler
         if let Some(ref bc) = self.cross_tab_channel {
-            let bc_unload = bc.clone();
-            let tab_id_unload = self.tab_id.clone();
+            let bc_unload1 = bc.clone();
+            let bc_unload2 = bc.clone();
+            let tab_id_unload1 = self.tab_id.clone();
+            let tab_id_unload2 = tab_id_unload1.clone();
             let window = web_sys::window().unwrap_throw();
             let onunload = Closure::wrap(Box::new(move || {
-                let msg = format!("PROTO|LEFT|{}|", tab_id_unload);
-                let _ = bc_unload.post_message(&JsValue::from_str(&msg));
+                let msg = format!("PROTO|LEFT|{}|", tab_id_unload1);
+                let _ = bc_unload1.post_message(&JsValue::from_str(&msg));
                 engine_info!("[lifecycle] promote beforeunload: sent LEFT — metadata persistence depends on last periodic checkpoint");
             }) as Box<dyn FnMut()>);
             window.set_onbeforeunload(Some(onunload.as_ref().unchecked_ref()));
             onunload.forget();
+
+            // pagehide: release Web Lock for bfcache
+            if let Some(ref lid) = promote_lock_id {
+                let lock_id = lid.clone();
+                let onpagehide = Closure::wrap(Box::new(move || {
+                    let msg = format!("PROTO|LEFT|{}|", tab_id_unload2);
+                    let _ = bc_unload2.post_message(&JsValue::from_str(&msg));
+                    release_lock_by_id(&lock_id);
+                    engine_info!("[lifecycle] promote pagehide: released Web Lock + sent LEFT (bfcache)");
+                }) as Box<dyn FnMut()>);
+                let _ = window.add_event_listener_with_callback("pagehide", onpagehide.as_ref().unchecked_ref());
+                onpagehide.forget();
+            }
         }
-        engine_info!("[lifecycle] beforeunload handler registered (promote)");
+        engine_info!("[lifecycle] beforeunload + pagehide handlers registered (promote)");
         plog("beforeunload");
 
         self.log_state("promote");
@@ -2543,9 +2717,19 @@ impl VaultSyncRuntime {
         cm.set(crate::capability::RuntimeCapability::Follower);
         engine_info!("[demote] capability set to Follower — recreating mirror runtime");
 
-        // ── 2. Create MirrorRuntime ──
+        // ── 2. Create LeaderElection for re-election and Wait acquisition ──
+        let le = Arc::new(
+            vaultsync_core::ipc::leader_election::LeaderElection::new(
+                &ns,
+                &vaultsync_core::storage::traits::StorageConfig::Wasm,
+            ),
+        );
+
+        // ── 3. Create MirrorRuntime ──
         let doc_store = Arc::new(std::sync::Mutex::new(crate::runtime::DocumentStore::new()));
         let mirror = MirrorRuntime::new(&self.tab_id, doc_store);
+        // Fix 2: Store leader_election on MirrorRuntime so LEFT handler triggers re-election
+        *mirror.leader_election.lock().unwrap() = Some(le.clone());
 
         {
             let mut mn = mirror.promote_ns.lock().unwrap();
@@ -2560,7 +2744,7 @@ impl VaultSyncRuntime {
             *mb = backend.clone();
         }
 
-        // ── 3. Attach BC message handler for MirrorRuntime ──
+        // ── 4. Attach BC message handler for MirrorRuntime ──
         if let Some(ref bc) = self.cross_tab_channel {
             let mirror_clone = mirror.clone();
             let mirror_handler = Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
@@ -2575,7 +2759,7 @@ impl VaultSyncRuntime {
             mirror_handler.forget();
             engine_info!("[demote] BC mirror handler attached");
 
-            // ── 4. Send SYNC to new leader ──
+            // ── 5. Send SYNC to new leader ──
             let session = crate::session_protocol::SessionProtocol::new(
                 bc.clone(),
                 self.tab_id.clone(),
@@ -2587,16 +2771,29 @@ impl VaultSyncRuntime {
         // Set Hydrating state — queries block until BC SYNC data arrives
         self.set_runtime_state(Self::RS_HYDRATING);
 
-        // ── 5. Acquire Web Lock in Wait mode for future promotion ──
-        let le = Arc::new(
-            vaultsync_core::ipc::leader_election::LeaderElection::new(
-                &ns,
-                &vaultsync_core::storage::traits::StorageConfig::Wasm,
-            ),
-        );
+        // ── 6. Register pagehide handler for the new LeaderElection ──
+        {
+            let le_for_unload = le.clone();
+            let bc_unload = self.cross_tab_channel.clone();
+            let tab_id_unload = self.tab_id.clone();
+            if let Some(window) = web_sys::window() {
+                let onpagehide = Closure::wrap(Box::new(move || {
+                    if let Some(ref bc) = bc_unload {
+                        let msg = format!("PROTO|LEFT|{}|", tab_id_unload);
+                        let _ = bc.post_message(&JsValue::from_str(&msg));
+                    }
+                    le_for_unload.release();
+                    engine_info!("[lifecycle] demote pagehide: released Web Lock + sent LEFT (bfcache)");
+                }) as Box<dyn FnMut()>);
+                let _ = window.add_event_listener_with_callback("pagehide", onpagehide.as_ref().unchecked_ref());
+                onpagehide.forget();
+            }
+        }
+
+        // ── 8. Acquire Web Lock in Wait mode for future promotion ──
         let le_events = le.events();
         let mirror_sub = mirror.clone();
-        let _sub = le_events.subscribe(move |_event: &vaultsync_core::runtime_bus::LeaderEvent| {
+        let sub_id = le_events.subscribe(move |_event: &vaultsync_core::runtime_bus::LeaderEvent| {
             mirror_sub.promotion_ready.store(true, Ordering::Release);
             engine_info!("[demote] LeaderEvent::Acquired — lock granted, promotion ready");
         });
@@ -2605,9 +2802,14 @@ impl VaultSyncRuntime {
         ).await;
         engine_info!("[demote] Web Lock acquired in Wait mode");
 
-        // ── 6. Swap fields via transition_to_follower ──
+        // ── 9. Swap fields via transition_to_follower ──
         unsafe {
             self.transition_to_follower(mirror, le);
+        }
+        // Fix 1: Store subscription handle on VaultSyncRuntime
+        unsafe {
+            let this_ptr = &*self as *const VaultSyncRuntime as *mut VaultSyncRuntime;
+            (*this_ptr).subscriptions.promotion_sub = sub_id;
         }
 
         Ok(())
@@ -2716,6 +2918,187 @@ impl VaultSyncRuntime {
         self.set_runtime_state(Self::RS_HYDRATING);
     }
 
+    /// Snapshot all records for a doc from the MirrorRuntime's DocumentStore.
+    /// Each record includes `record_id` injected into the field map.
+    /// Used by demotion SYNC_DONE handler to re-hydrate RuntimeStore.
+    #[wasm_bindgen(js_name = mirrorDocuments)]
+    pub fn mirror_documents(&self, doc_id: &str) -> Result<js_sys::Array, JsValue> {
+        let mirror = match self.mirror.as_ref() {
+            Some(m) => m.clone(),
+            None => return Ok(js_sys::Array::new()),
+        };
+        let store = mirror.document_store.lock().unwrap();
+        let docs = store.documents.get(doc_id);
+        let arr = js_sys::Array::new();
+        if let Some(records) = docs {
+            for (record_id, fields) in records {
+                let mut with_id = fields.clone();
+                with_id.insert("record_id".to_string(), CrdtValue::String(record_id.clone()));
+                let json_str = fields_to_json_string(&with_id)
+                    .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))?;
+                arr.push(&JsValue::from_str(&json_str));
+            }
+        }
+        Ok(arr)
+    }
+
+    /// Returns the current sync cursor from the SyncRuntime.
+    /// Used by JS bootstrap to wait for initial sync before populating DocumentStore.
+    #[wasm_bindgen(js_name = currentCursor)]
+    pub fn current_cursor(&self) -> u64 {
+        self.vault_runtime
+            .as_ref()
+            .and_then(|vr| vr.sync())
+            .map(|s| s.cursor())
+            .unwrap_or(0)
+    }
+
+    /// Event-driven replacement for cursor polling in JS bootstrap.
+    /// Awaits the `InitialSyncComplete` signal from the download worker,
+    /// which fires when `process_batch() -> Ok(0)` for the first time.
+    /// Falls back after a 10-second watchdog timeout (logs warning, returns false).
+    /// Returns `true` if the signal was received, `false` on timeout.
+    /// Safe to call multiple times — late callers resolve immediately from watch cache.
+    #[wasm_bindgen(js_name = waitForInitialSync)]
+    pub async fn wait_for_initial_sync(&self) -> bool {
+        let client = match self.client.as_ref() {
+            Some(c) => c,
+            None => {
+                engine_debug!("[waitForInitialSync] no client — returning false");
+                return false;
+            }
+        };
+
+        let rx = client.sync_lifecycle();
+
+        // Async task that loops until InitialSyncComplete, capturing rx by move.
+        // Check-before-wait to handle the already-complete case without an extra fast path.
+        let wait = async move {
+            let mut rx = rx;
+            loop {
+                if *rx.borrow_and_update() == SyncLifecycle::InitialSyncComplete {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+
+        let timeout = vaultsync_core::time_utils::sleep(std::time::Duration::from_secs(10));
+
+        use futures::future::Either;
+        match futures::future::select(Box::pin(wait), Box::pin(timeout)).await {
+            Either::Left(((), _)) => {
+                engine_debug!("[waitForInitialSync] signal received");
+                true
+            }
+            Either::Right(((), _)) => {
+                engine_warn!("[waitForInitialSync] timeout after 10s — proceeding without signal");
+                false
+            }
+        }
+    }
+
+    /// Re-populate the Rust DocumentStore from OPFS after initial sync completes.
+    /// Called by JS bootstrap() after _waitForReady() on the Leader path.
+    /// This fixes the timing gap where Patch 1 hydrates before sync, leaving the
+    /// DocumentStore empty on first startup even after data arrives in OPFS.
+    #[wasm_bindgen(js_name = populateDocumentStore)]
+    pub async fn populate_document_store(&self, doc_id: String) -> Result<JsValue, JsValue> {
+        let client = match self.client.as_ref() {
+            Some(c) => c.clone(),
+            None => return Ok(JsValue::from_f64(0.0)),
+        };
+        let runtime = match self.runtime.as_ref() {
+            Some(r) => r.clone(),
+            None => return Ok(JsValue::from_f64(0.0)),
+        };
+        let records = client.find(&doc_id, None).await
+            .map_err(|e| JsValue::from_str(&format!("[POPULATE_DS] find failed: {:?}", e)))?;
+        let count = records.len() as u32;
+        if count == 0 {
+            return Ok(JsValue::from_f64(0.0));
+        }
+        let mut store = runtime.document_store.lock().unwrap();
+        store.documents.remove(&doc_id);
+        for record in &records {
+            let rid = record.get("record_id")
+                .or_else(|| record.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            for (field, value) in record {
+                if field.starts_with('_') { continue; }
+                store.set_field(&doc_id, &rid, field, value.clone());
+            }
+        }
+        engine_info!("[POPULATE_DS] doc={} records={}", doc_id, count);
+        Ok(JsValue::from_f64(count as f64))
+    }
+
+    /// Direct hydration from the leader's DocumentStore to JS RuntimeStore.
+    /// Bypasses find() and _waitForReady() — reads from the Rust in-memory store
+    /// that was populated by new_with_coordinator() via OPFS.
+    /// Returns JSON array of all records across all doc IDs, each injected with record_id.
+    #[wasm_bindgen(js_name = hydrateRuntimeStore)]
+    pub fn hydrate_runtime_store(&self) -> Result<js_sys::Array, JsValue> {
+        let runtime = match self.runtime.as_ref() {
+            Some(r) => r,
+            None => {
+                engine_info!("[HYDRATE_RS] no runtime instance available");
+                return Ok(js_sys::Array::new());
+            }
+        };
+        let store = runtime.document_store.lock().unwrap();
+        engine_info!("[HYDRATE_RS] start runtime_ptr={:p} docs_in_store={}",
+            std::sync::Arc::as_ptr(runtime), store.documents.len());
+        let arr = js_sys::Array::new();
+        let mut total_records = 0u32;
+        let mut total_docs = 0u32;
+        for (doc_id, records) in &store.documents {
+            total_docs += 1;
+            engine_info!("[HYDRATE_RS]   doc={} records={}", doc_id, records.len());
+            for (record_id, fields) in records {
+                total_records += 1;
+                let field_names: Vec<&String> = fields.keys().collect();
+                let field_names_str: Vec<&str> = field_names.iter().map(|s| s.as_str()).collect();
+                engine_info!("[HYDRATE_RS]     record={} fields=[{}]", record_id, field_names_str.join(","));
+                let mut with_id = fields.clone();
+                with_id.insert("record_id".to_string(), CrdtValue::String(record_id.clone()));
+                let json_str = fields_to_json_string(&with_id)
+                    .map_err(|e| JsValue::from_str(&format!("Serialize failed: {:?}", e)))?;
+                arr.push(&JsValue::from_str(&json_str));
+            }
+        }
+        engine_info!("[HYDRATE_RS] complete docs={} records={}", total_docs, total_records);
+        Ok(arr)
+    }
+
+    /// Debug: dump full DocumentStore contents as JSON.
+    /// Returns {"docs": {"doc_id": {"records": N, "record_ids": ["id1", ...]}}}
+    #[wasm_bindgen(js_name = debugDocumentStore)]
+    pub fn debug_document_store(&self) -> String {
+        let runtime = match self.runtime.as_ref() {
+            Some(r) => r,
+            None => return r#"{"error":"no runtime"}"#.to_string(),
+        };
+        let store = runtime.document_store.lock().unwrap();
+        let mut doc_map = serde_json::Map::new();
+        for (doc_id, records) in &store.documents {
+            let mut rec_map = serde_json::Map::new();
+            rec_map.insert("records".to_string(), serde_json::Value::Number(serde_json::Number::from(records.len() as u64)));
+            let ids: Vec<String> = records.keys().cloned().collect();
+            rec_map.insert("record_ids".to_string(), serde_json::Value::Array(
+                ids.iter().map(|id| serde_json::Value::String(id.clone())).collect()
+            ));
+            doc_map.insert(doc_id.clone(), serde_json::Value::Object(rec_map));
+        }
+        let mut root = serde_json::Map::new();
+        root.insert("docs".to_string(), serde_json::Value::Object(doc_map));
+        serde_json::to_string(&root).unwrap_or_else(|_| r#"{"error":"serialize failed"}"#.to_string())
+    }
+
     /// Mark hydration complete. Unblocks any waiting find()/get() calls.
     /// Leader broadcasts LEADER_READY when marked ready.
     #[wasm_bindgen(js_name = markReady)]
@@ -2803,8 +3186,11 @@ impl VaultSyncRuntime {
         (*this_ptr).presence = presence;
         (*this_ptr).mirror = None;
         (*this_ptr).leader_election = None;
+        let lid = leader_lease.as_ref().and_then(|l| l.lock_id()).map(|s| s.to_string());
         (*this_ptr).leader_lease = leader_lease;
+        (*this_ptr).leader_lock_id = Mutex::new(lid);
         (*this_ptr).promotion_rx = Mutex::new(None);
+        (*this_ptr).subscriptions = RuntimeSubscriptions::new();
         (*this_ptr).lifecycle_manager = lifecycle_manager;
         (*this_ptr).saved_namespace = Mutex::new(saved_namespace);
         (*this_ptr).saved_coordinator_url = Mutex::new(saved_coordinator_url);
@@ -2862,6 +3248,7 @@ impl VaultSyncRuntime {
         (*this_ptr).replay_engine = None;
         // Drop the Lease — this releases the Web Lock so the next waiting follower can acquire it
         (*this_ptr).leader_lease = None;
+        (*this_ptr).leader_lock_id = Mutex::new(None);
         (*this_ptr).promotion_rx = Mutex::new(None);
 
         if let Some(ref cm) = (*this_ptr).capability_manager {

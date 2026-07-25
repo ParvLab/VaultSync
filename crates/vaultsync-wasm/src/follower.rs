@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use wasm_bindgen::JsValue;
 use vaultsync_core::crdt::types::CrdtValue;
+use vaultsync_core::ipc::leader_election::LeaderElection;
 
 use crate::metrics::RuntimeMetrics;
 use crate::runtime::DocumentStore;
@@ -46,6 +47,11 @@ pub struct MirrorRuntime {
     /// When true, handle_mirror_bc_message skips all mutation processing.
     /// Set by pause(), cleared by resume() or promote().
     pub paused: AtomicBool,
+    /// Fix 2: LeaderElection reference for re-election on LEFT.
+    /// Set by new_follower and demote. Acquire(Immediate) triggers re-election
+    /// when leader tab releases its Web Lock (pagehide or normal drop).
+    /// Uses Mutex for interior mutability (MirrorRuntime is behind Arc).
+    pub leader_election: Mutex<Option<Arc<LeaderElection>>>,
     /// Monotonic drain counter. Incremented by handle_mirror_bc_message on every
     /// processed mutation. Read by drain() to verify no mutations are in-flight.
     pub drain_seq: AtomicU64,
@@ -69,7 +75,7 @@ impl fmt::Debug for MirrorRuntime {
 
 impl MirrorRuntime {
     pub fn new(tab_id: &str, doc_store: Arc<std::sync::Mutex<DocumentStore>>) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(        Self {
             document_store: doc_store,
             runtime_gen: AtomicU64::new(0),
             bus_gen: AtomicU64::new(0),
@@ -91,6 +97,7 @@ impl MirrorRuntime {
             decode_fail_count: std::sync::atomic::AtomicU64::new(0),
             paused: AtomicBool::new(false),
             drain_seq: AtomicU64::new(0),
+            leader_election: Mutex::new(None),
         })
     }
 

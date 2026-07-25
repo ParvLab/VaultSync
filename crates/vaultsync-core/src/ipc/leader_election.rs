@@ -54,6 +54,13 @@ pub enum AcquireResult {
     Unsupported,
 }
 
+/// Release a Web Lock by its ID. Used from pagehide handlers to release the lock
+/// when the page goes into bfcache. On non-WASM targets this is a no-op.
+#[cfg(target_arch = "wasm32")]
+pub fn release_lock_by_id(lock_id: &str) {
+    release_web_lock(lock_id);
+}
+
 // ── Lease ──
 
 /// Represents exclusive ownership of the leader lock.
@@ -90,6 +97,13 @@ impl Lease {
     /// Timestamp (ms since epoch) when the lease was acquired.
     pub fn acquired_at(&self) -> f64 {
         self.acquired_at
+    }
+
+    /// The Web Lock ID (wasm32 only). Used by pagehide handlers to release the lock
+    /// when the page goes into bfcache (beforeunload does NOT fire for bfcache).
+    #[cfg(target_arch = "wasm32")]
+    pub fn lock_id(&self) -> Option<&str> {
+        self.handle.as_ref().map(|h| h.id.as_str())
     }
 }
 
