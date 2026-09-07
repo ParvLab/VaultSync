@@ -439,6 +439,36 @@ impl Storage for SQLiteStorage {
         .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
     }
 
+    async fn list_schemas(&self) -> Result<Vec<SchemaMeta>, VaultSyncError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT doc_id, version, schema_bytes FROM schemas"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(SchemaMeta {
+                    doc_id: row.get(0)?,
+                    version: row.get::<_, i64>(1)? as u64,
+                    schema_bytes: row.get(2)?,
+                })
+            })?;
+            let mut result = Vec::new();
+            for row in rows {
+                result.push(row?);
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(|e| VaultSyncError::Storage(format!("spawn_blocking error: {e}")))?
+    }
+
+    fn clone_box(&self) -> Box<dyn Storage> {
+        Box::new(Self {
+            conn: self.conn.clone(),
+        })
+    }
+
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, VaultSyncError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -753,6 +783,7 @@ impl SQLiteStorage {
             sync_status,
             synced_at: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
             created_at: row.get::<_, i64>(12)? as u64,
+            schema_version: 0,
             origin: MutationOrigin::Unknown,
             origin_context: String::new(),
         })

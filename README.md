@@ -33,7 +33,8 @@ VaultSync is an embedded local-first synchronization and replication runtime wit
 - [Security Model](#-security-model)
 - [Real-World Use Cases](#-real-world-use-cases)
 - [VaultSync vs The World](#-vaultsync-vs-the-world)
-- [Repository Structure](#-repository-structure)
+- [Deployment Modes](#-deployment-modes)
+- [Anti-Patterns to Avoid](#-anti-patterns-to-avoid)
 - [Contributing](#-contributing)
 - [Production Checklist](#-production-checklist)
 
@@ -117,64 +118,130 @@ Open the same app in 3 browser tabs. Close the one that was writing. VaultSync a
 ## 🔭 How It Works — High-Level
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Your Application Process                       │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐  │
-│  │   Application Layer                                          │  │
-│  │   vaultsync.db.todos.insert({ text: "buy milk" })               │  │
-│  │   vaultsync.db.todos.subscribe(callback)                         │  │
-│  └─────────────────────────┬───────────────────────────────────┘  │
-│                            │                                      │
-│  ┌─────────────────────────▼───────────────────────────────────┐  │
-│  │   VaultSync Core Engine (Rust + WASM)                            │  │
-│  │                                                               │  │
-│  │   ┌────────────────────┐  ┌──────────────────────────────┐  │  │
-│  │   │  CRDT Layer (Yrs)  │  │  E2EE Encryption             │  │  │
-│  │   │  Conflict-free     │  │  X25519 + ChaCha20Poly1305   │  │  │
-│  │   │  merge of all ops  │  │  Coordinator sees 0 plaintext│  │  │
-│  │   └──────────┬─────────┘  └────────────────┬─────────────┘  │  │
-│  │              │                              │                 │  │
-│  │   ┌──────────▼──────────────────────────────▼─────────────┐  │  │
-│  │   │  Multi-Tab IPC Layer                                   │  │  │
-│  │   │  Leader Election + Shared Memory + Crash Recovery      │  │  │
-│  │   └────────────────────────┬───────────────────────────────┘  │  │
-│  │                            │                                  │  │
-│  │   ┌────────────────────────▼───────────────────────────────┐  │  │
-│  │   │  Oplog & Sync Engine                                   │  │  │
-│  │   │  Append-only encrypted CRDT mutation log               │  │  │
-│  │   │  Upload queue + retry + batching                       │  │  │
-│  │   │  Download queue + replay + CRDT merge                  │  │  │
-│  │   └────────────────────────┬───────────────────────────────┘  │  │
-│  │                            │                                  │  │
-│  │   ┌────────────────────────▼───────────────────────────────┐  │  │
-│  │   │  Storage Abstraction                                   │  │  │
-│  │   │  SQLite / OPFS / IndexedDB / RocksDB / In-Memory       │  │  │
-│  │   └────────────────────────┬───────────────────────────────┘  │  │
-│  │                            │                                  │  │
-│  │   ┌────────────────────────▼───────────────────────────────┐  │  │
-│  │   │  Transport Abstraction                                 │  │  │
-│  │   │  BC (BroadcastChannel)  │  WS (WebSocket)  │  P2P (WebRTC)  │  │  │
-│  │   └────────────────────────────────────────────────────────┘  │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
-                                     │
-              ┌──────────────────────┴────────────────────────┐
-              │   Zero-Trust Coordinator (your choice)          │
-              │   Postgres │ Redis │ Cloudflare DO │ Custom     │
-              │   (only sees encrypted blobs + routing metadata)│
-              └─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                        Browser Tab / Process                         │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │   Application Layer                                          │   │
+│  │   vaultsync.db.todos.insert({ text: "buy milk" })               │   │
+│  │   vaultsync.db.todos.subscribe(callback)                         │   │
+│  │   React RuntimeStore (cache-first, no direct WASM calls)         │   │
+│  └──────────────────────────┬───────────────────────────────────┘   │
+│                             │                                       │
+│  ┌──────────────────────────▼───────────────────────────────────┐   │
+│  │   VaultSyncRuntime (Leader) — Rust + WASM                        │   │
+│  │                                                                  │   │
+│  │   ┌────────────────────┐    ┌──────────────────────────────┐   │   │
+│  │   │  CRDT Layer (Yrs)  │    │  E2EE Encryption             │   │   │
+│  │   │  Conflict-free     │    │  X25519 + ChaCha20Poly1305   │   │   │
+│  │   │  merge of all ops  │    │  Coordinator sees 0 plaintext│   │   │
+│  │   └──────────┬─────────┘    └────────────────┬─────────────┘   │   │
+│  │              │                                │                 │   │
+│  │   ┌──────────▼────────────────────────────────▼─────────────┐   │   │
+│  │   │  ContentIndexV2 — O(1) lookups, no OPFS scans            │   │   │
+│  │   │  IndexEntry { page_id, version, dirty, checksum, size }  │   │   │
+│  │   │  All reads go through ContentIndex — zero scans at runtime│   │   │
+│  │   └────────────────────────┬─────────────────────────────────┘   │   │
+│  │                            │                                     │   │
+│  │   ┌────────────────────────▼─────────────────────────────────┐   │   │
+│  │   │  Runtime-owned subsystems                                 │   │   │
+│  │   │                                                           │   │   │
+│  │   │  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐ │   │   │
+│  │   │  │UploadSchedule│  │DownloadSched │  │CompactionSched │ │   │   │
+│  │   │  │200ms debounce│  │replay + merge│  │idle/tombstone  │ │   │   │
+│  │   │  │batch builder │  │push-primary  │  │auto-triggered  │ │   │   │
+│  │   │  └──────┬───────┘  └──────┬───────┘  └───────┬────────┘ │   │   │
+│  │   │         │                 │                    │          │   │   │
+│  │   │  ┌──────▼─────────────────▼────────────────────▼────────┐ │   │   │
+│  │   │  │  Single PageStore per store                           │ │   │   │
+│  │   │  │  One Manifest, one ContentIndex — no dual-instance    │ │   │   │
+│  │   │  │  OPFS pages + system directory (_pages/_system/)      │ │   │   │
+│  │   │  └────────────────────────┬─────────────────────────────┘ │   │   │
+│  │   │                           │                               │   │   │
+│  │   │  ┌────────────────────────▼─────────────────────────────┐ │   │   │
+│  │   │  │  PersistenceEngine (formerly StorageEngine)           │ │   │   │
+│  │   │  │  WAL checkpointing only — 3 methods                   │ │   │   │
+│  │   │  │  checkpoint_wal / load_checkpoint / health            │ │   │   │
+│  │   │  └──────────────────────────────────────────────────────┘ │   │   │
+│  │   └───────────────────────────────────────────────────────────┘   │   │
+│  │                                                                   │   │
+│  │   ┌───────────────────────────────────────────────────────────┐   │   │
+│  │   │  RuntimeMetrics                                           │   │   │
+│  │   │  startup_ms / upload_latency / compaction_latency /       │   │   │
+│  │   │  page_count / tombstone_count / cache_hits / bc_latency   │   │   │
+│  │   └───────────────────────────────────────────────────────────┘   │   │
+│  │                                                                   │   │
+│  │   ┌───────────────────────────────────────────────────────────┐   │   │
+│  │   │  Oplog & Sync Engine                                      │   │   │
+│  │   │  Append-only encrypted CRDT mutation log                  │   │   │
+│  │   │  Upload via Scheduler / Download via push-primary         │   │   │
+│  │   └────────────────────────┬──────────────────────────────────┘   │   │
+│  │                            │                                     │   │
+│  │   ┌────────────────────────▼──────────────────────────────────┐   │   │
+│  │   │  Transport Layer                                          │   │   │
+│  │   │  BC (BroadcastChannel) │ WS (WebSocket) │ P2P (WebRTC)   │   │   │
+│  │   └───────────────────────────────────────────────────────────┘   │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │   MirrorRuntime (Follower) — lightweight, no storage          │   │
+│  │                                                                │   │
+│  │   ┌────────────────────────────────────────────────────────┐  │   │
+│  │   │  Boot sequence:                                        │  │   │
+│  │   │  1. Open BroadcastChannel (150ms heartbeat check)      │  │   │
+│  │   │  2. Leader exists? → construct MirrorRuntime           │  │   │
+│  │   │  3. Send FOLLOWER_ATTACH → receive RuntimeSnapshot     │  │   │
+│  │   │  4. Hydrate DocumentCache → READY in <200ms            │  │   │
+│  │   │  5. No leader? → build full VaultSyncRuntime           │  │   │
+│  │   │                                                        │  │   │
+│  │   │  Leader promotion: Web Lock acquisition, not heartbeat  │  │   │
+│  │   └────────────────────────────────────────────────────────┘  │   │
+│  │                                                                │   │
+│  │   ┌────────────────────────────────────────────────────────┐  │   │
+│  │   │  DocumentCache (SegmentedLRU)                           │  │   │
+│  │   │  Hydrated from single RuntimeSnapshot message            │  │   │
+│  │   │  Receives live mutations via BC                         │  │   │
+│  │   │  Gap detector for missed BC messages                    │  │   │
+│  │   └────────────────────────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────┘
+                             │
+         ┌───────────────────┴──────────────────────────┐
+         │   Zero-Trust Coordinator (your choice)        │
+         │   Postgres │ Redis │ Cloudflare DO │ Custom   │
+         │   (only sees encrypted blobs + routing metadata)│
+         └──────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 🏗️ Core Architecture
 
-VaultSync is built on three non-negotiable design principles:
+VaultSync's architecture centers on **Runtime Ownership** — a single `VaultSyncRuntime` struct owns all storage, index, scheduling, and coordination. There are no ad-hoc subsystem calls to OPFS. Every read goes through `ContentIndexV2` (O(1) lookup), every write goes through `UploadScheduler` (single debounced entry point), and follower tabs boot via `MirrorRuntime` (<200ms, no storage/coordinator/recovery).
 
-### 1. CRDT-Native From Day One
+```
+VaultSyncRuntime (leader)
+├── ContentIndexV2        — O(1) lookups, no OPFS directory scans
+├── PageStore             — single instance per store type
+├── UploadScheduler       — 200ms debounce, batch builder, single entry
+├── DownloadScheduler     — replay + push-primary delivery
+├── CompactionScheduler   — auto-triggered by idle + tombstone ratio
+├── RuntimeMetrics        — 15+ tracked operation metrics
+├── BroadcastChannel      — leader announcements + RuntimeSnapshot
+└── Coordinator           — WebSocket connection to zero-trust server
 
-Concurrent writes **never conflict**. There is no V1 (last-write-wins) → V2 (field merge) → V3 (CRDT) upgrade path. Every operation from the first line of code is a Yrs CRDT mutation. All replicas converge deterministically regardless of write order.
+MirrorRuntime (follower)
+├── DocumentCache         — SegmentedLRU, hydrated from RuntimeSnapshot
+├── BroadcastChannel      — receives live mutations
+├── Gap detector          — detects missed BC messages
+└── Leader promotion      — Web Lock acquisition, not heartbeat timeout
+
+React RuntimeStore       — subscribes to Runtime, diffs, single render
+```
+
+### Pillar 1: CRDT-Native Document Model
+
+Concurrent writes **never conflict**. Every operation is a Yrs CRDT mutation from day one. All replicas converge deterministically regardless of write order.
 
 | CRDT Type | Merge Behavior | Use Cases |
 |---|---|---|
@@ -184,7 +251,158 @@ Concurrent writes **never conflict**. There is no V1 (last-write-wins) → V2 (f
 | **Yrs Text** | Sequence CRDT (OT-compatible) | Rich text, collaborative documents |
 | **Yrs Array** | Ordered sequence with insert/delete/move | To-do lists, ranked items |
 
-### 2. Zero-Trust Coordinator
+### Pillar 2: ContentIndexV2 — O(1) Reads
+
+Generation 3 architecture eliminates all OPFS directory scans at runtime. `ContentIndexV2` is an in-memory index mapping `IndexKey` → `IndexEntry`:
+
+```
+ContentIndexV2
+├── entries: HashMap<IndexKey, IndexEntry>
+│   IndexEntry { page_id, version, dirty, checksum, size }
+├── live_pages: BTreeSet<PageId>
+└── rebuild_at_startup: list_page_ids() → scan OPFS once
+```
+
+Every `get()` / `find()` hits the index first — sub-microsecond lookup with zero OPFS I/O. Pages are read only for actual document data. The index is rebuilt once at startup via `list_page_ids()` and updated incrementally at runtime (`allocate_page_id()`, `bump_manifest_live_page()`, `tombstone_page()` all maintain the index). This eliminated the root cause of repeated upload loops ([Bug C](AGENTS.md)).
+
+### Pillar 3: Single PageStore per Store
+
+Each store type (doc_data, oplog, schemas) has exactly one `PageStore` instance behind one `Arc<Mutex<Option<StoreManifest>>>`. There is no dual-instance divergence — writes through `OpfsStorage` are immediately visible to `PersistenceEngine` because they share the same `PagesDir`.
+
+```
+PagesDir
+├── doc_data: PageStore   ← single manifest, single ContentIndex
+├── oplog: PageStore      ← single manifest, single ContentIndex
+└── schemas: PageStore    ← single manifest, single ContentIndex
+```
+
+Metadata (checkpoints, manifest backups) live in `_pages/_system/` — no more `WAL_CHECKPOINT_PAGE=0` conflict with real data pages ([Bug D](AGENTS.md)).
+
+### Pillar 4: UploadScheduler — Single Upload Entry Point
+
+V3 consolidates all upload paths into a single `UploadScheduler`:
+
+```
+Application write
+        │
+        ▼
+UploadScheduler.schedule(action, doc_id, record_id, fields)
+        │
+        ├── 200ms debounce timer (resets on each new schedule)
+        │
+        ▼
+Batch builder collects pending mutations
+        │
+        ▼
+prepare_flush() → insert/update/delete through VaultSyncClient
+        │
+        ▼
+Upload pipeline (batch upload to coordinator)
+```
+
+No bypass paths. No `upload_cycle()` timer. No repeat uploads. The single entry point makes the upload path trivial to debug — every upload originates from `schedule()`.
+
+### Pillar 5: CompactionScheduler — Auto-Triggered
+
+Compaction is Runtime-owned and auto-triggered — no developer interaction needed:
+
+| Trigger | Threshold | Action |
+|---------|-----------|--------|
+| **Idle** | No pending uploads + no recent mutations for 5s | Run compaction |
+| **Page count** | > 5000 live pages | Run compaction until count drops |
+| **Tombstone ratio** | Tombstones > 25% of total pages | Run compaction to reclaim space |
+
+The `CompactionScheduler` checks conditions on each `should_compact()` call. When any trigger fires, it delegates to `CompactionEngine` and schedules the compaction via `Runtime::scheduler`.
+
+### Pillar 6: MirrorRuntime — Follower Bootstrap in <200ms
+
+The Generation 3 architecture eliminates the expensive follower startup path. Previously, every tab built `BrowserStorage`, read OPFS, connected to the coordinator, and ran recovery — only to discover it was a follower. Now:
+
+```
+Tab opens
+    │
+    ▼
+Open BroadcastChannel
+    │
+    ▼
+Listen for heartbeat (150ms timeout)
+    │
+    ├── Leader exists? → Construct MirrorRuntime
+    │   ├── Send FOLLOWER_ATTACH
+    │   ├── Receive single RuntimeSnapshot message
+    │   │   (all documents + indexes + cursor + generation + pending_count)
+    │   ├── Hydrate DocumentCache (SegmentedLRU)
+    │   └── READY in <200ms — no OPFS, no coordinator, no recovery
+    │
+    └── No leader? → Build full VaultSyncRuntime
+```
+
+**Leader promotion**: When the current leader dies, followers detect via missed BC heartbeats and acquire the `Web Lock` (`navigator.locks.request`). The first follower to acquire the lock promotes to a full `VaultSyncRuntime` — no complex heartbeat timeout logic needed.
+
+### Pillar 7: Memory Manager + Resource Manager + Scheduler
+
+The supporting runtime layer governs cache, resources, and async work:
+
+**Memory Manager** — Three-tier document cache:
+
+| Tier | Access Pattern | Eviction |
+|------|---------------|----------|
+| **Resident** | Frequently / recently accessed | Pinned — evicted only under memory pressure |
+| **Recoverable** | Occasionally accessed | Evicted first — pages on disk, fast reload |
+| **Archived** | Rarely accessed | Evicted eagerly — compressed pages on disk |
+
+Scoring: `recency × 0.40 + frequency × 0.30 + size_penalty × 0.10 + predicted × 0.20` with a 100× multiplier for pinned documents.
+
+**Resource Manager** — Single source of truth for device resources (CPU, battery, memory, disk, network, idle). The Scheduler consults it before dispatching any background work.
+
+**Scheduler** — Priority queue for all async work (upload, download, heartbeats, reconnection, compaction, prefetch). Foreground reads preempt background compaction. Rate-limited by resource availability.
+
+### Pillar 8: RuntimeMetrics
+
+Every operation is tracked:
+
+| Metric | Source | Description |
+|--------|--------|-------------|
+| `startup_ms` | Runtime init | Time from `new()` to READY |
+| `hydrate_ms` | MirrorRuntime | Time to hydrate DocumentCache from RuntimeSnapshot |
+| `snapshot_size` | RuntimeSnapshot | Byte size of the RuntimeSnapshot message |
+| `upload_latency_us` | UploadScheduler | Microseconds per batch upload |
+| `download_latency_us` | DownloadScheduler | Microseconds per batch download |
+| `compaction_latency_us` | CompactionScheduler | Microseconds per compaction cycle |
+| `page_count` | PageStore | Total allocated pages |
+| `tombstone_count` | PageStore | Tombstoned pages |
+| `live_pages` | ContentIndex | Live (non-tombstoned) pages |
+| `dirty_pages` | ContentIndex | Pages with pending unsynced writes |
+| `pending_count` | UploadScheduler | Upload queue depth |
+| `cache_hits` | DocumentCache | In-memory cache hit count |
+| `cache_misses` | DocumentCache | In-memory cache miss count |
+| `bc_latency` | BroadcastChannel | Microseconds for BC round-trip |
+
+Exposed as `snapshot_json()` — accessible from JavaScript via `client.metrics()`.
+
+### Pillar 9: React RuntimeStore — No Direct WASM Calls
+
+React hooks (`useQuery`, `useVaultSyncOne`) no longer call `client.find()` or `client.get()` directly. Instead, they subscribe to a `RuntimeStore` that receives diffs from the Runtime:
+
+```
+Runtime mutates document
+        │
+        ▼
+Runtime fires status callback
+        │
+        ▼
+RuntimeStore updates internal Map
+        │
+        ▼
+React hook detects change via diff
+        │
+        ▼
+Single re-render
+```
+
+Zero OPFS calls from the React layer. No `fetchInitial()` loops. One mutation → one store update → one render.
+
+### Pillar 10: Zero-Trust Coordinator
 
 The sync server is **cryptographically blind** to your data. The coordinator stores:
 
@@ -201,20 +419,30 @@ The sync server is **cryptographically blind** to your data. The coordinator sto
 
 No field names. No field values. No schema info. Even if your coordinator is fully compromised, attackers see only encrypted bytes. Decryption keys never leave the device.
 
-### 3. Infrastructure-Agnostic
-
-The `Coordinator` is a **Rust trait**, not a specific service. Choose or build:
+The `Coordinator` is a **Rust trait**, not a specific service:
 
 ```rust
 pub trait Coordinator: Send + Sync + Debug {
     async fn push(mutations: Vec<EncryptedMutation>) -> Result<Vec<SequenceId>>;
     async fn pull(after: SequenceId, limit: usize) -> Result<Vec<PendingMutation>>;
     async fn subscribe(from_sequence: SequenceId) -> Result<Box<dyn Stream<...>>>;
-    async fn register(namespace: &str, info: ReplicaInfo) -> Result<()>;
+    async fn register(namespace: &str, info: ReplicaInfo) -> Result<RegisterResult>;
+
+    // Snapshot support
+    async fn store_snapshot(&self, snapshot: &SnapshotPayload) -> Result<()>;
+    async fn list_snapshots(&self, namespace: &str) -> Result<Vec<SnapshotMetadata>>;
+
+    // Protocol metadata
+    fn max_sequence(&self) -> u64;
+    fn history_preserved(&self) -> bool;
 }
 ```
 
-Swap from Postgres to Redis to Cloudflare DO without changing a single line of application code.
+Swap from Postgres to Redis to Cloudflare DO without changing a single line of application code. Each backend implements `history_preserved()` to indicate whether mutation history survives coordinator restarts — in-memory coordinators return `false`, D1- or Postgres-backed coordinators return `true`. The client uses this to decide whether a generation mismatch requires a full cursor reset or just a re-registration.
+
+### Pillar 11: Cache-Aware Query Planner
+
+The Query Planner resolves every read request through the fastest available tier: ContentIndex (in-memory, sub-microsecond) → Resident cache → Recoverable (local pages, sub-millisecond) → OPFS page read. Index lookups never reach storage. Document data reads fall through to OPFS only on cache miss. The Planner works with the UploadScheduler to mark dirty pages and with the CompactionScheduler to issue compaction when tombstone ratios climb.
 
 ---
 
@@ -358,32 +586,93 @@ When multiple browser tabs, Electron windows, or OS processes share the same loc
 - Oplog ordering violations
 - Subscription double-firing
 
-### VaultSync's Solution: Leader Election
+### VaultSync's Solution: VaultSyncRuntime + MirrorRuntime
 
-VaultSync uses **leader election** to coordinate write access. One process writes; all others read via shared memory.
+VaultSync uses a **leader + mirror** architecture. One tab runs the full `VaultSyncRuntime` (storage, coordinator, recovery, upload scheduler, compaction scheduler). All other tabs run lightweight `MirrorRuntime` — no storage, no coordinator, no recovery. Followers hydrate from a single `RuntimeSnapshot` message over BroadcastChannel.
 
 ```
-┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│   Tab A (Leader) │    │   Tab B (Reader)  │    │   Tab C (Reader)  │
-│                  │    │                   │    │                   │
-│ Write access: ✅  │    │ Write access: ❌   │    │ Write access: ❌   │
-│ Lock: acquired   │    │ Lock: waiting      │    │ Lock: waiting      │
-│ Heartbeat: 1s    │    │                   │    │                   │
-└────────┬─────────┘    └────────┬──────────┘    └────────┬──────────┘
-         │                       │                          │
-         └───────────────────────┼──────────────────────────┘
-                                 │
-                    ┌────────────▼───────────────┐
-                    │    Shared Memory Region      │
-                    │  CRDT document snapshots    │
-                    │  Oplog tail (ring buffer)   │
-                    │  Subscription notifications  │
-                    └─────────────────────────────┘
-                                 │
-                    ┌────────────▼───────────────┐
-                    │  Local Storage (SQLite/OPFS) │
-                    └─────────────────────────────┘
+┌──────────────────────────┐    ┌──────────────────────────┐    ┌──────────────────────────┐
+│   Tab A (VaultSyncRuntime) │    │   Tab B (MirrorRuntime)  │    │   Tab C (MirrorRuntime)  │
+│                          │    │                          │    │                          │
+│ 🏋️ Full engine            │    │ 🪶 Lightweight cache     │    │ 🪶 Lightweight cache     │
+│  ContentIndex + PageStore │    │  DocumentCache only      │    │  DocumentCache only      │
+│  UploadScheduler          │    │  No storage/coordinator  │    │  No storage/coordinator  │
+│  CompactionScheduler      │    │  No recovery             │    │  No recovery             │
+│  Coordinator connection   │    │                          │    │                          │
+│  Heartbeat: 1s            │    │  BC listener: 150ms check│    │  BC listener: 150ms check│
+│  Web Lock: held           │    │  Web Lock: waiting       │    │  Web Lock: waiting       │
+└───────────┬──────────────┘    └──────────┬───────────────┘    └──────────┬───────────────┘
+            │                              │                              │
+            └──────────────────────────────┼──────────────────────────────┘
+                                           │
+                              ┌────────────▼───────────────┐
+                              │   BroadcastChannel          │
+                              │  Heartbeat (1s)             │
+                              │  FOLLOWER_ATTACH            │
+                              │  RuntimeSnapshot (single    │
+                              │    message, all documents)  │
+                              │  Live mutations (real-time) │
+                              └─────────────────────────────┘
 ```
+
+#### Follower Boot Sequence (MirrorRuntime)
+
+Follower tabs skip the entire engine bootstrap — no OPFS scan, no coordinator connection, no recovery run:
+
+```
+Tab opens
+    │
+    ▼
+Open BroadcastChannel
+    │
+    ▼
+Listen for heartbeat (150ms timeout)
+    │
+    ├── Heartbeat detected → Leader exists
+    │   │
+    │   ├── Construct MirrorRuntime (zero-cost struct)
+    │   │
+    │   ├── Send FOLLOWER_ATTACH via BC
+    │   │
+    │   ├── Receive RuntimeSnapshot
+    │   │   ├── All documents + indexes (ContentIndexV2)
+    │   │   ├── Cursor + generation + pending_count
+    │   │   ├── Single deserialize — no doc-by-doc loop
+    │   │   └── Hydrate into DocumentCache (SegmentedLRU)
+    │   │
+    │   └── READY in <200ms
+    │
+    └── No heartbeat → No leader
+        │
+        └── Build full VaultSyncRuntime
+            ├── BrowserStorage → OPFS
+            ├── Coordinator connection
+            ├── Recovery + snapshot drain
+            └── READY (leader)
+```
+
+This eliminates the old architectural issue where every follower built the full engine, connected to the coordinator, and ran recovery — just to discover it was a follower.
+
+#### Leader Promotion — Web Lock, Not Heartbeat Timeout
+
+When the current leader's tab closes or crashes:
+
+```
+1. BroadcastChannel detects leader heartbeat loss
+2. All MirrorRuntime tabs attempt Web Lock acquisition:
+     navigator.locks.request("vaultsync-leader-{namespace}")
+3. First tab to acquire the lock:
+   → Destroys MirrorRuntime
+   → Builds full VaultSyncRuntime (OPFS + Coordinator + Recovery)
+   → Replays any pending mutations from local page store
+   → Begins sending heartbeat
+   → Sends RuntimeSnapshot to the new follower
+4. Other tabs detect new leader heartbeat
+   → Stay in MirrorRuntime mode
+   → Hydrate from new RuntimeSnapshot (maybe stale — gap detector handles)
+```
+
+No complex heartbeat timeout logic. No split-brain risk — Web Lock API guarantees single winner.
 
 ### Leader Election by Platform
 
@@ -393,34 +682,17 @@ VaultSync uses **leader election** to coordinate write access. One process write
 | **Native (Linux/macOS/Windows)** | `flock()` on SQLite WAL file or `CreateMutex` |
 | **Electron** | Browser mechanism + `net.Server` on local socket for cross-window IPC |
 
-### Heartbeat & Crash Recovery
-
-```
-Leader writes heartbeat every 1 second:
-  { leaderId: "tab-A", timestamp: ..., sequence: 42 }
-
-Reader checks every 500ms:
-  if current_time - leader.heartbeat > 3000ms:
-    → leader considered dead
-    → reader acquires lock → becomes new leader
-    → replays uncommitted ops from shared memory ring buffer
-    → notifies other readers via BroadcastChannel
-
-No data is lost — shared memory ring buffer preserves last N in-flight mutations.
-New leader continues sync from last confirmed sequence.
-```
-
 ### What Happens Across Tabs in Real Time
 
 When a CRDT merge happens:
 
-1. **Leader** merges mutation, writes to storage, updates shared memory
+1. **Leader (VaultSyncRuntime)** — merges mutation, writes to PageStore, updates ContentIndex
 2. **Leader** fires subscription callbacks in its own process
-3. **Leader** sends `{ changedDocs: ["todos/789"] }` via BroadcastChannel
-4. **Reader tabs** detect change, read from shared memory
-5. **Reader tabs** fire their own subscription callbacks
+3. **Leader** sends encoded mutation via BroadcastChannel (live mutation delivery)
+4. **MirrorRuntime tabs** receive mutation, merge into DocumentCache
+5. **MirrorRuntime tabs** fire their own subscription callbacks
 
-All tabs see the update in **< 5ms** — even the ones that didn't initiate the write.
+All tabs see the update in **< 5ms** — even the ones that didn't initiate the write. The old shared-memory ring buffer approach is replaced by BC-based live mutation delivery with gap detection.
 
 ---
 
@@ -458,13 +730,27 @@ Network reconnects
 VaultSync reconnects to coordinator (exponential backoff: 1s → 2s → 4s → ... → 30s)
        │
        ▼
-Step 1: Upload backlog
+Step 1: Re-register
+  → Send REGISTER with stored generation_id and cursor
+  → Receive REGISTER_ACK with coordinator's generation_id + history_preserved
+       │
+       ▼
+Step 2: Smart recovery
+  → generation_id matches? → skip recovery, resume sync
+  → generation_id changed + history_preserved = true?
+     → Keep cursor, re-register with same after value (data intact on coordinator)
+  → generation_id changed + history_preserved = false?
+     → Reset cursor to 0, drain MSG_SNAPSHOT frames, restore from snapshots,
+       then pull all mutations since max_snapshot_seq
+       │
+       ▼
+Step 3: Upload backlog
   → Read all pending mutations from oplog
   → Sort by local timestamp
   → Upload in batches (encrypted)
        │
        ▼
-Step 2: Download missed mutations
+Step 4: Download missed mutations
   → Request all mutations with sequence > last_synced_sequence
   → Decrypt each
   → Merge into local CRDT documents
@@ -481,12 +767,14 @@ Resume real-time sync
 
 | Scenario | Result |
 |---|---|
-| Process crash | Mutations in oplog survive — re-uploaded on restart |
+| Process crash | Mutations in page store survive — re-uploaded on restart |
 | Tab close | Shared memory ring buffer preserves in-flight mutations; new leader replays them |
-| Power failure | Oplog on persistent storage survives; re-uploaded on restart |
-| Local storage theft | E2EE oplog encrypted at rest — attacker sees only ciphertext |
+| Power failure | Page store on persistent storage survives via verify-before-rename pattern; re-uploaded on restart |
+| Local storage theft | All pages encrypted at rest — attacker sees only ciphertext |
 
 CRDT uploads are **idempotent by mutation ID**. Re-uploading a mutation the coordinator has already seen causes a silent deduplicated no-op. Zero duplicates.
+
+All storage uses page-oriented stores with independent pages per document type — no global index. Serialization uses Postcard with minimal segment headers. Every write follows a crash-safe verify-before-rename pattern: write to a temporary page, verify checksum, rename into place.
 
 ---
 
@@ -514,10 +802,14 @@ Step 1: Application Write
        ▼ UI
   Subscription fires immediately — React re-renders <0.1ms after write
 
-Step 2: Background Upload
-  Upload worker reads pending oplog entries
+Step 2: Background Upload (via UploadScheduler)
+  UploadScheduler.schedule() → 200ms debounce
        │
-  Batches multiple pending mutations if present
+  Batch builder collects all pending mutations
+       │
+  prepare_flush() → reads pending oplog entries
+       │
+  Batches multiple pending mutations
        │
   Sends encrypted_blob to coordinator via WebSocket PUSH frame
   (coordinator never sees yrs_update plaintext)
@@ -594,9 +886,20 @@ All coordinator communication uses binary WebSocket frames with a 5-byte header:
 └──────────┴────────────┴────────────────────────────────────────┘
 ```
 
-Key message types: `AUTH`, `REGISTER`, `PUSH`, `PUSH_ACK`, `PULL`, `PULL_RESPONSE`, `MUTATION_PUSH`, `HEARTBEAT`, `KEY_FETCH`, `SCHEMA_SYNC`.
+Key message types: `AUTH`, `REGISTER`, `PUSH`, `PUSH_ACK`, `PULL`, `PULL_RESPONSE`, `MUTATION_PUSH`, `HEARTBEAT`, `KEY_FETCH`, `SCHEMA_SYNC`, `MSG_SNAPSHOT` (compacted document payload), `SUBSCRIBE` (after snapshot drain), `NAMESPACE_ACK` (namespace-level registration response), `PULL_REQUEST` (explicit pull without requiring a push first).
 
-`REGISTER_ACK` payload now includes a `generation_id` field (`#[serde(default)]` for backward compatibility). On register, the client compares this with its stored `SyncState.generation_id`. A mismatch triggers an eager cursor reset to 0 and full re-download — this handles server restart scenarios where the mutation store has been replaced.
+`REGISTER_ACK` and `NAMESPACE_ACK` payloads include both `generation_id` and `history_preserved` fields:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `generation_id` | UUID string | Server/DO instance identifier — changes on restart |
+| `history_preserved` | bool | `true` if mutation history survives coordinator restart (D1/Postgres), `false` if in-memory (ephemeral) |
+
+On register, the client compares `generation_id` with its stored `SyncState.generation_id`. A mismatch triggers the **smart recovery** protocol:
+- If `history_preserved: true` — keep the current cursor, re-register with the same `after` value. Data is intact on the coordinator.
+- If `history_preserved: false` — reset cursor to 0, re-download everything from scratch.
+
+After registration, the client drains any available `MSG_SNAPSHOT` frames with a 300ms timeout and computes `effective_after = max(after, max_snapshot_seq)` for the `SUBSCRIBE` request. This prevents the server from pushing mutations that are already covered by restored snapshots.
 
 ---
 
@@ -731,6 +1034,10 @@ class MyCoordinator implements Coordinator {
   async push(mutations) { /* ... */ }
   async pull(after, limit) { /* ... */ }
   async subscribe(fromSequence) { /* ... */ }
+  get maxSequence() { return this.db.getMaxSequence() }
+  get historyPreserved() { return true }          // D1/Postgres: true. In-memory: false
+  async storeSnapshot(snapshot) { /* ... */ }
+  async listSnapshots(namespace) { /* ... */ }
 }
 ```
 
@@ -758,16 +1065,21 @@ When a new device joins an existing namespace:
 
 ```
 1. New device sends REGISTER with last_sequence = 0
-2. Coordinator checks: snapshot available?
-3a. YES: returns snapshot_url (compressed batch of encrypted mutations)
-    → New device downloads, decompresses, decrypts each mutation
-    → Applies all Yrs diffs in sequence order to build local CRDT state
-    → Fetches remaining mutations since snapshot
-3b. NO: Paginates through full mutation history via PULL
-4. Normal real-time sync begins
+2. Coordinator sends REGISTER_ACK with generation_id + history_preserved
+3. Snapshot drain phase (WASM coordinator):
+   → Listens for MSG_SNAPSHOT frames with 300ms timeout
+   → Caches all received snapshots (deduplicated by document ID)
+   → Computes max_snapshot_seq = max of all received snapshot sequences
+4. SUBSCRIBE with effective_after = max(0, max_snapshot_seq)
+   → Prevents coordinator from pushing mutations already covered by snapshots
+5. Apply all cached snapshots in batch
+6. Download mutations since effective_after via PULL
+7. Normal real-time sync begins
 ```
 
-Coordinator snapshots are **encrypted compressed mutation batches** — the coordinator never decrypts to create them.
+Coordinator snapshots are **compressed, encrypted document payloads** (snapshot_url on server coordinators, MSG_SNAPSHOT frames on WebSocket coordinators). Each snapshot carries `schema_version` and `created_at` timestamps. The coordinator never decrypts to create them.
+
+Compaction runs on each namespace's mutation log, producing a snapshot per document. Each snapshot includes its sequence number, checksum, and byte payload. Snapshots are uploaded to the coordinator automatically during compaction, replacing the need for the new device to replay hundreds of individual mutations for documents that have been compacted.
 
 ### Transport Abstraction
 
@@ -791,20 +1103,20 @@ Both are merged into a single self-filtering deduplication stream via **`Transpo
 - Mutations from the local replica are filtered out to prevent echo loops.
 - The merged stream is bridged through internal `futures::channel::mpsc::unbounded()` channels and `wasm_bindgen_futures::spawn_local` for WASM-compatible stream merging.
 
-This architecture keeps transport logic decoupled from the sync engine and allows adding future transports (WebRTC, libp2p) without engine changes.
+This architecture keeps transport logic decoupled from the sync engine and supports additional transports (WebRTC, libp2p) without engine changes.
 
-### MutationStore — OPFS-Backed Durable Queue
+### MutationStore — Page-Backed Durable Queue
 
-`MutationStore` provides a crash-recovery queue for pending mutations in the WASM environment:
+`MutationStore` provides a crash-recovery queue for pending mutations backed by the page store:
 
 ```
-push(entry)     → persist to OPFS as `<seq>-<uuid>.json` file
-pop_batch(limit) → load next N mutations for upload
-ack(id)          → remove mutation file (synced)
+push(entry)     → persist mutation to page store
+pop_batch(limit) → load next N pending mutations for upload
+ack(id)          → mark mutation as synced (in-page state)
 nack(id)         → leave in place for retry
 ```
 
-Each pending mutation is a JSON-serialized `OplogEntry` stored under a `_mutations/` directory in OPFS. On page load, the store scans existing files to recover any mutations that were in-flight during a crash. All local writes flow through `MutationStore.push()` before upload.
+Pending mutations share the same page-oriented segment abstraction as synced data — no individual files per mutation. On page load, the store scans the page store to recover any mutations that were in-flight during a crash. All local writes flow through `MutationStore.push()` before upload.
 
 ### Push-Primary — Real-Time via Subscribe Bridge
 
@@ -830,7 +1142,7 @@ leave:     { type: "leave", replica_id, namespace }
 - **`beforeunload` hook** sends an immediate `leave` message when a tab closes.
 - **`Peer count** exposed via `PresenceManager.peer_count()` — reflected in the `active_peers` metric.
 - **Exported via `#[wasm_bindgen]`** — callable from JavaScript as `new PresenceManager(namespace, replicaId)`.
-- Peers that disappear without a `leave` (e.g., tab crash) are eventually detected by heartbeat timeout, though the BroadcastChannel API provides immediate notification on tab close.
+- Peers that disappear without a `leave` (e.g., tab crash) are detected by heartbeat timeout, though the BroadcastChannel API provides immediate notification on tab close.
 
 ---
 
@@ -849,21 +1161,25 @@ leave:     { type: "leave", replica_id, namespace }
 | **Cross-tab notification** (shared memory / BroadcastChannel) | 2–10 µs | 1–5 ms |
 | **Snapshot load** (1MB Yrs document from mmap) | < 1 ms | 10–50 ms |
 
+All background tasks (uploads, downloads, compaction, prefetch, heartbeats) submit through the Scheduler's priority queue, which consults the Resource Manager (CPU/battery/memory/network/idle) to avoid starving foreground reads. Foreground reads always preempt background compaction.
+
 All benchmarks run via Criterion.rs. A > 10% regression fails the CI build.
 
 ### End-to-End Sync Targets (Engine + Typical Network)
 
 | Operation | Perceived Latency |
-|---|---|
+|---|---|---|
 | Write → visible on same device | **< 1ms** (local write) |
 | Write → coordinator ACK | **50–200ms** (fast network) |
 | Write → visible on another device | **100–500ms** (fast network) |
 | Reconnect + sync 1000 pending operations | **1–5 seconds** |
 | New replica bootstrap (1MB snapshot) | **500–2000ms** |
+| MirrorRuntime startup (follower tab) | **< 200ms** (no OPFS/coordinator/recovery) |
+| RuntimeSnapshot hydration (1MB, follower) | **< 100ms** (single deserialize) |
 
 ### Why Local-First Feels 0ms
 
-The UI updates **before** the network is involved. The write is committed to local SQLite/OPFS synchronously. The subscription fires synchronously after the local CRDT merge. The upload to the coordinator happens asynchronously in a background worker thread. Users see their action reflected immediately — network latency is invisible.
+The UI updates **before** the network is involved. The write goes through ContentIndex (O(1) lookup) → Resident cache → PageStore path synchronously. The UploadScheduler debounces and batches background uploads. The subscription fires synchronously after the local CRDT merge. The upload to the coordinator is dispatched through the Scheduler as a background task. Users see their action reflected immediately — network latency is invisible.
 
 ---
 
@@ -1093,9 +1409,21 @@ Exportable to Jaeger, Datadog, Grafana Tempo, or any OTLP-compatible backend.
 | `vaultsync_leader_status` | 1=leader, 0=reader |
 | `vaultsync_push_mutations_received` | Counter — mutations delivered via push (DownloadQueue) |
 | `vaultsync_snapshots_applied` | Counter — snapshot catch-ups applied (DownloadQueue) |
-| `vaultsync_optimistic_writes` | Counter — optimistic local writes (client.rs insert/update/delete) |
+| `vaultsync_optimistic_writes` | Counter — optimistic local writes (insert/update/delete) |
 | `vaultsync_hlc_logical_wraps` | Counter — HLC logical counter overflow events (HybridLogicalClock) |
 | `vaultsync_active_peers` | Gauge — active replicas in namespace (PresenceManager) |
+| `vaultsync_startup_ms` | Gauge — time from `new()` to READY (VaultSyncRuntime) |
+| `vaultsync_hydrate_ms` | Gauge — time to hydrate MirrorRuntime from RuntimeSnapshot |
+| `vaultsync_upload_latency_us` | Histogram — upload scheduler batch duration |
+| `vaultsync_download_latency_us` | Histogram — download scheduler batch duration |
+| `vaultsync_compaction_latency_us` | Histogram — compaction cycle duration |
+| `vaultsync_page_count` | Gauge — total allocated pages in PageStore |
+| `vaultsync_tombstone_count` | Gauge — tombstoned pages in PageStore |
+| `vaultsync_live_pages` | Gauge — live (non-tombstoned) pages in ContentIndex |
+| `vaultsync_dirty_pages` | Gauge — pages with pending unsynced writes |
+| `vaultsync_cache_hits` | Counter — in-memory DocumentCache hit count |
+| `vaultsync_cache_misses` | Counter — in-memory DocumentCache miss count |
+| `vaultsync_bc_latency_us` | Histogram — BroadcastChannel round-trip latency |
 
 ### Debug HTTP API
 
@@ -1317,10 +1645,24 @@ const vaultsync = new VaultSync({
   transports: {
     coordinator: true,
     p2p: { enabled: true },   // WebRTC for same-LAN peers
-    mesh: { enabled: false }  // libp2p mesh (future)
+    mesh: { enabled: false }  // libp2p mesh
   }
 })
 ```
+
+---
+
+## 🚫 Anti-Patterns to Avoid
+
+1. **Global index** — Never store everything in one serialized blob. Each document type has its own independent set of pages.
+2. **Synchronous migration** — All migrations are crash-safe with rollback (verify → rename → delete).
+3. **Flat pending storage** — Never one file per pending mutation. Pending and synced mutations use the same page-oriented segment abstraction.
+4. **External manifest files** — No separate `manifest.json` listing all segments. Segment metadata (checksum, count, range) lives in the page headers.
+5. **Storage coupled to sync** — The document store doesn't know about oplog entries. The mutation store doesn't know about queries.
+6. **Event-driven background work** — Background work is scheduled through the Scheduler with priorities, not scattered as ad-hoc timers.
+7. **Developer-maintained health** — The engine self-optimizes. No `compact()`, `vacuum()`, or `cleanup()` in the public API.
+8. **Repeated OPFS directory scans** — Never call `list_page_ids()` at runtime. All reads go through ContentIndexV2 (O(1) in-memory). The OPFS scan happens exactly once at startup.
+9. **Multiple upload paths** — Every upload goes through `UploadScheduler.schedule()`. No ad-hoc `push()` calls, no `upload_cycle()` timers bypassing the scheduler.
 
 ---
 
@@ -1368,9 +1710,10 @@ Before deploying VaultSync to production:
 - [ ] **Soft delete enabled** on all synced tables — prevents sync gaps on delete operations
 - [ ] **Schema migrations tracked** — every field addition has a versioned migration
 - [ ] **CRDT types chosen per field** — LWW / Counter / OR-Set / Text selected intentionally
-- [ ] **Oplog compaction configured** — snapshot interval + tombstone GC threshold set
+- [ ] **Snapshot compaction configured** — `auto_compact_ns` namespaces and `auto_compact_interval_minutes` set; compacted snapshots (seq, checksum, bytes) upload to coordinator automatically
 - [ ] **Multi-tab election tested** — verified 3+ tab crash recovery scenario
 - [ ] **Coordinator backups running** — snapshot + mutation log backup to durable storage
+- [ ] **history_preserved flag verified** — in-memory coordinators return `false`, D1/Postgres coordinators return `true`; confirm client handles gen-mismatch correctly for each
 - [ ] **OpenTelemetry configured** — traces, metrics, logs exported to your observability backend
 - [ ] **Sync lag alerting set up** — alert if `vaultsync_sync_lag_ms` > threshold
 - [ ] **Offline replica alerts** — alert if a replica hasn't synced within tombstone retention

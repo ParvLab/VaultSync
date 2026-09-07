@@ -121,6 +121,7 @@ impl VaultSyncFixture {
             SyncStatus::Pending,
             None,
             self.clock.now_ms(),
+            0,
             MutationOrigin::TestUtils,
             "",
         );
@@ -206,6 +207,7 @@ impl VaultSyncFixture {
                 SyncStatus::Synced,
                 Some(self.clock.now_ms() / 1000),
                 self.clock.now_ms(),
+                0,
                 MutationOrigin::TestUtils,
                 "download",
             );

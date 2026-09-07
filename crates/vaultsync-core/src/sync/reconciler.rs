@@ -3,10 +3,12 @@ use crate::error::VaultSyncError;
 use crate::oplog::entry::OplogEntry;
 use crate::storage::traits::Storage;
 use crate::subscription::engine::{FireSource, SubscriptionEngine};
+use crate::telemetry::log_data;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use tracing::level_filters::LevelFilter;
 use yrs::updates::decoder::Decode;
 use yrs::Update;
 use sha2::{Digest, Sha256};
@@ -49,7 +51,7 @@ impl Reconciler {
         let state = doc.to_map();
         let mut subs = self.subscriptions.lock().unwrap();
         let listeners = subs.listener_count(doc_id);
-        tracing::info!(
+        tracing::trace!(
             "[reconciler.fire_doc] doc={} record={} listeners={}",
             doc_id, record_id, listeners,
         );
@@ -59,7 +61,7 @@ impl Reconciler {
 
     fn is_deduped(&self, id: &str, record_id: &str) -> bool {
         let already_seen = self.seen_ids.lock().unwrap().0.contains(id);
-        tracing::debug!(
+        tracing::trace!(
             "[dedup] id={} record={} already_seen={}",
             id,
             record_id,
@@ -81,7 +83,7 @@ impl Reconciler {
 
     pub async fn apply_remote_update(&self, source: &str, entry: &OplogEntry) -> Result<(), VaultSyncError> {
         let content_hash = hex::encode(&Sha256::digest(&entry.yrs_update)[..8]);
-        tracing::info!(
+        tracing::trace!(
             "[reconciler] ENTER source={} seq={:?} doc={} record={} id={} sha256={} update_bytes={}",
             source,
             entry.sequence,
@@ -92,7 +94,7 @@ impl Reconciler {
             entry.yrs_update.len(),
         );
         if self.is_deduped(&entry.id, &entry.record_id) {
-            tracing::info!(
+            tracing::trace!(
                 "[reconciler] EXIT source={} dedup=true id={}",
                 source, entry.id,
             );
@@ -109,30 +111,30 @@ impl Reconciler {
             Some(bytes) => CRDTDocument::from_snapshot(&bytes)?,
             None => CRDTDocument::new(&entry.doc_id, &entry.record_id, 0),
         };
-        tracing::info!(
+        tracing::trace!(
             "[reconciler] doc_load source={} exists={} old_len={}",
             source, doc_exists, old_len,
         );
 
-        // ── Phase 1 diagnostic: state vector before apply ──
         let old_sv = doc.state_vector();
         let old_entries: Vec<_> = old_sv.iter().map(|(c, cl)| (c, cl)).collect();
-        tracing::info!(
-            "[reconciler] old_state_vector source={} entries={:?}",
-            source, old_entries,
-        );
 
-        // ── Phase 4 diagnostic: log actual document text before apply ──
-        let before_map = doc.to_map();
-        let before_title = before_map.get("title").map(|v| v.to_truncated(80)).unwrap_or_default();
-        let before_body = before_map.get("body").map(|v| v.to_truncated(80)).unwrap_or_default();
-        let before_updated_at = before_map.get("updatedAt").map(|v| v.to_truncated(80)).unwrap_or_default();
-        tracing::info!(
+        let before_diag = log_data(LevelFilter::TRACE, || {
+            let m = doc.to_map();
+            (
+                m.get("title").map(|v| v.to_truncated(80)).unwrap_or_default(),
+                m.get("body").map(|v| v.to_truncated(80)).unwrap_or_default(),
+                m.get("updatedAt").map(|v| v.to_truncated(80)).unwrap_or_default(),
+            )
+        });
+        tracing::trace!(
             "[reconciler] doc_before source={} doc={} record={} title={} body={} updatedAt={}",
-            source, entry.doc_id, entry.record_id, before_title, before_body, before_updated_at,
+            source, entry.doc_id, entry.record_id,
+            before_diag.as_ref().map(|d| d.0.as_str()).unwrap_or("-"),
+            before_diag.as_ref().map(|d| d.1.as_str()).unwrap_or("-"),
+            before_diag.as_ref().map(|d| d.2.as_str()).unwrap_or("-"),
         );
 
-        // ── Phase 6: warn on empty update ──
         if entry.yrs_update.is_empty() {
             tracing::error!(
                 "[reconciler] LEN_ZERO source={} id={} doc={} record={} seq={:?}",
@@ -140,15 +142,15 @@ impl Reconciler {
             );
         }
 
-        // ── Phase 1 diagnostic: inspect the incoming update ──
-        // ── Phase C: redundancy check (scoped tightly: yrs::Update !Send) ──
         let redundant = {
             let decoded = Update::decode_v1(&entry.yrs_update);
             match decoded {
                 Ok(decoded_update) => {
                     let update_sv = decoded_update.state_vector();
-                    let update_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
-                    tracing::info!(
+                    let update_entries = log_data(LevelFilter::TRACE, || {
+                        update_sv.iter().map(|(c, cl)| (c, cl)).collect::<Vec<_>>()
+                    });
+                    tracing::trace!(
                         "[reconciler] incoming_update source={} state_vector={:?}",
                         source, update_entries,
                     );
@@ -157,7 +159,7 @@ impl Reconciler {
                     })
                 }
                 Err(_) => {
-                    tracing::info!(
+                    tracing::trace!(
                         "[reconciler] incoming_update source={} decode_failed=true",
                         source,
                     );
@@ -166,59 +168,64 @@ impl Reconciler {
             }
         };
 
-        // ── Phase C: content fingerprint before apply ──
-        let before_snap = doc.to_snapshot();
-        let before_hash = hex::encode(&Sha256::digest(&before_snap)[..8]);
+        // Yrs can panic on stale updates in release wasm (panic=abort).
+        let before_hash = log_data(LevelFilter::TRACE, || {
+            let snap = doc.to_snapshot();
+            hex::encode(&Sha256::digest(&snap)[..8])
+        });
 
-        doc.apply_update(&entry.yrs_update)?;
+        if !redundant {
+            doc.apply_update(&entry.yrs_update)?;
+        } else {
+            tracing::trace!(
+                "[reconciler] skip_apply redundant=true source={} id={}",
+                source, entry.id,
+            );
+        }
 
-        // ── Phase 4 diagnostic: log actual document text after apply ──
-        let after_map = doc.to_map();
-        let after_title = after_map.get("title").map(|v| v.to_truncated(80)).unwrap_or_default();
-        let after_body = after_map.get("body").map(|v| v.to_truncated(80)).unwrap_or_default();
-        let after_updated_at = after_map.get("updatedAt").map(|v| v.to_truncated(80)).unwrap_or_default();
-        tracing::info!(
+        let after_diag = log_data(LevelFilter::TRACE, || {
+            let m = doc.to_map();
+            (
+                m.get("title").map(|v| v.to_truncated(80)).unwrap_or_default(),
+                m.get("body").map(|v| v.to_truncated(80)).unwrap_or_default(),
+                m.get("updatedAt").map(|v| v.to_truncated(80)).unwrap_or_default(),
+            )
+        });
+        tracing::trace!(
             "[reconciler] doc_after source={} doc={} record={} title={} body={} updatedAt={}",
-            source, entry.doc_id, entry.record_id, after_title, after_body, after_updated_at,
+            source, entry.doc_id, entry.record_id,
+            after_diag.as_ref().map(|d| d.0.as_str()).unwrap_or("-"),
+            after_diag.as_ref().map(|d| d.1.as_str()).unwrap_or("-"),
+            after_diag.as_ref().map(|d| d.2.as_str()).unwrap_or("-"),
         );
 
-        // ── Phase 1 diagnostic: state vector after apply ──
         let new_sv = doc.state_vector();
         let new_entries: Vec<_> = new_sv.iter().map(|(c, cl)| (c, cl)).collect();
-        tracing::info!(
-            "[reconciler] new_state_vector source={} entries={:?}",
-            source, new_entries,
-        );
         let snapshot = doc.to_snapshot();
-        let after_hash = hex::encode(&Sha256::digest(&snapshot)[..8]);
+        let after_hash = log_data(LevelFilter::TRACE, || {
+            hex::encode(&Sha256::digest(&snapshot)[..8])
+        });
         let doc_advanced = old_sv != new_sv;
         let doc_ptr_val = &doc as *const CRDTDocument as usize;
         let inner_doc_ptr_val = doc.inner_doc() as *const yrs::Doc as usize;
 
-        tracing::info!(
-            "[reconciler] crt_diag source={} id={} incoming={} before={} after={} snapshot_changed={} redundant={} sv_entries_old={} sv_entries_new={} doc_advanced={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x}",
+        tracing::trace!(
+            "[reconciler] crt_diag source={} id={} incoming={} before={:?} after={:?} snapshot_changed={} redundant={} sv_entries_old={} sv_entries_new={} doc_advanced={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x}",
             source, entry.id, content_hash, before_hash, after_hash,
             before_hash != after_hash, redundant,
             old_entries.len(), new_entries.len(), doc_advanced,
             doc_ptr_val, inner_doc_ptr_val,
         );
 
-        if !doc_advanced && redundant && !entry.yrs_update.is_empty() {
-            tracing::warn!(
-                "[reconciler] STALE_MUTATION source={} id={} doc={} record={} update_len={} redundant={} doc_advanced={} sv_old={:?} sv_new={:?} incoming={}",
-                source, entry.id, entry.doc_id, entry.record_id, entry.yrs_update.len(),
-                redundant, doc_advanced, old_entries, new_entries, content_hash,
-            );
-        }
         if !doc_advanced && !redundant && !entry.yrs_update.is_empty() {
-            tracing::warn!(
-                "[reconciler] BLIND_SPOT source={} id={} doc={} record={} update_len={} redundant={} doc_advanced={} sv_old={:?} sv_new={:?} incoming={}",
+            tracing::trace!(
+                "[reconciler] REMOTE_APPLY source={} id={} doc={} record={} update_len={} redundant={} doc_advanced={} client_count_before={} client_count_after={} incoming={}",
                 source, entry.id, entry.doc_id, entry.record_id, entry.yrs_update.len(),
-                redundant, doc_advanced, old_entries, new_entries, content_hash,
+                redundant, doc_advanced, old_entries.len(), new_entries.len(), content_hash,
             );
         }
 
-        tracing::info!(
+        tracing::trace!(
             "[reconciler] apply_update source={} update_bytes={} new_snapshot_len={}",
             source, entry.yrs_update.len(), snapshot.len(),
         );
@@ -230,19 +237,19 @@ impl Reconciler {
             Some(old) => old.as_slice() != snapshot.as_slice(),
             None => true,
         };
-        tracing::info!(
+        tracing::trace!(
             "[reconciler] snapshot_cmp source={} old_len={} new_len={} changed={}",
             source, old_len, snapshot.len(), changed,
         );
         if changed {
             if self.fire_suppressed.load(Ordering::SeqCst) {
-                tracing::debug!(
+                tracing::trace!(
                     "[reconciler.fire] SUPPRESSED source={} id={} doc={} record={}",
                     source, entry.id, entry.doc_id, entry.record_id,
                 );
             } else {
                 let listeners = self.subscriptions.lock().unwrap().listener_count(&entry.doc_id);
-                tracing::info!(
+                tracing::trace!(
                     "[reconciler.fire] seq={} mutation={} doc={} record={} changed={} listeners={}",
                     entry.sequence.unwrap_or(0),
                     entry.id,
@@ -258,7 +265,7 @@ impl Reconciler {
                     .fire(FireSource::ReconcilerPush, &entry.doc_id, &entry.record_id, &state);
             }
         }
-        tracing::info!(
+        tracing::trace!(
             "[reconciler] EXIT source={} changed={} id={}",
             source, changed, entry.id,
         );
@@ -272,23 +279,27 @@ impl Reconciler {
         plaintext_update: &[u8],
     ) -> Result<(), VaultSyncError> {
         let content_hash = hex::encode(&Sha256::digest(plaintext_update)[..8]);
-        tracing::info!(
+        tracing::trace!(
             "[reconciler] ENTER source={} encrypted doc={} record={} id={} sha256={} update_bytes={}",
             source, entry.doc_id, entry.record_id, entry.id, content_hash, plaintext_update.len(),
         );
 
-        // ── Phase 1 diagnostic: inspect the incoming encrypted update ──
-        if let Ok(decoded) = Update::decode_v1(plaintext_update) {
-            let update_sv = decoded.state_vector();
-            let update_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
-            tracing::info!(
-                "[reconciler] incoming_encrypted_update source={} state_vector={:?}",
-                source, update_entries,
-            );
-        }
+        let encrypted_update_entries: Option<Vec<(u64, u32)>> = log_data(LevelFilter::TRACE, || {
+            if let Ok(decoded) = Update::decode_v1(plaintext_update) {
+                let sv = decoded.state_vector();
+                let entries: Vec<_> = sv.iter().map(|(&c, &cl)| (c, cl)).collect();
+                entries
+            } else {
+                Vec::new()
+            }
+        });
+        tracing::trace!(
+            "[reconciler] incoming_encrypted_update source={} state_vector={:?}",
+            source, encrypted_update_entries,
+        );
 
         if self.is_deduped(&entry.id, &entry.record_id) {
-            tracing::info!(
+            tracing::trace!(
                 "[reconciler] EXIT source={} dedup=true id={}",
                 source, entry.id,
             );
@@ -305,23 +316,25 @@ impl Reconciler {
             None => CRDTDocument::new(&entry.doc_id, &entry.record_id, 0),
         };
 
-        // ── Phase 1 diagnostic: state vector before encrypted apply ──
         let old_sv = doc.state_vector();
-        let old_entries: Vec<_> = old_sv.iter().map(|(c, cl)| (c, cl)).collect();
-        tracing::info!(
-            "[reconciler] old_state_vector_enc source={} entries={:?}",
-            source, old_entries,
-        );
+        let encrypted_redundant = if let Ok(decoded) = Update::decode_v1(plaintext_update) {
+            let update_sv = decoded.state_vector();
+            update_sv.iter().all(|(client_id, clock)| {
+                old_sv.get(client_id) >= *clock
+            })
+        } else {
+            false
+        };
 
-        doc.apply_update(plaintext_update)?;
+        if !encrypted_redundant {
+            doc.apply_update(plaintext_update)?;
+        } else {
+            tracing::trace!(
+                "[reconciler] skip_apply_enc redundant=true source={} id={}",
+                source, entry.id,
+            );
+        }
 
-        // ── Phase 1 diagnostic: state vector after encrypted apply ──
-        let new_sv = doc.state_vector();
-        let new_entries: Vec<_> = new_sv.iter().map(|(c, cl)| (c, cl)).collect();
-        tracing::info!(
-            "[reconciler] new_state_vector_enc source={} entries={:?}",
-            source, new_entries,
-        );
         let snapshot = doc.to_snapshot();
         self.storage
             .insert_document(&entry.doc_id, &entry.record_id, &snapshot)
@@ -331,19 +344,19 @@ impl Reconciler {
             Some(old) => old.as_slice() != snapshot.as_slice(),
             None => true,
         };
-        tracing::info!(
+        tracing::trace!(
             "[reconciler] snapshot_cmp source={} encrypted old_len={} new_len={} changed={}",
             source, old_len, snapshot.len(), changed,
         );
         if changed {
             if self.fire_suppressed.load(Ordering::SeqCst) {
-                tracing::debug!(
+                tracing::trace!(
                     "[reconciler.fire] SUPPRESSED source={} encrypted id={} doc={} record={}",
                     source, entry.id, entry.doc_id, entry.record_id,
                 );
             } else {
                 let listeners = self.subscriptions.lock().unwrap().listener_count(&entry.doc_id);
-                tracing::info!(
+                tracing::trace!(
                     "[reconciler.fire] seq={} mutation={} doc={} record={} changed={} listeners={}",
                     entry.sequence.unwrap_or(0),
                     entry.id,
@@ -359,7 +372,7 @@ impl Reconciler {
                     .fire(FireSource::ReconcilerPush, &entry.doc_id, &entry.record_id, &state);
             }
         }
-        tracing::info!(
+        tracing::trace!(
             "[reconciler] EXIT source={} encrypted changed={} id={}",
             source, changed, entry.id,
         );
@@ -367,7 +380,7 @@ impl Reconciler {
     }
 
     pub async fn apply_batch(&self, source: &str, entries: &[OplogEntry]) -> Result<(), VaultSyncError> {
-        tracing::debug!("[reconciler] apply_batch start source={} count={}", source, entries.len());
+        tracing::trace!("[reconciler] apply_batch start source={} count={}", source, entries.len());
         if entries.is_empty() {
             return Ok(());
         }
@@ -413,7 +426,7 @@ impl Reconciler {
             };
             let mutation_id = doc_entries.first().map(|e| e.id.as_str()).unwrap_or("");
             let seq = doc_entries.first().map(|e| e.sequence.unwrap_or(0)).unwrap_or(0);
-            tracing::info!(
+            tracing::trace!(
                 "[reconciler.reconcile] doc={} record={} changed={} snap_len={} mutation={} seq={}",
                 doc_id, record_id, changed, snapshot.len(), mutation_id, seq,
             );
@@ -423,45 +436,43 @@ impl Reconciler {
             }
         }
 
-        tracing::debug!(
+        tracing::trace!(
             "[reconciler] write_batch_reconciliation start docs={}",
             updated_docs.len()
         );
         self.storage
             .write_batch_reconciliation(updated_docs)
             .await?;
-        tracing::debug!("[reconciler] write_batch_reconciliation done");
 
         for id in uncommitted_ids {
             self.mark_dedup(&id);
         }
 
-        tracing::info!(
+        tracing::trace!(
             "[reconciler.batch] docs_in_batch={} changed_count={} fire_suppressed={}",
             docs_in_batch,
             final_states.len(),
             self.fire_suppressed.load(Ordering::SeqCst),
         );
         if self.fire_suppressed.load(Ordering::SeqCst) {
-            tracing::debug!(
+            tracing::trace!(
                 "[reconciler.batch] SUPPRESSED source={} changed_count={}",
                 source, final_states.len(),
             );
         } else {
             let mut subs = self.subscriptions.lock().unwrap();
             for (doc_id, record_id, state) in &final_states {
-                tracing::info!(
+                tracing::trace!(
                     "[subscription.enqueue] doc={} record={} listeners={}",
                     doc_id, record_id, subs.listener_count(doc_id),
                 );
                 subs.fire(FireSource::ReconcilerPull, doc_id, record_id, state);
             }
-            tracing::info!(
+            tracing::trace!(
                 "[subscription.batch] fired={}",
                 final_states.len(),
             );
         }
-        tracing::debug!("[reconciler] apply_batch done");
 
         Ok(())
     }

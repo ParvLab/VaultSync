@@ -411,7 +411,7 @@ pub async fn store_snapshot(
         .store_snapshot(&ns, &snapshot)
         .await
         .map_err(|e| {
-            println!("DEBUG ERROR in store_snapshot: {:?}", e);
+            tracing::error!("store_snapshot failed: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(StatusCode::OK)

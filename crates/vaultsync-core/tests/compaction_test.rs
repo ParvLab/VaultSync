@@ -68,8 +68,8 @@ async fn test_snapshot_compaction_reduces_oplog() {
         .run_snapshot_compaction("compaction-ns")
         .await
         .unwrap();
-    assert_eq!(active_docs.snapshots_collapsed, 1);
-    assert!(active_docs.oplog_removed >= 100);
+    assert_eq!(active_docs.0.snapshots_collapsed, 1);
+    assert!(active_docs.0.oplog_removed >= 100);
 
     // 5. Verify the state still converges perfectly
     let doc_val = client.get("doc-1", "record-1").await.unwrap().unwrap();
@@ -277,6 +277,7 @@ mod oplog_cleanup {
             sync_status: SyncStatus::Synced,
             synced_at: Some(0),
             created_at: 0, // epoch
+            schema_version: 0,
             origin: MutationOrigin::Unknown,
             origin_context: String::new(),
         };
@@ -313,6 +314,7 @@ mod oplog_cleanup {
             sync_status: SyncStatus::Pending,
             synced_at: None,
             created_at: 0,
+            schema_version: 0,
             origin: MutationOrigin::Unknown,
             origin_context: String::new(),
         };
@@ -347,11 +349,12 @@ mod oplog_cleanup {
                 timestamp: 0,
                 sequence: Some(i),
                 sync_status: SyncStatus::Synced,
-                synced_at: Some(0),
-                created_at: 0,
-                origin: MutationOrigin::Unknown,
-                origin_context: String::new(),
-            };
+            synced_at: Some(0),
+            created_at: 0,
+            schema_version: 0,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
+        };
             storage.append_oplog(&e).await.unwrap();
         }
         for i in 5..8 {
@@ -369,6 +372,7 @@ mod oplog_cleanup {
                 sync_status: SyncStatus::Pending,
                 synced_at: None,
                 created_at: 0,
+                schema_version: 0,
                 origin: MutationOrigin::Unknown,
                 origin_context: String::new(),
             };
@@ -389,6 +393,7 @@ mod oplog_cleanup {
                 sync_status: SyncStatus::Synced,
                 synced_at: Some(u64::MAX),
                 created_at: u64::MAX, // future
+                schema_version: 0,
                 origin: MutationOrigin::Unknown,
                 origin_context: String::new(),
             };

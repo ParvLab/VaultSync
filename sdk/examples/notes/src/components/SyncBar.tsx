@@ -7,6 +7,13 @@ export function SyncBar() {
   const [isLeader, setIsLeader] = useState(false);
   const [showSyncing, setShowSyncing] = useState(false);
 
+  // Log badge changes for pending-count pipeline debugging
+  useEffect(() => {
+    if (status.pendingMutations > 0) {
+      console.debug(`[pending] badge pending=${status.pendingMutations} connected=${status.connected}`);
+    }
+  }, [status.pendingMutations, status.connected]);
+
   // Debounce: keep "Syncing..." visible for at least 1.5s after pending drops to 0
   useEffect(() => {
     if (status.pendingMutations > 0) {
@@ -17,10 +24,14 @@ export function SyncBar() {
     }
   }, [status.pendingMutations, showSyncing]);
 
+  const [runtimeMode, setRuntimeMode] = useState<string>('Connecting');
+
   useEffect(() => {
     const checkLeader = () => {
       try {
         setIsLeader(client.isLeader());
+        const mode = client.runtimeStatus?.mode || 'Connecting';
+        setRuntimeMode(mode);
       } catch (e) {
         // ignore
       }
@@ -30,7 +41,17 @@ export function SyncBar() {
     return () => clearInterval(interval);
   }, [client]);
 
-  const isSyncing = status.connected && (status.pendingMutations > 0 || showSyncing);
+  // A follower is connected via BC even when WS is closed
+  const isConnected = status.connected || runtimeMode === 'Mirror' || runtimeMode === 'Promoting';
+  const isSyncing = isConnected && (status.pendingMutations > 0 || showSyncing);
+
+  const connectionLabel = (() => {
+    if (isSyncing) return 'Syncing...';
+    if (runtimeMode === 'Mirror') return 'Mirror (BC)';
+    if (runtimeMode === 'Promoting') return 'Promoting...';
+    if (isConnected) return 'Connected';
+    return 'Offline';
+  })();
 
   return (
     <div className="status-bar">
@@ -50,11 +71,11 @@ export function SyncBar() {
       <div className="status-indicators">
         <div className="indicator-item">
           <div 
-            className={`status-dot ${isSyncing ? 'syncing' : status.connected ? 'connected' : 'disconnected'}`}
+            className={`status-dot ${isSyncing ? 'syncing' : isConnected ? 'connected' : 'disconnected'}`}
             data-testid="sync-status"
-            data-status={status.connected ? 'connected' : 'disconnected'}
+            data-status={isConnected ? 'connected' : 'disconnected'}
           />
-          <span>{isSyncing ? 'Syncing...' : status.connected ? 'Connected' : 'Offline'}</span>
+          <span>{connectionLabel}</span>
         </div>
 
         {status.pendingMutations > 0 && (

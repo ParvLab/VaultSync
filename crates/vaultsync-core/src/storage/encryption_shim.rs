@@ -140,6 +140,17 @@ impl Storage for EncryptedStorage {
         self.inner.write_schema(meta).await
     }
 
+    async fn list_schemas(&self) -> Result<Vec<SchemaMeta>, VaultSyncError> {
+        self.inner.list_schemas().await
+    }
+
+    fn clone_box(&self) -> Box<dyn Storage> {
+        Box::new(EncryptedStorage {
+            inner: self.inner.clone_box(),
+            device_key: self.device_key,
+        })
+    }
+
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, VaultSyncError> {
         self.inner.read_migrations().await
     }

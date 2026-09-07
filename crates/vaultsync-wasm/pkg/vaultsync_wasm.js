@@ -1,6 +1,40 @@
 /* @ts-self-types="./vaultsync_wasm.d.ts" */
-import { acquire_web_lock, release_web_lock } from './snippets/vaultsync-core-569f5a5e15e207ef/inline0.js';
+import { acquire_lock_immediate, acquire_web_lock, release_web_lock } from './snippets/vaultsync-core-569f5a5e15e207ef/inline0.js';
 
+
+/**
+ * @enum {0}
+ */
+export const ClientEvent = Object.freeze({
+    StatusDirty: 0, "0": "StatusDirty",
+});
+
+export class EventBusProxy {
+    static __wrap(ptr) {
+        const obj = Object.create(EventBusProxy.prototype);
+        obj.__wbg_ptr = ptr;
+        EventBusProxyFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        EventBusProxyFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_eventbusproxy_free(ptr, 0);
+    }
+    /**
+     * @returns {number}
+     */
+    subscriberCount() {
+        const ret = wasm.eventbusproxy_subscriberCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+}
+if (Symbol.dispose) EventBusProxy.prototype[Symbol.dispose] = EventBusProxy.prototype.free;
 
 /**
  * Manages multi-tab presence awareness via BroadcastChannel.
@@ -71,6 +105,722 @@ export class PresenceManager {
 }
 if (Symbol.dispose) PresenceManager.prototype[Symbol.dispose] = PresenceManager.prototype.free;
 
+export class ReplicationNamespace {
+    static __wrap(ptr) {
+        const obj = Object.create(ReplicationNamespace.prototype);
+        obj.__wbg_ptr = ptr;
+        ReplicationNamespaceFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ReplicationNamespaceFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_replicationnamespace_free(ptr, 0);
+    }
+    clearPending() {
+        wasm.replicationnamespace_clearPending(this.__wbg_ptr);
+    }
+    /**
+     * @returns {number}
+     */
+    pendingCount() {
+        const ret = wasm.replicationnamespace_pendingCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @param {number} limit
+     * @returns {string}
+     */
+    predictNext(limit) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.replicationnamespace_predictNext(this.__wbg_ptr, limit);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) ReplicationNamespace.prototype[Symbol.dispose] = ReplicationNamespace.prototype.free;
+
+/**
+ * SyncStateStore that reads/writes cursor+generation in memory AND persists
+ * every write through the MetadataStore-backed Storage trait.
+ * Legacy PersistentSyncStateStore is replaced by InMemorySyncStateStore.
+ * Cursor and generation are persisted via MetadataRuntime on checkpoint,
+ * not on every cursor update. This eliminates 2 OPFS writes per mutation.
+ */
+export class VaultSyncRuntime {
+    static __wrap(ptr) {
+        const obj = Object.create(VaultSyncRuntime.prototype);
+        obj.__wbg_ptr = ptr;
+        VaultSyncRuntimeFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        VaultSyncRuntimeFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_vaultsyncruntime_free(ptr, 0);
+    }
+    /**
+     * @returns {bigint}
+     */
+    active_key_version() {
+        const ret = wasm.vaultsyncruntime_active_key_version(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * Begin hydration phase. Must be paired with markReady().
+     */
+    beginHydration() {
+        wasm.vaultsyncruntime_beginHydration(this.__wbg_ptr);
+    }
+    /**
+     * Check if cache eviction is needed.
+     * @returns {boolean}
+     */
+    cacheNeedsEviction() {
+        const ret = wasm.vaultsyncruntime_cacheNeedsEviction(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Get cache stats as JSON.
+     * @returns {string}
+     */
+    cacheStats() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.vaultsyncruntime_cacheStats(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Phase 4f: Check if mirror should promote to leader (leader heartbeat timeout).
+     * Returns true if leader is gone and JS should reinitialize with new_with_coordinator().
+     * Legacy — prefer waitForPromotion() for event-driven usage.
+     * @returns {boolean}
+     */
+    checkMirrorPromotion() {
+        const ret = wasm.vaultsyncruntime_checkMirrorPromotion(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Runs compaction on the given namespace, returns JSON stats.
+     * @param {string} namespace
+     * @returns {Promise<string>}
+     */
+    compactNamespace(namespace) {
+        const ptr0 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_compactNamespace(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Returns the current sync cursor from the SyncRuntime.
+     * Used by JS bootstrap to wait for initial sync before populating DocumentStore.
+     * @returns {bigint}
+     */
+    currentCursor() {
+        const ret = wasm.vaultsyncruntime_currentCursor(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * Debug: dump full DocumentStore contents as JSON.
+     * Returns {"docs": {"doc_id": {"records": N, "record_ids": ["id1", ...]}}}
+     * @returns {string}
+     */
+    debugDocumentStore() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.vaultsyncruntime_debugDocumentStore(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @param {string} doc_id
+     * @param {string} schema_json
+     * @returns {Promise<void>}
+     */
+    define_schema(doc_id, schema_json) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(schema_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_define_schema(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * @param {string} doc_id
+     * @param {string} record_id
+     * @returns {Promise<void>}
+     */
+    delete(doc_id, record_id) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_delete(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * Force-demote this tab to Follower when LEADER_ELECTED is received from another tab.
+     * Creates a new MirrorRuntime + BC handler + LeaderElection so the tab can
+     * continue processing mutations and detect when to re-promote.
+     * Called from JS BC handler. Safe to call even if not currently leader (no-op in that case).
+     * @returns {Promise<void>}
+     */
+    demote() {
+        const ret = wasm.vaultsyncruntime_demote(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Returns the event bus for publishing/subscribing to engine events.
+     * @returns {EventBusProxy}
+     */
+    events() {
+        const ret = wasm.vaultsyncruntime_events(this.__wbg_ptr);
+        return EventBusProxy.__wrap(ret);
+    }
+    /**
+     * @param {string} doc_id
+     * @returns {Promise<Array<any>>}
+     */
+    find(doc_id) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_find(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * @param {string} doc_id
+     * @param {string} record_id
+     * @returns {Promise<void>}
+     */
+    fire_subscription(doc_id, record_id) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_fire_subscription(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * Phase 5: Flush pending uploads through the UploadScheduler.
+     * Drains pending mutations from the debounced queue and processes them
+     * through VaultSyncClient. Returns JSON with processed count and status.
+     * Call this periodically (e.g., every 100ms via JS setInterval).
+     * @returns {Promise<string>}
+     */
+    flushPendingUploads() {
+        const ret = wasm.vaultsyncruntime_flushPendingUploads(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @param {string} doc_id
+     * @param {string} record_id
+     * @returns {Promise<any>}
+     */
+    get(doc_id, record_id) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_get(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * Leader processes a command from a follower: executes the mutation through the normal
+     * VaultSyncClient pipeline, then broadcasts invalidation to all tabs.
+     * @param {string} verb
+     * @param {string} doc_id
+     * @param {string} record_id
+     * @param {string} json
+     * @returns {Promise<void>}
+     */
+    handle_command(verb, doc_id, record_id, json) {
+        const ptr0 = passStringToWasm0(verb, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_handle_command(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+        return ret;
+    }
+    /**
+     * Direct hydration from the leader's DocumentStore to JS RuntimeStore.
+     * Bypasses find() and _waitForReady() — reads from the Rust in-memory store
+     * that was populated by new_with_coordinator() via OPFS.
+     * Returns JSON array of all records across all doc IDs, each injected with record_id.
+     * @returns {Array<any>}
+     */
+    hydrateRuntimeStore() {
+        const ret = wasm.vaultsyncruntime_hydrateRuntimeStore(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
+    /**
+     * @param {string} doc_id
+     * @param {string} record_id
+     * @param {string} json
+     * @returns {Promise<void>}
+     */
+    insert(doc_id, record_id, json) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_insert(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+        return ret;
+    }
+    /**
+     * @returns {boolean}
+     */
+    is_leader() {
+        const ret = wasm.vaultsyncruntime_is_leader(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Phase 6: Returns last compaction duration in ms, or 0 if never run.
+     * @returns {bigint}
+     */
+    lastCompactionMs() {
+        const ret = wasm.vaultsyncruntime_lastCompactionMs(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * List active namespaces as JSON array.
+     * @returns {any[]}
+     */
+    listNamespaces() {
+        const ret = wasm.vaultsyncruntime_listNamespaces(this.__wbg_ptr);
+        var v1 = getArrayJsValueFromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
+     * @returns {any}
+     */
+    list_key_versions() {
+        const ret = wasm.vaultsyncruntime_list_key_versions(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
+    /**
+     * Run a single maintenance tick. Returns number of phases that ran.
+     * @returns {number}
+     */
+    maintenanceTick() {
+        const ret = wasm.vaultsyncruntime_maintenanceTick(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Mark hydration complete. Unblocks any waiting find()/get() calls.
+     * Leader broadcasts LEADER_READY when marked ready.
+     */
+    markReady() {
+        wasm.vaultsyncruntime_markReady(this.__wbg_ptr);
+    }
+    /**
+     * Returns a JSON snapshot of all metrics counters.
+     * Phase 4: Returns mirror metrics in follower mode.
+     * @returns {string}
+     */
+    metricsSnapshot() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.vaultsyncruntime_metricsSnapshot(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Snapshot all records for a doc from the MirrorRuntime's DocumentStore.
+     * Each record includes `record_id` injected into the field map.
+     * Used by demotion SYNC_DONE handler to re-hydrate RuntimeStore.
+     * @param {string} doc_id
+     * @returns {Array<any>}
+     */
+    mirrorDocuments(doc_id) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_mirrorDocuments(this.__wbg_ptr, ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
+    /**
+     * Phase 3: Check mirror paused state and drain_seq for promotion diagnostics.
+     * @returns {any}
+     */
+    mirrorState() {
+        const ret = wasm.vaultsyncruntime_mirrorState(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
+    /**
+     * @param {string} namespace
+     * @param {string} replica_id
+     * @param {string | null} [db_name]
+     * @param {string | null} [storage_backend]
+     * @returns {Promise<VaultSyncRuntime>}
+     */
+    static new(namespace, replica_id, db_name, storage_backend) {
+        const ptr0 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(replica_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        var ptr2 = isLikeNone(db_name) ? 0 : passStringToWasm0(db_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len2 = WASM_VECTOR_LEN;
+        var ptr3 = isLikeNone(storage_backend) ? 0 : passStringToWasm0(storage_backend, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len3 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_new(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+        return ret;
+    }
+    /**
+     * @param {string} namespace
+     * @param {string} replica_id
+     * @param {string} coordinator_url
+     * @param {string | null} [auth_token]
+     * @param {string | null} [db_name]
+     * @param {string | null} [storage_backend]
+     * @returns {Promise<VaultSyncRuntime>}
+     */
+    static new_with_coordinator(namespace, replica_id, coordinator_url, auth_token, db_name, storage_backend) {
+        const ptr0 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(replica_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(coordinator_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        var ptr3 = isLikeNone(auth_token) ? 0 : passStringToWasm0(auth_token, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len3 = WASM_VECTOR_LEN;
+        var ptr4 = isLikeNone(db_name) ? 0 : passStringToWasm0(db_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len4 = WASM_VECTOR_LEN;
+        var ptr5 = isLikeNone(storage_backend) ? 0 : passStringToWasm0(storage_backend, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len5 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_new_with_coordinator(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+        return ret;
+    }
+    /**
+     * @param {Function} callback
+     */
+    on_event(callback) {
+        wasm.vaultsyncruntime_on_event(this.__wbg_ptr, callback);
+    }
+    /**
+     * Phase 3: Pause mirror mutation processing for deterministic promotion snapshot.
+     * After pause(), no BC mutations will be applied. Returns the current drain_seq
+     * value so JS can verify the queue is quiescent.
+     * @returns {bigint}
+     */
+    pauseMirror() {
+        const ret = wasm.vaultsyncruntime_pauseMirror(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return BigInt.asUintN(64, ret[0]);
+    }
+    /**
+     * Re-populate the Rust DocumentStore from OPFS after initial sync completes.
+     * Called by JS bootstrap() after _waitForReady() on the Leader path.
+     * This fixes the timing gap where Patch 1 hydrates before sync, leaving the
+     * DocumentStore empty on first startup even after data arrives in OPFS.
+     * @param {string} doc_id
+     * @returns {Promise<any>}
+     */
+    populateDocumentStore(doc_id) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_populateDocumentStore(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Returns a clone of the PresenceManager if available.
+     * @returns {PresenceManager | undefined}
+     */
+    presence() {
+        const ret = wasm.vaultsyncruntime_presence(this.__wbg_ptr);
+        return ret === 0 ? undefined : PresenceManager.__wrap(ret);
+    }
+    /**
+     * Phase 4b: Promote this follower tab to leader in-process (6-phase pipeline).
+     * Called by JS when waitForPromotion() resolves.
+     * Phases: Acquire → Construct → Restore → Writable → Install → Announce.
+     * Each phase populates PromoteCtx fields; the pipeline guarantees ordering.
+     * @param {string} namespace
+     * @param {string} coordinator_url
+     * @param {string | null} [auth_token]
+     * @param {string | null} [db_name]
+     * @param {string | null} [storage_backend]
+     * @returns {Promise<void>}
+     */
+    promote(namespace, coordinator_url, auth_token, db_name, storage_backend) {
+        const ptr0 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(coordinator_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        var ptr2 = isLikeNone(auth_token) ? 0 : passStringToWasm0(auth_token, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len2 = WASM_VECTOR_LEN;
+        var ptr3 = isLikeNone(db_name) ? 0 : passStringToWasm0(db_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len3 = WASM_VECTOR_LEN;
+        var ptr4 = isLikeNone(storage_backend) ? 0 : passStringToWasm0(storage_backend, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len4 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_promote(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+        return ret;
+    }
+    /**
+     * @param {number} keep_versions
+     */
+    prune_key_versions(keep_versions) {
+        const ret = wasm.vaultsyncruntime_prune_key_versions(this.__wbg_ptr, keep_versions);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Returns the replication namespace proxy.
+     * @returns {ReplicationNamespace}
+     */
+    replication() {
+        const ret = wasm.vaultsyncruntime_replication(this.__wbg_ptr);
+        return ReplicationNamespace.__wrap(ret);
+    }
+    /**
+     * Runs the resource manager sweep (recompute access scores, promote/demote tiers).
+     * Returns JSON with tier byte counts, promotions, demotions, eviction candidates.
+     * @returns {Promise<string>}
+     */
+    resourceSweep() {
+        const ret = wasm.vaultsyncruntime_resourceSweep(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Phase 3: Resume mirror mutation processing (abort promotion).
+     */
+    resumeMirror() {
+        const ret = wasm.vaultsyncruntime_resumeMirror(this.__wbg_ptr);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * @returns {Promise<any>}
+     */
+    rotate_keys() {
+        const ret = wasm.vaultsyncruntime_rotate_keys(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Runs lifecycle (tombstone cleanup) on the given namespace, returns JSON stats.
+     * @param {string} namespace
+     * @returns {Promise<string>}
+     */
+    runLifecycle(namespace) {
+        const ptr0 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_runLifecycle(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * @returns {string}
+     */
+    runtimeState() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.vaultsyncruntime_runtimeState(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Returns the current runtime status as a string.
+     * Sprint D: Enhanced runtime status with health, namespace, lag, and leader identity.
+     * Possible values for "mode": "Leader", "Mirror", "Promoting", "Recovering", "Connecting", "Offline"
+     * @returns {string}
+     */
+    runtimeStatus() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.vaultsyncruntime_runtimeStatus(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Engine V2: expose Runtime + PersistenceEngine health stats to JS
+     * @returns {any}
+     */
+    runtime_storage_stats() {
+        const ret = wasm.vaultsyncruntime_runtime_storage_stats(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return takeFromExternrefTable0(ret[0]);
+    }
+    /**
+     * @returns {Promise<void>}
+     */
+    shutdown() {
+        const ret = wasm.vaultsyncruntime_shutdown(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Returns JSON with storage statistics (page count, segment state, etc.).
+     * @returns {Promise<string>}
+     */
+    storageStats() {
+        const ret = wasm.vaultsyncruntime_storageStats(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @param {string} doc_id
+     * @param {Function} callback
+     * @returns {WasmSubscriptionHandle}
+     */
+    subscribe(doc_id, callback) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_subscribe(this.__wbg_ptr, ptr0, len0, callback);
+        return WasmSubscriptionHandle.__wrap(ret);
+    }
+    /**
+     * @returns {Promise<any>}
+     */
+    sync_status() {
+        const ret = wasm.vaultsyncruntime_sync_status(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Phase 6: Try auto-compaction via CompactionScheduler.
+     * Returns JSON with compaction stats, or null if no compaction was needed.
+     * JS should call this periodically (e.g., every 30s via setInterval).
+     * @returns {Promise<any>}
+     */
+    tryCompact() {
+        const ret = wasm.vaultsyncruntime_tryCompact(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @param {WasmSubscriptionHandle} handle
+     */
+    unsubscribe(handle) {
+        _assertClass(handle, WasmSubscriptionHandle);
+        const ret = wasm.vaultsyncruntime_unsubscribe(this.__wbg_ptr, handle.__wbg_ptr);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * @param {string} doc_id
+     * @param {string} record_id
+     * @param {string} json
+     * @returns {Promise<void>}
+     */
+    update(doc_id, record_id, json) {
+        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.vaultsyncruntime_update(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+        return ret;
+    }
+    /**
+     * Event-driven replacement for cursor polling in JS bootstrap.
+     * Awaits the `InitialSyncComplete` signal from the download worker,
+     * which fires when `process_batch() -> Ok(0)` for the first time.
+     * Falls back after a 10-second watchdog timeout (logs warning, returns false).
+     * Returns `true` if the signal was received, `false` on timeout.
+     * Safe to call multiple times — late callers resolve immediately from watch cache.
+     * @returns {Promise<boolean>}
+     */
+    waitForInitialSync() {
+        const ret = wasm.vaultsyncruntime_waitForInitialSync(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Step 4: Wait for promotion signal via oneshot channel (event-driven, no polling).
+     * Resolves when LeaderEvent::Acquired fires (Web Lock granted to this follower).
+     * JS await this, then calls promote(). Returns immediately if already signaled.
+     * @returns {Promise<void>}
+     */
+    waitForPromotion() {
+        const ret = wasm.vaultsyncruntime_waitForPromotion(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Returns the working sets namespace proxy for CRUD operations.
+     * @returns {WorkingSetsNamespace}
+     */
+    workingSets() {
+        const ret = wasm.vaultsyncruntime_workingSets(this.__wbg_ptr);
+        return WorkingSetsNamespace.__wrap(ret);
+    }
+    /**
+     * Returns the workspace namespace proxy for CRUD operations.
+     * @returns {WorkspaceNamespace}
+     */
+    workspace() {
+        const ret = wasm.vaultsyncruntime_workspace(this.__wbg_ptr);
+        return WorkspaceNamespace.__wrap(ret);
+    }
+}
+if (Symbol.dispose) VaultSyncRuntime.prototype[Symbol.dispose] = VaultSyncRuntime.prototype.free;
+
 export class WasmIPC {
     static __wrap(ptr) {
         const obj = Object.create(WasmIPC.prototype);
@@ -100,6 +850,15 @@ export class WasmIPC {
             throw takeFromExternrefTable0(ret[1]);
         }
         return WasmIPC.__wrap(ret[0]);
+    }
+    /**
+     * Create WasmIPC from an existing BroadcastChannel (used by client integration)
+     * @param {BroadcastChannel} channel
+     * @returns {WasmIPC}
+     */
+    static new_with_channel(channel) {
+        const ret = wasm.wasmipc_new_with_channel(channel);
+        return WasmIPC.__wrap(ret);
     }
     /**
      * @param {Function} callback
@@ -154,10 +913,10 @@ export class WasmSubscriptionHandle {
         wasm.__wbg_wasmsubscriptionhandle_free(ptr, 0);
     }
     /**
-     * @param {WasmVaultSyncClient} client
+     * @param {VaultSyncRuntime} client
      */
     cancel(client) {
-        _assertClass(client, WasmVaultSyncClient);
+        _assertClass(client, VaultSyncRuntime);
         const ret = wasm.wasmsubscriptionhandle_cancel(this.__wbg_ptr, client.__wbg_ptr);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
@@ -166,283 +925,199 @@ export class WasmSubscriptionHandle {
 }
 if (Symbol.dispose) WasmSubscriptionHandle.prototype[Symbol.dispose] = WasmSubscriptionHandle.prototype.free;
 
-export class WasmVaultSyncClient {
+export class WorkingSetsNamespace {
     static __wrap(ptr) {
-        const obj = Object.create(WasmVaultSyncClient.prototype);
+        const obj = Object.create(WorkingSetsNamespace.prototype);
         obj.__wbg_ptr = ptr;
-        WasmVaultSyncClientFinalization.register(obj, obj.__wbg_ptr, obj);
+        WorkingSetsNamespaceFinalization.register(obj, obj.__wbg_ptr, obj);
         return obj;
     }
     __destroy_into_raw() {
         const ptr = this.__wbg_ptr;
         this.__wbg_ptr = 0;
-        WasmVaultSyncClientFinalization.unregister(this);
+        WorkingSetsNamespaceFinalization.unregister(this);
         return ptr;
     }
     free() {
         const ptr = this.__destroy_into_raw();
-        wasm.__wbg_wasmvaultsyncclient_free(ptr, 0);
+        wasm.__wbg_workingsetsnamespace_free(ptr, 0);
+    }
+    clearActive() {
+        wasm.workingsetsnamespace_clearActive(this.__wbg_ptr);
     }
     /**
+     * @param {string} name
+     * @param {string} filter_json
+     * @param {bigint | null} [workspace_id]
      * @returns {bigint}
      */
-    active_key_version() {
-        const ret = wasm.wasmvaultsyncclient_active_key_version(this.__wbg_ptr);
-        return BigInt.asUintN(64, ret);
-    }
-    /**
-     * @param {string} doc_id
-     * @param {string} schema_json
-     * @returns {Promise<void>}
-     */
-    define_schema(doc_id, schema_json) {
-        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    create(name, filter_json, workspace_id) {
+        const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(schema_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const ptr1 = passStringToWasm0(filter_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmvaultsyncclient_define_schema(this.__wbg_ptr, ptr0, len0, ptr1, len1);
-        return ret;
+        const ret = wasm.workingsetsnamespace_create(this.__wbg_ptr, ptr0, len0, ptr1, len1, !isLikeNone(workspace_id), isLikeNone(workspace_id) ? BigInt(0) : workspace_id);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return BigInt.asUintN(64, ret[0]);
     }
     /**
-     * @param {string} doc_id
-     * @param {string} record_id
-     * @returns {Promise<void>}
-     */
-    delete(doc_id, record_id) {
-        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmvaultsyncclient_delete(this.__wbg_ptr, ptr0, len0, ptr1, len1);
-        return ret;
-    }
-    /**
-     * @param {string} doc_id
-     * @returns {Promise<Array<any>>}
-     */
-    find(doc_id) {
-        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmvaultsyncclient_find(this.__wbg_ptr, ptr0, len0);
-        return ret;
-    }
-    /**
-     * @param {string} doc_id
-     * @param {string} record_id
-     * @returns {Promise<void>}
-     */
-    fire_subscription(doc_id, record_id) {
-        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmvaultsyncclient_fire_subscription(this.__wbg_ptr, ptr0, len0, ptr1, len1);
-        return ret;
-    }
-    /**
-     * @param {string} doc_id
-     * @param {string} record_id
-     * @returns {Promise<any>}
-     */
-    get(doc_id, record_id) {
-        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmvaultsyncclient_get(this.__wbg_ptr, ptr0, len0, ptr1, len1);
-        return ret;
-    }
-    /**
-     * Leader processes a command from a follower: executes the mutation through the normal
-     * VaultSyncClient pipeline, then broadcasts invalidation to all tabs.
-     * @param {string} verb
-     * @param {string} doc_id
-     * @param {string} record_id
-     * @param {string} json
-     * @returns {Promise<void>}
-     */
-    handle_command(verb, doc_id, record_id, json) {
-        const ptr0 = passStringToWasm0(verb, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ptr2 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len2 = WASM_VECTOR_LEN;
-        const ptr3 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len3 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmvaultsyncclient_handle_command(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
-        return ret;
-    }
-    /**
-     * @param {string} doc_id
-     * @param {string} record_id
-     * @param {string} json
-     * @returns {Promise<void>}
-     */
-    insert(doc_id, record_id, json) {
-        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ptr2 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len2 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmvaultsyncclient_insert(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
-        return ret;
-    }
-    /**
+     * @param {bigint} id
      * @returns {boolean}
      */
-    is_leader() {
-        const ret = wasm.wasmvaultsyncclient_is_leader(this.__wbg_ptr);
+    delete(id) {
+        const ret = wasm.workingsetsnamespace_delete(this.__wbg_ptr, id);
         return ret !== 0;
     }
     /**
      * @returns {any}
      */
-    list_key_versions() {
-        const ret = wasm.wasmvaultsyncclient_list_key_versions(this.__wbg_ptr);
+    getActive() {
+        const ret = wasm.workingsetsnamespace_getActive(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {string}
+     */
+    list() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.workingsetsnamespace_list(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * @param {bigint} id
+     * @returns {boolean}
+     */
+    setActive(id) {
+        const ret = wasm.workingsetsnamespace_setActive(this.__wbg_ptr, id);
+        return ret !== 0;
+    }
+}
+if (Symbol.dispose) WorkingSetsNamespace.prototype[Symbol.dispose] = WorkingSetsNamespace.prototype.free;
+
+export class WorkspaceNamespace {
+    static __wrap(ptr) {
+        const obj = Object.create(WorkspaceNamespace.prototype);
+        obj.__wbg_ptr = ptr;
+        WorkspaceNamespaceFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WorkspaceNamespaceFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_workspacenamespace_free(ptr, 0);
+    }
+    /**
+     * @param {string} name
+     * @param {string} namespace
+     * @param {string} schema_json
+     * @param {string} retention_json
+     * @returns {bigint}
+     */
+    create(name, namespace, schema_json, retention_json) {
+        const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(schema_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(retention_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ret = wasm.workspacenamespace_create(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
-        return takeFromExternrefTable0(ret[0]);
+        return BigInt.asUintN(64, ret[0]);
     }
     /**
-     * Returns a JSON snapshot of all metrics counters.
+     * @param {bigint} id
+     * @returns {boolean}
+     */
+    delete(id) {
+        const ret = wasm.workspacenamespace_delete(this.__wbg_ptr, id);
+        return ret !== 0;
+    }
+    /**
+     * @param {bigint} id
      * @returns {string}
      */
-    metricsSnapshot() {
-        let deferred1_0;
-        let deferred1_1;
+    get(id) {
+        let deferred2_0;
+        let deferred2_1;
         try {
-            const ret = wasm.wasmvaultsyncclient_metricsSnapshot(this.__wbg_ptr);
-            deferred1_0 = ret[0];
-            deferred1_1 = ret[1];
-            return getStringFromWasm0(ret[0], ret[1]);
+            const ret = wasm.workspacenamespace_get(this.__wbg_ptr, id);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
         } finally {
-            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
         }
     }
     /**
-     * @param {string} namespace
-     * @param {string} replica_id
-     * @param {string | null} [db_name]
-     * @param {string | null} [storage_backend]
-     * @returns {Promise<WasmVaultSyncClient>}
+     * @returns {string}
      */
-    static new(namespace, replica_id, db_name, storage_backend) {
-        const ptr0 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(replica_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        var ptr2 = isLikeNone(db_name) ? 0 : passStringToWasm0(db_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        var len2 = WASM_VECTOR_LEN;
-        var ptr3 = isLikeNone(storage_backend) ? 0 : passStringToWasm0(storage_backend, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        var len3 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmvaultsyncclient_new(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
-        return ret;
-    }
-    /**
-     * @param {string} namespace
-     * @param {string} replica_id
-     * @param {string} coordinator_url
-     * @param {string | null} [auth_token]
-     * @param {string | null} [db_name]
-     * @param {string | null} [storage_backend]
-     * @returns {Promise<WasmVaultSyncClient>}
-     */
-    static new_with_coordinator(namespace, replica_id, coordinator_url, auth_token, db_name, storage_backend) {
-        const ptr0 = passStringToWasm0(namespace, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(replica_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ptr2 = passStringToWasm0(coordinator_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len2 = WASM_VECTOR_LEN;
-        var ptr3 = isLikeNone(auth_token) ? 0 : passStringToWasm0(auth_token, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        var len3 = WASM_VECTOR_LEN;
-        var ptr4 = isLikeNone(db_name) ? 0 : passStringToWasm0(db_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        var len4 = WASM_VECTOR_LEN;
-        var ptr5 = isLikeNone(storage_backend) ? 0 : passStringToWasm0(storage_backend, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        var len5 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmvaultsyncclient_new_with_coordinator(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
-        return ret;
-    }
-    /**
-     * Returns a clone of the PresenceManager if available.
-     * @returns {PresenceManager | undefined}
-     */
-    presence() {
-        const ret = wasm.wasmvaultsyncclient_presence(this.__wbg_ptr);
-        return ret === 0 ? undefined : PresenceManager.__wrap(ret);
-    }
-    /**
-     * @param {number} keep_versions
-     */
-    prune_key_versions(keep_versions) {
-        const ret = wasm.wasmvaultsyncclient_prune_key_versions(this.__wbg_ptr, keep_versions);
-        if (ret[1]) {
-            throw takeFromExternrefTable0(ret[0]);
+    list() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.workspacenamespace_list(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
         }
     }
     /**
-     * @returns {Promise<any>}
+     * @param {bigint} id
+     * @param {string | null} [name]
+     * @param {string | null} [retention_json]
+     * @returns {boolean}
      */
-    rotate_keys() {
-        const ret = wasm.wasmvaultsyncclient_rotate_keys(this.__wbg_ptr);
-        return ret;
-    }
-    /**
-     * @returns {Promise<void>}
-     */
-    shutdown() {
-        const ret = wasm.wasmvaultsyncclient_shutdown(this.__wbg_ptr);
-        return ret;
-    }
-    /**
-     * @param {string} doc_id
-     * @param {Function} callback
-     * @returns {WasmSubscriptionHandle}
-     */
-    subscribe(doc_id, callback) {
-        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmvaultsyncclient_subscribe(this.__wbg_ptr, ptr0, len0, callback);
-        return WasmSubscriptionHandle.__wrap(ret);
-    }
-    /**
-     * @returns {Promise<any>}
-     */
-    sync_status() {
-        const ret = wasm.wasmvaultsyncclient_sync_status(this.__wbg_ptr);
-        return ret;
-    }
-    /**
-     * @param {WasmSubscriptionHandle} handle
-     */
-    unsubscribe(handle) {
-        _assertClass(handle, WasmSubscriptionHandle);
-        const ret = wasm.wasmvaultsyncclient_unsubscribe(this.__wbg_ptr, handle.__wbg_ptr);
-        if (ret[1]) {
-            throw takeFromExternrefTable0(ret[0]);
+    update(id, name, retention_json) {
+        var ptr0 = isLikeNone(name) ? 0 : passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len0 = WASM_VECTOR_LEN;
+        var ptr1 = isLikeNone(retention_json) ? 0 : passStringToWasm0(retention_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len1 = WASM_VECTOR_LEN;
+        const ret = wasm.workspacenamespace_update(this.__wbg_ptr, id, ptr0, len0, ptr1, len1);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
         }
-    }
-    /**
-     * @param {string} doc_id
-     * @param {string} record_id
-     * @param {string} json
-     * @returns {Promise<void>}
-     */
-    update(doc_id, record_id, json) {
-        const ptr0 = passStringToWasm0(doc_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(record_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ptr2 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len2 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmvaultsyncclient_update(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
-        return ret;
+        return ret[0] !== 0;
     }
 }
-if (Symbol.dispose) WasmVaultSyncClient.prototype[Symbol.dispose] = WasmVaultSyncClient.prototype.free;
+if (Symbol.dispose) WorkspaceNamespace.prototype[Symbol.dispose] = WorkspaceNamespace.prototype.free;
 
 /**
  * @param {Uint8Array} ciphertext
@@ -491,9 +1166,23 @@ export function encrypt(plaintext, sender_sk, recipient_pk) {
 export function init() {
     wasm.init();
 }
+
+/**
+ * @param {string} level
+ */
+export function set_log_level_from_str(level) {
+    const ptr0 = passStringToWasm0(level, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    wasm.set_log_level_from_str(ptr0, len0);
+}
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
+        __wbg___wbindgen_boolean_get_2304fb8c853028c8: function(arg0) {
+            const v = arg0;
+            const ret = typeof(v) === 'boolean' ? v : undefined;
+            return isLikeNone(ret) ? 0xFFFFFF : ret ? 1 : 0;
+        },
         __wbg___wbindgen_debug_string_edece8177ad01481: function(arg0, arg1) {
             const ret = debugString(arg1);
             const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -536,9 +1225,16 @@ function __wbg_get_imports() {
         __wbg__wbg_cb_unref_3fa391f3fcdb55f8: function(arg0) {
             arg0._wbg_cb_unref();
         },
+        __wbg_acquire_lock_immediate_71820c0d3c8f1071: function(arg0, arg1, arg2, arg3, arg4, arg5) {
+            const ret = acquire_lock_immediate(getStringFromWasm0(arg0, arg1), getStringFromWasm0(arg2, arg3), arg4, arg5);
+            return ret;
+        },
         __wbg_acquire_web_lock_25fd29220bdfc055: function(arg0, arg1, arg2, arg3, arg4, arg5) {
             acquire_web_lock(getStringFromWasm0(arg0, arg1), getStringFromWasm0(arg2, arg3), arg4, arg5);
         },
+        __wbg_addEventListener_aedacff123afaebd: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            arg0.addEventListener(getStringFromWasm0(arg1, arg2), arg3);
+        }, arguments); },
         __wbg_addIceCandidate_8c940af93aa89e1b: function(arg0, arg1) {
             const ret = arg0.addIceCandidate(arg1);
             return ret;
@@ -551,8 +1247,16 @@ function __wbg_get_imports() {
             const ret = arg0.call(arg1, arg2, arg3, arg4);
             return ret;
         }, arguments); },
+        __wbg_call_13665d9f14390edc: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.call(arg1);
+            return ret;
+        }, arguments); },
         __wbg_call_dfde26266607c996: function() { return handleError(function (arg0, arg1, arg2) {
             const ret = arg0.call(arg1, arg2);
+            return ret;
+        }, arguments); },
+        __wbg_call_faa0a261f288f846: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = arg0.call(arg1, arg2, arg3);
             return ret;
         }, arguments); },
         __wbg_candidate_6982144c4b510573: function(arg0) {
@@ -608,9 +1312,6 @@ function __wbg_get_imports() {
             const ret = arg0.data;
             return ret;
         },
-        __wbg_debug_83758bc0b77ada71: function(arg0) {
-            console.debug(arg0);
-        },
         __wbg_debug_f6bcfe64fbe89f8c: function(arg0, arg1) {
             console.debug(getStringFromWasm0(arg0, arg1));
         },
@@ -618,6 +1319,13 @@ function __wbg_get_imports() {
             const ret = arg0.delete(arg1);
             return ret;
         }, arguments); },
+        __wbg_entries_8db5a11d802d4c53: function(arg0) {
+            const ret = arg0.entries();
+            return ret;
+        },
+        __wbg_error_4ce7a41d31c7b468: function(arg0, arg1) {
+            console.error(getStringFromWasm0(arg0, arg1));
+        },
         __wbg_error_a6fa202b58aa1cd3: function(arg0, arg1) {
             let deferred0_0;
             let deferred0_1;
@@ -677,16 +1385,6 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
-        __wbg_instanceof_FileSystemDirectoryHandle_66036b337d6b010d: function(arg0) {
-            let result;
-            try {
-                result = arg0 instanceof FileSystemDirectoryHandle;
-            } catch (_) {
-                result = false;
-            }
-            const ret = result;
-            return ret;
-        },
         __wbg_instanceof_IdbOpenDbRequest_2cce7fd687448f0f: function(arg0) {
             let result;
             try {
@@ -701,6 +1399,16 @@ function __wbg_get_imports() {
             let result;
             try {
                 result = arg0 instanceof IDBRequest;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
+        __wbg_instanceof_Promise_09012cfa9708520a: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof Promise;
             } catch (_) {
                 result = false;
             }
@@ -727,6 +1435,16 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
+        __wbg_instanceof_WebSocket_5b52be0d691ebab1: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof WebSocket;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
         __wbg_instanceof_Window_faa5cf994f49cca7: function(arg0) {
             let result;
             try {
@@ -741,14 +1459,15 @@ function __wbg_get_imports() {
             const ret = Object.is(arg0, arg1);
             return ret;
         },
+        __wbg_length_2591a0f4f659a55c: function(arg0) {
+            const ret = arg0.length;
+            return ret;
+        },
         __wbg_length_56fcd3e2b7e0299d: function(arg0) {
             const ret = arg0.length;
             return ret;
         },
-        __wbg_log_eb752234eec406d1: function(arg0) {
-            console.log(arg0);
-        },
-        __wbg_log_fcd177d347f98f47: function(arg0, arg1) {
+        __wbg_log_168b1fa9576f2040: function(arg0, arg1) {
             console.log(getStringFromWasm0(arg0, arg1));
         },
         __wbg_msCrypto_bd5a034af96bcba6: function(arg0) {
@@ -765,6 +1484,10 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbg_new_02d162bc6cf02f60: function() {
             const ret = new Object();
+            return ret;
+        },
+        __wbg_new_0_2722fcdb71a888a6: function() {
+            const ret = new Date();
             return ret;
         },
         __wbg_new_227d7c05414eb861: function() {
@@ -849,6 +1572,10 @@ function __wbg_get_imports() {
             const ret = arg0.open(getStringFromWasm0(arg1, arg2), arg3 >>> 0);
             return ret;
         }, arguments); },
+        __wbg_parse_2c1cad6215e84999: function() { return handleError(function (arg0, arg1) {
+            const ret = JSON.parse(getStringFromWasm0(arg0, arg1));
+            return ret;
+        }, arguments); },
         __wbg_performance_3fcf6e32a7e1ed0a: function(arg0) {
             const ret = arg0.performance;
             return ret;
@@ -885,10 +1612,6 @@ function __wbg_get_imports() {
         __wbg_randomFillSync_6c25eac9869eb53c: function() { return handleError(function (arg0, arg1) {
             arg0.randomFillSync(arg1);
         }, arguments); },
-        __wbg_random_a8dfe52b70cb65a5: function() {
-            const ret = Math.random();
-            return ret;
-        },
         __wbg_readyState_a1a00cc8898812ac: function(arg0) {
             const ret = arg0.readyState;
             return ret;
@@ -1001,6 +1724,10 @@ function __wbg_get_imports() {
         __wbg_set_type_da7bc1c21cfe0a36: function(arg0, arg1) {
             arg0.type = __wbindgen_enum_RtcSdpType[arg1];
         },
+        __wbg_slice_3f9ca2832ef75a48: function() { return handleError(function (arg0, arg1, arg2) {
+            const ret = arg0.slice(arg1, arg2);
+            return ret;
+        }, arguments); },
         __wbg_stack_3b0d974bbf31e44f: function(arg0, arg1) {
             const ret = arg1.stack;
             const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -1056,10 +1783,21 @@ function __wbg_get_imports() {
             const ret = arg0.then(arg1, arg2);
             return ret;
         },
+        __wbg_then_bd927500e8905df2: function(arg0, arg1, arg2) {
+            const ret = arg0.then(arg1, arg2);
+            return ret;
+        },
+        __wbg_trace_822dbcb10dfd03eb: function(arg0, arg1) {
+            console.trace(getStringFromWasm0(arg0, arg1));
+        },
         __wbg_transaction_b7261fed68fa4264: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = arg0.transaction(getStringFromWasm0(arg1, arg2), __wbindgen_enum_IdbTransactionMode[arg3]);
             return ret;
         }, arguments); },
+        __wbg_vaultsyncruntime_new: function(arg0) {
+            const ret = VaultSyncRuntime.__wrap(arg0);
+            return ret;
+        },
         __wbg_versions_276b2795b1c6a219: function(arg0) {
             const ret = arg0.versions;
             return ret;
@@ -1067,57 +1805,53 @@ function __wbg_get_imports() {
         __wbg_warn_ed320d51da79dd3d: function(arg0, arg1) {
             console.warn(getStringFromWasm0(arg0, arg1));
         },
-        __wbg_wasmvaultsyncclient_new: function(arg0) {
-            const ret = WasmVaultSyncClient.__wrap(arg0);
-            return ret;
-        },
         __wbg_write_4a589e6ce69a6253: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.write(arg1);
             return ret;
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 324, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2dccc7bc52fbc5e7);
-            return ret;
-        },
-        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 838, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1372, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1);
             return ret;
         },
+        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 912, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df);
+            return ret;
+        },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 326, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
-            const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hc470a37e1ced5300);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 910, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 324, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h2dccc7bc52fbc5e7_3);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 1114, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 634, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
-            const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 912, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4);
             return ret;
         },
         __wbindgen_cast_0000000000000006: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 634, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
-            const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1_5);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCDataChannelEvent")], shim_idx: 1114, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_5);
             return ret;
         },
         __wbindgen_cast_0000000000000007: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 634, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
-            const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1_6);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("RTCPeerConnectionIceEvent")], shim_idx: 1114, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_6);
             return ret;
         },
         __wbindgen_cast_0000000000000008: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 673, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1ae5816e5fd698bd);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1199, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h5a816e701a8600f2);
             return ret;
         },
         __wbindgen_cast_0000000000000009: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 675, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
-            const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h0edffd97ea4639bb);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1201, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hd15eeae72bcd25a2);
             return ret;
         },
         __wbindgen_cast_000000000000000a: function(arg0) {
@@ -1151,36 +1885,36 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__h1ae5816e5fd698bd(arg0, arg1) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h1ae5816e5fd698bd(arg0, arg1);
+function wasm_bindgen__convert__closures_____invoke__h5a816e701a8600f2(arg0, arg1) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h5a816e701a8600f2(arg0, arg1);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h0edffd97ea4639bb(arg0, arg1) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h0edffd97ea4639bb(arg0, arg1);
+function wasm_bindgen__convert__closures_____invoke__hd15eeae72bcd25a2(arg0, arg1) {
+    wasm.wasm_bindgen__convert__closures_____invoke__hd15eeae72bcd25a2(arg0, arg1);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h2dccc7bc52fbc5e7(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h2dccc7bc52fbc5e7(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__hc470a37e1ced5300(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__hc470a37e1ced5300(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h6fb81e698e30f778(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h2dccc7bc52fbc5e7_3(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h2dccc7bc52fbc5e7_3(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h8fef397f314f78df_4(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1_5(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1_5(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_5(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_5(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1_6(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h1696ececbfb6a2c1_6(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_6(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h3f5a6bd03c85dcd0_6(arg0, arg1, arg2);
 }
 
 function wasm_bindgen__convert__closures_____invoke__h685410aed2fde3f1(arg0, arg1, arg2) {
@@ -1202,18 +1936,30 @@ const __wbindgen_enum_IdbTransactionMode = ["readonly", "readwrite", "versioncha
 
 
 const __wbindgen_enum_RtcSdpType = ["offer", "pranswer", "answer", "rollback"];
+const EventBusProxyFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_eventbusproxy_free(ptr, 1));
 const PresenceManagerFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_presencemanager_free(ptr, 1));
+const ReplicationNamespaceFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_replicationnamespace_free(ptr, 1));
+const VaultSyncRuntimeFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_vaultsyncruntime_free(ptr, 1));
 const WasmIPCFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_wasmipc_free(ptr, 1));
 const WasmSubscriptionHandleFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_wasmsubscriptionhandle_free(ptr, 1));
-const WasmVaultSyncClientFinalization = (typeof FinalizationRegistry === 'undefined')
+const WorkingSetsNamespaceFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_wasmvaultsyncclient_free(ptr, 1));
+    : new FinalizationRegistry(ptr => wasm.__wbg_workingsetsnamespace_free(ptr, 1));
+const WorkspaceNamespaceFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_workspacenamespace_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();
@@ -1294,6 +2040,17 @@ function debugString(val) {
     }
     // TODO we could test for more things here, like `Set`s and `Map`s.
     return className;
+}
+
+function getArrayJsValueFromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    const mem = getDataViewMemory0();
+    const result = [];
+    for (let i = ptr; i < ptr + 4 * len; i += 4) {
+        result.push(wasm.__wbindgen_externrefs.get(mem.getUint32(i, true)));
+    }
+    wasm.__externref_drop_slice(ptr, len);
+    return result;
 }
 
 function getArrayU8FromWasm0(ptr, len) {

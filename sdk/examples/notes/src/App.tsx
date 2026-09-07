@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect } from 'react';
-import { VaultSyncProvider, useVaultSyncMutations, useQuery, useVaultSyncClient } from '@vaultsync/react';
+import { VaultSyncProvider, BootstrapProvider, useVaultSyncMutations, useQuery, useVaultSyncClient } from '@vaultsync/react';
 import { SyncBar } from './components/SyncBar';
 import { NoteList } from './components/NoteList';
 import { NoteEditor } from './components/NoteEditor';
@@ -37,7 +37,6 @@ function MainLayout() {
       await mutations.insert(id, {
         title: '',
         body: '',
-        updatedAt: Date.now(),
       });
       setActiveNoteId(id);
     } catch (err) {
@@ -100,7 +99,9 @@ export default function App() {
 
   return (
     <VaultSyncProvider config={config}>
-      <MainLayout />
+      <BootstrapProvider docIds={['notes']}>
+        <MainLayout />
+      </BootstrapProvider>
     </VaultSyncProvider>
   );
 }

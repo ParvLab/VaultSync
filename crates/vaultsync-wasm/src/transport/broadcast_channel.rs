@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use futures::channel::mpsc;
+use tracing::debug;
 use futures::Stream;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -8,19 +9,9 @@ use vaultsync_core::coordinator::traits::{EncryptedMutation, PendingMutation};
 use vaultsync_core::transport::traits::{
     InboundMutation, Transport, TransportError, TransportSource,
 };
-use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::Closure;
+use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{BroadcastChannel, MessageEvent};
-
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = console, js_name = log)]
-    fn console_log_str(s: &str);
-}
-
-macro_rules! log {
-    ($($t:tt)*) => (console_log_str(&format!($($t)*)));
-}
 
 /// BroadcastChannel transport for same-origin tab-to-tab communication
 ///
@@ -49,7 +40,7 @@ impl BroadcastChannelTransport {
             listeners: Mutex::new(Vec::new()),
         };
 
-        log!("[BC] created channel={}", transport.channel_name);
+        debug!("[BC] created channel={}", transport.channel_name);
         Ok(transport)
     }
 

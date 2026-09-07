@@ -1,481 +1,435 @@
 use async_trait::async_trait;
 use js_sys::Uint8Array;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::Mutex;
-use vaultsync_core::oplog::entry::{OplogEntry, SyncStatus};
+use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
+use vaultsync_core::crdt::document::CRDTDocument;
+use vaultsync_core::oplog::entry::{MutationType, OplogEntry, SyncStatus};
 use vaultsync_core::storage::traits::{KeyRecord, MigrationRecord, SchemaMeta, Storage};
 use vaultsync_core::sync::state::SyncState;
+use vaultsync_core::time_utils::SendJsFuture;
 use vaultsync_core::VaultSyncError;
-use wasm_bindgen::{JsCast, JsValue};
 use web_sys::*;
 
-use vaultsync_core::time_utils::SendJsFuture;
+use crate::metadata_runtime::MetadataRuntime;
+use crate::metadata_store::MetadataStore;
+use crate::migration::{DocEntry, PagesDir};
+use crate::page_store::{IndexKey, PageId, PageStore};
+use crate::storage_runtime::StorageRuntime;
+use crate::version_chain::VersionChain;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OpfsIndex {
-    version: u32,
-    doc_listing: HashMap<String, Vec<String>>,
-    oplog: Vec<OplogEntry>,
-    sync_states: HashMap<String, SyncState>,
-    schemas: HashMap<String, SchemaMeta>,
-    migrations: Vec<MigrationRecord>,
-    keys: Vec<KeyRecord>,
-}
-
-impl Default for OpfsIndex {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            doc_listing: HashMap::new(),
-            oplog: Vec::new(),
-            sync_states: HashMap::new(),
-            schemas: HashMap::new(),
-            migrations: Vec::new(),
-            keys: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OpfsStorage {
-    inner: Mutex<OpfsInner>,
-    tx_lock: futures::lock::Mutex<()>,
-}
-
-#[derive(Debug)]
-struct OpfsInner {
-    root: JsValue,
-    index: OpfsIndex,
-}
-
-impl OpfsInner {
-    fn root_handle(&self) -> FileSystemDirectoryHandle {
-        self.root.clone().dyn_into().unwrap()
-    }
+    root: Arc<Mutex<FileSystemDirectoryHandle>>,
+    pages: PagesDir,
+    /// StorageRuntime for allocation authority and scheduling
+    storage_runtime: Arc<Mutex<Option<Arc<StorageRuntime>>>>,
+    /// MetadataRuntime for in-memory metadata cache (zero OPFS reads during operation)
+    metadata_runtime: Arc<Mutex<Option<Arc<MetadataRuntime>>>>,
+    /// MetadataStore for SyncState (singleton, not append-only)
+    sync_state_store: MetadataStore<SyncState>,
+    /// MetadataStore for Schema metadata (all schemas as a single page)
+    schema_store: MetadataStore<Vec<(String, SchemaMeta)>>,
+    /// MetadataStore for Migration records (all records as a single page)
+    migration_store: MetadataStore<Vec<MigrationRecord>>,
+    /// MetadataStore for Key records (all keys as a single page)
+    key_store: MetadataStore<Vec<KeyRecord>>,
 }
 
 impl OpfsStorage {
+    /// Expose the PagesDir so all subsystems share the same PageStore instances
+    pub fn pages(&self) -> &PagesDir {
+        &self.pages
+    }
+
+    /// Set the StorageRuntime (called after construction from bootstrap).
+    /// Enables allocation routing through PageManager + StorageScheduler.
+    pub fn set_storage_runtime(&self, sr: Arc<StorageRuntime>) {
+        let mut guard = self.storage_runtime.lock().unwrap();
+        *guard = Some(sr);
+    }
+
+    /// Set the MetadataRuntime (called after construction from bootstrap).
+    /// Routes SyncState, Schema, Key, Migration reads/writes through in-memory cache.
+    pub fn set_metadata_runtime(&self, mr: Arc<MetadataRuntime>) {
+        let mut guard = self.metadata_runtime.lock().unwrap();
+        *guard = Some(mr);
+    }
+
+    /// Load MetadataRuntime from the MetadataStore backends.
+    /// Returns None if MetadataRuntime construction fails (non-fatal — falls back to direct MetadataStore).
+    pub async fn try_load_metadata_runtime(&self) -> Option<Arc<MetadataRuntime>> {
+        match MetadataRuntime::load(
+            self.sync_state_store.clone(),
+            self.schema_store.clone(),
+            self.migration_store.clone(),
+            self.key_store.clone(),
+        ).await {
+            Ok(mr) => Some(mr),
+            Err(e) => {
+                engine_debug!("[MetadataRuntime] load deferred: {:?}", e);
+                None
+            }
+        }
+    }
+
+    /// Allocate a doc_data page ID, routing through StorageRuntime when available.
+    async fn alloc_doc_data(&self, reason: &'static str) -> Result<PageId, VaultSyncError> {
+        self.allocate_store_page_id("doc_data", &self.pages.doc_data, reason).await
+    }
+
+    /// Allocate an oplog page ID, routing through StorageRuntime when available.
+    async fn alloc_oplog(&self, reason: &'static str) -> Result<PageId, VaultSyncError> {
+        self.allocate_store_page_id("oplog", &self.pages.oplog, reason).await
+    }
+
+    /// Write a page through StorageRuntime scheduler (when available) or directly.
+    async fn write_store_page(&self, store_name: &'static str, store: &PageStore, page_id: PageId, data: Vec<u8>) -> Result<(), VaultSyncError> {
+        let sr = {
+            let guard = self.storage_runtime.lock().unwrap();
+            guard.clone()
+        };
+        if let Some(sr) = sr {
+            sr.enqueue_write_page(store_name, page_id, data).await
+        } else {
+            store.write_page(page_id, &data).await
+        }
+    }
+
+    /// Tombstone a page through StorageRuntime scheduler (when available) or directly.
+    async fn tombstone_store_page(&self, store_name: &'static str, store: &PageStore, page_id: PageId) -> Result<(), VaultSyncError> {
+        let sr = {
+            let guard = self.storage_runtime.lock().unwrap();
+            guard.clone()
+        };
+        if let Some(sr) = sr {
+            sr.enqueue_tombstone_page(store_name, page_id).await
+        } else {
+            store.tombstone_page(page_id).await
+        }
+    }
+
+    /// Write a doc_data page through the scheduler.
+    async fn write_doc_page(&self, page_id: PageId, data: Vec<u8>) -> Result<(), VaultSyncError> {
+        self.write_store_page("doc_data", &self.pages.doc_data, page_id, data).await
+    }
+
+    /// Write an oplog page through the scheduler.
+    async fn write_oplog_page(&self, page_id: PageId, data: Vec<u8>) -> Result<(), VaultSyncError> {
+        self.write_store_page("oplog", &self.pages.oplog, page_id, data).await
+    }
+
+    /// Tombstone a doc_data page through the scheduler.
+    async fn tombstone_doc_page(&self, page_id: PageId) -> Result<(), VaultSyncError> {
+        self.tombstone_store_page("doc_data", &self.pages.doc_data, page_id).await
+    }
+
+    /// Tombstone an oplog page through the scheduler.
+    async fn tombstone_oplog_page(&self, page_id: PageId) -> Result<(), VaultSyncError> {
+        self.tombstone_store_page("oplog", &self.pages.oplog, page_id).await
+    }
+
+    /// Allocate a page ID through StorageRuntime (when set) or PageStore (fallback).
+    /// StorageRuntime handles PageManager tracking; PageStore handles ContentIndex update.
+    async fn allocate_store_page_id(
+        &self,
+        store_name: &'static str,
+        store: &PageStore,
+        reason: &'static str,
+    ) -> Result<PageId, VaultSyncError> {
+        // Check if StorageRuntime is available (quick lock, no await in scope)
+        let page_id_opt = {
+            let guard = self.storage_runtime.lock().unwrap();
+            guard.as_ref().map(|sr| sr.allocate_page_id(store_name, reason))
+        };
+        if let Some(page_id) = page_id_opt {
+            // Commit the pre-allocated page to ContentIndex (no lock held)
+            store.commit_allocated_page_id(page_id).await?;
+            Ok(page_id)
+        } else {
+            store.allocate_page_id(reason).await
+        }
+    }
+
+    /// Get a clone of the root directory handle (for PageStore creation)
+    pub async fn db_dir(&self) -> Result<FileSystemDirectoryHandle, VaultSyncError> {
+        Ok(self.root.lock().unwrap().clone())
+    }
+
+    /// Write a file to _pages/_system/ for metadata (checkpoint, manifest backups, etc.)
+    pub(crate) async fn write_system_file(&self, name: &str, data: &[u8]) -> Result<(), VaultSyncError> {
+        let db_dir = self.root.lock().unwrap().clone();
+        let pages_root = ensure_dir(&db_dir, "_pages").await?;
+        let sys_dir = ensure_dir(&pages_root, "_system").await?;
+        let opts = FileSystemGetFileOptions::new();
+        opts.set_create(true);
+        let file_val = SendJsFuture::from(sys_dir.get_file_handle_with_options(name, &opts))
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("get_file_handle: {:?}", e)))?;
+        let file_handle: FileSystemFileHandle = file_val.into();
+        let writable_val = SendJsFuture::from(file_handle.create_writable())
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("create_writable: {:?}", e)))?;
+        let writable: FileSystemWritableFileStream = writable_val.into();
+        let js_array = Uint8Array::new_with_length(data.len() as u32);
+        js_array.copy_from(data);
+        let write_promise = writable
+            .write_with_buffer_source(&js_array)
+            .map_err(|e| VaultSyncError::Storage(format!("write: {:?}", e)))?;
+        SendJsFuture::from(write_promise)
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("write done: {:?}", e)))?;
+        let ws: web_sys::WritableStream = writable.into();
+        SendJsFuture::from(ws.close())
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("close: {:?}", e)))?;
+        Ok(())
+    }
+
+    /// Read a file from _pages/_system/.
+    pub(crate) async fn read_system_file(&self, name: &str) -> Result<Option<Vec<u8>>, VaultSyncError> {
+        let db_dir = self.root.lock().unwrap().clone();
+        let pages_root = ensure_dir(&db_dir, "_pages").await?;
+        let sys_dir = ensure_dir(&pages_root, "_system").await?;
+        let opts = FileSystemGetFileOptions::new();
+        opts.set_create(false);
+        let file_val = SendJsFuture::from(sys_dir.get_file_handle_with_options(name, &opts))
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("get_file_handle: {:?}", e)));
+        let file_handle: FileSystemFileHandle = match file_val {
+            Ok(v) => v.into(),
+            Err(_) => return Ok(None),
+        };
+        let file_val = SendJsFuture::from(file_handle.get_file())
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("get_file: {:?}", e)))?;
+        let file: File = file_val.into();
+        let blob: &Blob = file.as_ref();
+        let buf_val = SendJsFuture::from(blob.array_buffer())
+            .await
+            .map_err(|e| VaultSyncError::Storage(format!("array_buffer: {:?}", e)))?;
+        let uint8 = Uint8Array::new(&buf_val);
+        let mut bytes = vec![0u8; uint8.length() as usize];
+        uint8.copy_to(&mut bytes);
+        Ok(Some(bytes))
+    }
+
     pub async fn new(db_name: &str) -> Result<Self, VaultSyncError> {
+        let _t0 = js_sys::Date::now();
         let window =
             web_sys::window().ok_or_else(|| VaultSyncError::Storage("no window".into()))?;
-        let navigator = window.navigator();
-        let storage: StorageManager = navigator.storage();
+        let storage_mgr = window.navigator().storage();
 
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] get_directory start"));
-        let root_val = SendJsFuture::from(storage.get_directory())
+        let root_val = vaultsync_core::time_utils::SendJsFuture::from(storage_mgr.get_directory())
             .await
             .map_err(|e| VaultSyncError::Storage(format!("get_directory failed: {:?}", e)))?;
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] get_directory done"));
-
+        let t_root = (js_sys::Date::now() - _t0) as u64;
         let root_handle: FileSystemDirectoryHandle = root_val.clone().into();
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!("[opfs] ensure_dir '{}' start", db_name)));
-        let db_dir = Self::ensure_dir(&root_handle, db_name).await?;
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!("[opfs] ensure_dir '{}' done", db_name)));
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] ensure_dir '_system' start"));
-        Self::ensure_dir(&db_dir, "_system").await?;
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] ensure_dir '_system' done"));
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] ensure_dir 'docs' start"));
-        Self::ensure_dir(&db_dir, "docs").await?;
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] ensure_dir 'docs' done"));
+        let db_dir = ensure_dir(&root_handle, db_name).await?;
+        let t_dbdir = (js_sys::Date::now() - _t0) as u64;
+        engine_info!("[OpfsStorage] get_directory: {}ms | ensure_dir: {}ms | total so far: {}ms", t_root, t_dbdir - t_root, t_dbdir);
 
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] load_index start"));
-        let index = Self::load_index(&db_dir).await?;
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[opfs] load_index done: {} sync_states, {} oplog entries",
-            index.sync_states.len(),
-            index.oplog.len()
-        )));
+        let migration_done = crate::migration::try_migrate_from_v1(db_name).await.unwrap_or(false);
+        let t_mig = (js_sys::Date::now() - _t0) as u64;
+        if migration_done {
+            engine_info!("[opfs] v1→v2 migration complete (at {}ms)", t_mig);
+        }
+
+        let pages = PagesDir::open(&db_dir).await?;
+        let t_pages = (js_sys::Date::now() - _t0) as u64;
+        let sync_state_store = MetadataStore::new(pages.sync_states.clone());
+        let schema_store = MetadataStore::new(pages.schemas.clone());
+        let migration_store = MetadataStore::new(pages.migrations.clone());
+        let key_store = MetadataStore::new(pages.keys.clone());
+        let t_total = (js_sys::Date::now() - _t0) as u64;
+        engine_info!("[OpfsStorage] pages_dir: {}ms | MetadataStores: {}ms | total: {}ms", t_pages - t_mig, t_total - t_pages, t_total);
 
         Ok(Self {
-            inner: Mutex::new(OpfsInner {
-                root: JsValue::from(db_dir),
-                index,
-            }),
-            tx_lock: futures::lock::Mutex::new(()),
+            root: Arc::new(Mutex::new(db_dir)),
+            pages,
+            storage_runtime: Arc::new(Mutex::new(None)),
+            metadata_runtime: Arc::new(Mutex::new(None)),
+            sync_state_store,
+            schema_store,
+            migration_store,
+            key_store,
         })
     }
 
-    async fn ensure_dir(
-        root: &FileSystemDirectoryHandle,
-        name: &str,
-    ) -> Result<FileSystemDirectoryHandle, VaultSyncError> {
-        let opts = FileSystemGetDirectoryOptions::new();
-        opts.set_create(true);
-        let promise = root.get_directory_handle_with_options(name, &opts);
-        let val = SendJsFuture::from(promise)
-            .await
-            .map_err(|e| VaultSyncError::Storage(format!("ensure_dir failed: {:?}", e)))?;
-        Ok(val.into())
+    fn lock_name(&self, store: &str) -> String {
+        format!("vaultsync-opfs-{}", store)
     }
 
-    async fn get_dir(
-        root: &FileSystemDirectoryHandle,
-        path: &[&str],
-    ) -> Result<FileSystemDirectoryHandle, VaultSyncError> {
-        let mut dir = root.clone();
-        for p in path {
-            let opts = FileSystemGetDirectoryOptions::new();
-            opts.set_create(true);
-            let promise = dir.get_directory_handle_with_options(p, &opts);
-            let val = SendJsFuture::from(promise)
-                .await
-                .map_err(|e| VaultSyncError::Storage(format!("get_dir failed: {:?}", e)))?;
-            dir = val.into();
-        }
-        Ok(dir)
+    /// Physically remove tombstoned page files from disk.
+    /// Returns total number of pages cleaned across all stores.
+    pub async fn cleanup_tombstoned_pages(&self) -> Result<usize, VaultSyncError> {
+        self.cleanup_tombstoned_pages_routed().await
     }
 
-    async fn sleep(ms: u64) {
-        vaultsync_core::time_utils::sleep(std::time::Duration::from_millis(ms)).await;
-    }
-
-    async fn write_doc_file(
-        root: &FileSystemDirectoryHandle,
-        doc_id: &str,
-        record_id: &str,
-        data: &[u8],
-    ) -> Result<(), VaultSyncError> {
-        let dir = Self::get_dir(root, &["docs", doc_id]).await?;
-        let opts = FileSystemGetFileOptions::new();
-        opts.set_create(true);
-
-        let mut attempts = 0;
-        let max_attempts = 15;
-        loop {
-            let res = async {
-                let promise = dir.get_file_handle_with_options(record_id, &opts);
-                let file_val = SendJsFuture::from(promise).await.map_err(|e| {
-                    VaultSyncError::Storage(format!("get_file_handle failed: {:?}", e))
-                })?;
-                let file_handle: FileSystemFileHandle = file_val.into();
-
-                let writable_promise = file_handle.create_writable();
-                let writable_val = SendJsFuture::from(writable_promise).await.map_err(|e| {
-                    VaultSyncError::Storage(format!("create_writable failed: {:?}", e))
-                })?;
-                let writable: FileSystemWritableFileStream = writable_val.into();
-
-                let js_array = js_sys::Uint8Array::new_with_length(data.len() as u32);
-                js_array.copy_from(data);
-                let write_promise = writable
-                    .write_with_buffer_source(&js_array)
-                    .map_err(|e| VaultSyncError::Storage(format!("write error: {:?}", e)))?;
-                SendJsFuture::from(write_promise)
-                    .await
-                    .map_err(|e| VaultSyncError::Storage(format!("write failed: {:?}", e)))?;
-
-                let close: WritableStream = writable.into();
-                SendJsFuture::from(close.close())
-                    .await
-                    .map_err(|e| VaultSyncError::Storage(format!("close failed: {:?}", e)))?;
-
-                Ok(())
-            }
-            .await;
-
-            match res {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= max_attempts {
-                        return Err(e);
-                    }
-                    let delay = 15 + (js_sys::Math::random() * 15.0) as u64;
-                    Self::sleep(delay).await;
-                }
-            }
-        }
-    }
-
-    async fn read_doc_file(
-        root: &FileSystemDirectoryHandle,
-        doc_id: &str,
-        record_id: &str,
-    ) -> Result<Option<Vec<u8>>, VaultSyncError> {
-        let dir = Self::get_dir(root, &["docs", doc_id]).await?;
-        let opts = FileSystemGetFileOptions::new();
-        opts.set_create(false);
-
-        let mut attempts = 0;
-        let max_attempts = 15;
-        loop {
-            let res = async {
-                let file_val =
-                    match SendJsFuture::from(dir.get_file_handle_with_options(record_id, &opts))
-                        .await
-                    {
-                        Ok(val) => val,
-                        Err(e) => {
-                            let is_not_found = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
-                                .ok()
-                                .and_then(|v| v.as_string())
-                                .map_or(false, |s| s == "NotFoundError");
-                            if is_not_found {
-                                return Ok(None);
-                            } else {
-                                return Err(VaultSyncError::Storage(format!(
-                                    "get_file_handle failed: {:?}",
-                                    e
-                                )));
-                            }
-                        }
-                    };
-                let file_handle: FileSystemFileHandle = file_val.into();
-
-                let file_val = SendJsFuture::from(file_handle.get_file())
-                    .await
-                    .map_err(|e| VaultSyncError::Storage(format!("get_file failed: {:?}", e)))?;
-                let file: File = file_val.into();
-
-                let blob: &Blob = file.as_ref();
-                let buf_promise = blob.array_buffer();
-                let buf_val = SendJsFuture::from(buf_promise).await.map_err(|e| {
-                    VaultSyncError::Storage(format!("array_buffer failed: {:?}", e))
-                })?;
-
-                let uint8 = Uint8Array::new(&buf_val);
-                let mut bytes = vec![0u8; uint8.length() as usize];
-                uint8.copy_to(&mut bytes);
-                Ok(Some(bytes))
-            }
-            .await;
-
-            match res {
-                Ok(data) => return Ok(data),
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= max_attempts {
-                        return Err(e);
-                    }
-                    let delay = 15 + (js_sys::Math::random() * 15.0) as u64;
-                    Self::sleep(delay).await;
-                }
-            }
-        }
-    }
-
-    async fn delete_doc_file(
-        root: &FileSystemDirectoryHandle,
-        doc_id: &str,
-        record_id: &str,
-    ) -> Result<(), VaultSyncError> {
-        let dir = Self::get_dir(root, &["docs", doc_id]).await?;
-        let mut attempts = 0;
-        let max_attempts = 15;
-        loop {
-            let promise = dir.remove_entry(record_id);
-            match SendJsFuture::from(promise).await {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= max_attempts {
-                        return Err(VaultSyncError::Storage(format!(
-                            "remove_entry failed: {:?}",
-                            e
-                        )));
-                    }
-                    let delay = 15 + (js_sys::Math::random() * 15.0) as u64;
-                    Self::sleep(delay).await;
-                }
-            }
-        }
-    }
-
-    /// Snapshot the index state for diagnostic logging.
-    fn index_state(label: &str, index: &OpfsIndex) {
-        let pending: Vec<&str> = index
-            .oplog
-            .iter()
-            .filter(|e| e.sync_status.is_uploadable())
-            .map(|e| e.id.as_str())
-            .collect();
-        let synced: Vec<&str> = index
-            .oplog
-            .iter()
-            .filter(|e| matches!(e.sync_status, SyncStatus::Synced))
-            .map(|e| e.id.as_str())
-            .collect();
-        let mut hasher = DefaultHasher::new();
-        index.oplog.len().hash(&mut hasher);
-        pending.len().hash(&mut hasher);
-        for id in &pending {
-            id.hash(&mut hasher);
-        }
-        let hash = hasher.finish();
-        web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[INDEX] {} hash={:#x} oplog={} pending={} synced={} pending_ids={:?}",
-            label,
-            hash,
-            index.oplog.len(),
-            pending.len(),
-            synced.len(),
-            pending,
-        )));
-    }
-
-    async fn load_index(root: &FileSystemDirectoryHandle) -> Result<OpfsIndex, VaultSyncError> {
-        let opts = FileSystemGetFileOptions::new();
-        opts.set_create(false);
-        let dir = Self::get_dir(root, &["_system"]).await?;
-
-        let mut attempts = 0;
-        let max_attempts = 15;
-        loop {
-            if attempts > 0 {
-                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!("[opfs] load_index retry attempt {}", attempts)));
-            }
-            let res = async {
-                let file_val =
-                    match SendJsFuture::from(dir.get_file_handle_with_options("index.json", &opts))
-                        .await
-                    {
-                        Ok(val) => val,
-                        Err(e) => {
-                            let is_not_found = js_sys::Reflect::get(&e, &JsValue::from_str("name"))
-                                .ok()
-                                .and_then(|v| v.as_string())
-                                .map_or(false, |s| s == "NotFoundError");
-                            if is_not_found {
-                                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str("[opfs] load_index default empty (no index.json)"));
-                                return Ok(OpfsIndex::default());
-                            } else {
-                                return Err(VaultSyncError::Storage(format!(
-                                    "get_file_handle: {:?}",
-                                    e
-                                )));
-                            }
-                        }
-                    };
-                let file_handle: FileSystemFileHandle = file_val.into();
-                let file_val = SendJsFuture::from(file_handle.get_file())
-                    .await
-                    .map_err(|e| VaultSyncError::Storage(format!("get_file: {:?}", e)))?;
-                let file: File = file_val.into();
-                let blob: &Blob = file.as_ref();
-                let buf_promise = blob.array_buffer();
-                let buf_val = SendJsFuture::from(buf_promise)
-                    .await
-                    .map_err(|e| VaultSyncError::Storage(format!("array_buffer: {:?}", e)))?;
-                let uint8 = Uint8Array::new(&buf_val);
-                let mut bytes = vec![0u8; uint8.length() as usize];
-                uint8.copy_to(&mut bytes);
-
-                if bytes.is_empty() {
-                    return Err(VaultSyncError::Storage("empty index file".into()));
-                }
-
-                let index: OpfsIndex = serde_json::from_slice(&bytes)
-                    .map_err(|e| VaultSyncError::Storage(format!("json parse: {:?}", e)))?;
-                Ok(index)
-            }
-            .await;
-
-            match res {
-                Ok(index) => {
-                    Self::index_state("LOAD", &index);
-                    return Ok(index);
-                }
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= max_attempts {
-                        return Err(e);
-                    }
-                    let delay = 15 + (js_sys::Math::random() * 15.0) as u64;
-                    Self::sleep(delay).await;
-                }
-            }
-        }
-    }
-
-    async fn flush_index(
-        root: &FileSystemDirectoryHandle,
-        index: &OpfsIndex,
-    ) -> Result<(), VaultSyncError> {
-        Self::index_state("FLUSH_BEFORE", index);
-        // ── Race detection: log all uploadable entries at flush time ──
-        let pending: Vec<&OplogEntry> = index.oplog.iter().filter(|e| e.sync_status.is_uploadable()).collect();
-        if !pending.is_empty() {
-            let ids: Vec<String> = pending.iter().map(|e| format!("{}={:?}", &e.id[..e.id.len().min(12)], e.sync_status)).collect();
-            let op_count: usize = index.doc_listing.values().map(|v| v.len()).sum();
-            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                "[opfs_flush] pending={} entries=[{}] docs={} version={}",
-                pending.len(),
-                ids.join(", "),
-                op_count,
-                index.version,
-            )));
-        }
-        let json = serde_json::to_vec(index)
-            .map_err(|e| VaultSyncError::Storage(format!("json: {:?}", e)))?;
-        let sys_dir = Self::get_dir(root, &["_system"]).await?;
-        let opts = FileSystemGetFileOptions::new();
-        opts.set_create(true);
-
-        let mut attempts = 0;
-        let max_attempts = 15;
-        loop {
-            let res = async {
-                let promise = sys_dir.get_file_handle_with_options("index.json", &opts);
-                let file_val = SendJsFuture::from(promise)
-                    .await
-                    .map_err(|e| VaultSyncError::Storage(format!("get_file_handle: {:?}", e)))?;
-                let file_handle: FileSystemFileHandle = file_val.into();
-                let writable_promise = file_handle.create_writable();
-                let writable_val = SendJsFuture::from(writable_promise)
-                    .await
-                    .map_err(|e| VaultSyncError::Storage(format!("create_writable: {:?}", e)))?;
-                let writable: FileSystemWritableFileStream = writable_val.into();
-                let js_array = js_sys::Uint8Array::new_with_length(json.len() as u32);
-                js_array.copy_from(&json);
-                let write_promise = writable
-                    .write_with_buffer_source(&js_array)
-                    .map_err(|e| VaultSyncError::Storage(format!("write: {:?}", e)))?;
-                SendJsFuture::from(write_promise)
-                    .await
-                    .map_err(|e| VaultSyncError::Storage(format!("write done: {:?}", e)))?;
-                let close: WritableStream = writable.into();
-                SendJsFuture::from(close.close())
-                    .await
-                    .map_err(|e| VaultSyncError::Storage(format!("close: {:?}", e)))?;
-                Ok(())
-            }
-            .await;
-
-            match res {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= max_attempts {
-                        return Err(e);
-                    }
-                    let delay = 15 + (js_sys::Math::random() * 15.0) as u64;
-                    Self::sleep(delay).await;
-                }
-            }
-        }
-    }
-
-    fn get_cached_index(&self) -> OpfsIndex {
-        self.inner.lock().unwrap().index.clone()
-    }
-
-    fn get_cached_root_and_index(&self) -> (FileSystemDirectoryHandle, OpfsIndex) {
-        let inner = self.inner.lock().unwrap();
-        (inner.root_handle(), inner.index.clone())
-    }
-
-    async fn load_index_from_disk(
+    async fn tombstone_existing_doc_pages(
         &self,
-    ) -> Result<(FileSystemDirectoryHandle, OpfsIndex), VaultSyncError> {
-        let root = {
-            let inner = self.inner.lock().unwrap();
-            inner.root_handle()
+        doc_id: &str,
+        record_id: &str,
+    ) -> Result<usize, VaultSyncError> {
+        // Use ContentIndex for O(1) lookup — eliminates all OPFS scans.
+        // Orphan pages are repaired at startup in StorageRuntime::new(), so the
+        // ContentIndex is always authoritative during normal writes.
+        let store = &self.pages.doc_data;
+        let key = IndexKey::Document {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
         };
-        let index = Self::load_index(&root).await?;
-        Ok((root, index))
+        let existing = store.content_index_lookup(&key);
+        if let Some(entry) = existing {
+            self.tombstone_doc_page(entry.page_id).await?;
+            store.remove_from_index(&key).await?;
+            Ok(1)
+        } else {
+            // No entry in ContentIndex — trust the index (orphan repair happens at startup).
+            // Return 0 instead of falling through to O(n) OPFS scan.
+            Ok(0)
+        }
     }
+}
+
+// ── StorageRuntime routing helpers ──────────────────────────────────────
+// These check for an active StorageRuntime and route through it when
+// available, falling back to direct PageStore access otherwise.
+impl OpfsStorage {
+    /// Get StorageRuntime handle (cloned) if available.
+    fn with_sr(&self) -> Option<Arc<StorageRuntime>> {
+        let guard = self.storage_runtime.lock().unwrap();
+        guard.clone()
+    }
+
+    /// Route cleanup_tombstoned_pages through StorageRuntime or directly.
+    async fn cleanup_tombstoned_pages_routed(&self) -> Result<usize, VaultSyncError> {
+        // No per-store routing needed — iterates all stores
+        // StorageRuntime processes via scheduler, but cleanup is a bulk
+        // maintenance operation that reads disk directly.
+        let mut total = 0usize;
+        total += self.pages.doc_data.cleanup_tombstoned_pages().await?;
+        total += self.pages.oplog.cleanup_tombstoned_pages().await?;
+        total += self.pages.sync_states.cleanup_tombstoned_pages().await?;
+        total += self.pages.schemas.cleanup_tombstoned_pages().await?;
+        total += self.pages.migrations.cleanup_tombstoned_pages().await?;
+        total += self.pages.keys.cleanup_tombstoned_pages().await?;
+        Ok(total)
+    }
+
+    /// Route list_page_ids for doc_data through StorageRuntime or directly.
+    async fn list_doc_page_ids(&self, caller: &'static str) -> Result<Vec<PageId>, VaultSyncError> {
+        if let Some(sr) = self.with_sr() {
+            sr.list_page_ids("doc_data", caller).await
+        } else {
+            self.pages.doc_data.list_page_ids(caller).await
+        }
+    }
+
+    /// Route read_page for doc_data through StorageRuntime or directly.
+    async fn read_doc_page(&self, page_id: PageId) -> Result<Option<Vec<u8>>, VaultSyncError> {
+        if let Some(sr) = self.with_sr() {
+            sr.read_page("doc_data", page_id).await
+        } else {
+            self.pages.doc_data.read_page(page_id).await
+        }
+    }
+
+    /// Route adjust_pending_count on oplog through StorageRuntime or directly.
+    async fn adjust_oplog_pending_count(&self, delta: i32, caller: &'static str) -> Result<(), VaultSyncError> {
+        let before = self.pages.oplog.pending_count();
+        let result = if let Some(sr) = self.with_sr() {
+            sr.adjust_pending_count("oplog", delta).await
+        } else {
+            self.pages.oplog.adjust_pending_count(delta);
+            Ok(())
+        };
+        let after = self.pages.oplog.pending_count();
+        engine_info!(
+            "[PENDING_COUNT] caller={} delta={} before={} after={}",
+            caller, delta, before, after,
+        );
+        result
+    }
+
+    /// Route schedule_gc on oplog through StorageRuntime or directly.
+    fn schedule_oplog_gc(&self) {
+        if let Some(sr) = self.with_sr() {
+            sr.schedule_gc("oplog");
+        } else {
+            self.pages.oplog.schedule_gc();
+        }
+    }
+
+    /// Route run_pending_gc on oplog through StorageRuntime or directly.
+    async fn run_oplog_gc(&self) -> Result<usize, VaultSyncError> {
+        if let Some(sr) = self.with_sr() {
+            sr.run_pending_gc("oplog").await
+        } else {
+            self.pages.oplog.run_pending_gc().await
+        }
+    }
+
+    /// Route set_current_page on oplog through StorageRuntime or directly.
+    async fn set_oplog_current_page(&self, page_id: PageId) -> Result<(), VaultSyncError> {
+        if let Some(sr) = self.with_sr() {
+            sr.set_current_page("oplog", page_id).await
+        } else {
+            self.pages.oplog.set_current_page(page_id).await
+        }
+    }
+
+    /// Verify an oplog page write: read back and check content, then run invariant.
+    /// On mismatch between manifest pending_count and actual uploadable entries,
+    /// repairs the counter by rebuilding it from OPFS (recovery, not prevention).
+    async fn verify_oplog_write(
+        &self,
+        caller: &'static str,
+        page_id: PageId,
+        expected_data: &[u8],
+        entries: &[OplogEntry],
+    ) -> Result<(), VaultSyncError> {
+        let read_back = self.pages.oplog.read_page(page_id).await?;
+        let match_ok = read_back.as_deref() == Some(expected_data);
+        if !match_ok {
+            engine_warn!(
+                "[WRITE_VERIFY] MISMATCH caller={} page={}: wrote {} bytes, read {} bytes",
+                caller, page_id, expected_data.len(),
+                read_back.as_ref().map(|d| d.len()).unwrap_or(0),
+            );
+        } else {
+            engine_trace!(
+                "[WRITE_VERIFY] MATCH caller={} page={} bytes={} entries={}",
+                caller, page_id, expected_data.len(), entries.len(),
+            );
+        }
+
+        if let Some(ns) = entries.first().map(|e| e.namespace.as_str()) {
+            let manifest_pending = self.pages.oplog.pending_count();
+            let all_entries = read_all_oplog_entries(&self.pages.oplog).await?;
+            let actual_uploadable = all_entries.iter()
+                .filter(|e| e.namespace == ns && e.sync_status.is_uploadable())
+                .count();
+            if manifest_pending != actual_uploadable {
+                engine_error!(
+                    "[INVARIANT VIOLATION] pending_count={} != actual_uploadable={} caller={} ns={} page={} — invariant violation, counter is poisoned",
+                    manifest_pending, actual_uploadable, caller, ns, page_id,
+                );
+            } else {
+                engine_trace!(
+                    "[INVARIANT] OK pending={} uploadable={} caller={} ns={}",
+                    manifest_pending, actual_uploadable, caller, ns,
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn get_lock_manager() -> Result<LockManager, VaultSyncError> {
+    let window = web_sys::window()
+        .ok_or_else(|| VaultSyncError::Storage("no window".into()))?;
+    Ok(window.navigator().locks())
 }
 
 #[async_trait]
@@ -486,25 +440,29 @@ impl Storage for OpfsStorage {
         record_id: &str,
         bytes: &[u8],
     ) -> Result<(), VaultSyncError> {
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[storage] apply mutation doc_id={} record_id={}",
-            doc_id, record_id
-        )));
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        Self::write_doc_file(&root, doc_id, record_id, bytes).await?;
-        let listing = index.doc_listing.entry(doc_id.to_string()).or_default();
-        if !listing.contains(&record_id.to_string()) {
-            listing.push(record_id.to_string());
+        // Tombstone existing pages (uses ContentIndex O(1) when populated)
+        let tombstoned = self.tombstone_existing_doc_pages(doc_id, record_id).await?;
+        if tombstoned > 1 {
+            tracing::warn!(
+                "[OpfsStorage] insert_document: tombstoned {} live pages for {}/{} (expected 1)",
+                tombstoned, doc_id, record_id
+            );
         }
-        Self::flush_index(&root, &index).await?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.index = index;
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[storage] mutation doc_id={} committed",
-            doc_id
-        )));
-        Ok(())
+        let entry = DocEntry {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
+            bytes: bytes.to_vec(),
+        };
+        let page_id = self.alloc_doc_data("insert_document").await?;
+        let encoded = postcard::to_allocvec(&entry)
+            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
+        self.write_doc_page(page_id, encoded).await?;
+        // Populate ContentIndex forward + reverse indexes at write time
+        let key = IndexKey::Document {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
+        };
+        self.pages.doc_data.update_content_index(key, page_id).await
     }
 
     async fn get_document(
@@ -512,24 +470,74 @@ impl Storage for OpfsStorage {
         doc_id: &str,
         record_id: &str,
     ) -> Result<Option<Vec<u8>>, VaultSyncError> {
-        let root = {
-            let inner = self.inner.lock().unwrap();
-            inner.root_handle()
+        // Use ContentIndex for O(1) lookup
+        let key = IndexKey::Document {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
         };
-        Self::read_doc_file(&root, doc_id, record_id).await
+        if let Some(entry) = self.pages.doc_data.content_index_lookup(&key) {
+            return match self.read_doc_page(entry.page_id).await? {
+                Some(data) => {
+                    if let Ok(doc) = postcard::from_bytes::<DocEntry>(&data) {
+                        Ok(Some(doc.bytes))
+                    } else {
+                        Ok(Some(data))
+                    }
+                }
+                None => Ok(None),
+            };
+        }
+        // ContentIndex is authoritative — no O(n) OPFS scan fallback.
+        // Orphan pages are repaired at startup in StorageRuntime::new().
+        Ok(None)
     }
 
     async fn delete_document(&self, doc_id: &str, record_id: &str) -> Result<(), VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        Self::delete_doc_file(&root, doc_id, record_id).await?;
-        if let Some(listing) = index.doc_listing.get_mut(doc_id) {
-            listing.retain(|r| r != record_id);
+        let key = IndexKey::Document {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
+        };
+        // Use ContentIndex for O(1) tombstone lookup + index cleanup
+        if let Some(entry) = self.pages.doc_data.content_index_lookup(&key) {
+            self.tombstone_doc_page(entry.page_id).await?;
+            self.pages.doc_data.remove_from_index(&key).await?;
+        } else {
+            // Fallback: O(n) scan for pre-migration data
+            let count = self.tombstone_existing_doc_pages(doc_id, record_id).await?;
+            if count > 1 {
+                tracing::warn!(
+                    "[OpfsStorage] delete_document: tombstoned {} live pages for {}/{}",
+                    count, doc_id, record_id
+                );
+            }
         }
-        Self::flush_index(&root, &index).await?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.index = index;
         Ok(())
+    }
+
+    async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, VaultSyncError> {
+        let page_ids = self.list_doc_page_ids("list_documents").await?;
+        let mut latest: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        for id in page_ids {
+            if let Some(data) = self.read_doc_page(id).await? {
+                if let Ok(entry) = postcard::from_bytes::<DocEntry>(&data) {
+                    if entry.doc_id == doc_id {
+                        // Diagnostic: check deleted status during enumeration
+                        if let Ok(doc) = CRDTDocument::from_snapshot(&entry.bytes) {
+                            let map = doc.to_map();
+                            if map.contains_key("_deleted") {
+                                tracing::trace!(
+                                    "[LIST_DOCS] record={} deleted={:?}",
+                                    entry.record_id,
+                                    map.get("_deleted"),
+                                );
+                            }
+                        }
+                        latest.insert(entry.record_id, entry.bytes);
+                    }
+                }
+            }
+        }
+        Ok(latest.into_iter().collect())
     }
 
     async fn write_document_and_oplog(
@@ -539,17 +547,51 @@ impl Storage for OpfsStorage {
         bytes: &[u8],
         entry: &OplogEntry,
     ) -> Result<(), VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        Self::write_doc_file(&root, doc_id, record_id, bytes).await?;
-        let listing = index.doc_listing.entry(doc_id.to_string()).or_default();
-        if !listing.contains(&record_id.to_string()) {
-            listing.push(record_id.to_string());
+        // Tombstone existing pages (uses ContentIndex O(1) when populated)
+        let tombstoned = self.tombstone_existing_doc_pages(doc_id, record_id).await?;
+        if tombstoned > 1 {
+            tracing::warn!(
+                "[OpfsStorage] write_document_and_oplog: tombstoned {} live pages for {}/{} (expected 1)",
+                tombstoned, doc_id, record_id
+            );
         }
-        index.oplog.push(entry.clone());
-        Self::flush_index(&root, &index).await?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.index = index;
+        // Write new document page
+        let doc_entry = DocEntry {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
+            bytes: bytes.to_vec(),
+        };
+        let encoded_doc = postcard::to_allocvec(&doc_entry)
+            .map_err(|e| VaultSyncError::Storage(format!("encode doc: {:?}", e)))?;
+        let doc_page_id = self.alloc_doc_data("write_document").await?;
+        self.write_doc_page(doc_page_id, encoded_doc).await?;
+        // Populate ContentIndex forward + reverse indexes at write time
+        let doc_key = IndexKey::Document {
+            doc_id: doc_id.to_string(),
+            record_id: record_id.to_string(),
+        };
+        self.pages.doc_data.update_content_index(doc_key, doc_page_id).await?;
+
+        // Diagnostic: verify _deleted field in written snapshot
+        if let Ok(doc) = CRDTDocument::from_snapshot(&doc_entry.bytes) {
+            let map = doc.to_map();
+            tracing::info!(
+                "[DELETE_VERIFY] doc={} record={} page={} has_deleted={} deleted_value={:?}",
+                doc_id, record_id, doc_page_id,
+                map.contains_key("_deleted"),
+                map.get("_deleted"),
+            );
+        }
+
+        // Write oplog entry
+        let encoded_entry = postcard::to_allocvec(&[entry.clone()])
+            .map_err(|e| VaultSyncError::Storage(format!("encode oplog: {:?}", e)))?;
+        let oplog_page_id = self.alloc_oplog("write_oplog").await?;
+        self.write_oplog_page(oplog_page_id, encoded_entry.clone()).await?;
+        if entry.sync_status.is_uploadable() {
+            self.adjust_oplog_pending_count(1, "write_document_and_oplog").await?;
+        }
+        self.verify_oplog_write("write_document", oplog_page_id, &encoded_entry, &[entry.clone()]).await?;
         Ok(())
     }
 
@@ -559,39 +601,42 @@ impl Storage for OpfsStorage {
         record_id: &str,
         entry: &OplogEntry,
     ) -> Result<(), VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        Self::delete_doc_file(&root, doc_id, record_id).await?;
-        if let Some(listing) = index.doc_listing.get_mut(doc_id) {
-            listing.retain(|r| r != record_id);
+        self.delete_document(doc_id, record_id).await?;
+        let encoded = postcard::to_allocvec(&[entry.clone()])
+            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
+        let page_id = self.alloc_oplog("delete_oplog").await?;
+        self.write_oplog_page(page_id, encoded.clone()).await?;
+        if entry.sync_status.is_uploadable() {
+            self.adjust_oplog_pending_count(1, "delete_document_and_oplog").await?;
         }
-        index.oplog.push(entry.clone());
-        Self::flush_index(&root, &index).await?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.index = index;
+        self.verify_oplog_write("delete_document", page_id, &encoded, &[entry.clone()]).await?;
         Ok(())
-    }
-
-    async fn list_documents(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, VaultSyncError> {
-        let (root, index) = self.get_cached_root_and_index();
-        let record_ids = index.doc_listing.get(doc_id).cloned().unwrap_or_default();
-        let mut results = Vec::new();
-        for rid in &record_ids {
-            if let Some(data) = Self::read_doc_file(&root, doc_id, rid).await? {
-                results.push((rid.clone(), data));
-            }
-        }
-        Ok(results)
     }
 
     async fn append_oplog(&self, entry: &OplogEntry) -> Result<(), VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        index.oplog.push(entry.clone());
-        Self::flush_index(&root, &index).await?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.index = index;
+        let encoded = postcard::to_allocvec(&[entry.clone()])
+            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
+        let page_id = self.alloc_oplog("append_oplog").await?;
+        self.write_oplog_page(page_id, encoded.clone()).await?;
+        if entry.sync_status.is_uploadable() {
+            self.adjust_oplog_pending_count(1, "append_oplog").await?;
+        }
+        self.verify_oplog_write("append_oplog", page_id, &encoded, &[entry.clone()]).await?;
         Ok(())
+    }
+
+    async fn pending_count(&self, _namespace: &str) -> Result<usize, VaultSyncError> {
+        Ok(self.pages.oplog.pending_count())
+    }
+
+    async fn begin_transaction(&self) -> Result<Box<dyn vaultsync_core::storage::transaction::StorageTransaction>, VaultSyncError> {
+        let tx = crate::transaction::OpfsTransaction::new(&self.pages.oplog).await?;
+        let guard = self.storage_runtime.lock().unwrap();
+        if let Some(ref sr) = *guard {
+            Ok(Box::new(tx.with_runtime(sr.clone())))
+        } else {
+            Ok(Box::new(tx))
+        }
     }
 
     async fn read_pending_oplog(
@@ -599,80 +644,151 @@ impl Storage for OpfsStorage {
         namespace: &str,
         limit: usize,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (_, index) = self.load_index_from_disk().await?;
-        let results: Vec<OplogEntry> = index
-            .oplog
-            .iter()
-            .filter(|e| e.namespace == namespace && e.sync_status.is_uploadable())
-            .take(limit)
-            .cloned()
-            .collect();
-        let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
-        web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[PENDING_READ] ns={} count={} ids={:?}",
-            namespace,
-            results.len(),
-            ids,
-        )));
-        Ok(results)
+        let page_ids = self.pages.oplog.list_page_ids("read_pending_oplog").await.unwrap_or_default();
+        let page_count = page_ids.len();
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let resolved_count = entries.len();
+
+        // Phase 4: Divergence detection — if pending_count > 0 but no uploadable
+        // entries exist in OPFS, the in-memory counter has diverged from reality.
+        // This is a BUG — treat it as such (debug_assert in debug, error log in release).
+        // Never auto-repair in the hot path. The counter is eventually corrected
+        // by the next mutation cycle or on next startup via verify_engine_invariants().
+        let any_uploadable = entries.iter().any(|e| e.sync_status.is_uploadable());
+        if page_count > 0 && !any_uploadable {
+            let cached = self.pages.oplog.pending_count();
+            if cached > 0 {
+                let statuses: Vec<String> = entries.iter()
+                    .map(|e| format!("{}={:?}", e.id, e.sync_status))
+                    .collect();
+                engine_error!(
+                    "[DIVERGENCE] pending_count={} but 0 uploadable entries in OPFS. ns={} statuses=[{}] — this is a bug",
+                    cached, namespace, statuses.join(","),
+                );
+                #[cfg(debug_assertions)]
+                debug_assert!(false, "pending_count={} but 0 uploadable entries in ns={}", cached, namespace);
+            }
+        }
+        let resolved_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+        let resolved_statuses: Vec<String> = entries.iter().map(|e| format!("{:?}", e.sync_status)).collect();
+
+        let ns_filtered: Vec<&OplogEntry> = entries.iter().filter(|e| e.namespace == namespace).collect();
+        let ns_count = ns_filtered.len();
+        let ns_ids: Vec<&str> = ns_filtered.iter().map(|e| e.id.as_str()).collect();
+        let ns_statuses: Vec<String> = ns_filtered.iter().map(|e| format!("{:?}", e.sync_status)).collect();
+
+        let uploadable: Vec<&OplogEntry> = ns_filtered.into_iter().filter(|e| e.sync_status.is_uploadable()).collect();
+        let uploadable_count = uploadable.len();
+        let uploadable_ids: Vec<&str> = uploadable.iter().map(|e| e.id.as_str()).collect();
+
+        engine_trace!(
+            "[READ_OPLOG] pages={} resolved={} ns={} uploadable={} caller_ns={} limit={}",
+            page_count, resolved_count, ns_count, uploadable_count, namespace, limit,
+        );
+
+        let take: Vec<OplogEntry> = uploadable.into_iter().take(limit).cloned().collect();
+        Ok(take)
     }
 
     async fn mark_synced(&self, id: &str, sequence: u64) -> Result<(), VaultSyncError> {
-        web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[MARK_SYNCED] id={} seq={}",
-            id, sequence,
-        )));
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        let before_ids: Vec<String> = index
-            .oplog
-            .iter()
-            .filter(|e| e.sync_status.is_uploadable())
-            .map(|e| e.id.clone())
+        let before_pending = self.pages.oplog.pending_count();
+
+        // LOOKUP: read all entries, check if target exists and its current status
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let total_before = entries.len();
+        let found = entries.iter().any(|e| e.id == id);
+        let before_status = entries.iter().find(|e| e.id == id).map(|e| format!("{:?}", e.sync_status));
+
+        engine_info!(
+            "[MARK_SYNCED] LOOKUP id={} seq={} found={} total_entries={} status={:?} pending_before={}",
+            id, sequence, found, total_before, before_status, before_pending,
+        );
+
+        let mut updated: Vec<OplogEntry> = entries
+            .into_iter()
+            .filter(|e| e.id == id)
             .collect();
-        if let Some(entry) = index.oplog.iter_mut().find(|e| e.id == id) {
-            let old_status = format!("{:?}", entry.sync_status);
-            entry.sync_status = SyncStatus::Synced;
-            entry.sequence = Some(sequence);
-            web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
-                "[MARK_SYNCED] found id={} old_status={} origin={:?} ctx={}",
-                id, old_status, entry.origin, entry.origin_context,
-            )));
-        } else {
-            web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
-                "[MARK_SYNCED] NOT FOUND id={} in oplog (oplog_len={})",
-                id,
-                index.oplog.len(),
-            )));
+        if updated.is_empty() {
+            engine_warn!("[MARK_SYNCED] NOT_FOUND id={} seq={}", id, sequence);
+            return Ok(());
         }
-        Self::flush_index(&root, &index).await?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.index = index;
-        let after_ids: Vec<String> = inner
-            .index
-            .oplog
-            .iter()
-            .filter(|e| e.sync_status.is_uploadable())
-            .map(|e| e.id.clone())
-            .collect();
-        drop(inner);
-        web_sys::console::debug_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[MARK_SYNCED] done id={} pending_before={:?} pending_after={:?}",
-            id, before_ids, after_ids,
-        )));
+
+        // UPDATE MEMORY: transition to Synced
+        for e in &mut updated {
+            e.sync_status = SyncStatus::Synced;
+            e.sequence = Some(sequence);
+        }
+
+        // WRITE PAGE: persist the delta page
+        let encoded = postcard::to_allocvec(&updated)
+            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
+        let page_id = self.alloc_oplog("mark_synced").await?;
+
+        engine_info!(
+            "[MARK_SYNCED] WRITE id={} seq={} page_id={}",
+            id, sequence, page_id,
+        );
+
+        self.write_oplog_page(page_id, encoded).await?;
+
+        // RELOAD + VERIFY: read back and check status transition persisted
+        let reload_entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let reload_status = reload_entries.iter().find(|e| e.id == id).map(|e| format!("{:?}", e.sync_status));
+        let reload_verified = reload_entries.iter().any(|e| e.id == id && e.sync_status == SyncStatus::Synced);
+
+        engine_info!(
+            "[MARK_SYNCED] RELOAD id={} seq={} status={:?} verified={}",
+            id, sequence, reload_status, reload_verified,
+        );
+
+        // Delta page — do NOT update current_page. The base page stays canonical.
+        self.adjust_oplog_pending_count(-1, "mark_synced").await?;
+        let after_pending = self.pages.oplog.pending_count();
+
+        engine_info!(
+            "[MARK_SYNCED] PENDING id={} seq={} before={} after={}",
+            id, sequence, before_pending, after_pending,
+        );
+
+        // Post-condition invariant: verify counter matches reality
+        // Uses already-loaded reload_entries (no extra OPFS scan)
+        if before_pending > 0 {
+            let actual_uploadable = reload_entries.iter().filter(|e| e.sync_status.is_uploadable()).count();
+            let expected = (before_pending - 1) as usize;
+            if after_pending as usize != expected || actual_uploadable != expected {
+                engine_error!(
+                    "[POST_SYNC INVARIANT] id={} seq={}: pending {}->{} expected={} actual_uploadable={} verified={}",
+                    id, sequence, before_pending, after_pending, expected, actual_uploadable, reload_verified,
+                );
+            }
+        }
+
+        self.schedule_oplog_gc();
+
         Ok(())
     }
 
-    async fn mark_failed(&self, id: &str, _error: &str) -> Result<(), VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        if let Some(entry) = index.oplog.iter_mut().find(|e| e.id == id) {
-            entry.sync_status = SyncStatus::Failed;
+    async fn mark_failed(&self, id: &str, error: &str) -> Result<(), VaultSyncError> {
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let mut updated: Vec<OplogEntry> = entries
+            .into_iter()
+            .filter(|e| e.id == id)
+            .collect();
+        if updated.is_empty() {
+            tracing::warn!("[mark_failed] id={}.. not found in storage, skipping", if id.len() >= 8 { &id[..8] } else { id });
+            return Ok(());
         }
-        Self::flush_index(&root, &index).await?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.index = index;
+        for e in &mut updated {
+            e.sync_status = SyncStatus::Failed;
+        }
+        let encoded = postcard::to_allocvec(&updated)
+            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
+        let page_id = self.alloc_oplog("mark_failed").await?;
+        self.write_oplog_page(page_id, encoded).await?;
+
+        self.adjust_oplog_pending_count(-1, "mark_failed").await?;
+        self.schedule_oplog_gc();
+
         Ok(())
     }
 
@@ -681,101 +797,124 @@ impl Storage for OpfsStorage {
         namespace: &str,
         seq: u64,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
-        let index = self.get_cached_index();
-        let results: Vec<OplogEntry> = index
-            .oplog
-            .iter()
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let filtered: Vec<OplogEntry> = entries
+            .into_iter()
             .filter(|e| e.namespace == namespace && e.sequence.map_or(false, |s| s > seq))
-            .cloned()
             .collect();
-        Ok(results)
+        Ok(filtered)
     }
 
-    async fn read_sync_state(&self, namespace: &str) -> Result<Option<SyncState>, VaultSyncError> {
-        Ok(self.get_cached_index().sync_states.get(namespace).cloned())
+    async fn read_sync_state(&self, _namespace: &str) -> Result<Option<SyncState>, VaultSyncError> {
+        // Route through MetadataRuntime (in-memory) when available — zero OPFS reads
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            return Ok(mr.read_sync_state());
+        }
+        self.sync_state_store.read().await
     }
 
     async fn write_sync_state(&self, state: &SyncState) -> Result<(), VaultSyncError> {
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[storage.write_sync_state] ns={} cursor={} gen={}",
-            state.namespace, state.last_synced_sequence, state.generation_id
-        )));
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        index
-            .sync_states
-            .insert(state.namespace.clone(), state.clone());
-        Self::flush_index(&root, &index).await?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.index = index;
-        Ok(())
+        // Route through MetadataRuntime (in-memory + mark dirty) when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            mr.write_sync_state(state.clone());
+            return Ok(());
+        }
+        self.sync_state_store.write(state).await
     }
 
     async fn read_schema(&self, doc_id: &str) -> Result<Option<SchemaMeta>, VaultSyncError> {
-        Ok(self.get_cached_index().schemas.get(doc_id).cloned())
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            return Ok(mr.read_schema(doc_id));
+        }
+        let all = self.schema_store.read().await?.unwrap_or_default();
+        Ok(all.into_iter().find(|(d, _)| d == doc_id).map(|(_, s)| s))
     }
 
     async fn write_schema(&self, meta: &SchemaMeta) -> Result<(), VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        index.schemas.insert(meta.doc_id.clone(), meta.clone());
-        Self::flush_index(&root, &index).await?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.index = index;
-        Ok(())
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            mr.write_schema(meta.clone());
+            return Ok(());
+        }
+        let mut all = self.schema_store.read().await?.unwrap_or_default();
+        if let Some(pos) = all.iter().position(|(d, _)| d == &meta.doc_id) {
+            all[pos] = (meta.doc_id.clone(), meta.clone());
+        } else {
+            all.push((meta.doc_id.clone(), meta.clone()));
+        }
+        self.schema_store.write(&all).await
     }
 
     async fn read_migrations(&self) -> Result<Vec<MigrationRecord>, VaultSyncError> {
-        Ok(self.get_cached_index().migrations.clone())
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            return Ok(mr.read_migrations());
+        }
+        Ok(self.migration_store.read().await?.unwrap_or_default())
     }
 
     async fn write_migration(&self, record: &MigrationRecord) -> Result<(), VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        let pos = index
-            .migrations
-            .iter()
-            .position(|m| m.version == record.version);
-        if let Some(i) = pos {
-            index.migrations[i] = record.clone();
-        } else {
-            index.migrations.push(record.clone());
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            mr.write_migration(record.clone());
+            return Ok(());
         }
-        Self::flush_index(&root, &index).await?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.index = index;
-        Ok(())
+        let mut all = self.migration_store.read().await?.unwrap_or_default();
+        all.push(record.clone());
+        self.migration_store.write(&all).await
     }
 
     async fn read_keys(&self, namespace: &str) -> Result<Vec<KeyRecord>, VaultSyncError> {
-        let index = self.get_cached_index();
-        let results: Vec<KeyRecord> = index
-            .keys
-            .iter()
-            .filter(|k| k.namespace == namespace)
-            .cloned()
-            .collect();
-        Ok(results)
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            return Ok(mr.read_keys(namespace));
+        }
+        let all = self.key_store.read().await?.unwrap_or_default();
+        Ok(all.into_iter().filter(|k| k.namespace == namespace).collect())
     }
 
     async fn write_key(&self, key: &KeyRecord) -> Result<(), VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        let pos = index
-            .keys
-            .iter()
-            .position(|k| k.namespace == key.namespace && k.version == key.version);
-        if let Some(i) = pos {
-            index.keys[i] = key.clone();
-        } else {
-            index.keys.push(key.clone());
+        // Route through MetadataRuntime when available
+        if let Some(mr) = self.metadata_runtime.lock().unwrap().as_ref() {
+            mr.write_key(key.clone());
+            return Ok(());
         }
-        Self::flush_index(&root, &index).await?;
-        let mut inner = self.inner.lock().unwrap();
-        inner.index = index;
-        Ok(())
+        let mut all = self.key_store.read().await?.unwrap_or_default();
+        all.push(key.clone());
+        self.key_store.write(&all).await
     }
 
+    // ADR-001: Failed Entry Lifecycle (WASM)
+    //
+    // Status: UNDEFINED PRODUCT BEHAVIOR — NOT A BUG
+    //
+    // The engine is behaving consistently. The product simply does not define
+    // what should happen to Failed entries after they reach that state.
+    //
+    // Current behavior:
+    //   Pending → Optimistic → Synced     ✓ (happy path)
+    //   Pending → Optimistic → Failed     ⚠️ (terminal — no transition defined)
+    //
+    // Consequences:
+    //   - Failed entries are NOT uploadable (is_uploadable() returns false)
+    //   - Failed entries survive compaction (delete_synced_before only removes Synced)
+    //   - No code path converts Failed→Pending on WASM (reset_stale_pending is a no-op)
+    //   - Failed entries accumulate indefinitely in OPFS storage
+    //   - IndexedDB backend HAS a real reset_stale_pending (converts Failed→Pending)
+    //
+    // Options (choose one):
+    //   A) Implement reset_stale_pending for WASM (convert Failed→Pending on reconnect,
+    //      matching IndexedDB behavior). Treats all failures as retryable transport errors.
+    //   B) Add RetryableFailed/PermanentFailed distinction. Transport failures retry
+    //      automatically; logical failures (schema, auth) surface to user. TTL-based
+    //      cleanup for RetryableFailed.
+    //   C) Do nothing — Failed accumulates forever. Acceptable if a storage wipe or
+    //      manual intervention path exists.
+    //
+    // Recommendation: Do NOT change failure semantics until the engine has been
+    // frozen and soak-tested. Changing this path risks reopening the upload pipeline.
+    // ============================================================================
     async fn reset_stale_pending(
         &self,
         _namespace: &str,
@@ -786,18 +925,53 @@ impl Storage for OpfsStorage {
 
     async fn delete_synced_oplog_older_than(
         &self,
-        _namespace: &str,
-        _older_than_secs: u64,
+        namespace: &str,
+        older_than_secs: u64,
     ) -> Result<usize, VaultSyncError> {
-        Ok(0)
+        self.run_oplog_gc().await?;
+        let cutoff = (js_sys::Date::now() as u64).saturating_sub(older_than_secs * 1000);
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let before = entries.len();
+        let remaining: Vec<OplogEntry> = entries
+            .into_iter()
+            .filter(|e| {
+                !(e.namespace == namespace
+                    && e.sync_status == SyncStatus::Synced
+                    && e.created_at < cutoff)
+            })
+            .collect();
+        let removed = before - remaining.len();
+        let encoded = postcard::to_allocvec(&remaining)
+            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
+        let page_id = self.alloc_oplog("delete_synced_oplog_older_than").await?;
+        self.write_oplog_page(page_id, encoded).await?;
+
+        // Full-state rewrite — mark as current and schedule deferred GC.
+        self.set_oplog_current_page(page_id).await?;
+        self.schedule_oplog_gc();
+
+        Ok(removed)
     }
 
     async fn list_tombstoned_documents(
         &self,
-        _namespace: &str,
-        _older_than_secs: u64,
+        namespace: &str,
+        older_than_secs: u64,
     ) -> Result<Vec<(String, String)>, VaultSyncError> {
-        Ok(Vec::new())
+        let now_ms = js_sys::Date::now() as u64;
+        let threshold = now_ms.saturating_sub(older_than_secs * 1000);
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let results: Vec<(String, String)> = entries
+            .into_iter()
+            .filter(|e| {
+                e.namespace == namespace
+                    && e.mutation_type == MutationType::CrdtDelete
+                    && e.sync_status == SyncStatus::Synced
+                    && e.created_at < threshold
+            })
+            .map(|e| (e.doc_id, e.record_id))
+            .collect();
+        Ok(results)
     }
 
     async fn update_oplog_encrypted_blob(
@@ -810,28 +984,68 @@ impl Storage for OpfsStorage {
 
     async fn list_active_documents(
         &self,
-        _namespace: &str,
+        namespace: &str,
     ) -> Result<Vec<(String, String)>, VaultSyncError> {
-        Ok(Vec::new())
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let mut seen = std::collections::HashSet::new();
+        for entry in &entries {
+            if entry.namespace == namespace {
+                seen.insert((entry.doc_id.clone(), entry.record_id.clone()));
+            }
+        }
+        Ok(seen.into_iter().collect())
     }
 
     async fn read_synced_oplog_for_document(
         &self,
-        _namespace: &str,
-        _doc_id: &str,
-        _record_id: &str,
+        namespace: &str,
+        doc_id: &str,
+        record_id: &str,
     ) -> Result<Vec<OplogEntry>, VaultSyncError> {
-        Ok(Vec::new())
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let results: Vec<OplogEntry> = entries
+            .into_iter()
+            .filter(|e| {
+                e.namespace == namespace
+                    && e.doc_id == doc_id
+                    && e.record_id == record_id
+                    && e.sync_status == SyncStatus::Synced
+            })
+            .collect();
+        Ok(results)
     }
 
     async fn delete_synced_oplog_before_timestamp(
         &self,
-        _namespace: &str,
-        _doc_id: &str,
-        _record_id: &str,
-        _timestamp: u64,
+        namespace: &str,
+        doc_id: &str,
+        record_id: &str,
+        timestamp: u64,
     ) -> Result<usize, VaultSyncError> {
-        Ok(0)
+        self.run_oplog_gc().await?;
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let before = entries.len();
+        let remaining: Vec<OplogEntry> = entries
+            .into_iter()
+            .filter(|e| {
+                !(e.namespace == namespace
+                    && e.doc_id == doc_id
+                    && e.record_id == record_id
+                    && e.sync_status == SyncStatus::Synced
+                    && e.created_at < timestamp)
+            })
+            .collect();
+        let removed = before - remaining.len();
+        let encoded = postcard::to_allocvec(&remaining)
+            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
+        let page_id = self.alloc_oplog("delete_synced_oplog_before_timestamp").await?;
+        self.write_oplog_page(page_id, encoded).await?;
+
+        // Full-state rewrite — mark as current and schedule deferred GC.
+        self.set_oplog_current_page(page_id).await?;
+        self.schedule_oplog_gc();
+
+        Ok(removed)
     }
 
     async fn delete_synced_before(
@@ -839,22 +1053,235 @@ impl Storage for OpfsStorage {
         namespace: &str,
         cutoff_ms: u64,
     ) -> Result<usize, VaultSyncError> {
-        let _guard = self.tx_lock.lock().await;
-        let (root, mut index) = self.load_index_from_disk().await?;
-        let before = index.oplog.len();
-        index.oplog.retain(|entry| {
-            !(entry.namespace == namespace
-                && entry.sync_status == SyncStatus::Synced
-                && entry.created_at < cutoff_ms)
-        });
-        let removed = before - index.oplog.len();
-        if removed > 0 {
-            Self::flush_index(&root, &index).await?;
-            let mut inner = self.inner.lock().unwrap();
-            inner.index = index;
-        }
+        self.run_oplog_gc().await?;
+        let entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let before = entries.len();
+        let remaining: Vec<OplogEntry> = entries
+            .into_iter()
+            .filter(|e| {
+                !(e.namespace == namespace
+                    && e.sync_status == SyncStatus::Synced
+                    && e.created_at < cutoff_ms)
+            })
+            .collect();
+        let removed = before - remaining.len();
+        let encoded = postcard::to_allocvec(&remaining)
+            .map_err(|e| VaultSyncError::Storage(format!("encode: {:?}", e)))?;
+        let page_id = self.alloc_oplog("delete_synced_before").await?;
+        self.write_oplog_page(page_id, encoded).await?;
+
+        // Full-state rewrite — mark as current and schedule deferred GC.
+        self.set_oplog_current_page(page_id).await?;
+        self.schedule_oplog_gc();
+
         Ok(removed)
     }
+}
+
+impl OpfsStorage {
+    /// Repair diverged pending_count: if manifest says >0 but actual uploadable entries
+    /// from OPFS differ, reset manifest to match OPFS and persist the correction.
+    /// Called at startup (BrowserStorage::new) to reconcile persisted state with reality.
+    /// Also accessible as an explicit repair API for maintenance/debugging.
+    pub(crate) async fn repair_if_diverged(&self) -> Result<(), VaultSyncError> {
+        let manifest_pending = self.pages.oplog.pending_count();
+        engine_info!(
+            "[RECOVERY] repair_if_diverged entered: manifest_pending={}",
+            manifest_pending,
+        );
+        if manifest_pending == 0 {
+            return Ok(()); // Fast path: no divergence possible
+        }
+
+        let all_entries = read_all_oplog_entries(&self.pages.oplog).await?;
+        let actual_uploadable = all_entries.iter().filter(|e| e.sync_status.is_uploadable()).count();
+        if manifest_pending != actual_uploadable {
+            engine_info!(
+                "[RECOVERY] pending_count mismatch: manifest={} actual={} — repairing manifest",
+                manifest_pending, actual_uploadable,
+            );
+            self.pages.oplog.set_pending_count(actual_uploadable);
+            self.pages.oplog.persist_current_manifest("repair_if_diverged").await?;
+            engine_info!(
+                "[RECOVERY] pending_count repaired: {} -> {} (persisted)",
+                manifest_pending, actual_uploadable,
+            );
+        }
+        Ok(())
+    }
+}
+
+async fn read_all_entries<T: serde::de::DeserializeOwned + serde::Serialize>(
+    store: &PageStore,
+    caller: &str,
+) -> Result<Vec<T>, VaultSyncError> {
+    engine_trace!("[storage] read_all_entries: reading current_page");
+    let current = store.current_page().await;
+    engine_trace!("[storage] read_all_entries: current_page={}", current);
+
+    engine_trace!("[storage] read_all_entries: listing page_ids");
+    let page_ids = match store.list_page_ids(caller).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            engine_error!("[storage] list_page_ids failed: {:?}", e);
+            return Ok(Vec::new());
+        }
+    };
+    engine_debug!("[storage] read_all_entries: page_ids.len={}", page_ids.len());
+
+    // If manifest knows the current full-state page, only read that page
+    // plus any pages written after it (delta pages).
+    let ids_to_read: Vec<PageId> = if current > 0 {
+        page_ids.into_iter().filter(|id| *id >= current).collect()
+    } else {
+        page_ids
+    };
+
+    let total = ids_to_read.len();
+    engine_debug!("[storage] read_all_entries: ids_to_read={}", total);
+
+    let mut all = Vec::new();
+    let mut next_log_pct = 10u8;
+    let mut read_errors = 0usize;
+    for (i, id) in ids_to_read.iter().enumerate() {
+        // Progress log at INFO every 10% for large scans (no current_page = legacy store)
+        if current == 0 && total > 100 {
+            let pct = ((i + 1) * 100 / total) as u8;
+            if pct >= next_log_pct {
+                next_log_pct = pct + 10;
+                engine_info!("[storage] scanning page {}/{} ({}%)", i + 1, total, pct);
+            }
+        }
+        // Gracefully handle individual page read/parse errors
+        match store.read_page(*id).await {
+            Ok(Some(data)) => {
+                // Size guard: pages > 16MB trigger emergency split; attempt read regardless.
+                // This guard is a circuit breaker, not a data filter — we never silently skip.
+                if data.len() > 16_000_000 {
+                    engine_warn!("[storage] page {} oversized ({} bytes), attempting read", id, data.len());
+                } else if data.len() > 8_000_000 {
+                    engine_debug!("[storage] page {} large ({} bytes), scheduling background split", id, data.len());
+                    store.schedule_split(id).await;
+                }
+                if let Ok(chunk) = postcard::from_bytes::<Vec<T>>(&data) {
+                    all.extend(chunk);
+                } else if let Ok(single) = postcard::from_bytes::<T>(&data) {
+                    all.push(single);
+                }
+            }
+            Ok(None) => {} // tombstoned or deleted
+            Err(e) => {
+                read_errors += 1;
+                if read_errors <= 3 {
+                    engine_warn!("[storage] read_page {} error: {:?}", id, e);
+                }
+                if read_errors == 3 {
+                    engine_warn!("[storage] suppressing further read_page errors");
+                }
+            }
+        }
+    }
+
+    if read_errors > 0 {
+        engine_warn!("[storage] read_all_entries: {} page read errors", read_errors);
+    }
+
+    Ok(all)
+}
+
+/// Read all oplog entries, resolving base + delta pages via VersionChain.
+/// Always deduplicates by entry ID — later pages override earlier ones.
+pub async fn read_all_oplog_entries(
+    store: &PageStore,
+) -> Result<Vec<OplogEntry>, VaultSyncError> {
+    let current = store.current_page().await;
+    let store_name = store.store_name();
+    let mut page_ids = store.list_page_ids("read_all_oplog_entries").await.unwrap_or_default();
+    page_ids.sort_unstable();
+
+    if page_ids.is_empty() {
+        engine_trace!("[read_all_oplog_entries] store={} current_page={} page_ids=0 — empty store", store_name, current);
+        return Ok(Vec::new());
+    }
+
+    engine_trace!(
+        "[read_all_oplog_entries] store={} current_page={} total_pages={} ids=[{}]",
+        store_name, current, page_ids.len(),
+        page_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","),
+    );
+
+    // Include orphan pages: pages with recycled IDs < current_page that were
+    // allocated from the free list after the last checkpoint. These are live
+    // pages with post-checkpoint data that must be visible to the upload
+    // pipeline and invariant checks. Bug fix: the old filter excluded them,
+    // causing pending_count divergence (page ID 117 < current_page 118).
+    let (base_id, deltas, orphans): (PageId, Vec<PageId>, Vec<PageId>) = if current > 0 {
+        let mut greater = Vec::new();
+        let mut lesser = Vec::new();
+        for id in page_ids {
+            if id == current {
+                // base page — skip
+            } else if id > current {
+                greater.push(id);
+            } else {
+                lesser.push(id); // orphan: recycled from free list, written after checkpoint
+            }
+        }
+        (current, greater, lesser)
+    } else {
+        (0, page_ids, vec![])
+    };
+
+    engine_trace!(
+        "[read_all_oplog_entries] store={} base_id={} delta_count={} orphan_count={}",
+        store_name, base_id, deltas.len(), orphans.len(),
+    );
+
+    let mut chain = VersionChain::new(base_id);
+    for d in &deltas {
+        chain.add_delta(*d);
+    }
+    for o in &orphans {
+        chain.add_orphan(*o);
+    }
+
+    // Pre-check: verify VersionChain references against OPFS reality
+    {
+        let all_ids = store.list_page_ids("versionchain_precheck").await.unwrap_or_default();
+        let all_set: std::collections::BTreeSet<u64> = all_ids.iter().copied().collect();
+        let mut stale = Vec::new();
+        if base_id > 0 && !all_set.contains(&base_id) {
+            stale.push(format!("base={}", base_id));
+        }
+        for d in &deltas {
+            if !all_set.contains(d) {
+                stale.push(format!("delta={}", d));
+            }
+        }
+        for o in &orphans {
+            if !all_set.contains(o) {
+                stale.push(format!("orphan={}", o));
+            }
+        }
+        if !stale.is_empty() {
+            engine_warn!(
+                "[VersionChain::precheck] store={} current_page={} — {} stale references: {}",
+                store_name, current, stale.len(), stale.join(","),
+            );
+        } else {
+            engine_trace!(
+                "[VersionChain::precheck] store={} current_page={} base={} deltas={} orphans={} — all {} pages on disk",
+                store_name, current, base_id, deltas.len(), orphans.len(), all_set.len(),
+            );
+        }
+    }
+
+    let result = chain.resolve(store).await?;
+    engine_trace!(
+        "[read_all_oplog_entries] store={} resolved_entries={}",
+        store_name, result.len(),
+    );
+    Ok(result)
 }
 
 use crate::indexeddb::IndexedDbStorage;
@@ -866,44 +1293,36 @@ pub enum BrowserStorage {
 }
 
 impl BrowserStorage {
+    /// Physically remove tombstoned page files from disk.
+    /// No-op for IndexedDB backend.
+    pub async fn cleanup_tombstoned_pages(&self) -> Result<usize, VaultSyncError> {
+        match self {
+            Self::Opfs(opfs) => opfs.cleanup_tombstoned_pages().await,
+            Self::Idb(_) => Ok(0),
+        }
+    }
+
     pub async fn new(db_name: &str, backend: Option<&str>) -> Result<Self, VaultSyncError> {
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[Rust] BrowserStorage::new: db_name={}, requested_backend={:?}",
-            db_name, backend
-        )));
+        engine_debug!("[Rust] BrowserStorage::new: db_name={}, requested_backend={:?}", db_name, backend);
 
         match backend {
             Some("opfs") => {
                 let opfs = OpfsStorage::new(db_name).await?;
-                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-                    "[Rust] Using forced OPFS storage backend"
-                ));
+                opfs.repair_if_diverged().await?;
                 Ok(Self::Opfs(opfs))
             }
             Some("indexeddb") => {
                 let idb = IndexedDbStorage::new(db_name).await?;
-                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-                    "[Rust] Using forced IndexedDB storage backend"
-                ));
                 Ok(Self::Idb(idb))
             }
             _ => {
-                // OPFS is the preferred default: it is faster, quota-exempt, and
-                // not shared across browser profiles (avoids key-mismatch issues).
-                // Fall back to IndexedDB only when OPFS is unavailable (e.g. non-secure
-                // context or older browsers).
                 match OpfsStorage::new(db_name).await {
                     Ok(opfs) => {
-                        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-                            "[Rust] Using default OPFS storage backend",
-                        ));
+                        opfs.repair_if_diverged().await?;
                         Ok(Self::Opfs(opfs))
                     }
                     Err(e) => {
-                        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                            "[Rust] OPFS unavailable, falling back to IndexedDB: {:?}",
-                            e
-                        )));
+                        engine_info!("[Rust] OPFS unavailable, falling back to IndexedDB: {:?}", e);
                         let idb = IndexedDbStorage::new(db_name).await?;
                         Ok(Self::Idb(idb))
                     }
@@ -987,6 +1406,20 @@ impl Storage for BrowserStorage {
         match self {
             Self::Opfs(s) => s.append_oplog(entry).await,
             Self::Idb(s) => s.append_oplog(entry).await,
+        }
+    }
+
+    async fn pending_count(&self, namespace: &str) -> Result<usize, VaultSyncError> {
+        match self {
+            Self::Opfs(s) => s.pending_count(namespace).await,
+            Self::Idb(s) => s.pending_count(namespace).await,
+        }
+    }
+
+    async fn begin_transaction(&self) -> Result<Box<dyn vaultsync_core::storage::transaction::StorageTransaction>, VaultSyncError> {
+        match self {
+            Self::Opfs(s) => s.begin_transaction().await,
+            Self::Idb(s) => s.begin_transaction().await,
         }
     }
 
@@ -1195,4 +1628,17 @@ impl Storage for BrowserStorage {
             Self::Idb(s) => s.delete_synced_before(namespace, cutoff_ms).await,
         }
     }
+}
+
+async fn ensure_dir(
+    root: &FileSystemDirectoryHandle,
+    name: &str,
+) -> Result<FileSystemDirectoryHandle, VaultSyncError> {
+    let opts = FileSystemGetDirectoryOptions::new();
+    opts.set_create(true);
+    let promise = root.get_directory_handle_with_options(name, &opts);
+    let val = vaultsync_core::time_utils::SendJsFuture::from(promise)
+        .await
+        .map_err(|e| VaultSyncError::Storage(format!("ensure_dir failed: {:?}", e)))?;
+    Ok(val.into())
 }

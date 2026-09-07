@@ -27,6 +27,8 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
   const lastEditRef = useRef<{ title: number; body: number }>({ title: 0, body: 0 });
   // Cooldown: if field has focus but no edit within this window, treat focus as stale
   const FOCUS_COOLDOWN_MS = 2000;
+  // Content hash of the last successful save — prevents re-saving identical content
+  const lastSavedContentRef = useRef('');
 
   useEffect(() => {
     titleRef.current = title;
@@ -52,7 +54,7 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
           setLastSaved(new Date(timestamp).toLocaleTimeString());
         }
 
-        requestAnimationFrame(() => { isHydrating.current = false; });
+        queueMicrotask(() => { isHydrating.current = false; });
       } else {
         // If it's the same note but updated externally (e.g. from another tab),
         // merge the updates unless the user is actively editing that field.
@@ -65,7 +67,7 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
           && Date.now() - lastEditRef.current.title < FOCUS_COOLDOWN_MS;
         if (!titleActive && titleRef.current !== note.title) {
           if (document.activeElement?.id === 'note-title-input') {
-            console.warn('[FocusGuard] title field has stale focus (no recent edit), allowing merge');
+            console.log('[FocusGuard] title field has stale focus (no recent edit), allowing merge');
           }
           setTitle((note.title as string) || '');
           merged = true;
@@ -75,7 +77,7 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
           && Date.now() - lastEditRef.current.body < FOCUS_COOLDOWN_MS;
         if (!bodyActive && bodyRef.current !== note.body) {
           if (document.activeElement?.id === 'note-body-textarea') {
-            console.warn('[FocusGuard] body field has stale focus (no recent edit), allowing merge');
+            console.log('[FocusGuard] body field has stale focus (no recent edit), allowing merge');
           }
           setBody((note.body as string) || '');
           merged = true;
@@ -83,7 +85,7 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
 
         if (merged) {
           isHydrating.current = true;
-          requestAnimationFrame(() => { isHydrating.current = false; });
+          queueMicrotask(() => { isHydrating.current = false; });
 
           const timestamp = Number(note.updatedAt || Date.now());
           if (timestamp !== lastSavedRef.current) {
@@ -97,32 +99,39 @@ export function NoteEditor({ noteId }: NoteEditorProps) {
 
   // Debounced auto-save effect
   useEffect(() => {
-    // Skip auto-save on initial mount or load, and during hydration/merge
     if (loading || !note || isHydrating.current) return;
 
-    // Check if anything actually changed
+    // Content-key guard: skip if we already saved this exact content.
+    // Uses JSON.stringify for deterministic, collision-free comparison.
+    const contentKey = JSON.stringify({ title: title.trim(), body });
+    if (contentKey === lastSavedContentRef.current) return;
+
     const hasChanges = title !== (note.title as string || '') || body !== (note.body as string || '');
     if (!hasChanges) return;
+
+    // Mark as saved BEFORE the async save, so a subsequent effect run
+    // sees the same content key and short-circuits before reaching here.
+    // On save failure, reset the ref so the next attempt can retry.
+    lastSavedContentRef.current = contentKey;
 
     setIsSaving(true);
     const timer = setTimeout(async () => {
       try {
-        const updatedAt = Date.now();
         await mutations.update(noteId, {
           title: title.trim(),
           body,
-          updatedAt,
         });
-        setLastSaved(new Date(updatedAt).toLocaleTimeString());
+        setLastSaved(new Date().toLocaleTimeString());
       } catch (err) {
+        lastSavedContentRef.current = '';
         console.error('Auto-save failed:', err);
       } finally {
         setIsSaving(false);
       }
-    }, 600); // 600ms debounce
+    }, 600);
 
     return () => clearTimeout(timer);
-  }, [title, body, noteId, loading, mutations]);
+  }, [title, body, noteId, loading, mutations, note]);
 
   if (loading && !note) {
     return (

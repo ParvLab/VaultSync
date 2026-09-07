@@ -68,6 +68,10 @@ impl RetryEngine {
         self.attempts.get(id).copied().unwrap_or(0) >= self.config.max_attempts
     }
 
+    pub fn failure_count(&self, id: &str) -> u32 {
+        self.attempts.get(id).copied().unwrap_or(0)
+    }
+
     pub fn can_retry(&self, id: &str) -> bool {
         if self.is_exhausted(id) {
             return false;

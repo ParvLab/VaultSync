@@ -1,61 +1,29 @@
-import { useEffect, useState } from 'react';
-import { useVaultSyncClient } from './useVaultSyncClient.js';
+import { useEffect, useRef, useState } from 'react';
+import { useRuntimeLifecycle } from './useRuntimeLifecycle.js';
 import type { RecordFields } from '@vaultsync/web';
 
 export function useVaultSyncOne(docId: string, recordId: string) {
-  const client = useVaultSyncClient();
-  const [data, setData] = useState<RecordFields | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<Error | null>(null);
+  const { store, status } = useRuntimeLifecycle();
+  const [data, setData] = useState<RecordFields | null>(() => store?.get(docId, recordId) as RecordFields | null);
+  const prevRef = useRef<RecordFields | null>(null);
 
   useEffect(() => {
-    let active = true;
+    if (!store) return;
 
-    async function fetchInitial() {
-      try {
-        const record = await client.get(docId, recordId);
-        if (active) {
-          setData(record);
-          setLoading(false);
-        }
-      } catch (err) {
-        if (active) {
-          setError(err as Error);
-          setLoading(false);
-        }
-      }
+    const current = store.get(docId, recordId) as RecordFields | null;
+    if (current !== prevRef.current) {
+      prevRef.current = current;
+      setData(current);
     }
 
-    // Register subscription FIRST so we don't miss fires from reconciler during startup
-    let notifySeq = 0;
-    const unsubscribe = client.subscribe(docId, async (changedRecordId: string) => {
-      const seq = ++notifySeq;
-      console.log(`[notify] seq=${seq} doc=${docId} phase=react_callback_one t=${Date.now()}`);
-      if (!active) return;
-      if (changedRecordId === recordId) {
-        try {
-          const record = await client.get(docId, recordId);
-          console.log(`[notify] seq=${seq} doc=${docId} record=${recordId} phase=react_setData_one t=${Date.now()}`);
-          if (active) {
-            setData(record);
-          }
-        } catch (err) {
-          console.error('Failed to refresh single record:', err);
-        }
+    return store.subscribe(docId, recordId, () => {
+      const record = store.get(docId, recordId) as RecordFields | null;
+      if (record !== prevRef.current) {
+        prevRef.current = record;
+        setData(record);
       }
     });
+  }, [store, docId, recordId]);
 
-    fetchInitial();
-
-    return () => {
-      active = false;
-      unsubscribe();
-    };
-  }, [client, docId, recordId]);
-
-  return {
-    data,
-    loading,
-    error,
-  };
+  return { data, loading: status !== 'ready', error: null };
 }

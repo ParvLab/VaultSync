@@ -18,7 +18,7 @@ web-sys = { version = "0.3", features = [
     "FileSystemFileHandle", "FileSystemWritableFileStream",
     "FileSystemGetFileOptions", "FileSystemGetDirectoryOptions",
     "FileSystemCreateWritableOptions", "FileSystemRemoveOptions",
-    "Blob", "File", "WritableStream",
+    "Blob", "File", "WritableStream", "Lock", "LockManager",
     "IdbDatabase", "IdbTransaction", "IdbObjectStore",
     "IdbFactory", "IdbRequest", "IdbOpenDbRequest",
     "IdbTransactionMode", "IdbVersionChangeEvent",
@@ -35,6 +35,8 @@ async-trait = "0.1"
 tracing = "0.1"
 futures = "0.3"
 uuid = { version = "1", features = ["v4", "js"] }
+postcard = { version = "1", features = ["alloc"] }
+crc32fast = "1"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

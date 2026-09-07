@@ -60,6 +60,7 @@ use memmap2::MmapMut;
 pub struct SharedMemoryInner {
     mmap: MmapMut,
     _file: std::fs::File,
+    #[allow(dead_code)]
     file_path: std::path::PathBuf,
     capacity: usize,
 }
@@ -73,6 +74,7 @@ pub struct SharedMemoryInner {
 #[derive(Clone)]
 pub struct SharedMemory {
     inner: Arc<RwLock<SharedMemoryInner>>,
+    #[allow(dead_code)]
     namespace: String,
 }
 

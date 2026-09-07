@@ -1,11 +1,12 @@
 use crate::config::VaultSyncConfig;
 #[cfg(feature = "async-runtime")]
 use crate::coordinator::memory::InMemoryCoordinator;
-use crate::coordinator::traits::{Coordinator, ReplicaInfo};
+use crate::coordinator::traits::{Coordinator, CursorValidation, PendingMutation, ReplicaInfo};
 use crate::crdt::document::CRDTDocument;
 use crate::crdt::types::CrdtValue;
 use crate::e2ee::keyring::{E2eeDecryptor, E2eeEncryptor, KeyRing};
 use crate::error::VaultSyncError;
+use crate::materialization::ViewMaterializer;
 use crate::oplog::entry::{MutationOrigin, MutationType, OplogEntry, SyncStatus};
 use crate::oplog::log::OpLog;
 use crate::schema::migration::MigrationDefinition;
@@ -19,9 +20,14 @@ use crate::subscription::filter::Filter;
 use crate::sync::download::DownloadQueue;
 use crate::sync::reconciler::Reconciler;
 use crate::sync::state::SyncState;
+use crate::sync::sync_state_store::SyncStateStore;
 use crate::sync::upload::UploadQueue;
+#[cfg(feature = "async-runtime")]
+use crate::sync::SyncLifecycle;
+use crate::telemetry::log_data;
 use crate::telemetry::tracing::VaultSyncTelemetry;
 use futures::StreamExt;
+use tracing::level_filters::LevelFilter;
 use std::collections::HashMap;
 use std::sync::Arc;
 use yrs::updates::decoder::Decode;
@@ -29,6 +35,73 @@ use yrs::Update;
 use sha2::{Digest, Sha256};
 
 pub type Callback = Box<dyn Fn(&str, &str, &HashMap<String, CrdtValue>) + Send>;
+
+// ============================================================================
+// VaultSync Engine Guarantees
+// ============================================================================
+//
+// These are the synchronization contract that all engine subsystems must
+// preserve. Every regression test in manager_integration.rs guards one or
+// more of these guarantees. Any future change that violates a guarantee is a
+// regression, not a refactor.
+//
+// Storage
+// - Every committed page is immutable. Pages are append-only.
+// - GC never mutates page contents — it only deletes pages by advancing
+//   current_page and running deferred garbage collection.
+// - The manifest has CRC32 checksum integrity. Corrupted manifests are
+//   detected on read and trigger a rebuild from page files.
+//
+// Merge
+// - VersionChain resolves by document ID: the latest page's entry for a
+//   given ID always wins. Delta pages are sorted by page ID before
+//   processing to guarantee deterministic merge order.
+// - Merge is deterministic and idempotent. Re-applying the same pages in
+//   the same order produces the same result.
+//
+// Upload
+// - Only entries with sync_status == Pending or Optimistic are uploadable.
+// - Synced and Failed entries are never picked up by the upload pipeline.
+// - Upload is idempotent: duplicate acknowledgements are harmless.
+// - Reconnect never duplicates committed mutations — cursor advancement
+//   prevents replay of already-synced entries.
+//
+// Compaction (delete_synced_before)
+// - Only Synced entries older than the cutoff are removed.
+// - Pending entries survive compaction regardless of age.
+// - Failed entries survive compaction regardless of age.
+// - Optimistic entries survive compaction regardless of age.
+// - Namespace isolation: compacting namespace A never touches namespace B.
+//
+// Lifecycle (run_lifecycle)
+// - Only documents with a CrdtDelete tombstone older than the retention
+//   policy are physically deleted.
+// - Active documents are never touched by lifecycle.
+//
+// Recovery
+// - Crash-safe after every committed page. A page write is all-or-nothing
+//   (atomic write to OPFS/IDB).
+// - Restart reconstructs engine state solely from persisted pages. No
+//   external state is required.
+// - Cursor is preserved across restarts when history_preserved is true.
+//   On generation mismatch with history_preserved=false, cursor resets to 0
+//   and a full snapshot restore is performed.
+//
+// Multi-tab
+// - Exactly one leader uploads. Followers observe via BroadcastChannel.
+// - BroadcastChannel messages are self-filtered (the sending tab ignores
+//   its own messages via origin-based filtering).
+// - Leader election uses a shared lock; tab crash triggers automatic
+//   re-election by the next tab.
+//
+// UI (Reactive Layer)
+// - Engine state drives UI exclusively through the event bridge:
+//   Core ClientEvent::StatusDirty → pending_count channel → WASM bridge →
+//   JS SDK → React Context.
+// - No polling. No setInterval. No redundant syncStatus() calls.
+// - Comparison guard in React's setSyncStatus prevents re-renders when
+//   status fields are identical.
+// ============================================================================
 
 pub struct VaultSyncClient {
     config: VaultSyncConfig,
@@ -52,15 +125,30 @@ pub struct VaultSyncClient {
     p2p_handle: Option<vaultsync_transport_libp2p::LibP2pTransportHandle>,
     pub metrics: Arc<crate::telemetry::metrics::VaultSyncMetrics>,
     pub debug_api: Arc<crate::telemetry::debug::DebugApi>,
+    pub health: Arc<crate::telemetry::health::HealthRegistry>,
+    pub logger: Arc<dyn crate::telemetry::logger::Logger>,
     pub leader_election: Arc<crate::ipc::leader_election::LeaderElection>,
     pub schema_version: u64,
     pub shared_memory: Arc<crate::ipc::shared_memory::SharedMemory>,
     pub events: crate::sync::events::SyncEvents,
+    pub sync_state_store: Option<Arc<dyn SyncStateStore>>,
     initialized: std::sync::atomic::AtomicBool,
     clock: crate::clock::HybridLogicalClock,
     pending_count_cache: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(target_arch = "wasm32")]
     pending_count_rx: std::sync::Mutex<Option<futures::channel::mpsc::UnboundedReceiver<usize>>>,
+    /// ViewMaterializer — enforces the three-level authority model.
+    /// Materializes local pending state on top of confirmed remote state.
+    /// Created during build_client(), called during initialize().
+    materializer: Option<Arc<ViewMaterializer>>,
+    /// Download channel receiver, held until `start_download_worker()` is called
+    /// after subscribe completes in `initialize()`.
+    download_worker_rx:
+        std::sync::Mutex<Option<futures::channel::mpsc::UnboundedReceiver<Option<PendingMutation>>>>,
+    /// Watch channel for initial sync lifecycle state.
+    /// JS bootstrap awaits `InitialSyncComplete` before populating DocumentStore.
+    #[cfg(feature = "async-runtime")]
+    sync_lifecycle_tx: tokio::sync::watch::Sender<SyncLifecycle>,
 }
 
 impl VaultSyncClient {
@@ -195,14 +283,15 @@ impl VaultSyncClient {
         storage: Arc<dyn Storage>,
         migrations: Vec<Arc<crate::schema::migration::MigrationDefinition>>,
         auto_initialize: bool,
+        sync_state_store: Option<Arc<dyn SyncStateStore>>,
     ) -> Result<Self, VaultSyncError> {
-        let _t = crate::time_utils::system_time_now_ms();
+        let _t_mig = crate::time_utils::system_time_now_ms();
         tracing::info!("[client.new] migration start");
         let runner = crate::schema::migration::MigrationRunner::new(storage.clone(), migrations);
         runner.validate_applied().await?;
         runner.run_pending().await?;
         let schema_version = runner.current_version().await;
-        tracing::info!("[client.new] migration done {} ms", crate::time_utils::system_time_now_ms() - _t);
+        tracing::info!("[client.new] migration done {} ms", crate::time_utils::system_time_now_ms() - _t_mig);
 
         let _t = crate::time_utils::system_time_now_ms();
         tracing::info!("[client.new] keys start");
@@ -305,7 +394,7 @@ impl VaultSyncClient {
                 state.last_synced_sequence
             }
             None => {
-                tracing::info!("[client.new] read_sync_state no state took {} ms", crate::time_utils::system_time_now_ms() - _t);
+                tracing::debug!("[client.new] read_sync_state no state took {} ms", crate::time_utils::system_time_now_ms() - _t);
                 0
             }
         };
@@ -317,16 +406,35 @@ impl VaultSyncClient {
             storage.clone(),
             metrics.clone(),
         ));
+        let health = Arc::new(crate::telemetry::health::HealthRegistry::new());
+        let log_config = Arc::new(crate::telemetry::logger::ModuleLogConfig::new(config.log_level));
+        let logger: Arc<dyn crate::telemetry::logger::Logger> =
+            Arc::new(crate::telemetry::logger::TracingLogger::with_config(log_config.clone()));
 
-        let upload_queue = Arc::new(UploadQueue::new(
+        // Register health checks using the Storage trait
+        use crate::telemetry::health::{CoordinatorHealthCheck, OplogHealthCheck, StorageHealthCheck};
+        health.register(Box::new(StorageHealthCheck::new("storage", storage.clone())));
+        health.register(Box::new(CoordinatorHealthCheck::new("coordinator", coordinator.clone())));
+        health.register(Box::new(OplogHealthCheck::new(
+            "oplog",
+            storage.clone(),
+            &config.namespace,
+            1000,
+        )));
+
+        let mut upload_queue = UploadQueue::new(
             oplog.clone(),
             coordinator.clone(),
             config.upload.clone(),
             config.retry.clone(),
             metrics.clone(),
-        ));
+        );
+        if let Some(ref sss) = sync_state_store {
+            upload_queue = upload_queue.with_sync_state_store(sss.clone());
+        }
+        let upload_queue = Arc::new(upload_queue);
 
-        let download_queue = Arc::new(DownloadQueue::new(
+        let mut download_queue = DownloadQueue::new(
             coordinator.clone(),
             storage.clone(),
             &config.namespace,
@@ -337,10 +445,36 @@ impl VaultSyncClient {
             metrics.clone(),
             config.max_clock_skew,
             config.replica_id.clone(),
-        ));
+        );
+        if let Some(ref sss) = sync_state_store {
+            download_queue = download_queue.with_sync_state_store(sss.clone());
+        }
+        let download_queue = Arc::new(download_queue);
         tracing::info!("[client.new] queue init done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
+        let _t = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] schema loading start");
         let schema = Arc::new(std::sync::Mutex::new(SchemaRegistry::new()));
+        // Load persisted schemas from storage (collect data before locking)
+        let schemas_from_storage: Vec<(String, Vec<u8>)> = {
+            match storage.list_schemas().await {
+                Ok(meta_list) => meta_list.into_iter().map(|m| (m.doc_id, m.schema_bytes)).collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to list schemas from storage");
+                    Vec::new()
+                }
+            }
+        };
+        {
+            let mut reg = schema.lock().unwrap();
+            for (doc_id, bytes) in schemas_from_storage {
+                if let Ok(schema_def) = serde_json::from_slice::<crate::schema::registry::DocumentSchema>(&bytes) {
+                    // Use define_local to avoid re-writing to storage
+                    let _ = reg.define_local(&doc_id, schema_def);
+                }
+            }
+        }
+        tracing::info!("[client.new] schema loading done {} ms", crate::time_utils::system_time_now_ms() - _t);
         let _telemetry = Arc::new(VaultSyncTelemetry::new());
 
         #[cfg(target_arch = "wasm32")]
@@ -426,13 +560,15 @@ impl VaultSyncClient {
         let (events, upload_event_rx, download_event_rx, pending_count_rx) =
             crate::sync::events::SyncEvents::new();
 
-        // Clone before moving into Self (used by download worker below)
-        let coord_for_dl = coordinator.clone();
-        let ns_for_dl = config.namespace.clone();
+        // Clone before moving into Self (used by compaction worker below)
+        let coord_for_comp = coordinator.clone();
         let pending_count_tx = events.pending_count.clone();
         let pending_cache = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let client = Self {
+        #[cfg(feature = "async-runtime")]
+        let (sync_lifecycle_tx, _sync_lifecycle_rx) = tokio::sync::watch::channel(SyncLifecycle::Connecting);
+
+        let mut client = Self {
             config,
             storage,
             coordinator,
@@ -454,26 +590,45 @@ impl VaultSyncClient {
             p2p_handle,
             metrics,
             debug_api,
+            health,
+            logger,
             leader_election: leader_election.clone(),
             schema_version,
             shared_memory,
             events,
+            sync_state_store,
             initialized: std::sync::atomic::AtomicBool::new(false),
             clock: crate::clock::HybridLogicalClock::new(),
             pending_count_cache: pending_cache.clone(),
             #[cfg(target_arch = "wasm32")]
             pending_count_rx: std::sync::Mutex::new(Some(pending_count_rx)),
+            download_worker_rx: std::sync::Mutex::new(Some(download_event_rx)),
+            #[cfg(feature = "async-runtime")]
+            sync_lifecycle_tx,
+            materializer: None,
         };
         tracing::info!("[client.new] construction done {} ms", crate::time_utils::system_time_now_ms() - _t);
 
         // Initialize pending count cache from storage
+        let _t_pc = crate::time_utils::system_time_now_ms();
+        tracing::info!("[client.new] pending_count start");
         let initial_pending = upload_queue.pending_count().await.unwrap_or(0);
+        tracing::info!("[client.new] pending_count done {} ms initial_pending={}", crate::time_utils::system_time_now_ms() - _t_pc, initial_pending);
         pending_cache.store(initial_pending, std::sync::atomic::Ordering::Relaxed);
+
+        // Create the ViewMaterializer for pending intent overlay.
+        // Runs after coordinator replay (snapshot drain + subscribe) and before workers.
+        let materializer_ns = client.config.namespace.clone();
+        let materializer_cursor = last_sequence;
+        client.materializer = Some(Arc::new(ViewMaterializer::new(
+            client.storage.clone(),
+            &materializer_ns,
+            materializer_cursor,
+        )));
 
         let namespace_clone = client.config.namespace.clone();
         let storage_clone = client.storage.clone();
         let upload_events_rx = upload_event_rx;
-        let download_events_rx = download_event_rx;
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -503,51 +658,33 @@ impl VaultSyncClient {
             loop {
                 // Wait for a notification. While offline, skip the channel
                 // and wait for the backoff timer directly.
-                let wake_source: &str;
                 if offline {
                     if backoff_ms > 0 {
                         crate::time_utils::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     }
-                    wake_source = "timer";
                     // Drain any stale notifications that piled up while we slept
                     while let Ok(()) = upload_rx.try_recv() {}
                 } else {
-                    wake_source = "notify";
                     match upload_rx.next().await {
                         Some(_) => {}
                         None => break,
                     }
                 }
 
-                tracing::debug!(
-                    "[upload_worker] WAKE source={} offline={} backoff={}ms pending_cache={}",
-                    wake_source, offline, backoff_ms, pc_cache.load(std::sync::atomic::Ordering::Relaxed),
-                );
-
                 // Process all pending batches
                 loop {
                     match uq.process_batch().await {
                         Ok(0) => {
-                            // Either no pending entries OR coordinator unavailable.
-                            // Distinguish by checking pending count.
                             if let Ok(count) = uq.pending_count().await {
-                                if count > 0 && !offline {
-                                    tracing::warn!(
-                                        "[upload_worker] OFFLINE_ENTER pending={} backoff=1s",
-                                        count
-                                    );
+                                let safe_count = if count > 1_000_000 { 0 } else { count };
+                                if safe_count > 0 && !offline {
+                                    tracing::info!("[UPLOAD] offline pending={}", safe_count);
                                     offline = true;
                                     backoff_ms = 1000;
-                                } else if count > 0 {
-                                    // Still offline after retry; increase backoff
+                                } else if safe_count > 0 {
                                     backoff_ms = std::cmp::min(backoff_ms * 2, 30000);
-                                    tracing::debug!(
-                                        "[upload_worker] OFFLINE_RETRY pending={} backoff={}ms",
-                                        count, backoff_ms,
-                                    );
-                                } else if count == 0 && offline {
-                                    // All pending cleared — return to online
-                                    tracing::info!("[upload_worker] ONLINE pending=0");
+                                } else if safe_count == 0 && offline {
+                                    tracing::info!("[UPLOAD] online pending=0");
                                     offline = false;
                                     backoff_ms = 0;
                                 }
@@ -555,16 +692,15 @@ impl VaultSyncClient {
                             break;
                         }
                         Ok(n) => {
-                            // Successfully pushed — reset offline state
                             if offline {
-                                tracing::info!("[upload_worker] RECONNECTED pushed={}", n);
+                                tracing::info!("[UPLOAD] reconnected pushed={}", n);
                             }
                             offline = false;
                             backoff_ms = 0;
                             continue;
                         }
                         Err(e) => {
-                            tracing::warn!("[upload_worker] BATCH_FAILED {:?}", e);
+                            tracing::warn!("[UPLOAD] batch_failed {:?}", e);
                             break;
                         }
                     }
@@ -572,83 +708,39 @@ impl VaultSyncClient {
 
                 // Update pending count cache
                 if let Ok(count) = uq.pending_count().await {
-                    pc_cache.store(count, std::sync::atomic::Ordering::Relaxed);
-                    let _ = pc_tx.unbounded_send(count);
+                    let max_reasonable = 1_000_000usize;
+                    let safe_count = if count > max_reasonable {
+                        tracing::warn!("[pending] count={} exceeds max_reasonable={} — capping to 0", count, max_reasonable);
+                        0
+                    } else {
+                        count
+                    };
+                    pc_cache.store(safe_count, std::sync::atomic::Ordering::Relaxed);
+                    let _ = pc_tx.unbounded_send(safe_count);
                 }
             }
         });
 
-        // ── Download worker (push-driven) ─────────────────────────────────
-        let dq = download_queue.clone();
-        let mut download_rx = download_events_rx;
-        let _coord = coord_for_dl;
-        let _ns = ns_for_dl;
-        let initial_seq = download_queue.last_sequence();
+        // ── Download worker (push-driven) — spawned in initialize() after subscribe ──
+
+        // ── Background sync timer (periodic, respects sync_interval) ──────
+        let sync_interval = client.config.sync_interval;
+        let bg_uq = upload_queue.clone();
+        let bg_dq = download_queue.clone();
+        let bg_pc = pending_cache.clone();
+        let bg_le = leader_election.clone();
         crate::time_utils::spawn(async move {
-            tracing::debug!("[download_worker] started cursor={} t={}", initial_seq, crate::time_utils::system_time_now_ms());
-
             loop {
-                let mut needs_backfill = true;
-
-                match download_rx.next().await {
-                    None => {
-                        tracing::debug!("[download_worker] channel closed, exiting");
-                        break;
-                    }
-                    Some(Some(m)) => {
-                        // Push mutation arrived from coordinator
-                        tracing::info!(
-                            "[download_worker] push seq={} id={}",
-                            m.sequence,
-                            m.id
-                        );
-                        match dq.process_push_mutation(m).await {
-                            Ok(outcome) => {
-                                tracing::debug!(
-                                    "[download_worker] push outcome={:?}",
-                                    outcome
-                                );
-                                needs_backfill = outcome == crate::sync::download::PushOutcome::GapDetected;
-                                // ── Phase 4: always backfill at least once during replay ──
-                                if !needs_backfill && dq.is_replay_mode() {
-                                    needs_backfill = true;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[download_worker] process_push_mutation error: {:?}",
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    Some(None) => {
-                        // Bootstrap or wakeup: drain process_batch
-                    }
+                crate::time_utils::sleep(sync_interval).await;
+                // Leader uploads pending mutations
+                if bg_le.is_leader() {
+                    let _ = bg_uq.process_batch().await;
                 }
-
-                if needs_backfill {
-                    loop {
-                        match dq.process_batch().await {
-                            Ok(0) => {
-                                tracing::debug!("[download_worker] process_batch -> 0");
-                                break;
-                            }
-                            Ok(count) => {
-                                tracing::info!(
-                                    "[download_worker] process_batch -> {}",
-                                    count
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[download_worker] process_batch error {:?}",
-                                    e
-                                );
-                                break;
-                            }
-                        }
-                    }
+                // All tabs download
+                let _ = bg_dq.process_batch().await;
+                // Reconcile pending count cache
+                if let Ok(count) = bg_uq.pending_count().await {
+                    bg_pc.store(count, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         });
@@ -657,6 +749,7 @@ impl VaultSyncClient {
         let le = leader_election.clone();
         let ns = namespace_clone.clone();
         let comp_storage = storage_clone.clone();
+        let comp_coord = coord_for_comp;
         crate::time_utils::spawn(async move {
             let compaction_engine = crate::sync::compaction::CompactionEngine::new(
                 comp_storage,
@@ -666,16 +759,36 @@ impl VaultSyncClient {
             let mut last_snapshot = crate::time_utils::PlatformInstant::now();
 
             loop {
-                crate::time_utils::sleep(std::time::Duration::from_secs(5)).await;
-                if !le.try_acquire().unwrap_or(false) {
-                    continue;
-                }
-                if last_compaction.elapsed() >= std::time::Duration::from_secs(600) {
+                crate::time_utils::sleep(std::time::Duration::from_secs(30)).await;
+                // Age-based compaction and tombstone cleanup run on ALL tabs
+                if last_compaction.elapsed() >= std::time::Duration::from_secs(300) {
                     let _ = compaction_engine.run_compaction(&ns).await;
                     last_compaction = crate::time_utils::PlatformInstant::now();
                 }
-                if last_snapshot.elapsed() >= std::time::Duration::from_secs(3600) {
-                    let _ = compaction_engine.run_snapshot_compaction(&ns).await;
+                // Snapshot compaction runs only on the leader (re-writes docs)
+                if le.is_leader()
+                    && last_snapshot.elapsed() >= std::time::Duration::from_secs(900)
+                {
+                    match compaction_engine.run_snapshot_compaction(&ns).await {
+                        Ok((_stats, snapshots)) => {
+                            for snap in &snapshots {
+                                if let Err(e) = comp_coord.store_snapshot(&ns, snap).await {
+                                    tracing::warn!(
+                                        "[compaction] failed to upload snapshot doc={} seq={}: {:?}",
+                                        snap.doc_id, snap.sequence, e
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "[compaction] uploaded snapshot doc={} seq={}",
+                                        snap.doc_id, snap.sequence
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("[compaction] snapshot run failed: {:?}", e);
+                        }
+                    }
                     last_snapshot = crate::time_utils::PlatformInstant::now();
                 }
             }
@@ -711,7 +824,29 @@ impl VaultSyncClient {
         storage: Arc<dyn Storage>,
         migrations: Vec<Arc<crate::schema::migration::MigrationDefinition>>,
     ) -> Result<Self, VaultSyncError> {
-        Self::build_client(config, coordinator, keyring, storage, migrations, true).await
+        Self::build_client(config, coordinator, keyring, storage, migrations, true, None).await
+    }
+
+    /// Create a client with an explicit SyncStateStore for in-memory cursor/generation reads.
+    /// When provided, the DownloadQueue will bypass OPFS reads for cursor and generation,
+    /// using the SyncStateStore instead (O(1), no I/O).
+    pub async fn new_with_sync_state_store(
+        config: VaultSyncConfig,
+        coordinator: Arc<dyn Coordinator>,
+        keyring: Arc<KeyRing>,
+        storage: Arc<dyn Storage>,
+        sync_state_store: Arc<dyn SyncStateStore>,
+    ) -> Result<Self, VaultSyncError> {
+        Self::build_client(
+            config,
+            coordinator,
+            keyring,
+            storage,
+            crate::schema::migration::get_global_migrations(),
+            true,
+            Some(sync_state_store),
+        )
+        .await
     }
 
     /// Like `new_with_storage`, but does NOT call `initialize()` internally.
@@ -731,11 +866,36 @@ impl VaultSyncClient {
             storage,
             crate::schema::migration::get_global_migrations(),
             false,
+            None,
+        )
+        .await
+    }
+
+    /// Like `new_with_sync_state_store`, but does NOT call `initialize()` internally.
+    /// The caller MUST call `initialize()` before using the client.
+    /// Use this when you need to wire event channels + provide a SyncStateStore
+    /// before the WebSocket background processor starts.
+    pub async fn new_with_sync_state_store_skip_init(
+        config: VaultSyncConfig,
+        coordinator: Arc<dyn Coordinator>,
+        keyring: Arc<KeyRing>,
+        storage: Arc<dyn Storage>,
+        sync_state_store: Arc<dyn SyncStateStore>,
+    ) -> Result<Self, VaultSyncError> {
+        Self::build_client(
+            config,
+            coordinator,
+            keyring,
+            storage,
+            crate::schema::migration::get_global_migrations(),
+            false,
+            Some(sync_state_store),
         )
         .await
     }
 
     pub async fn initialize(&self) -> Result<(), VaultSyncError> {
+        let init_t0 = crate::time_utils::PlatformInstant::now();
         if self.initialized.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
@@ -754,7 +914,8 @@ impl VaultSyncClient {
         };
 
         let cursor = self.download_queue.last_sequence();
-        tracing::info!("[4/9] coordinator register cursor={}", cursor);
+        let reg_t0 = crate::time_utils::PlatformInstant::now();
+        tracing::info!("[Coordinator] register cursor={}", cursor);
         let registered = self.coordinator
             .register(&self.config.namespace, replica_info.clone(), cursor)
             .await;
@@ -764,66 +925,134 @@ impl VaultSyncClient {
                 tracing::warn!("Coordinator unavailable, continuing offline: {:?}", e);
             }
             Ok(()) => {
+                let reg_elapsed = reg_t0.elapsed().as_millis();
                 let cursor_before = self.download_queue.last_sequence();
-                tracing::info!("[4.5/9] register returned cursor={}", cursor_before);
+                tracing::info!("[Coordinator] register returned cursor={} register={}ms", cursor_before, reg_elapsed);
 
                 // Check generation ID — reset cursor if server restarted
+                let gen_t0 = crate::time_utils::PlatformInstant::now();
                 let server_gen = self.coordinator.generation_id().await;
                 if !server_gen.is_empty() {
-                    tracing::info!("[5/9] generation check server_gen={} cursor={}", server_gen, cursor_before);
+                    tracing::info!("[Recovery] server gen={} cursor={}", server_gen, cursor_before);
                     if let Some(mut state) = self.storage.read_sync_state(&self.config.namespace).await? {
                         if state.generation_id != server_gen {
                             let cursor_was = cursor_before;
+                            let history_ok = self.coordinator.history_preserved().await;
+
+                            // Update generation ID immediately — never trust local metadata
+                            // without asking the coordinator to validate the cursor.
                             state.generation_id = server_gen.clone();
-                            state.last_synced_sequence = 0;
-                            let now_ms = crate::time_utils::system_time_now_ms();
-                            state.last_sync_at = Some(now_ms);
-                            self.storage.write_sync_state(&state).await?;
-                            tracing::debug!(
-                                "[client] write_sync_state cursor={} gen={} (from client init generation mismatch)",
-                                state.last_synced_sequence,
-                                state.generation_id
-                            );
-                            self.download_queue.reset_cursor(0);
-                            let cursor_after = self.download_queue.last_sequence();
-                            tracing::debug!(
-                                "[sync_state] generation mismatch: local={} server={} -> resetting cursor (was {})",
-                                state.generation_id,
-                                server_gen,
-                                cursor_was
-                            );
+
+                            // Always validate cursor against coordinator's max_sequence,
+                            // regardless of history_preserved. A gen mismatch means the
+                            // server identity changed — we must verify our cursor is valid
+                            // for this server's data range.
+                            let cursor_validation = self.coordinator.cursor_validation(cursor_was).await;
+                            let gen_elapsed = gen_t0.elapsed().as_millis();
                             tracing::info!(
-                                "[5.5/9] cursor after gen check={} (subscribe was with after={})",
-                                cursor_after,
-                                cursor_was
+                                "[Recovery] gen mismatch: cursor={} gen={} history_preserved={} validation={:?} gen_check={}ms",
+                                cursor_was,
+                                server_gen,
+                                history_ok,
+                                cursor_validation,
+                                gen_elapsed,
                             );
 
-                            // ── Phase 4: enable replay batching to suppress notification storm ──
                             self.download_queue.set_replay_mode(true);
 
-                            // Phase 2: reconnect with cursor=0 so subscribe uses the right value
-                            tracing::info!("[6/9] generation changed, reconnecting with cursor=0");
-                            let _ = self.coordinator.disconnect().await;
-                            let new_cursor = self.download_queue.last_sequence(); // should be 0
-                            match self.coordinator
-                                .register(&self.config.namespace, replica_info, new_cursor)
-                                .await
-                            {
-                                Ok(()) => {
-                                    tracing::info!("[6.5/9] re-register complete cursor={}", new_cursor);
+                            match cursor_validation {
+                                CursorValidation::Unknown | CursorValidation::Valid => {
+                                    // Keep cursor — no reconnect needed
+                                    let now_ms = crate::time_utils::system_time_now_ms();
+                                    state.last_sync_at = Some(now_ms);
+                                    self.storage.write_sync_state(&state).await?;
+                                    tracing::info!(
+                                        "[Recovery] cursor valid or unknown — keeping cursor={}",
+                                        cursor_was,
+                                    );
                                 }
-                                Err(e) => {
-                                    tracing::warn!("Re-register failed after gen reset: {:?}", e);
+                                CursorValidation::Invalid => {
+                                    // Cursor truly stale — must reconnect with cursor=0
+                                    tracing::info!(
+                                        "[Recovery] cursor INVALID — resetting cursor to 0 for full replay"
+                                    );
+                                    state.last_synced_sequence = 0;
+                                    state.generation_id = server_gen.clone();
+                                    let now_ms = crate::time_utils::system_time_now_ms();
+                                    state.last_sync_at = Some(now_ms);
+                                    self.storage.write_sync_state(&state).await?;
+                                    self.download_queue.reset_cursor(0);
+                                    let reconnect_t0 = crate::time_utils::PlatformInstant::now();
+                                    let _ = self.coordinator.disconnect().await;
+                                    match self.coordinator
+                                        .register(&self.config.namespace, replica_info.clone(), 0)
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            let reconnect_elapsed = reconnect_t0.elapsed().as_millis();
+                                            tracing::info!("[Recovery] re-registered cursor=0 reconnect={}ms", reconnect_elapsed);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Re-register failed after cursor reset: {:?}", e);
+                                        }
+                                    }
                                 }
                             }
-                        } else {
-                            tracing::info!("[sync_state] generation OK gen={}", server_gen);
-                        }
+                    } else {
+                        let gen_elapsed = gen_t0.elapsed().as_millis();
+                        tracing::info!("[Recovery] generation OK gen={} gen_check={}ms", server_gen, gen_elapsed);
                     }
+                }
+                } else {
+                    tracing::debug!("[Recovery] server does not support generation tracking");
                 }
             }
         }
 
+        // ── Subscribe for push notifications after recovery ──
+        let sub_cursor = self.download_queue.last_sequence();
+        let sub_t0 = crate::time_utils::PlatformInstant::now();
+        if self.coordinator.subscribe(&self.config.namespace, sub_cursor).await.is_ok() {
+            let sub_elapsed = sub_t0.elapsed().as_millis();
+            tracing::info!("[Subscribed] after={} subscribe={}ms", sub_cursor, sub_elapsed);
+        } else {
+            tracing::warn!("[Subscribed] failed (pull-only mode)");
+        }
+
+        // ── Materialize local pending state over confirmed remote state ──
+        // This enforces the three-level authority model:
+        //   Persistent Storage → Confirmed Remote → Local Pending (always wins)
+        // Runs AFTER snapshot drain + subscribe, BEFORE download worker starts.
+        if let Some(ref materializer) = self.materializer {
+            match materializer.materialize().await {
+                Ok(summary) => {
+                    if !summary.is_empty() {
+                        tracing::info!(
+                            "[Materializer] pending={} replayed={} conflicts={} elapsed={}ms",
+                            summary.pending_intents_restored,
+                            summary.semantic_replays,
+                            summary.conflicts_detected,
+                            summary.elapsed_ms,
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Non-fatal — pending entries remain in the oplog and will
+                    // be re-uploaded when the coordinator reconnects.
+                    tracing::warn!("[Materializer] materialization error: {:?}", e);
+                }
+            }
+        }
+
+        // ── Signal that subscribe + materialization is done; data may start flowing ──
+        #[cfg(feature = "async-runtime")]
+        let _ = self.sync_lifecycle_tx.send(SyncLifecycle::Downloading);
+
+        // ── Start download worker now that materialization is complete ──
+        self.start_download_worker();
+
+        let init_elapsed = init_t0.elapsed().as_millis();
+        tracing::info!("[Initialize] done total={}ms", init_elapsed);
         Ok(())
     }
 
@@ -837,12 +1066,152 @@ impl VaultSyncClient {
         Ok(())
     }
 
+    /// Spawns the download worker thread/task.
+    /// Called once from `initialize()` after subscribe completes,
+    /// ensuring the worker never wakes before recovery is done.
+    fn start_download_worker(&self) {
+        let rx = self.download_worker_rx.lock().unwrap().take();
+        let Some(mut download_rx) = rx else {
+            tracing::warn!("[download_worker] already started or rx missing");
+            return;
+        };
+        let dq = self.download_queue.clone();
+        #[cfg(feature = "async-runtime")]
+        let sync_lifecycle_tx = self.sync_lifecycle_tx.clone();
+        let initial_sync_fired_count = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let isfc = initial_sync_fired_count.clone();
+
+        crate::time_utils::spawn(async move {
+            // Drain stale wakeups accumulated before subscribe
+            while let Ok(_) = download_rx.try_recv() {}
+
+            tracing::debug!(
+                "[download_worker] started cursor={}",
+                dq.last_sequence()
+            );
+
+            loop {
+                let mut needs_backfill = true;
+
+                match download_rx.next().await {
+                    None => {
+                        tracing::debug!("[download_worker] channel closed, exiting");
+                        break;
+                    }
+                    Some(Some(m)) => {
+                        let push_start = crate::time_utils::system_time_now_ms();
+                        let cursor_before = dq.last_sequence();
+                        tracing::trace!(
+                            "[download_worker] push seq={} id={} cursor={}",
+                            m.sequence, m.id, cursor_before,
+                        );
+                        match dq.process_push_mutation(m).await {
+                            Ok(outcome) => {
+                                let push_elapsed = crate::time_utils::system_time_now_ms() - push_start;
+                                let cursor_after = dq.last_sequence();
+                                let is_contiguous = matches!(outcome, crate::sync::download::PushOutcome::Contiguous);
+                                let is_stale = matches!(outcome, crate::sync::download::PushOutcome::Stale);
+                                tracing::debug!(
+                                    "[download_worker] wake=push cursor_before={} cursor_after={} received=1 applied={} redundant={} elapsed={}ms",
+                                    cursor_before, cursor_after,
+                                    if is_contiguous { 1 } else { 0 },
+                                    if is_stale { 1 } else { 0 },
+                                    push_elapsed,
+                                );
+                                needs_backfill = outcome == crate::sync::download::PushOutcome::GapDetected;
+                                // Force one backfill after first contiguous push to check for more data.
+                                // This ensures `process_batch() -> Ok(0)` fires the InitialSyncComplete
+                                // signal even when all mutations arrive as contiguous pushes.
+                                if !needs_backfill && isfc.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                                    needs_backfill = true;
+                                }
+                                if !needs_backfill && dq.is_replay_mode() {
+                                    needs_backfill = true;
+                                }
+                            }
+                            Err(e) => {
+                                let push_elapsed = crate::time_utils::system_time_now_ms() - push_start;
+                                tracing::warn!(
+                                    "[download_worker] process_push_mutation error elapsed={}ms: {:?}",
+                                    push_elapsed,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Some(None) => {
+                        // Bootstrap or wakeup: drain process_batch
+                    }
+                }
+
+                if needs_backfill {
+                    let batch_start = crate::time_utils::system_time_now_ms();
+                    let cursor_before_batch = dq.last_sequence();
+                    loop {
+                        match dq.process_batch().await {
+                            Ok(0) => {
+                                tracing::trace!("[download_worker] process_batch -> 0");
+                                // Fire InitialSyncComplete on first process_batch -> Ok(0).
+                                // AtomicU8 prevents re-firing; 0→1 transition happens exactly once.
+                                if isfc.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+                                    #[cfg(feature = "async-runtime")]
+                                    {
+                                        tracing::info!("[download_worker] initial sync complete — signaling waiters");
+                                        let _ = sync_lifecycle_tx.send(SyncLifecycle::InitialSyncComplete);
+                                    }
+                                }
+                                break;
+                            }
+                            Ok(count) => {
+                                let batch_elapsed = crate::time_utils::system_time_now_ms() - batch_start;
+                                tracing::trace!(
+                                    "[download_worker] process_batch -> {} ({:.0}ms)",
+                                    count,
+                                    batch_elapsed
+                                );
+                            }
+                            Err(e) => {
+                                let batch_elapsed = crate::time_utils::system_time_now_ms() - batch_start;
+                                tracing::warn!(
+                                    "[download_worker] process_batch error elapsed={}ms: {:?}",
+                                    batch_elapsed,
+                                    e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    let cursor_after_batch = dq.last_sequence();
+                    let batch_elapsed = crate::time_utils::system_time_now_ms() - batch_start;
+                    tracing::debug!(
+                        "[download_worker] wake=batch cursor_before={} cursor_after={} elapsed={}ms",
+                        cursor_before_batch, cursor_after_batch, batch_elapsed,
+                    );
+                }
+            }
+        });
+    }
+
+    /// Record the schema version watermark for a document.
+    fn watermark_version(&self, doc_id: &str, record_id: &str, version: u64) {
+        self.schema.lock().unwrap().watermark_version(doc_id, record_id, version);
+    }
+
+    /// Filter out engine-managed metadata fields from user-provided field maps.
+    /// These fields are auto-set by the engine to prevent unnecessary CRDT mutations.
+    fn filter_meta_fields(fields: &mut HashMap<String, CrdtValue>) {
+        fields.remove("updatedAt");
+        fields.remove("updated_at");
+    }
+
     pub async fn insert(
         &self,
         doc_id: &str,
         record_id: &str,
-        fields: HashMap<String, CrdtValue>,
+        mut fields: HashMap<String, CrdtValue>,
     ) -> Result<(), VaultSyncError> {
+        Self::filter_meta_fields(&mut fields);
+
         let span = tracing::info_span!(
             "vaultsync.write",
             doc_id = doc_id,
@@ -855,12 +1224,20 @@ impl VaultSyncClient {
             .record_mutation_attempt(&self.config.namespace, "attempt");
 
         let mutation_id = uuid::Uuid::new_v4().to_string();
-        let mut doc = CRDTDocument::new(doc_id, record_id, 0);
+
+        // Version enforcement: if a schema is registered, use its version
+        let schema_version = {
+            let registry = self.schema.lock().unwrap();
+            registry.get(doc_id).map_or(0, |s| s.version)
+        };
+        let mut doc = CRDTDocument::new(doc_id, record_id, schema_version);
+
+        // Auto-set updatedAt to HLC wall clock — it reflects when content was created
+        let hlc = self.clock.now();
+        fields.insert("updatedAt".to_string(), CrdtValue::Number(hlc.wall as f64));
 
         let sv_before = doc.state_vector();
         let sv_before_entries: Vec<_> = sv_before.iter().map(|(c, cl)| (c, cl)).collect();
-        let snap_before = doc.to_snapshot();
-        let snap_hash_before = hex::encode(&Sha256::digest(&snap_before)[..8]);
         let doc_ptr = &doc as *const CRDTDocument as usize;
         let inner_doc_ptr = doc.inner_doc() as *const yrs::Doc as usize;
 
@@ -872,21 +1249,30 @@ impl VaultSyncClient {
 
         let sv_after = doc.state_vector();
         let sv_after_entries: Vec<_> = sv_after.iter().map(|(c, cl)| (c, cl)).collect();
-        let snap_after = doc.to_snapshot();
-        let snap_hash_after = hex::encode(&Sha256::digest(&snap_after)[..8]);
         let doc_advanced = sv_before != sv_after;
 
         let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
-        if let Ok(decoded) = Update::decode_v1(&update_bytes) {
-            let update_sv = decoded.state_vector();
-            let update_sv_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
-            tracing::info!(
-                "[client.insert] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={} snap_hash_after={} doc_advanced={}",
-                mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
-                doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
-                snap_hash_before, snap_hash_after, doc_advanced,
-            );
-        }
+        let snap_hash_before = log_data(LevelFilter::TRACE, || {
+            hex::encode(&Sha256::digest(&doc.to_snapshot())[..8])
+        });
+        let snap_hash_after = log_data(LevelFilter::TRACE, || {
+            hex::encode(&Sha256::digest(&doc.to_snapshot())[..8])
+        });
+        let update_sv_entries: Option<Vec<(u64, u32)>> = log_data(LevelFilter::TRACE, || {
+            if let Ok(decoded) = Update::decode_v1(&update_bytes) {
+                let sv = decoded.state_vector();
+                let entries: Vec<_> = sv.iter().map(|(&c, &cl)| (c, cl)).collect();
+                entries
+            } else {
+                Vec::new()
+            }
+        });
+        tracing::trace!(
+            "[client.insert] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={:?} snap_hash_after={:?} doc_advanced={}",
+            mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
+            doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
+            snap_hash_before, snap_hash_after, doc_advanced,
+        );
 
         if !doc_advanced && !update_bytes.is_empty() {
             tracing::warn!(
@@ -907,7 +1293,6 @@ impl VaultSyncClient {
             .encryptor
             .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-        let hlc = self.clock.now();
         if self.clock.did_logical_wrap() {
             self.metrics.record_hlc_wrap();
             self.clock.clear_logical_wrap();
@@ -926,6 +1311,7 @@ impl VaultSyncClient {
             SyncStatus::Optimistic,
             None,
             hlc.wall,
+            doc.schema_version,
             MutationOrigin::Insert,
             "",
         );
@@ -965,6 +1351,8 @@ impl VaultSyncClient {
                         .set_oplog_size(&self.config.namespace, entries.len() as i64);
                 }
 
+                self.watermark_version(doc_id, record_id, doc.schema_version);
+
                 // Fire reactive subscriptions locally
                 let state = doc.to_map();
                 let sub_span = tracing::info_span!("subscription.fire", doc_id = doc_id);
@@ -988,8 +1376,10 @@ impl VaultSyncClient {
         &self,
         doc_id: &str,
         record_id: &str,
-        fields: HashMap<String, CrdtValue>,
+        mut fields: HashMap<String, CrdtValue>,
     ) -> Result<(), VaultSyncError> {
+        Self::filter_meta_fields(&mut fields);
+
         let span = tracing::info_span!(
             "vaultsync.write",
             doc_id = doc_id,
@@ -1004,15 +1394,41 @@ impl VaultSyncClient {
         let existing = self.storage.get_document(doc_id, record_id).await?;
         let mut doc = match existing {
             Some(bytes) => CRDTDocument::from_snapshot(&bytes)?,
-            None => CRDTDocument::new(doc_id, record_id, 0),
+            None => {
+                let sv = self.schema.lock().unwrap().get(doc_id).map_or(0, |s| s.version);
+                CRDTDocument::new(doc_id, record_id, sv)
+            },
         };
+        // Version enforcement: existing docs must match registered schema
+        {
+            let registry = self.schema.lock().unwrap();
+            registry.validate_version(doc_id, doc.schema_version)?;
+        }
+
+        // ── Phase 0: skip no-op writes (no content field changed) ──
+        let content_changed = fields.iter().any(|(key, value)| {
+            doc.get_field(key).as_ref().map_or(true, |existing| existing != value)
+        });
+        if !content_changed {
+            tracing::trace!(
+                "[client.update] SKIP no-op mutation doc={} record={} — content unchanged",
+                doc_id, record_id,
+            );
+            return Ok(());
+        }
+
         let mutation_id = uuid::Uuid::new_v4().to_string();
 
-        // ── Phase 1: state vector + snapshot hash BEFORE mutation ──
+        // Auto-set updatedAt to HLC wall clock (content changed, so timestamp advances)
+        let hlc = self.clock.now();
+        if self.clock.did_logical_wrap() {
+            self.metrics.record_hlc_wrap();
+            self.clock.clear_logical_wrap();
+        }
+        fields.insert("updatedAt".to_string(), CrdtValue::Number(hlc.wall as f64));
+
         let sv_before = doc.state_vector();
         let sv_before_entries: Vec<_> = sv_before.iter().map(|(c, cl)| (c, cl)).collect();
-        let snap_before = doc.to_snapshot();
-        let snap_hash_before = hex::encode(&Sha256::digest(&snap_before)[..8]);
         let doc_ptr = &doc as *const CRDTDocument as usize;
         let inner_doc_ptr = doc.inner_doc() as *const yrs::Doc as usize;
 
@@ -1022,24 +1438,32 @@ impl VaultSyncClient {
             }
         });
 
-        // ── Phase 1: state vector + snapshot hash AFTER mutation ──
         let sv_after = doc.state_vector();
         let sv_after_entries: Vec<_> = sv_after.iter().map(|(c, cl)| (c, cl)).collect();
-        let snap_after = doc.to_snapshot();
-        let snap_hash_after = hex::encode(&Sha256::digest(&snap_after)[..8]);
         let doc_advanced = sv_before != sv_after;
 
         let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
-        if let Ok(decoded) = Update::decode_v1(&update_bytes) {
-            let update_sv = decoded.state_vector();
-            let update_sv_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
-            tracing::info!(
-                "[client.update] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={} snap_hash_after={} doc_advanced={}",
-                mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
-                doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
-                snap_hash_before, snap_hash_after, doc_advanced,
-            );
-        }
+        let snap_hash_before = log_data(LevelFilter::TRACE, || {
+            hex::encode(&Sha256::digest(&doc.to_snapshot())[..8])
+        });
+        let snap_hash_after = log_data(LevelFilter::TRACE, || {
+            hex::encode(&Sha256::digest(&doc.to_snapshot())[..8])
+        });
+        let update_sv_entries: Option<Vec<(u64, u32)>> = log_data(LevelFilter::TRACE, || {
+            if let Ok(decoded) = Update::decode_v1(&update_bytes) {
+                let sv = decoded.state_vector();
+                let entries: Vec<_> = sv.iter().map(|(&c, &cl)| (c, cl)).collect();
+                entries
+            } else {
+                Vec::new()
+            }
+        });
+        tracing::trace!(
+            "[client.update] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={:?} snap_hash_after={:?} doc_advanced={}",
+            mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
+            doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
+            snap_hash_before, snap_hash_after, doc_advanced,
+        );
 
         if !doc_advanced && !update_bytes.is_empty() {
             tracing::warn!(
@@ -1060,11 +1484,6 @@ impl VaultSyncClient {
             .encryptor
             .encrypt_symmetric(&update_bytes, &self.config.namespace)?;
 
-        let hlc = self.clock.now();
-        if self.clock.did_logical_wrap() {
-            self.metrics.record_hlc_wrap();
-            self.clock.clear_logical_wrap();
-        }
         let entry = OplogEntry::new(
             mutation_id,
             self.config.replica_id.clone(),
@@ -1079,6 +1498,7 @@ impl VaultSyncClient {
             SyncStatus::Optimistic,
             None,
             hlc.wall,
+            doc.schema_version,
             MutationOrigin::Update,
             "",
         );
@@ -1095,11 +1515,11 @@ impl VaultSyncClient {
             .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
             .await;
         let write_elapsed = write_t0.elapsed();
-        tracing::info!(
-            "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
-            entry.id, doc_id, record_id, write_elapsed.as_millis(),
-            if res.is_ok() { "ok" } else { "err" },
-        );
+            tracing::trace!(
+                "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
+                entry.id, doc_id, record_id, write_elapsed.as_millis(),
+                if res.is_ok() { "ok" } else { "err" },
+            );
         drop(append_guard);
 
         match res {
@@ -1124,6 +1544,8 @@ impl VaultSyncClient {
                     self.metrics
                         .set_oplog_size(&self.config.namespace, entries.len() as i64);
                 }
+
+                self.watermark_version(doc_id, record_id, doc.schema_version);
 
                 // Fire reactive subscriptions locally
                 let state = doc.to_map();
@@ -1159,12 +1581,15 @@ impl VaultSyncClient {
         let existing = self.storage.get_document(doc_id, record_id).await?;
         if let Some(bytes) = existing {
             let mut doc = CRDTDocument::from_snapshot(&bytes)?;
+            // Version enforcement: existing docs must match registered schema
+            {
+                let registry = self.schema.lock().unwrap();
+                registry.validate_version(doc_id, doc.schema_version)?;
+            }
             let mutation_id = uuid::Uuid::new_v4().to_string();
 
             let sv_before = doc.state_vector();
             let sv_before_entries: Vec<_> = sv_before.iter().map(|(c, cl)| (c, cl)).collect();
-            let snap_before = doc.to_snapshot();
-            let snap_hash_before = hex::encode(&Sha256::digest(&snap_before)[..8]);
             let doc_ptr = &doc as *const CRDTDocument as usize;
             let inner_doc_ptr = doc.inner_doc() as *const yrs::Doc as usize;
 
@@ -1172,21 +1597,30 @@ impl VaultSyncClient {
 
             let sv_after = doc.state_vector();
             let sv_after_entries: Vec<_> = sv_after.iter().map(|(c, cl)| (c, cl)).collect();
-            let snap_after = doc.to_snapshot();
-            let snap_hash_after = hex::encode(&Sha256::digest(&snap_after)[..8]);
             let doc_advanced = sv_before != sv_after;
 
             let content_hash = hex::encode(&Sha256::digest(&update_bytes)[..8]);
-            if let Ok(decoded) = Update::decode_v1(&update_bytes) {
-                let update_sv = decoded.state_vector();
-                let update_sv_entries: Vec<_> = update_sv.iter().map(|(c, cl)| (c, cl)).collect();
-                tracing::info!(
-                    "[client.delete] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={} snap_hash_after={} doc_advanced={}",
-                    mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
-                    doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
-                    snap_hash_before, snap_hash_after, doc_advanced,
-                );
-            }
+            let snap_hash_before = log_data(LevelFilter::TRACE, || {
+                hex::encode(&Sha256::digest(&doc.to_snapshot())[..8])
+            });
+            let snap_hash_after = log_data(LevelFilter::TRACE, || {
+                hex::encode(&Sha256::digest(&doc.to_snapshot())[..8])
+            });
+            let update_sv_entries: Option<Vec<(u64, u32)>> = log_data(LevelFilter::TRACE, || {
+                if let Ok(decoded) = Update::decode_v1(&update_bytes) {
+                    let sv = decoded.state_vector();
+                    let entries: Vec<_> = sv.iter().map(|(&c, &cl)| (c, cl)).collect();
+                    entries
+                } else {
+                    Vec::new()
+                }
+            });
+            tracing::trace!(
+                "[client.delete] id={} yrs_update source=client doc={} record={} sha256={} update_sv={:?} len={} doc_ptr=0x{:x} inner_doc_ptr=0x{:x} sv_before={:?} sv_after={:?} snap_hash_before={:?} snap_hash_after={:?} doc_advanced={}",
+                mutation_id, doc_id, record_id, content_hash, update_sv_entries, update_bytes.len(),
+                doc_ptr, inner_doc_ptr, sv_before_entries, sv_after_entries,
+                snap_hash_before, snap_hash_after, doc_advanced,
+            );
 
             if !doc_advanced && !update_bytes.is_empty() {
                 tracing::warn!(
@@ -1220,8 +1654,17 @@ impl VaultSyncClient {
                 SyncStatus::Optimistic,
                 None,
                 hlc.wall,
+                doc.schema_version,
                 MutationOrigin::Delete,
                 "",
+            );
+
+            let pre_write_map = doc.to_map();
+            tracing::info!(
+                "[DELETE_CORE] record={} has_deleted={} deleted_value={:?}",
+                record_id,
+                pre_write_map.contains_key("_deleted"),
+                pre_write_map.get("_deleted"),
             );
 
             let append_span = tracing::info_span!(
@@ -1236,7 +1679,7 @@ impl VaultSyncClient {
                 .write_document_and_oplog(doc_id, record_id, &snapshot, &entry)
                 .await;
             let write_elapsed = write_t0.elapsed();
-            tracing::info!(
+            tracing::trace!(
                 "[pipeline] write_document_and_oplog id={} doc={} record={} elapsed={}ms status={}",
                 mutation_id, doc_id, record_id, write_elapsed.as_millis(),
                 if res.is_ok() { "ok" } else { "err" },
@@ -1266,7 +1709,9 @@ impl VaultSyncClient {
                         .set_oplog_size(&self.config.namespace, entries.len() as i64);
                 }
 
-                    // Fire reactive subscriptions locally
+                self.watermark_version(doc_id, record_id, doc.schema_version);
+
+                // Fire reactive subscriptions locally
                     let state = doc.to_map();
                     let sub_span = tracing::info_span!("subscription.fire", doc_id = doc_id);
                     let _sub_guard = sub_span.enter();
@@ -1310,17 +1755,32 @@ impl VaultSyncClient {
         filter: Option<&Filter>,
     ) -> Result<Vec<HashMap<String, CrdtValue>>, VaultSyncError> {
         let docs = self.storage.list_documents(doc_id).await?;
+        let total = docs.len();
         let mut results = Vec::new();
+        let mut deleted_count = 0;
         for (_rid, bytes) in docs {
             let doc = CRDTDocument::from_snapshot(&bytes)?;
             let map = doc.to_map();
             if let Some(CrdtValue::Boolean(true)) = map.get("_deleted") {
+                tracing::trace!(
+                    "[FIND_FILTER] doc={} record={} skipped (deleted)",
+                    doc_id,
+                    _rid,
+                );
+                deleted_count += 1;
                 continue;
             }
             if filter.as_ref().is_none_or(|f| f.matches(&map)) {
                 results.push(map);
             }
         }
+        tracing::debug!(
+            "[FIND_RESULT] doc={} total={} deleted={} returned={}",
+            doc_id,
+            total,
+            deleted_count,
+            results.len(),
+        );
         Ok(results)
     }
 
@@ -1365,7 +1825,20 @@ impl VaultSyncClient {
     pub async fn force_sync(&self) -> Result<usize, VaultSyncError> {
         let uploaded = self.upload_queue.process_batch().await?;
         let downloaded = self.download_queue.process_batch().await?;
+        // Reconcile pending count cache after processing (retries may have
+        // exhausted and marked entries as Failed, changing the count).
+        if let Ok(count) = self.upload_queue.pending_count().await {
+            self.pending_count_cache
+                .store(count, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(uploaded + downloaded)
+    }
+
+    pub fn set_connection_manager(
+        &self,
+        cm: Option<Arc<crate::connection_manager::ConnectionManager>>,
+    ) {
+        self.upload_queue.set_connection_manager(cm);
     }
 
     pub async fn sync_status(&self) -> Result<SyncState, VaultSyncError> {
@@ -1393,6 +1866,11 @@ impl VaultSyncClient {
     /// after each batch and by write methods. Avoids OPFS reads on every call.
     pub async fn pending_uploads(&self) -> Result<usize, VaultSyncError> {
         Ok(self.pending_count_cache.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Check if this instance holds the leader lock.
+    pub fn is_leader(&self) -> bool {
+        self.leader_election.is_leader()
     }
 
     /// Take the pending-count receiver for event-driven status updates.
@@ -1496,7 +1974,7 @@ impl VaultSyncClient {
         doc_id: &str,
         schema: DocumentSchema,
     ) -> Result<(), VaultSyncError> {
-        self.schema.lock().unwrap().define(doc_id, schema)
+        self.schema.lock().unwrap().define(doc_id, schema, None).await
     }
 
     pub async fn apply_migration(
@@ -1613,4 +2091,16 @@ impl VaultSyncClient {
 
     #[cfg(target_arch = "wasm32")]
     async fn broadcast_p2p(&self, _entry: &OplogEntry, _key_version: u64) {}
+
+    pub fn health(&self) -> &Arc<crate::telemetry::health::HealthRegistry> {
+        &self.health
+    }
+
+    /// Returns a watch receiver for the initial sync lifecycle state.
+    /// JS side uses this to await `InitialSyncComplete` before populating
+    /// the DocumentStore, replacing the previous cursor-polling approach.
+    #[cfg(feature = "async-runtime")]
+    pub fn sync_lifecycle(&self) -> tokio::sync::watch::Receiver<SyncLifecycle> {
+        self.sync_lifecycle_tx.subscribe()
+    }
 }

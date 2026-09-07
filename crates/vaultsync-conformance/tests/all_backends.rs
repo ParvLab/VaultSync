@@ -36,8 +36,11 @@ async fn test_http_conformance() {
             db_url: "".to_string(),
             auth_token: None,
             admin_token: None,
+            auto_compact_ns: String::new(),
+            auto_compact_interval_minutes: 0,
         },
         sessions: Default::default(),
+        generation_id: "test".to_string(),
     };
 
     let app = build_router(state);

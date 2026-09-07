@@ -43,7 +43,7 @@ impl Coordinator for SQLiteCoordinator {
         let namespace_str = namespace.to_string();
         let tx_sender = self.tx.clone();
 
-        tracing::info!("[push] db={} ns={} count={}", db_path, namespace_str, mutations.len());
+        tracing::debug!("[push] db={} ns={} count={}", db_path, namespace_str, mutations.len());
 
         let push_res = tokio::task::spawn_blocking(move || {
             let mut conn_guard = conn.lock().map_err(|e| CoordinatorError::Internal(e.to_string()))?;
@@ -133,7 +133,7 @@ impl Coordinator for SQLiteCoordinator {
                 params![namespace_str],
                 |r| r.get(0),
             ).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-            tracing::info!("[pull] db={} ns={} after={} max_seq={}", db_path, namespace_str, after, max_seq);
+            tracing::debug!("[pull] db={} ns={} after={} max_seq={}", db_path, namespace_str, after, max_seq);
             if max_seq < after as i64 {
                 tracing::warn!("[pull] cursor past end: after={} max_seq={}", after, max_seq);
             }
@@ -164,12 +164,12 @@ impl Coordinator for SQLiteCoordinator {
             for row in rows {
                 res.push(row.map_err(|e| CoordinatorError::Internal(e.to_string()))?);
             }
-            tracing::info!("[pull] returned {} rows", res.len());
+            tracing::debug!("[pull] returned {} rows", res.len());
             if let Some(first) = res.first() {
-                tracing::info!("[pull] first seq={}", first.sequence);
+                tracing::debug!("[pull] first seq={}", first.sequence);
             }
             if let Some(last) = res.last() {
-                tracing::info!("[pull] last seq={}", last.sequence);
+                tracing::debug!("[pull] last seq={}", last.sequence);
             }
             Ok(res)
         }).await.map_err(|e| CoordinatorError::Internal(e.to_string()))?
@@ -694,6 +694,7 @@ mod tests {
                     public_key: vec![1, 2, 3],
                     schema_version: 5,
                 },
+                0,
             )
             .await
             .unwrap();

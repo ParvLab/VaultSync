@@ -31,6 +31,11 @@ struct D1SchemaVersionRow {
     version: i64,
 }
 
+#[derive(Deserialize)]
+struct D1MaxSeqRow {
+    max_seq: Option<i64>,
+}
+
 fn server_generation_id() -> &'static str {
     static GEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     GEN.get_or_init(|| uuid::Uuid::new_v4().to_string())
@@ -466,6 +471,8 @@ impl DurableObject for NamespaceDurableObject {
                     snapshot_available: false,
                     snapshot_sequence: 0,
                     error: None,
+                    history_preserved: true,
+                    max_sequence: 0,
                 };
                 if let Ok(Some(row)) = db
                     .prepare("SELECT version FROM schema_versions WHERE namespace = ?1")
@@ -474,6 +481,23 @@ impl DurableObject for NamespaceDurableObject {
                     .await
                 {
                     ack.coordinator_sequence = row.version as u64;
+                }
+                // Query max sequence for cursor validation.
+                // After compaction, mutations rows are deleted but snapshots
+                // retain the max sequence — query both and take the max.
+                if let Ok(Some(max_row)) = db
+                    .prepare(
+                        "SELECT COALESCE(MAX(m.seq), 0) AS max_seq FROM (\
+                         SELECT MAX(sequence) AS seq FROM mutations WHERE namespace = ?1 \
+                         UNION ALL \
+                         SELECT MAX(sequence) AS seq FROM snapshots WHERE namespace = ?1 \
+                        ) m"
+                    )
+                    .bind(&[add_payload.namespace.clone().into()])?
+                    .first::<D1MaxSeqRow>(None)
+                    .await
+                {
+                    ack.max_sequence = max_row.max_seq.unwrap_or(0) as u64;
                 }
 
                 let mut available_snapshots = Vec::new();
@@ -526,6 +550,8 @@ impl DurableObject for NamespaceDurableObject {
                         bytes: snap.bytes,
                         checksum: snap.checksum,
                         namespace: add_payload.namespace.clone(),
+                        schema_version: snap.schema_version,
+                        created_at: snap.created_at,
                     };
                     if let Ok(snap_frame) = vaultsync_core::coordinator::ws_proto::encode_frame(
                         vaultsync_core::coordinator::ws_proto::MSG_SNAPSHOT,
@@ -595,6 +621,8 @@ impl DurableObject for NamespaceDurableObject {
                     snapshot_url: None,
                     error: None,
                     generation_id: server_generation_id().to_string(),
+                    history_preserved: true,
+                    max_sequence: 0,
                 };
                 if let Ok(Some(row)) = db
                     .prepare("SELECT version FROM schema_versions WHERE namespace = ?1")
@@ -603,6 +631,23 @@ impl DurableObject for NamespaceDurableObject {
                     .await
                 {
                     reg_ack.coordinator_sequence = row.version as u64;
+                }
+                // Query max sequence for cursor validation.
+                // After compaction, mutations rows are deleted but snapshots
+                // retain the max sequence — query both and take the max.
+                if let Ok(Some(max_row)) = db
+                    .prepare(
+                        "SELECT COALESCE(MAX(m.seq), 0) AS max_seq FROM (\
+                         SELECT MAX(sequence) AS seq FROM mutations WHERE namespace = ?1 \
+                         UNION ALL \
+                         SELECT MAX(sequence) AS seq FROM snapshots WHERE namespace = ?1 \
+                        ) m"
+                    )
+                    .bind(&[attachment.namespace.clone().into()])?
+                    .first::<D1MaxSeqRow>(None)
+                    .await
+                {
+                    reg_ack.max_sequence = max_row.max_seq.unwrap_or(0) as u64;
                 }
 
                 let mut available_snapshots = Vec::new();
@@ -655,6 +700,8 @@ impl DurableObject for NamespaceDurableObject {
                         bytes: snap.bytes,
                         checksum: snap.checksum,
                         namespace: attachment.namespace.clone(),
+                        schema_version: snap.schema_version,
+                        created_at: snap.created_at,
                     };
                     if let Ok(snap_frame) = vaultsync_core::coordinator::ws_proto::encode_frame(
                         vaultsync_core::coordinator::ws_proto::MSG_SNAPSHOT,

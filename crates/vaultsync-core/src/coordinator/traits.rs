@@ -4,6 +4,19 @@ use serde::{Deserialize, Serialize};
 
 pub type SequenceId = u64;
 
+/// Result of validating a client's cursor against the server's current state.
+/// Replaces magic-number checks like `server_max == 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorValidation {
+    /// Server can't verify the cursor (e.g., in-memory coordinator, no history).
+    /// Client should keep its cursor and proceed.
+    Unknown,
+    /// Cursor is valid: `server_max >= cursor`. No re-registration needed.
+    Valid,
+    /// Cursor is stale: `server_max < cursor`. Client must reset to 0 and replay.
+    Invalid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedMutation {
     pub id: String,
@@ -84,6 +97,33 @@ pub trait Coordinator: Send + Sync + std::fmt::Debug {
     /// Empty string means "generation tracking not supported" — cursor reset is skipped.
     async fn generation_id(&self) -> String {
         String::new()
+    }
+    /// Whether the coordinator's mutation history survives restarts (e.g., D1 backend).
+    /// When true, the client can keep its cursor on generation mismatch.
+    /// Default false (in-memory coordinators lose everything on restart).
+    async fn history_preserved(&self) -> bool {
+        false
+    }
+    /// Returns the server's current max oplog sequence, or 0 if unknown.
+    /// The client uses this to validate its cursor after a generation mismatch:
+    /// if `max_sequence < client_cursor`, the cursor is no longer valid.
+    async fn max_sequence(&self) -> u64 {
+        0
+    }
+    /// Validate a cursor against the server's state.
+    /// Default implementation uses `max_sequence()`:
+    /// - 0 → Unknown (can't validate)
+    /// - >= cursor → Valid
+    /// - < cursor → Invalid
+    async fn cursor_validation(&self, cursor: SequenceId) -> CursorValidation {
+        let server_max = self.max_sequence().await;
+        if server_max == 0 {
+            CursorValidation::Unknown
+        } else if server_max >= cursor {
+            CursorValidation::Valid
+        } else {
+            CursorValidation::Invalid
+        }
     }
     async fn update_replica_key(
         &self,

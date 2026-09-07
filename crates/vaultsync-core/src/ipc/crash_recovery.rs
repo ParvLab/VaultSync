@@ -50,6 +50,7 @@ impl CrashRecovery {
                             SyncStatus::Pending,
                             None,
                             epoch,
+                            0,
                             MutationOrigin::CrashRecovery,
                             "",
                         );

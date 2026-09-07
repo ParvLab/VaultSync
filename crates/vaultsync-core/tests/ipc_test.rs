@@ -68,13 +68,14 @@ async fn test_crash_recovery_requeues_stale_pending() {
         sequence: None,
         sync_status: SyncStatus::Failed,
         synced_at: None,
-        created_at: now - 100_000,
-        origin: MutationOrigin::Unknown,
-        origin_context: String::new(),
-    };
-    storage.append_oplog(&stale_entry).await.unwrap();
+            created_at: now - 100_000,
+            schema_version: 0,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
+        };
+        storage.append_oplog(&stale_entry).await.unwrap();
 
-    // 2. Insert a failed entry created 10 seconds ago (not stale)
+        // 2. Insert a failed entry created 10 seconds ago (not stale)
     let fresh_entry = OplogEntry {
         id: "fresh-id".to_string(),
         replica_id: "replica-1".to_string(),
@@ -88,13 +89,14 @@ async fn test_crash_recovery_requeues_stale_pending() {
         sequence: None,
         sync_status: SyncStatus::Failed,
         synced_at: None,
-        created_at: now - 10_000,
-        origin: MutationOrigin::Unknown,
-        origin_context: String::new(),
-    };
-    storage.append_oplog(&fresh_entry).await.unwrap();
+            created_at: now - 10_000,
+            schema_version: 0,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
+        };
+        storage.append_oplog(&fresh_entry).await.unwrap();
 
-    // 3. Run recovery
+        // 3. Run recovery
     let keyring = Arc::new(vaultsync_core::e2ee::keyring::KeyRing::generate());
     let recovery = CrashRecovery::new(storage.clone(), ns.to_string());
     let recovered_count = recovery.recover(keyring).await.expect("recovery runs");
@@ -130,13 +132,14 @@ async fn test_compaction_removes_synced_entries() {
         sequence: Some(42),
         sync_status: SyncStatus::Synced,
         synced_at: Some(now_secs - 10 * 86400),
-        created_at: (now_secs - 10 * 86400) * 1000,
-        origin: MutationOrigin::Unknown,
-        origin_context: String::new(),
-    };
-    storage.append_oplog(&stale_entry).await.unwrap();
+            created_at: (now_secs - 10 * 86400) * 1000,
+            schema_version: 0,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
+        };
+        storage.append_oplog(&stale_entry).await.unwrap();
 
-    // 2. Insert a synced entry from 2 days ago (fresh)
+        // 2. Insert a synced entry from 2 days ago (fresh)
     let fresh_entry = OplogEntry {
         id: "fresh-id".to_string(),
         replica_id: "replica-1".to_string(),
@@ -150,13 +153,14 @@ async fn test_compaction_removes_synced_entries() {
         sequence: Some(43),
         sync_status: SyncStatus::Synced,
         synced_at: Some(now_secs - 2 * 86400),
-        created_at: (now_secs - 2 * 86400) * 1000,
-        origin: MutationOrigin::Unknown,
-        origin_context: String::new(),
-    };
-    storage.append_oplog(&fresh_entry).await.unwrap();
+            created_at: (now_secs - 2 * 86400) * 1000,
+            schema_version: 0,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
+        };
+        storage.append_oplog(&fresh_entry).await.unwrap();
 
-    // 3. Run compaction
+        // 3. Run compaction
     let engine = CompactionEngine::new(storage.clone(), CompactionConfig::default());
     let stats = engine.run_compaction(ns).await.expect("compaction runs");
     assert_eq!(stats.oplog_removed, 1);
@@ -196,11 +200,12 @@ async fn test_compaction_removes_tombstoned_docs() {
         sequence: Some(101),
         sync_status: SyncStatus::Synced,
         synced_at: Some((now_ms - 2 * 86400_000) / 1000),
-        created_at: now_ms - 2 * 86400_000,
-        origin: MutationOrigin::Unknown,
-        origin_context: String::new(),
-    };
-    storage.append_oplog(&delete_entry).await.unwrap();
+            created_at: now_ms - 2 * 86400_000,
+            schema_version: 0,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
+        };
+        storage.append_oplog(&delete_entry).await.unwrap();
 
     // Verify document exists before compaction
     let doc_before = storage.get_document("doc-id-1", "rec-id-1").await.unwrap();

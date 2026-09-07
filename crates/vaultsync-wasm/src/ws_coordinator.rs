@@ -1,40 +1,21 @@
+use crate::{engine_debug, engine_info, engine_trace, engine_warn};
 use async_trait::async_trait;
 use futures::channel::{mpsc, oneshot};
 use futures::future::Either;
 use futures::FutureExt;
 use futures::{Stream, StreamExt};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use vaultsync_core::connection_manager::ConnectionManager;
 use vaultsync_core::coordinator::traits::{
     Coordinator, CoordinatorError, EncryptedMutation, PendingMutation, ReplicaInfo, SequenceId,
 };
 use vaultsync_core::coordinator::ws_proto::*;
+use vaultsync_core::crdt::snapshot::Snapshot;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{BinaryType, WebSocket};
-
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = console, js_name = log)]
-    fn console_log_str(s: &str);
-    #[wasm_bindgen(js_namespace = console, js_name = debug)]
-    fn console_debug_str(s: &str);
-    #[wasm_bindgen(js_namespace = console, js_name = warn)]
-    fn console_warn_str(s: &str);
-}
-
-macro_rules! console_log {
-    ($($t:tt)*) => (console_log_str(&format!($($t)*)));
-}
-
-macro_rules! console_debug {
-    ($($t:tt)*) => (console_debug_str(&format!($($t)*)));
-}
-
-macro_rules! console_warn {
-    ($($t:tt)*) => (console_warn_str(&format!($($t)*)));
-}
 
 #[derive(Debug, Clone)]
 pub struct WasmWsCoordinator {
@@ -54,6 +35,7 @@ struct ConnectionState {
 struct WasmWsCoordinatorInner {
     url: String,
     auth_token: Option<String>,
+    connection_manager: Mutex<Option<Arc<ConnectionManager>>>,
     replica_id: Mutex<String>,
     connection: Mutex<ConnectionState>,
     pending_requests: Mutex<HashMap<String, oneshot::Sender<Vec<u8>>>>,
@@ -62,7 +44,11 @@ struct WasmWsCoordinatorInner {
     download_notify: Mutex<Option<mpsc::UnboundedSender<Option<PendingMutation>>>>,
     upload_notify: Mutex<Option<mpsc::UnboundedSender<()>>>,
     generation_id: Mutex<String>,
+    history_preserved: AtomicBool,
+    max_sequence: AtomicU64,
     conn_gen: AtomicU64,
+    /// Snapshots received from server pushes (MSG_SNAPSHOT) during REGISTER or later.
+    received_snapshots: Mutex<Vec<Snapshot>>,
 }
 
 impl std::fmt::Debug for WasmWsCoordinatorInner {
@@ -83,6 +69,7 @@ impl WasmWsCoordinator {
             inner: Arc::new(WasmWsCoordinatorInner {
                 url: url.to_string(),
                 auth_token,
+                connection_manager: Mutex::new(None),
                 replica_id: Mutex::new(String::new()),
                 connection: Mutex::new(ConnectionState {
                     ws: None,
@@ -96,19 +83,27 @@ impl WasmWsCoordinator {
                 download_notify: Mutex::new(None),
                 upload_notify: Mutex::new(None),
                 generation_id: Mutex::new(String::new()),
+                history_preserved: AtomicBool::new(false),
+                max_sequence: AtomicU64::new(0),
                 conn_gen: AtomicU64::new(0),
+                received_snapshots: Mutex::new(Vec::new()),
             }),
         }
     }
 
+    pub fn set_connection_manager(&self, cm: Arc<ConnectionManager>) {
+        *self.inner.connection_manager.lock().unwrap() = Some(cm);
+        engine_debug!("[WasmWs] connection_manager registered");
+    }
+
     pub fn set_download_notify(&self, tx: mpsc::UnboundedSender<Option<PendingMutation>>) {
         *self.inner.download_notify.lock().unwrap() = Some(tx);
-        console_log!("[WasmWs] download_notify registered");
+        engine_debug!("[WasmWs] download_notify registered");
     }
 
     pub fn set_upload_notify(&self, tx: mpsc::UnboundedSender<()>) {
         *self.inner.upload_notify.lock().unwrap() = Some(tx);
-        console_log!("[WasmWs] upload_notify registered");
+        engine_debug!("[WasmWs] upload_notify registered");
     }
 
     async fn connect_and_handshake(
@@ -117,17 +112,27 @@ impl WasmWsCoordinator {
         after: SequenceId,
         info: Option<&ReplicaInfo>,
     ) -> Result<(), CoordinatorError> {
-        console_log!("[5/9] coordinator connect");
+        self.connect_and_handshake_impl(namespace, after, info, false).await
+    }
+
+    async fn connect_and_handshake_impl(
+        &self,
+        namespace: &str,
+        after: SequenceId,
+        info: Option<&ReplicaInfo>,
+        skip_subscribe: bool,
+    ) -> Result<(), CoordinatorError> {
+        engine_debug!("[VaultSync] coordinator connect");
 
         // ── Single-flight guard: only one caller connects, others wait ──
         let wait_for_connection = {
             let mut state = self.inner.connection.lock().unwrap();
             if state.ws.is_some() {
-                console_log!("[WasmWs] already connected");
+                engine_debug!("[WasmWs] already connected");
                 return Ok(());
             }
             if state.connecting {
-                console_log!("[WasmWs] connection in progress, waiting...");
+                engine_debug!("[WasmWs] connection in progress, waiting...");
                 let (tx, rx) = oneshot::channel();
                 state.waiters.push(tx);
                 Some(rx)
@@ -146,11 +151,11 @@ impl WasmWsCoordinator {
 
         // Perform connection handshake
         let reconn_t0 = js_sys::Date::now();
-        let result = self.do_connect(namespace, after, info, generation).await;
+        let result = self.do_connect(namespace, after, info, generation, skip_subscribe).await;
         let reconn_elapsed = (js_sys::Date::now() - reconn_t0) as u64;
 
         // Notify waiters and finalize state
-        let had_ws = {
+        let _had_ws = {
             let mut state = self.inner.connection.lock().unwrap();
             let had = state.ws.is_some();
             state.connecting = false;
@@ -174,9 +179,9 @@ impl WasmWsCoordinator {
 
         // On successful reconnect, wake workers to resume syncing
         if result.is_ok() {
-            console_log!(
-                "[reconnect] SUCCESS generation={} elapsed={}ms had_ws_before={} notifying_workers=true",
-                generation, reconn_elapsed, had_ws,
+            engine_info!(
+                "[reconnect] SUCCESS generation={} elapsed={}ms",
+                generation, reconn_elapsed,
             );
             if let Some(ref notify) = *self.inner.upload_notify.lock().unwrap() {
                 let _ = notify.unbounded_send(());
@@ -185,7 +190,7 @@ impl WasmWsCoordinator {
                 let _ = notify.unbounded_send(None);
             }
         } else {
-            console_warn!(
+            engine_warn!(
                 "[reconnect] FAIL generation={} elapsed={}ms",
                 generation, reconn_elapsed,
             );
@@ -195,16 +200,20 @@ impl WasmWsCoordinator {
     }
 
     /// Performs the actual WebSocket connection and handshake.
-    /// Returns the established WebSocket on success.
+    /// When `skip_subscribe` is true, SUBSCRIBE is not sent — the caller
+    /// must call `subscribe()` separately after the generation check.
     async fn do_connect(
         &self,
         namespace: &str,
         after: SequenceId,
         info: Option<&ReplicaInfo>,
         generation: u64,
+        skip_subscribe: bool,
     ) -> Result<(), CoordinatorError> {
+        let dc_t0 = js_sys::Date::now();
         let ws_url = get_ws_url(&self.inner.url, namespace);
-        console_debug!("[reconnect] state=Connecting url={}", ws_url);
+        engine_debug!("[reconnect] state=Connecting url={}", ws_url);
+        engine_info!("[CONN][T0] CONNECTING url={}", ws_url);
         let ws = WebSocket::new(&ws_url).map_err(|e| {
             CoordinatorError::Internal(format!("Failed to create WebSocket: {:?}", e))
         })?;
@@ -215,7 +224,7 @@ impl WasmWsCoordinator {
             let (open_tx, open_rx) = oneshot::channel::<()>();
             let open_tx_cell = std::cell::RefCell::new(Some(open_tx));
             let open_callback = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-                console_log!("[WasmWs] WebSocket opened!");
+                engine_info!("[CONN][T1] OPEN");
                 if let Some(tx) = open_tx_cell.borrow_mut().take() {
                     let _ = tx.send(());
                 }
@@ -228,11 +237,19 @@ impl WasmWsCoordinator {
             let close_tx_cell = std::cell::RefCell::new(Some(close_tx));
             let inner_close_clone = self.inner.clone();
             let close_callback = Closure::wrap(Box::new(move |e: web_sys::Event| {
-                console_log!("[WasmWs] WebSocket closed/failed: {:?}", e);
+                let reason = e
+                    .target()
+                    .and_then(|t| t.dyn_into::<web_sys::WebSocket>().ok())
+                    .map(|ws| ws.ready_state())
+                    .unwrap_or(99);
+                engine_warn!("[CONN][T8] CLOSED ready_state={}", reason);
                 if let Some(tx) = close_tx_cell.borrow_mut().take() {
                     let _ = tx.send(());
                 }
                 inner_close_clone.connection.lock().unwrap().ws = None;
+                if let Some(ref cm) = *inner_close_clone.connection_manager.lock().unwrap() {
+                    cm.transition(vaultsync_core::connection_manager::ConnectionState::Closed);
+                }
             }) as Box<dyn Fn(web_sys::Event)>);
             ws.set_onclose(Some(close_callback.as_ref().unchecked_ref()));
             close_callback.forget();
@@ -242,10 +259,15 @@ impl WasmWsCoordinator {
 
         futures::select! {
             _ = open_rx.fuse() => {
-                console_log!("[WasmWs] open_rx resolved, connected!");
+                let ws_open_elapsed = (js_sys::Date::now() - dc_t0) as u64;
+                engine_info!("[ws] ws_open elapsed={}ms", ws_open_elapsed);
+                if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+                    cm.transition(vaultsync_core::connection_manager::ConnectionState::Authenticating);
+                }
             }
             _ = close_rx.fuse() => {
-                console_log!("[WasmWs] close_rx resolved, connection failed!");
+                engine_warn!("[CONN][T8] CLOSED (handshake_failed)");
+                engine_info!("[WasmWs] WebSocket closed/failed!");
                 return Err(CoordinatorError::NotAvailable);
             }
         }
@@ -269,8 +291,9 @@ impl WasmWsCoordinator {
         };
 
         // 2. Perform AUTH
-        console_debug!("[reconnect] state=Authenticating");
-        console_log!("[6/9] auth");
+        let auth_t0 = js_sys::Date::now();
+        engine_debug!("[reconnect] state=Authenticating");
+        engine_debug!("[VaultSync] auth");
         let token = self.inner.auth_token.clone().unwrap_or_default();
         let replica_id = info
             .map(|i| i.replica_id.clone())
@@ -285,6 +308,7 @@ impl WasmWsCoordinator {
             encode_frame(MSG_AUTH, &auth).map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         ws.send_with_u8_array(&auth_frame)
             .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+        engine_debug!("[CONN][T2] AUTH_SENT");
 
         // Wait for AUTH_ACK with 5s timeout
         let auth_resp = recv_with_timeout(&mut msg_rx, 5).await?;
@@ -293,7 +317,7 @@ impl WasmWsCoordinator {
             decode_frame(&auth_resp).map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type != MSG_AUTH_ACK {
-            console_log!(
+            engine_warn!(
                 "[WasmWs] auth failed: expected MSG_AUTH_ACK, got {:02X}",
                 msg_type
             );
@@ -305,15 +329,21 @@ impl WasmWsCoordinator {
 
         let auth_ack: AuthAckPayload = serde_json::from_slice(payload)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        engine_info!("[CONN][T3] AUTH_OK status={}", auth_ack.status);
+        if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+            cm.transition(vaultsync_core::connection_manager::ConnectionState::Registering);
+        }
 
         if auth_ack.status != "ok" {
-            console_log!("[WasmWs] auth ack status is not ok: {:?}", auth_ack.error);
+            engine_warn!("[WasmWs] auth ack status is not ok: {:?}", auth_ack.error);
             return Err(CoordinatorError::AuthFailed);
         }
-        console_log!("[WasmWs] auth successful!");
+        let auth_elapsed = (js_sys::Date::now() - auth_t0) as u64;
+        engine_info!("[ws] auth elapsed={}ms", auth_elapsed);
 
         // 3. Perform REGISTER
-        console_log!("[7/9] register");
+        let reg_t0 = js_sys::Date::now();
+        engine_debug!("[VaultSync] register");
         let reg = RegisterPayload {
             replica_id: replica_id.clone(),
             namespace: namespace.to_string(),
@@ -326,6 +356,7 @@ impl WasmWsCoordinator {
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
         ws.send_with_u8_array(&reg_frame)
             .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+        engine_debug!("[CONN][T4] REGISTER_SENT");
 
         // Wait for REGISTER_ACK with 5s timeout
         let reg_resp = recv_with_timeout(&mut msg_rx, 5).await?;
@@ -334,7 +365,7 @@ impl WasmWsCoordinator {
             decode_frame(&reg_resp).map_err(|e| CoordinatorError::Internal(e))?;
 
         if msg_type != MSG_REGISTER_ACK {
-            console_log!(
+            engine_warn!(
                 "[WasmWs] register failed: expected MSG_REGISTER_ACK, got {:02X}",
                 msg_type
             );
@@ -344,40 +375,97 @@ impl WasmWsCoordinator {
             )));
         }
 
-        // Extract generation_id from RegisterAck
+        // Extract generation_id, history_preserved, and max_sequence from RegisterAck
         if let Ok(ack) = serde_json::from_slice::<RegisterAckPayload>(payload) {
             if !ack.generation_id.is_empty() {
                 let mut gen = self.inner.generation_id.lock().unwrap();
                 *gen = ack.generation_id.clone();
-                console_log!(
-                    "[WasmWs] server generation_id={}",
-                    ack.generation_id
+                engine_debug!(
+                    "[WasmWs] server generation_id={} max_sequence={}",
+                    ack.generation_id,
+                    ack.max_sequence
                 );
             }
+            self.inner.history_preserved.store(ack.history_preserved, Ordering::SeqCst);
+            self.inner.max_sequence.store(ack.max_sequence, Ordering::SeqCst);
         }
 
-        console_log!("[WasmWs] register successful!");
+        let reg_elapsed = (js_sys::Date::now() - reg_t0) as u64;
+        engine_info!("[CONN][T5] REGISTER_OK elapsed={}ms", reg_elapsed);
+        if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+            cm.transition(vaultsync_core::connection_manager::ConnectionState::Online);
+        }
 
-        // 4. Perform SUBSCRIBE
-        console_log!("[8/9] subscribe after={}", after);
-        let sub = SubscribePayload {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            namespace: namespace.to_string(),
-            after,
-        };
-        let sub_frame = encode_frame(MSG_SUBSCRIBE, &sub)
-            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
-        ws.send_with_u8_array(&sub_frame)
-            .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+        // 3.5 Drain MSG_SNAPSHOT frames pushed by server after REGISTER_ACK
+        let snap_t0 = js_sys::Date::now();
+        engine_debug!("[WasmWs] draining snapshots after register");
+        loop {
+            let timeout = vaultsync_core::time_utils::sleep(
+                std::time::Duration::from_millis(300),
+            );
+            futures::pin_mut!(timeout);
+            match futures::future::select(msg_rx.next(), timeout).await {
+                Either::Left((Some(bin), _)) => {
+                    if let Ok((mt, pl)) = decode_frame(&bin) {
+                        if mt == MSG_SNAPSHOT {
+                            if let Ok(sp) = serde_json::from_slice::<SnapshotPayload>(pl) {
+                                engine_trace!("[WasmWs] drained snapshot doc={} seq={}", sp.doc_id, sp.sequence);
+                                let snapshot = Snapshot {
+                                    doc_id: sp.doc_id,
+                                    record_id: sp.record_id,
+                                    schema_version: sp.schema_version,
+                                    sequence: sp.sequence,
+                                    created_at: sp.created_at,
+                                    bytes: sp.bytes,
+                                    checksum: sp.checksum,
+                                };
+                                self.inner.received_snapshots.lock().unwrap().push(snapshot);
+                            }
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        let snap_elapsed = (js_sys::Date::now() - snap_t0) as u64;
+        engine_info!("[ws] snapshot_drain elapsed={}ms", snap_elapsed);
+
+        // Compute effective subscribe cursor: prefer max snapshot seq from drain over raw `after`
+        let max_snap_seq = self.inner.received_snapshots.lock().unwrap()
+            .iter()
+            .map(|s| s.sequence)
+            .max()
+            .unwrap_or(0);
+        let effective_after = std::cmp::max(after, max_snap_seq);
+
+        // 4. Perform SUBSCRIBE (skipped when caller will subscribe separately after gen check)
+        let sub_t0 = js_sys::Date::now();
+        if !skip_subscribe {
+            engine_info!("[CONN][T6] SUBSCRIBING after={}", effective_after);
+            engine_debug!("[VaultSync] subscribe after={} (after={} max_snapshot={})", effective_after, after, max_snap_seq);
+            let sub = SubscribePayload {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                namespace: namespace.to_string(),
+                after: effective_after,
+            };
+            let sub_frame = encode_frame(MSG_SUBSCRIBE, &sub)
+                .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            ws.send_with_u8_array(&sub_frame)
+                .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+            let sub_elapsed = (js_sys::Date::now() - sub_t0) as u64;
+            engine_info!("[ws] subscribe_send elapsed={}ms", sub_elapsed);
+        } else {
+            engine_debug!("[VaultSync] subscribe deferred (will subscribe after gen check)");
+        }
 
         // Spawn background message processor with generation guard
         let inner_clone = self.inner.clone();
         let reader_gen = generation;
-        console_debug!("[WasmWs] reader started gen={}", reader_gen);
+        engine_debug!("[WasmWs] reader started gen={}", reader_gen);
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(bin) = msg_rx.next().await {
                 if inner_clone.conn_gen.load(Ordering::SeqCst) != reader_gen {
-                    console_debug!(
+                    engine_debug!(
                         "[WasmWs] reader exiting gen={} current={}",
                         reader_gen,
                         inner_clone.conn_gen.load(Ordering::SeqCst)
@@ -390,14 +478,14 @@ impl WasmWsCoordinator {
                             // Self-filter: skip mutations from our own replica
                             let self_rid = inner_clone.replica_id.lock().unwrap();
                             if mutat.replica_id == *self_rid {
-                                console_debug!(
+                                engine_trace!(
                                     "[WasmWs] skipping own mutation: seq={}",
                                     mutat.sequence
                                 );
                                 continue;
                             }
                             drop(self_rid);
-                            console_log!(
+                            engine_trace!(
                                 "[WasmWs] push seq={}",
                                 mutat.sequence
                             );
@@ -420,6 +508,20 @@ impl WasmWsCoordinator {
                                     .await;
                             }
                         }
+                    } else if msg_type == MSG_SNAPSHOT {
+                        if let Ok(sp) = serde_json::from_slice::<SnapshotPayload>(payload) {
+                            let snapshot = Snapshot {
+                                doc_id: sp.doc_id,
+                                record_id: sp.record_id,
+                                schema_version: sp.schema_version,
+                                sequence: sp.sequence,
+                                created_at: sp.created_at,
+                                bytes: sp.bytes,
+                                checksum: sp.checksum,
+                            };
+                            inner_clone.received_snapshots.lock().unwrap().push(snapshot);
+                            engine_trace!("[reader] cached snapshot seq={}", sp.sequence);
+                        }
                     } else if matches!(msg_type, MSG_HEARTBEAT | MSG_HEARTBEAT_ACK | MSG_ERROR) {
                         // System messages — no response routing needed
                     } else {
@@ -428,7 +530,7 @@ impl WasmWsCoordinator {
                                 json_val.get("request_id").and_then(|v| v.as_str())
                             {
                                 let mut reqs = inner_clone.pending_requests.lock().unwrap();
-                                console_debug!(
+                                engine_trace!(
                                     "[reader] routing req={} pending_requests={}",
                                     req_id,
                                     reqs.len()
@@ -436,7 +538,7 @@ impl WasmWsCoordinator {
                                 if let Some(tx) = reqs.remove(req_id) {
                                     let _ = tx.send(bin);
                                 } else {
-                                    console_debug!("[reader] NO WAITER for req={}", req_id);
+                                    engine_trace!("[reader] NO WAITER for req={}", req_id);
                                 }
                             }
                         }
@@ -448,7 +550,7 @@ impl WasmWsCoordinator {
         // Spawn heartbeat loop with generation guard
         let hb_inner = self.inner.clone();
         let hb_gen = generation;
-        console_debug!("[WasmWs] heartbeat started gen={}", hb_gen);
+        engine_debug!("[WasmWs] heartbeat started gen={}", hb_gen);
         let ws_clone = ws.clone();
         let replica_id_hb = auth.replica_id.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -479,7 +581,7 @@ impl WasmWsCoordinator {
             // Set signaling handler with generation guard
             let signal_inner = self.inner.clone();
             let signal_gen = generation;
-            console_debug!("[WasmWs] signal loop started gen={}", signal_gen);
+            engine_debug!("[WasmWs] signal loop started gen={}", signal_gen);
             wasm_bindgen_futures::spawn_local(async move {
                 peer_coord_clone
                     .set_signal_handler(move |target_id, signal_type, data| {
@@ -560,6 +662,7 @@ impl WasmWsCoordinator {
             state.generation = generation;
         }
 
+        engine_info!("[CONN][T7] ONLINE gen={}", generation);
         Ok(())
     }
 
@@ -569,33 +672,45 @@ impl WasmWsCoordinator {
         request_id: &str,
         payload: &T,
     ) -> Result<Vec<u8>, CoordinatorError> {
+        tracing::trace!("[send_request] create oneshot channel req={}", request_id);
         let (tx, rx) = oneshot::channel::<Vec<u8>>();
         {
             let mut reqs = self.inner.pending_requests.lock().unwrap();
             reqs.insert(request_id.to_string(), tx);
+            tracing::trace!("[send_request] inserted pending req={} pending_count={}", request_id, reqs.len());
         }
 
+        tracing::trace!("[send_request] encode frame start req={}", request_id);
         let frame = encode_frame(msg_type, payload)
             .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        tracing::trace!("[send_request] encode frame done req={} frame_len={}", request_id, frame.len());
 
         {
             let state = self.inner.connection.lock().unwrap();
             if let Some(ref ws) = state.ws {
                 if ws.ready_state() == 1 {
-                    console_debug!("[ws] sending frame req={} type={:02X}", request_id, msg_type);
+                    engine_trace!("[ws] sending frame req={} type={:02X}", request_id, msg_type);
                     ws.send_with_u8_array(&frame)
                         .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+                    tracing::trace!("[send_request] frame sent req={}", request_id);
                 } else {
-                    console_debug!("[ws] send_request NOT_AVAILABLE (ready_state={}) req={}", ws.ready_state(), request_id);
+                    engine_warn!("[CONN][ERR] NotAvailable ready_state={} ws_some=true req={}", ws.ready_state(), request_id);
+                    // Clear zombie WS reference so next attempt reconnects
+                    let mut state = self.inner.connection.lock().unwrap();
+                    if let Some(ref live_ws) = state.ws {
+                        if live_ws.ready_state() != 1 {
+                            state.ws = None;
+                        }
+                    }
                     return Err(CoordinatorError::NotAvailable);
                 }
             } else {
-                console_debug!("[ws] send_request NOT_AVAILABLE (no ws) req={}", request_id);
+                engine_warn!("[CONN][ERR] NotAvailable ws_some=false req={}", request_id);
                 return Err(CoordinatorError::NotAvailable);
             }
         }
 
-        console_debug!("[ws] waiting for response req={}", request_id);
+        tracing::trace!("[send_request] awaiting response req={}", request_id);
         let timeout =
             vaultsync_core::time_utils::sleep(std::time::Duration::from_secs(10));
 
@@ -604,15 +719,17 @@ impl WasmWsCoordinator {
 
         match futures::future::select(rx, timeout).await {
             Either::Left((Ok(resp), _)) => {
+                tracing::trace!("[send_request] response received req={} resp_len={}", request_id, resp.len());
                 Ok(resp)
             }
 
             Either::Left((Err(_), _)) => {
+                tracing::trace!("[send_request] cancelled req={}", request_id);
                 Err(CoordinatorError::Internal("request cancelled".into()))
             }
 
             Either::Right(_) => {
-                console_warn!("[ws] request timed out after 10s req={}", request_id);
+                engine_warn!("[ws] request timed out after 10s req={}", request_id);
                 tracing::warn!("[ws] request timed out after 10s");
                 Err(CoordinatorError::Timeout)
             }
@@ -656,18 +773,25 @@ impl Coordinator for WasmWsCoordinator {
         namespace: &str,
         mutations: Vec<EncryptedMutation>,
     ) -> Result<Vec<SequenceId>, CoordinatorError> {
+        // Fast path: skip if ConnectionManager says we're offline
+        if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+            if !cm.is_online() {
+                tracing::trace!("[WasmWs] push skipped: cm.state()={:?}", cm.state());
+                return Err(CoordinatorError::NotAvailable);
+            }
+        }
         let is_connected = {
             let state = self.inner.connection.lock().unwrap();
             state.ws.is_some()
         };
         if !is_connected {
             if let Err(e) = self.connect_and_handshake(namespace, 0, None).await {
-                console_warn!("[WasmWs] Reconnect failed during push: {:?}", e);
+                engine_warn!("[WasmWs] Reconnect failed during push: {:?}", e);
                 return Err(e);
             }
         }
         if !mutations.is_empty() {
-            console_log!(
+            engine_debug!(
                 "[WasmWs] push called for namespace={}, mutations count={}",
                 namespace,
                 mutations.len()
@@ -679,26 +803,33 @@ impl Coordinator for WasmWsCoordinator {
             mutations,
         };
 
+        tracing::trace!("[WasmWs] push: send_request start req_id={}", req_id);
         let resp_bin = self.send_request(MSG_PUSH, &req_id, &payload).await?;
+        tracing::trace!("[WasmWs] push: send_request done resp_len={}", resp_bin.len());
+        tracing::trace!("[WasmWs] push: decode_frame start");
         let (msg_type, payload) =
             decode_frame(&resp_bin).map_err(|e| CoordinatorError::Internal(e))?;
+        tracing::trace!("[WasmWs] push: decode_frame done msg_type={:02X}", msg_type);
 
         if msg_type == MSG_PUSH_ACK {
+            tracing::trace!("[WasmWs] push: parse ack start");
             let ack: PushAckPayload = serde_json::from_slice(payload)
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+            tracing::trace!("[WasmWs] push: parse ack done seq_count={}", ack.sequences.len());
             if let Some(err) = ack.error {
-                console_log!("[WasmWs] push failed with error: {}", err);
+                engine_warn!("[WasmWs] push failed with error: {}", err);
                 return Err(CoordinatorError::Internal(err));
             }
             if !ack.sequences.is_empty() {
-                console_log!(
+                engine_debug!(
                     "[WasmWs] push ack success, returned sequences={:?}",
                     ack.sequences
                 );
             }
+            tracing::trace!("[WasmWs] push: return sequences ok");
             Ok(ack.sequences)
         } else {
-            console_log!("[WasmWs] push got invalid response type: {:02X}", msg_type);
+            engine_warn!("[WasmWs] push got invalid response type: {:02X}", msg_type);
             Err(CoordinatorError::Internal(
                 "Invalid response type".to_string(),
             ))
@@ -711,13 +842,19 @@ impl Coordinator for WasmWsCoordinator {
         after: SequenceId,
         limit: usize,
     ) -> Result<Vec<PendingMutation>, CoordinatorError> {
+        if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+            if !cm.is_online() {
+                tracing::trace!("[WasmWs] pull skipped: cm.state()={:?}", cm.state());
+                return Err(CoordinatorError::NotAvailable);
+            }
+        }
         let is_connected = {
             let state = self.inner.connection.lock().unwrap();
             state.ws.is_some()
         };
         if !is_connected {
             if let Err(e) = self.connect_and_handshake(namespace, after, None).await {
-                console_log!("[WasmWs] Reconnect failed during pull: {:?}", e);
+                engine_info!("[WasmWs] Reconnect failed during pull: {:?}", e);
                 return Err(e);
             }
         }
@@ -738,7 +875,7 @@ impl Coordinator for WasmWsCoordinator {
             let resp: PullResponsePayload = serde_json::from_slice(payload)
                 .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
             if !resp.mutations.is_empty() {
-                console_log!(
+                engine_debug!(
                     "[WasmWs] pull returned {} mutations, has_more={}",
                     resp.mutations.len(),
                     resp.has_more
@@ -746,7 +883,7 @@ impl Coordinator for WasmWsCoordinator {
             }
             Ok(resp.mutations)
         } else {
-            console_log!("[WasmWs] pull got invalid response type: {:02X}", msg_type);
+            engine_warn!("[WasmWs] pull got invalid response type: {:02X}", msg_type);
             Err(CoordinatorError::Internal(
                 "Invalid response type".to_string(),
             ))
@@ -758,6 +895,12 @@ impl Coordinator for WasmWsCoordinator {
         namespace: &str,
         from_sequence: SequenceId,
     ) -> Result<Box<dyn Stream<Item = PendingMutation> + Send>, CoordinatorError> {
+        if let Some(ref cm) = *self.inner.connection_manager.lock().unwrap() {
+            if !cm.is_online() {
+                tracing::trace!("[WasmWs] subscribe skipped: cm.state()={:?}", cm.state());
+                return Err(CoordinatorError::NotAvailable);
+            }
+        }
         let is_connected = {
             let state = self.inner.connection.lock().unwrap();
             state.ws.is_some()
@@ -798,7 +941,7 @@ impl Coordinator for WasmWsCoordinator {
         info: ReplicaInfo,
         last_sequence: SequenceId,
     ) -> Result<(), CoordinatorError> {
-        console_log!(
+        engine_debug!(
             "[WasmWs] register last_sequence={}",
             last_sequence
         );
@@ -814,7 +957,7 @@ impl Coordinator for WasmWsCoordinator {
         };
 
         if !is_connected {
-            self.connect_and_handshake(namespace, last_sequence, Some(&info))
+            self.connect_and_handshake_impl(namespace, last_sequence, Some(&info), true)
                 .await?;
         } else {
             let reg = RegisterPayload {
@@ -864,27 +1007,75 @@ impl Coordinator for WasmWsCoordinator {
         Ok(0)
     }
 
+    async fn list_snapshots(
+        &self,
+        _namespace: &str,
+    ) -> Result<Vec<Snapshot>, CoordinatorError> {
+        let snaps = self.inner.received_snapshots.lock().unwrap().clone();
+        engine_debug!("[WasmWs] list_snapshots returning {} snapshots", snaps.len());
+        Ok(snaps)
+    }
+
+    async fn store_snapshot(
+        &self,
+        _namespace: &str,
+        snapshot: &Snapshot,
+    ) -> Result<(), CoordinatorError> {
+        let payload = SnapshotPayload {
+            doc_id: snapshot.doc_id.clone(),
+            record_id: snapshot.record_id.clone(),
+            sequence: snapshot.sequence,
+            bytes: snapshot.bytes.clone(),
+            checksum: snapshot.checksum,
+            namespace: _namespace.to_string(),
+            schema_version: snapshot.schema_version,
+            created_at: snapshot.created_at,
+        };
+        let frame = encode_frame(MSG_SNAPSHOT, &payload)
+            .map_err(|e| CoordinatorError::Internal(e.to_string()))?;
+        let state = self.inner.connection.lock().unwrap();
+        if let Some(ref ws) = state.ws {
+            if ws.ready_state() == 1 {
+                ws.send_with_u8_array(&frame)
+                    .map_err(|e| CoordinatorError::Internal(format!("{:?}", e)))?;
+                engine_trace!("[WasmWs] stored snapshot doc={} seq={}", snapshot.doc_id, snapshot.sequence);
+            }
+        }
+        Ok(())
+    }
+
     async fn disconnect(&self) -> Result<(), CoordinatorError> {
-        console_log!("[WasmWs] disconnect requested");
+        engine_debug!("[CONN][T10] CLOSING");
+        engine_debug!("[WasmWs] disconnect requested");
         let mut state = self.inner.connection.lock().unwrap();
         if let Some(ws) = state.ws.take() {
             ws.set_onopen(None);
             ws.set_onclose(None);
             ws.set_onmessage(None);
             let _ = ws.close();
-            console_log!("[WasmWs] existing connection closed");
+            engine_debug!("[WasmWs] existing connection closed");
         }
         state.connecting = false;
         state.waiters.clear();
         drop(state);
+        // Clear cached snapshots to avoid stale data on reconnect
+        self.inner.received_snapshots.lock().unwrap().clear();
         // Bump conn_gen to invalidate background readers from the old connection
         self.inner.conn_gen.fetch_add(1, Ordering::SeqCst);
-        console_log!("[WasmWs] disconnect complete");
+        engine_debug!("[WasmWs] disconnect complete");
         Ok(())
     }
 
     async fn generation_id(&self) -> String {
         self.inner.generation_id.lock().unwrap().clone()
+    }
+
+    async fn history_preserved(&self) -> bool {
+        self.inner.history_preserved.load(Ordering::SeqCst)
+    }
+
+    async fn max_sequence(&self) -> u64 {
+        self.inner.max_sequence.load(Ordering::SeqCst)
     }
 }
 

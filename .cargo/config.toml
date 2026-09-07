@@ -1,2 +1,6 @@
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-args=/PDB:NONE"]
+# PDB generation is harmless; the /PDB:NONE flag causes LNK1201 on MSVC 14.50
+
+# navigator.locks API (Web Locks) requires the unstable web-sys feature
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

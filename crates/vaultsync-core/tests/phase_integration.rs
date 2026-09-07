@@ -123,6 +123,7 @@ async fn test_push_mutation_decrypt_and_apply() {
             sync_status: SyncStatus::Synced,
             synced_at: None,
             created_at: m.timestamp,
+            schema_version: 0,
             origin: MutationOrigin::Unknown,
             origin_context: String::new(),
         }
@@ -901,11 +902,12 @@ async fn test_optimistic_write_promoted_to_pending_on_upload_scan() {
         sequence: None,
         sync_status: SyncStatus::Optimistic,
         synced_at: None,
-        created_at: 1000,
-        origin: MutationOrigin::Unknown,
-        origin_context: String::new(),
-    };
-    storage.write_document_and_oplog("doc-scan", "rec-scan", &vec![], &entry).await.unwrap();
+            created_at: 1000,
+            schema_version: 0,
+            origin: MutationOrigin::Unknown,
+            origin_context: String::new(),
+        };
+        storage.write_document_and_oplog("doc-scan", "rec-scan", &vec![], &entry).await.unwrap();
 
     // Now initialize — should scan optimistic entries and promote to pending
     client.initialize().await.unwrap();

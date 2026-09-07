@@ -100,6 +100,7 @@ pub fn run(args: BenchArgs) {
                         sync_status: SyncStatus::Pending,
                         synced_at: None,
                         created_at: 1000,
+                        schema_version: 0,
                         origin: MutationOrigin::Unknown,
                         origin_context: String::new(),
                     };

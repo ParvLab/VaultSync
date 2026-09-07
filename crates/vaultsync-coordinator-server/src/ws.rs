@@ -238,6 +238,8 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
         snapshot_url: None,
         error: None,
         generation_id: state.generation_id.clone(),
+        history_preserved: false,
+        max_sequence: state.coordinator.max_sequence().await,
     };
 
     let mut available_snapshots = Vec::new();
@@ -280,6 +282,8 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
             bytes: snap.bytes,
             checksum: snap.checksum,
             namespace: ns.clone(),
+            schema_version: snap.schema_version,
+            created_at: snap.created_at,
         };
         if let Ok(snap_frame) = encode_frame(MSG_SNAPSHOT, &snap_payload) {
             if tx.send(Message::Binary(snap_frame)).await.is_err() {
@@ -341,7 +345,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                     MSG_PUSH => {
                         if let Ok(push) = serde_json::from_slice::<PushPayload>(payload) {
                             let req_id = push.request_id.clone();
-                            tracing::info!(
+                            tracing::debug!(
                                 "[ws] MSG_PUSH received count={} req={}",
                                 push.mutations.len(),
                                 req_id
@@ -351,7 +355,7 @@ async fn handle_ws_session(state: AppState, ns: String, socket: WebSocket) {
                                 Ok(seqs) => (seqs, None),
                                 Err(e) => (vec![], Some(format!("{:?}", e))),
                             };
-                            tracing::info!("[ws] MSG_PUSH stored, sending ACK req={}", req_id);
+                            tracing::debug!("[ws] MSG_PUSH stored, sending ACK req={}", req_id);
                             let ack = PushAckPayload {
                                 request_id: push.request_id,
                                 sequences: sequences.clone(),
